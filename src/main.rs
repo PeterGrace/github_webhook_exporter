@@ -1,33 +1,39 @@
-#[macro_use] extern crate tracing;
+use std::process::ExitCode;
 
-use console_subscriber as tokio_console_subscriber;
-use tracing_subscriber::{EnvFilter, Registry, prelude::*};
-use tracing_subscriber::fmt::format::FmtSpan;
-fn main() {
-    let _ = dotenv::dotenv();
+use anyhow::{Context, Result};
+use github_webhook_exporter::{
+    app::{self, AppState},
+    config::RuntimeConfig,
+    telemetry,
+};
+use tokio::net::TcpListener;
+use tracing::{error, info};
 
-    //region console logging
-    let console_layer = tokio_console_subscriber::spawn();
-    let filter_layer = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("warn"))
-        .unwrap();
-    let format_layer = tracing_subscriber::fmt::layer()
-        .event_format(
-            tracing_subscriber::fmt::format()
-                .with_file(true)
-                .with_thread_ids(true)
-                .with_thread_names(true)
-                .with_line_number(true),
-        )
-        .with_span_events(FmtSpan::NONE);
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            // Configuration can fail before the normal subscriber exists. This fallback preserves
+            // structured error reporting without changing an already-installed subscriber.
+            telemetry::init_fallback();
+            error!(error = ?error, "application terminated");
+            ExitCode::FAILURE
+        }
+    }
+}
 
+async fn run() -> Result<()> {
+    let config = RuntimeConfig::from_env().context("failed to load runtime configuration")?;
+    telemetry::init(config.rust_log()).context("failed to initialize local telemetry")?;
 
-    let subscriber = Registry::default()
-        .with(console_layer)
-        .with(filter_layer)
-        .with(format_layer);
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
-    //endregion
+    let bind_address = config.bind_address();
+    let listener = TcpListener::bind(bind_address)
+        .await
+        .with_context(|| format!("failed to bind HTTP listener at {bind_address}"))?;
+    info!(%bind_address, "HTTP server listening");
 
-    info!("Hello, world!");
+    app::serve(listener, AppState::new(config))
+        .await
+        .context("HTTP server failed")
 }
