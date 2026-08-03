@@ -1,5 +1,9 @@
 # Build Spec: GitHub Webhook Exporter
 
+> **Historical draft:** This monolithic draft has been superseded by the reviewed decomposition in
+> [`docs/superpowers/specs/2026-08-03-github-webhook-exporter-design.md`](superpowers/specs/2026-08-03-github-webhook-exporter-design.md).
+> The scoped specifications govern wherever they conflict with this document.
+
 ## Objective
 
 Build a single-instance Rust daemon that:
