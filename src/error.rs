@@ -99,7 +99,8 @@ impl IntoResponse for AppError {
                     "invalid_request",
                     "repository update must not be empty",
                 ),
-                RepositoryStoreError::Cryptographic(_)
+                RepositoryStoreError::AuthenticationFailed
+                | RepositoryStoreError::Cryptographic(_)
                 | RepositoryStoreError::Unavailable
                 | RepositoryStoreError::InternalData
                 | RepositoryStoreError::Internal(_) => internal_response(),

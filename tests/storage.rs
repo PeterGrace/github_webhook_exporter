@@ -345,6 +345,90 @@ async fn encrypted_conflicts_wrong_keys_and_tampering_fail_closed_atomically() {
 }
 
 #[tokio::test]
+async fn repository_authentication_secret_only_loads_enabled_candidates() {
+    let (_directory, _pool, store) = test_store(7).await;
+    store
+        .create(
+            name("owner/enabled"),
+            secret("enabled-webhook-secret"),
+            true,
+        )
+        .await
+        .expect("enabled repository is created");
+    store
+        .create(
+            name("owner/disabled"),
+            secret("disabled-webhook-secret"),
+            false,
+        )
+        .await
+        .expect("disabled repository is created");
+
+    let candidate = store
+        .authentication_secret(&name("owner/enabled"))
+        .await
+        .expect("enabled repository yields authentication material");
+    let disabled_error = store
+        .authentication_secret(&name("owner/disabled"))
+        .await
+        .expect_err("disabled repositories must not yield authentication material");
+    let unknown_error = store
+        .authentication_secret(&name("owner/unknown"))
+        .await
+        .expect_err("unknown repositories must not yield authentication material");
+
+    assert_eq!(candidate.expose_secret(), "enabled-webhook-secret");
+    assert!(matches!(
+        disabled_error,
+        RepositoryStoreError::AuthenticationFailed
+    ));
+    assert!(matches!(
+        unknown_error,
+        RepositoryStoreError::AuthenticationFailed
+    ));
+    assert_eq!(disabled_error.to_string(), unknown_error.to_string());
+}
+
+#[tokio::test]
+async fn repository_authentication_errors_redact_candidate_and_stored_material() {
+    const REPOSITORY_NAME: &str = "sensitive-owner/sensitive-repository";
+    const PLAINTEXT_SECRET: &str = "sensitive-webhook-secret";
+    const CIPHERTEXT_MARKER: &str = "ciphertext-marker-value";
+    const NONCE_MARKER: &str = "nonce-marker";
+    let (_directory, pool, store) = test_store(7).await;
+    let created = store
+        .create(name(REPOSITORY_NAME), secret(PLAINTEXT_SECRET), true)
+        .await
+        .expect("repository is created");
+    sqlx::query(
+        "UPDATE repositories SET webhook_secret_ciphertext = ?, webhook_secret_nonce = ? \
+         WHERE id = ?",
+    )
+    .bind(CIPHERTEXT_MARKER.as_bytes())
+    .bind(NONCE_MARKER.as_bytes())
+    .bind(created.id().get())
+    .execute(&pool)
+    .await
+    .expect("encrypted fields are replaced with test markers");
+
+    let error = store
+        .authentication_secret(&name(REPOSITORY_NAME))
+        .await
+        .expect_err("tampered authentication material must fail closed");
+
+    for rendered in [error.to_string(), format!("{error:?}")] {
+        for forbidden in [
+            REPOSITORY_NAME,
+            PLAINTEXT_SECRET,
+            CIPHERTEXT_MARKER,
+            NONCE_MARKER,
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
+}
+
+#[tokio::test]
 async fn locked_database_maps_to_unavailable_after_the_busy_timeout() {
     let (_directory, pool, store) = test_store(7).await;
     let mut locking_connection = pool

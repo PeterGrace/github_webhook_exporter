@@ -1,10 +1,12 @@
 mod admin_auth;
 mod secret_cipher;
+mod webhook_auth;
 
 use std::fmt;
 
 pub use admin_auth::{AdminAuthenticator, AuthenticationError};
 pub use secret_cipher::RepositorySecretCipher;
+pub use webhook_auth::{WebhookAuthenticationError, WebhookAuthenticator, WebhookSignature};
 
 use secrecy::{zeroize::Zeroizing, ExposeSecret, SecretBox, SecretSlice, SecretString};
 use thiserror::Error;

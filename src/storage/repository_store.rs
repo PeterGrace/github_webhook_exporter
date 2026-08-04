@@ -88,6 +88,35 @@ impl RepositoryStore {
             .collect()
     }
 
+    /// Loads and decrypts webhook authentication material for an enabled repository.
+    ///
+    /// Disabled and unknown repositories both return
+    /// [`RepositoryStoreError::AuthenticationFailed`]. This method never includes the candidate
+    /// repository name or encrypted fields in its errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryStoreError::AuthenticationFailed`] when no enabled repository matches,
+    /// a cryptographic failure for invalid encrypted storage, or a redacted persistence failure.
+    pub async fn authentication_secret(
+        &self,
+        full_name: &CanonicalRepositoryName,
+    ) -> Result<RepositorySecret, RepositoryStoreError> {
+        let row = sqlx::query(
+            "SELECT webhook_secret_ciphertext, webhook_secret_nonce, encryption_version \
+             FROM repositories WHERE full_name = ? AND enabled = 1",
+        )
+        .bind(full_name.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?
+        .ok_or(RepositoryStoreError::AuthenticationFailed)?;
+        let encrypted = decode_encrypted_secret(&row)?;
+        self.cipher
+            .decrypt(full_name, &encrypted)
+            .map_err(RepositoryStoreError::Cryptographic)
+    }
+
     /// Fetches repository metadata by identifier after authenticating its stored secret.
     ///
     /// # Errors
@@ -236,19 +265,7 @@ fn decode_row(row: SqliteRow) -> Result<StoredRepository, RepositoryStoreError> 
             .as_str(),
     )
     .map_err(RepositoryStoreError::Cryptographic)?;
-    let version = u8::try_from(
-        row.try_get::<i64, _>("encryption_version")
-            .map_err(map_sqlx_error)?,
-    )
-    .map_err(|_| RepositoryStoreError::Cryptographic(SecurityError::InvalidEncryptedSecret))?;
-    let encrypted = EncryptedRepositorySecret::from_parts(
-        version,
-        &row.try_get::<Vec<u8>, _>("webhook_secret_nonce")
-            .map_err(map_sqlx_error)?,
-        row.try_get("webhook_secret_ciphertext")
-            .map_err(map_sqlx_error)?,
-    )
-    .map_err(RepositoryStoreError::Cryptographic)?;
+    let encrypted = decode_encrypted_secret(&row)?;
     let enabled = match row.try_get::<i64, _>("enabled").map_err(map_sqlx_error)? {
         0 => false,
         1 => true,
@@ -265,9 +282,30 @@ fn decode_row(row: SqliteRow) -> Result<StoredRepository, RepositoryStoreError> 
     })
 }
 
+fn decode_encrypted_secret(
+    row: &SqliteRow,
+) -> Result<EncryptedRepositorySecret, RepositoryStoreError> {
+    let version = u8::try_from(
+        row.try_get::<i64, _>("encryption_version")
+            .map_err(map_sqlx_error)?,
+    )
+    .map_err(|_| RepositoryStoreError::Cryptographic(SecurityError::InvalidEncryptedSecret))?;
+    EncryptedRepositorySecret::from_parts(
+        version,
+        &row.try_get::<Vec<u8>, _>("webhook_secret_nonce")
+            .map_err(map_sqlx_error)?,
+        row.try_get("webhook_secret_ciphertext")
+            .map_err(map_sqlx_error)?,
+    )
+    .map_err(RepositoryStoreError::Cryptographic)
+}
+
 /// A stable, redacted repository persistence failure.
 #[derive(Debug, Error)]
 pub enum RepositoryStoreError {
+    /// No enabled repository matches a webhook-authentication candidate.
+    #[error("webhook authentication failed")]
+    AuthenticationFailed,
     /// No repository exists with the requested identifier.
     #[error("repository was not found")]
     NotFound,
