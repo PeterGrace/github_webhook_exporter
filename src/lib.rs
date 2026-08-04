@@ -6,5 +6,7 @@ pub mod app;
 pub mod config;
 /// Safe HTTP-facing application errors.
 pub mod error;
+/// Cryptographic and administrative-authentication security primitives.
+pub mod security;
 /// Local structured tracing initialization.
 pub mod telemetry;
