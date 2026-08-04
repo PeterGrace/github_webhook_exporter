@@ -55,6 +55,10 @@ impl<'store> WebhookAuthenticator<'store> {
 
     /// Authenticates the exact borrowed request bytes for one canonical repository candidate.
     ///
+    /// Unknown and disabled repositories return the same error as signature mismatches, but this
+    /// method does not equalize their execution time. HTTP callers must use identical responses
+    /// and logging for every unauthorized outcome so they do not widen that timing signal.
+    ///
     /// # Errors
     ///
     /// Returns [`WebhookAuthenticationError::Unauthorized`] for unknown or disabled repositories,
