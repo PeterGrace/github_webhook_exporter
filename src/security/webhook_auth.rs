@@ -99,6 +99,9 @@ pub enum WebhookAuthenticationError {
     #[error("webhook authentication failed")]
     Unauthorized,
     /// Authentication material could not be loaded or decrypted.
+    ///
+    /// HTTP callers should treat this as a retryable service-unavailable outcome rather than an
+    /// unauthorized request.
     #[error("webhook authentication is unavailable")]
     Unavailable,
 }
