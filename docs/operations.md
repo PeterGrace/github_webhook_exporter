@@ -38,7 +38,8 @@ curl --fail --silent --show-error http://127.0.0.1:8080/health/ready
 ```
 
 Both responses have empty bodies. Database paths, SQL errors, and internal details are never sent
-to the client. A readiness failure does not terminate the process.
+to the client. A readiness failure does not terminate the process; it emits a normalized structured
+warning for local diagnosis.
 
 ## Graceful shutdown
 
