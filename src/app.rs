@@ -3,33 +3,38 @@ use std::sync::Arc;
 use axum::Router;
 use tokio::net::TcpListener;
 
-use crate::config::RuntimeConfig;
+use crate::{api, security::AdminAuthenticator, storage::RepositoryStore};
 
 /// Immutable dependencies shared by all HTTP request handlers.
 #[derive(Clone)]
 pub struct AppState {
-    config: Arc<RuntimeConfig>,
+    repository_store: Arc<RepositoryStore>,
+    admin_authenticator: Arc<AdminAuthenticator>,
 }
 
 impl AppState {
-    /// Creates application state from validated runtime configuration.
-    pub fn new(config: RuntimeConfig) -> Self {
+    /// Creates application state from initialized repository and authentication services.
+    pub fn new(repository_store: RepositoryStore, admin_authenticator: AdminAuthenticator) -> Self {
         Self {
-            config: Arc::new(config),
+            repository_store: Arc::new(repository_store),
+            admin_authenticator: Arc::new(admin_authenticator),
         }
     }
 
-    /// Returns the validated process configuration.
-    pub fn config(&self) -> &RuntimeConfig {
-        &self.config
+    /// Returns encrypted repository persistence.
+    pub fn repository_store(&self) -> &RepositoryStore {
+        &self.repository_store
+    }
+
+    /// Returns the independent administrator credential verifier.
+    pub fn admin_authenticator(&self) -> &AdminAuthenticator {
+        &self.admin_authenticator
     }
 }
 
 /// Builds the composable application router.
-///
-/// Feature issues extend this router with health, configuration, webhook, and metrics routes.
 pub fn build_router(state: AppState) -> Router {
-    Router::new().with_state(state)
+    api::router().with_state(state)
 }
 
 /// Serves the application router on an already-bound TCP listener.
@@ -46,13 +51,13 @@ pub async fn serve(listener: TcpListener, state: AppState) -> std::io::Result<()
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, ffi::OsString, time::Duration};
+    use std::time::Duration;
 
     use axum::{
         body::Body,
         http::{Request, StatusCode},
     };
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use sqlx::SqlitePool;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
@@ -60,29 +65,29 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use crate::config::RuntimeConfig;
+    use crate::{
+        security::{AdminAuthenticator, AdminToken, MasterKey, RepositorySecretCipher},
+        storage::RepositoryStore,
+    };
 
     use super::{build_router, serve, AppState};
 
-    fn runtime_config() -> RuntimeConfig {
-        let variables = HashMap::from([
-            (
-                "GHE_DATABASE_PATH".to_owned(),
-                OsString::from("/tmp/exporter.db"),
-            ),
-            (
-                "GHE_MASTER_KEY".to_owned(),
-                OsString::from(STANDARD.encode([7_u8; 32])),
-            ),
-            ("GHE_ADMIN_TOKEN".to_owned(), OsString::from("admin-token")),
-        ]);
-        RuntimeConfig::from_lookup(|variable| variables.get(variable).cloned())
-            .expect("test configuration is valid")
+    async fn app_state() -> AppState {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite opens");
+        let key = MasterKey::from_slice(&[7_u8; 32]).expect("test key is valid");
+        let cipher = RepositorySecretCipher::new(&key).expect("test cipher initializes");
+        let token = AdminToken::new("admin-token".to_owned()).expect("test token is valid");
+        AppState::new(
+            RepositoryStore::new(pool, cipher),
+            AdminAuthenticator::new(&token),
+        )
     }
 
     #[tokio::test]
-    async fn empty_application_router_is_ready_for_feature_routes() {
-        let router = build_router(AppState::new(runtime_config()));
+    async fn application_router_exposes_only_registered_feature_routes() {
+        let router = build_router(app_state().await);
 
         let response = router
             .oneshot(
@@ -103,7 +108,7 @@ mod tests {
             .await
             .expect("ephemeral listener binds");
         let address = listener.local_addr().expect("listener has an address");
-        let server = tokio::spawn(serve(listener, AppState::new(runtime_config())));
+        let server = tokio::spawn(serve(listener, app_state().await));
         let mut stream = TcpStream::connect(address)
             .await
             .expect("client connects to server");

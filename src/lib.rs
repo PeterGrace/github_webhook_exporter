@@ -1,5 +1,7 @@
 //! Runtime foundation for the GitHub webhook exporter.
 
+/// Authenticated HTTP APIs.
+pub mod api;
 /// HTTP application state, router construction, and server lifecycle primitives.
 pub mod app;
 /// Typed, validated, and redacted runtime configuration.
