@@ -1,4 +1,5 @@
 use std::{
+    io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::Path,
     process::{Command, Stdio},
@@ -62,20 +63,31 @@ fn database_startup_failure_is_fatal_and_redacted() {
 
 #[cfg(unix)]
 #[test]
-fn sigterm_uses_the_graceful_shutdown_path() {
+fn sigterm_graceful_shutdown_and_health_redaction() {
     let directory = tempfile::tempdir().expect("temporary directory is created");
     let bind_address = unused_loopback_address();
     let mut command = configured_command(&directory.path().join("exporter.db"), bind_address);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().expect("exporter process starts");
     let deadline = Instant::now() + Duration::from_secs(3);
-    while TcpStream::connect(bind_address).is_err() {
-        if Instant::now() >= deadline {
-            child.kill().expect("stalled exporter is killed");
-            panic!("exporter did not bind before the test deadline");
+    let mut stream = loop {
+        match TcpStream::connect(bind_address) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                child.kill().expect("stalled exporter is killed");
+                panic!("exporter did not bind before the test deadline: {error}");
+            }
         }
-        thread::sleep(Duration::from_millis(10));
-    }
+    };
+    stream
+        .write_all(b"GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("readiness request is written");
+    let mut health_response = String::new();
+    stream
+        .read_to_string(&mut health_response)
+        .expect("readiness response is read");
+    assert!(health_response.starts_with("HTTP/1.1 200 OK\r\n"));
 
     let signal_status = Command::new("kill")
         .arg("-TERM")
@@ -91,6 +103,16 @@ fn sigterm_uses_the_graceful_shutdown_path() {
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     assert!(stderr.contains("Terminate"));
     assert!(stderr.contains("HTTP server stopped"));
-    assert!(!stderr.contains("startup-admin-token-secret"));
-    assert!(!stderr.contains(&STANDARD.encode([7_u8; 32])));
+    for captured in [&health_response, &stderr] {
+        for forbidden in [
+            "startup-admin-token-secret",
+            STANDARD.encode([7_u8; 32]).as_str(),
+            "Authorization",
+            "webhook_secret",
+            "ciphertext",
+            "nonce",
+        ] {
+            assert!(!captured.contains(forbidden));
+        }
+    }
 }
