@@ -11,9 +11,11 @@ use std::{
 use std::collections::HashMap;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use secrecy::{zeroize::Zeroizing, SecretBox, SecretString};
+use secrecy::zeroize::Zeroizing;
 use thiserror::Error;
 use tracing_subscriber::EnvFilter;
+
+use crate::security::{AdminToken, MasterKey};
 
 const DEFAULT_BIND_ADDRESS: &str = "[::]:8080";
 const DEFAULT_RUST_LOG: &str = "info";
@@ -23,8 +25,8 @@ const MASTER_KEY_LENGTH: usize = 32;
 /// Fully validated process configuration loaded from environment variables.
 pub struct RuntimeConfig {
     database_path: PathBuf,
-    master_key: SecretBox<[u8; MASTER_KEY_LENGTH]>,
-    admin_token: SecretString,
+    master_key: MasterKey,
+    admin_token: AdminToken,
     bind_address: SocketAddr,
     shutdown_timeout: Duration,
     rust_log: String,
@@ -47,12 +49,12 @@ impl RuntimeConfig {
     }
 
     /// Returns the zeroizing database-encryption root key.
-    pub fn master_key(&self) -> &SecretBox<[u8; MASTER_KEY_LENGTH]> {
+    pub fn master_key(&self) -> &MasterKey {
         &self.master_key
     }
 
     /// Returns the zeroizing configuration API credential.
-    pub fn admin_token(&self) -> &SecretString {
+    pub fn admin_token(&self) -> &AdminToken {
         &self.admin_token
     }
 
@@ -95,16 +97,16 @@ impl RuntimeConfig {
                 variable: "GHE_MASTER_KEY",
             });
         }
-        let master_key = SecretBox::init_with_mut(|key: &mut [u8; MASTER_KEY_LENGTH]| {
-            key.copy_from_slice(decoded_master_key.as_slice());
-        });
+        let master_key = MasterKey::from_slice(decoded_master_key.as_slice()).map_err(|_| {
+            ConfigError::Invalid {
+                variable: "GHE_MASTER_KEY",
+            }
+        })?;
 
-        let admin_token = required_string(&mut lookup, "GHE_ADMIN_TOKEN")?;
-        if admin_token.is_empty() {
-            return Err(ConfigError::Invalid {
+        let admin_token = AdminToken::new(required_string(&mut lookup, "GHE_ADMIN_TOKEN")?)
+            .map_err(|_| ConfigError::Invalid {
                 variable: "GHE_ADMIN_TOKEN",
-            });
-        }
+            })?;
 
         let bind_address = optional_string(&mut lookup, "GHE_BIND_ADDRESS")?
             .unwrap_or_else(|| DEFAULT_BIND_ADDRESS.to_owned())
@@ -137,7 +139,7 @@ impl RuntimeConfig {
         Ok(Self {
             database_path: PathBuf::from(database_path),
             master_key,
-            admin_token: SecretString::from(admin_token),
+            admin_token,
             bind_address,
             shutdown_timeout: Duration::from_secs(shutdown_timeout_seconds),
             rust_log,
@@ -215,7 +217,8 @@ mod tests {
     use std::{collections::HashMap, ffi::OsString, net::SocketAddr, path::Path, time::Duration};
 
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use secrecy::ExposeSecret;
+
+    use crate::security::{AdminAuthenticator, RepositorySecretCipher};
 
     use super::{ConfigError, RuntimeConfig};
 
@@ -240,8 +243,12 @@ mod tests {
         let config = RuntimeConfig::from_map(required_variables()).expect("configuration is valid");
 
         assert_eq!(config.database_path(), Path::new("/tmp/exporter.db"));
-        assert_eq!(config.master_key().expose_secret(), &[7_u8; 32]);
-        assert_eq!(config.admin_token().expose_secret(), ADMIN_TOKEN);
+        assert!(RepositorySecretCipher::new(config.master_key()).is_ok());
+        assert_eq!(
+            AdminAuthenticator::new(config.admin_token())
+                .authenticate(Some("Bearer admin-token-value")),
+            Ok(())
+        );
         assert_eq!(config.bind_address(), SocketAddr::from(([0_u16; 8], 8080)));
         assert_eq!(config.shutdown_timeout(), Duration::from_secs(30));
         assert_eq!(config.rust_log(), "info");
