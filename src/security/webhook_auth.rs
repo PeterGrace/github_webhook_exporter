@@ -76,6 +76,8 @@ impl<'store> WebhookAuthenticator<'store> {
             .authentication_secret(repository_name)
             .await
             .map_err(WebhookAuthenticationError::from_store_error)?;
+        // HMAC-SHA-256 accepts keys of any length; retain the fallible API mapping so a future
+        // implementation change still fails closed.
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.expose_secret().as_bytes())
             .map_err(|_| WebhookAuthenticationError::Unavailable)?;
         mac.update(request_body);
