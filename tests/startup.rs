@@ -62,8 +62,7 @@ fn database_startup_failure_is_fatal_and_redacted() {
 }
 
 #[cfg(unix)]
-#[test]
-fn sigterm_graceful_shutdown_and_health_redaction() {
+fn assert_graceful_signal(signal: &str, expected_signal: &str) {
     let directory = tempfile::tempdir().expect("temporary directory is created");
     let bind_address = unused_loopback_address();
     let mut command = configured_command(&directory.path().join("exporter.db"), bind_address);
@@ -90,18 +89,18 @@ fn sigterm_graceful_shutdown_and_health_redaction() {
     assert!(health_response.starts_with("HTTP/1.1 200 OK\r\n"));
 
     let signal_status = Command::new("kill")
-        .arg("-TERM")
+        .arg(signal)
         .arg(child.id().to_string())
         .status()
         .expect("kill command runs");
     assert!(signal_status.success());
     let output = child
         .wait_with_output()
-        .expect("exporter exits after SIGTERM");
+        .expect("exporter exits after the shutdown signal");
 
     assert!(output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
-    assert!(stderr.contains("Terminate"));
+    assert!(stderr.contains(expected_signal));
     assert!(stderr.contains("HTTP server stopped"));
     for captured in [&health_response, &stderr] {
         for forbidden in [
@@ -115,4 +114,16 @@ fn sigterm_graceful_shutdown_and_health_redaction() {
             assert!(!captured.contains(forbidden));
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_graceful_shutdown_and_health_redaction() {
+    assert_graceful_signal("-TERM", "Terminate");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_uses_the_same_graceful_shutdown_path() {
+    assert_graceful_signal("-INT", "Interrupt");
 }
