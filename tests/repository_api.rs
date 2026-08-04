@@ -344,6 +344,27 @@ async fn create_accepts_the_maximum_secret_length() {
 }
 
 #[tokio::test]
+async fn create_maps_an_oversized_json_body_to_the_stable_invalid_request_error() {
+    let app = TestApp::new().await;
+
+    let response = app
+        .create(serde_json::json!({
+            "full_name": "owner/repository",
+            "webhook_secret": "x".repeat(2 * 1024 * 1024)
+        }))
+        .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(response).await,
+        serde_json::json!({
+            "code": "invalid_request",
+            "message": "request is invalid"
+        })
+    );
+}
+
+#[tokio::test]
 async fn create_rejects_malformed_json_with_a_stable_error() {
     let app = TestApp::new().await;
 
