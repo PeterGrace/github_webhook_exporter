@@ -11,6 +11,7 @@ use thiserror::Error;
 
 const MASTER_KEY_LENGTH: usize = 32;
 const NONCE_LENGTH: usize = 12;
+const GCM_TAG_LENGTH: usize = 16;
 const MAX_REPOSITORY_SECRET_LENGTH: usize = 65_536;
 const MAX_REPOSITORY_NAME_SEGMENT_LENGTH: usize = 100;
 
@@ -169,7 +170,7 @@ impl EncryptedRepositorySecret {
         let nonce = nonce
             .try_into()
             .map_err(|_| SecurityError::InvalidEncryptedSecret)?;
-        if ciphertext.len() < 16 {
+        if ciphertext.len() < GCM_TAG_LENGTH {
             return Err(SecurityError::InvalidEncryptedSecret);
         }
 

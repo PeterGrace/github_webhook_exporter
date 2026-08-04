@@ -10,7 +10,7 @@ use sha2::Sha256;
 
 use super::{
     CanonicalRepositoryName, EncryptedRepositorySecret, MasterKey, RepositorySecret, SecurityError,
-    REPOSITORY_SECRET_ENCRYPTION_VERSION,
+    NONCE_LENGTH, REPOSITORY_SECRET_ENCRYPTION_VERSION,
 };
 
 const KEY_DERIVATION_CONTEXT: &[u8] = b"github-webhook-exporter/repository-secret/v1";
@@ -60,7 +60,7 @@ impl RepositorySecretCipher {
                 },
             )
             .map_err(|_| SecurityError::EncryptionFailed)?;
-        let mut stored_nonce = [0_u8; 12];
+        let mut stored_nonce = [0_u8; NONCE_LENGTH];
         stored_nonce.copy_from_slice(&nonce);
 
         Ok(EncryptedRepositorySecret {
@@ -101,6 +101,8 @@ impl RepositorySecretCipher {
                 )
                 .map_err(|_| SecurityError::DecryptionFailed)?,
         );
+        // These checks defend against authenticated values produced outside this implementation;
+        // `encrypt` itself accepts only non-empty, bounded UTF-8 repository secrets.
         let plaintext = std::str::from_utf8(&plaintext)
             .map_err(|_| SecurityError::DecryptionFailed)?
             .to_owned();
