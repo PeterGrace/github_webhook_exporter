@@ -1,4 +1,29 @@
-use std::process::Command;
+use std::{
+    net::{SocketAddr, TcpListener, TcpStream},
+    path::Path,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+fn configured_command(database_path: &Path, bind_address: SocketAddr) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_github_webhook_exporter"));
+    command
+        .env_clear()
+        .env("GHE_DATABASE_PATH", database_path)
+        .env("GHE_MASTER_KEY", STANDARD.encode([7_u8; 32]))
+        .env("GHE_ADMIN_TOKEN", "startup-admin-token-secret")
+        .env("GHE_BIND_ADDRESS", bind_address.to_string())
+        .env("GHE_SHUTDOWN_TIMEOUT_SECONDS", "2");
+    command
+}
+
+fn unused_loopback_address() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral listener binds");
+    listener.local_addr().expect("listener has an address")
+}
 
 #[test]
 fn invalid_configuration_reports_variable_without_leaking_credentials() {
@@ -17,4 +42,55 @@ fn invalid_configuration_reports_variable_without_leaking_credentials() {
     assert!(stderr.contains("GHE_MASTER_KEY"));
     assert!(!stderr.contains(INVALID_MASTER_KEY));
     assert!(!stderr.contains(ADMIN_TOKEN));
+}
+
+#[test]
+fn database_startup_failure_is_fatal_and_redacted() {
+    let directory = tempfile::tempdir().expect("temporary directory is created");
+    let database_path = directory.path().join("missing-parent/exporter.db");
+    let output = configured_command(&database_path, unused_loopback_address())
+        .output()
+        .expect("exporter process starts");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(stderr.contains("failed to initialize SQLite storage"));
+    assert!(!stderr.contains("startup-admin-token-secret"));
+    assert!(!stderr.contains(&STANDARD.encode([7_u8; 32])));
+    assert!(!stderr.contains(database_path.to_string_lossy().as_ref()));
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_uses_the_graceful_shutdown_path() {
+    let directory = tempfile::tempdir().expect("temporary directory is created");
+    let bind_address = unused_loopback_address();
+    let mut command = configured_command(&directory.path().join("exporter.db"), bind_address);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().expect("exporter process starts");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while TcpStream::connect(bind_address).is_err() {
+        if Instant::now() >= deadline {
+            child.kill().expect("stalled exporter is killed");
+            panic!("exporter did not bind before the test deadline");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let signal_status = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()
+        .expect("kill command runs");
+    assert!(signal_status.success());
+    let output = child
+        .wait_with_output()
+        .expect("exporter exits after SIGTERM");
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(stderr.contains("Terminate"));
+    assert!(stderr.contains("HTTP server stopped"));
+    assert!(!stderr.contains("startup-admin-token-secret"));
+    assert!(!stderr.contains(&STANDARD.encode([7_u8; 32])));
 }

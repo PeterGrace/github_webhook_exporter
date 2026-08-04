@@ -28,22 +28,24 @@ struct TestApp {
     _directory: TempDir,
 }
 
+fn router_for_pool(pool: SqlitePool) -> Router {
+    let master_key = MasterKey::from_slice(MASTER_KEY_BYTES).expect("test key is valid");
+    let cipher = RepositorySecretCipher::new(&master_key).expect("test cipher initializes");
+    let admin_token = AdminToken::new(ADMIN_TOKEN.to_owned()).expect("test token is valid");
+    build_router(AppState::new(
+        RepositoryStore::new(pool, cipher),
+        AdminAuthenticator::new(&admin_token),
+    ))
+}
+
 impl TestApp {
     async fn new() -> Self {
         let directory = tempfile::tempdir().expect("temporary directory is created");
         let pool = open_database(&directory.path().join("api.db"))
             .await
             .expect("test database opens and migrates");
-        let master_key = MasterKey::from_slice(MASTER_KEY_BYTES).expect("test key is valid");
-        let cipher = RepositorySecretCipher::new(&master_key).expect("test cipher initializes");
-        let admin_token = AdminToken::new(ADMIN_TOKEN.to_owned()).expect("test token is valid");
-        let state = AppState::new(
-            RepositoryStore::new(pool.clone(), cipher),
-            AdminAuthenticator::new(&admin_token),
-        );
-
         Self {
-            router: build_router(state),
+            router: router_for_pool(pool.clone()),
             pool,
             _directory: directory,
         }
@@ -191,6 +193,51 @@ async fn authentication_rejects_all_invalid_credentials_uniformly() {
             })
         );
     }
+}
+
+#[tokio::test]
+async fn repository_metadata_remains_available_after_process_state_restart() {
+    let directory = tempfile::tempdir().expect("temporary directory is created");
+    let database_path = directory.path().join("restart.db");
+    let first_pool = open_database(&database_path)
+        .await
+        .expect("first database instance opens");
+    let first_router = router_for_pool(first_pool.clone());
+    let create = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/repositories")
+        .header(header::AUTHORIZATION, "Bearer independent-admin-token")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"full_name":"owner/persistent","webhook_secret":"restart-secret"}"#,
+        ))
+        .expect("request is valid");
+    let created = first_router
+        .oneshot(create)
+        .await
+        .expect("first router serves request");
+    assert_eq!(created.status(), StatusCode::CREATED);
+    first_pool.close().await;
+
+    let second_pool = open_database(&database_path)
+        .await
+        .expect("second database instance opens");
+    let list = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/repositories")
+        .header(header::AUTHORIZATION, "Bearer independent-admin-token")
+        .body(Body::empty())
+        .expect("request is valid");
+    let listed = router_for_pool(second_pool)
+        .oneshot(list)
+        .await
+        .expect("second router serves request");
+
+    assert_eq!(listed.status(), StatusCode::OK);
+    let body = String::from_utf8(response_body(listed).await).expect("response is UTF-8");
+    assert!(body.contains("owner/persistent"));
+    assert!(!body.contains("restart-secret"));
+    assert!(!body.contains("webhook_secret"));
 }
 
 #[tokio::test]
