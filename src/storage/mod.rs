@@ -1,3 +1,4 @@
+mod delivery_store;
 mod repository_store;
 
 use std::{fs::OpenOptions, io, path::Path, time::Duration};
@@ -5,6 +6,7 @@ use std::{fs::OpenOptions, io, path::Path, time::Duration};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+pub use delivery_store::{DeliveryClaim, DeliveryStore, DeliveryStoreError};
 pub use repository_store::{RepositoryStore, RepositoryStoreError};
 use sqlx::{
     migrate::MigrateError,
