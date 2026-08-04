@@ -65,6 +65,10 @@ impl RepositoryStore {
 
     /// Lists all repository metadata in identifier order after authenticating every stored secret.
     ///
+    /// Listing is deliberately all-or-nothing: if any row fails authentication, no repository
+    /// metadata is returned. This prevents callers from treating a partially verified database as
+    /// a complete configuration snapshot.
+    ///
     /// # Errors
     ///
     /// Returns a cryptographic failure if any persisted encrypted value is invalid, and a redacted

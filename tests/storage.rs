@@ -103,12 +103,18 @@ async fn database_startup_migrates_and_hardens_every_connection() {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let mode = std::fs::metadata(&database_path)
-            .expect("database metadata is readable")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
+        for database_artifact in [
+            database_path.clone(),
+            database_path.with_file_name("exporter.sqlite3-wal"),
+            database_path.with_file_name("exporter.sqlite3-shm"),
+        ] {
+            let mode = std::fs::metadata(&database_artifact)
+                .expect("database artifact metadata is readable")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{}", database_artifact.display());
+        }
     }
 }
 
@@ -249,8 +255,15 @@ async fn encrypted_rotation_and_rename_preserve_associated_data_invariants() {
     drop(store);
     pool.close().await;
     for entry in fs::read_dir(directory.path()).expect("database directory is readable") {
-        let bytes = fs::read(entry.expect("directory entry is readable").path())
-            .expect("database artifact is readable");
+        let artifact_path = entry.expect("directory entry is readable").path();
+        let bytes = match fs::read(&artifact_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!(
+                "database artifact {} is readable: {error}",
+                artifact_path.display()
+            ),
+        };
         for plaintext in [PLAINTEXT_MARKER, "rotated-secret"] {
             assert!(!bytes
                 .windows(plaintext.len())
@@ -319,6 +332,41 @@ async fn encrypted_conflicts_wrong_keys_and_tampering_fail_closed_atomically() {
         store.list().await,
         Err(RepositoryStoreError::Cryptographic(_))
     ));
+    assert!(matches!(
+        store.delete(first.id()).await,
+        Err(RepositoryStoreError::Cryptographic(_))
+    ));
+    let retained_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM repositories WHERE id = ?")
+        .bind(first.id().get())
+        .fetch_one(&pool)
+        .await
+        .expect("tampered row remains queryable for recovery");
+    assert_eq!(retained_rows, 1);
+}
+
+#[tokio::test]
+async fn locked_database_maps_to_unavailable_after_the_busy_timeout() {
+    let (_directory, pool, store) = test_store(7).await;
+    let mut locking_connection = pool
+        .acquire()
+        .await
+        .expect("locking connection is available");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *locking_connection)
+        .await
+        .expect("write lock is acquired");
+    let started_at = tokio::time::Instant::now();
+
+    let result = store
+        .create(name("owner/blocked"), secret("blocked-secret"), true)
+        .await;
+
+    assert!(matches!(result, Err(RepositoryStoreError::Unavailable)));
+    assert!(started_at.elapsed() >= Duration::from_secs(5));
+    sqlx::query("ROLLBACK")
+        .execute(&mut *locking_connection)
+        .await
+        .expect("write lock is released");
 }
 
 async fn encrypted_fields(pool: &SqlitePool, id: i64) -> (Vec<u8>, Vec<u8>, i64) {
