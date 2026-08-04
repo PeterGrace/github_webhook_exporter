@@ -12,6 +12,8 @@ pub mod domain;
 pub mod error;
 /// Unauthenticated process liveness and SQLite readiness endpoints.
 pub mod health;
+/// Operating-system signal normalization for graceful process shutdown.
+pub mod lifecycle;
 /// Cryptographic and administrative-authentication security primitives.
 pub mod security;
 /// SQLite startup, migrations, probes, and repository persistence.
