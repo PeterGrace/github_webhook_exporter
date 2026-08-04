@@ -20,6 +20,11 @@ use crate::security::{AdminToken, MasterKey};
 const DEFAULT_BIND_ADDRESS: &str = "[::]:8080";
 const DEFAULT_RUST_LOG: &str = "info";
 const DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_WEBHOOK_BODY_LIMIT_BYTES: u64 = 2_097_152;
+const MAX_WEBHOOK_BODY_LIMIT_BYTES: u64 = 2_097_152;
+const DEFAULT_DELIVERY_RETENTION_DAYS: u64 = 7;
+const DEFAULT_DELIVERY_PRUNE_INTERVAL_SECONDS: u64 = 3_600;
+const SECONDS_PER_DAY: u64 = 86_400;
 const MASTER_KEY_LENGTH: usize = 32;
 
 /// Fully validated process configuration loaded from environment variables.
@@ -29,6 +34,9 @@ pub struct RuntimeConfig {
     admin_token: AdminToken,
     bind_address: SocketAddr,
     shutdown_timeout: Duration,
+    webhook_body_limit_bytes: usize,
+    delivery_retention: Duration,
+    delivery_prune_interval: Duration,
     rust_log: String,
 }
 
@@ -66,6 +74,21 @@ impl RuntimeConfig {
     /// Returns the maximum graceful-shutdown duration.
     pub fn shutdown_timeout(&self) -> Duration {
         self.shutdown_timeout
+    }
+
+    /// Returns the maximum accepted GitHub webhook request-body size in bytes.
+    pub fn webhook_body_limit_bytes(&self) -> usize {
+        self.webhook_body_limit_bytes
+    }
+
+    /// Returns how long processed webhook delivery identifiers are retained.
+    pub fn delivery_retention(&self) -> Duration {
+        self.delivery_retention
+    }
+
+    /// Returns the interval between processed-delivery pruning passes.
+    pub fn delivery_prune_interval(&self) -> Duration {
+        self.delivery_prune_interval
     }
 
     /// Returns the validated tracing filter directive.
@@ -130,6 +153,36 @@ impl RuntimeConfig {
             });
         }
 
+        let webhook_body_limit_bytes = optional_positive_u64(
+            &mut lookup,
+            "GHE_WEBHOOK_BODY_LIMIT_BYTES",
+            DEFAULT_WEBHOOK_BODY_LIMIT_BYTES,
+        )?;
+        if webhook_body_limit_bytes > MAX_WEBHOOK_BODY_LIMIT_BYTES {
+            return Err(ConfigError::Invalid {
+                variable: "GHE_WEBHOOK_BODY_LIMIT_BYTES",
+            });
+        }
+        let webhook_body_limit_bytes =
+            usize::try_from(webhook_body_limit_bytes).map_err(|_| ConfigError::Invalid {
+                variable: "GHE_WEBHOOK_BODY_LIMIT_BYTES",
+            })?;
+        let delivery_retention_days = optional_positive_u64(
+            &mut lookup,
+            "GHE_DELIVERY_RETENTION_DAYS",
+            DEFAULT_DELIVERY_RETENTION_DAYS,
+        )?;
+        let delivery_retention_seconds = delivery_retention_days
+            .checked_mul(SECONDS_PER_DAY)
+            .ok_or(ConfigError::Invalid {
+                variable: "GHE_DELIVERY_RETENTION_DAYS",
+            })?;
+        let delivery_prune_interval_seconds = optional_positive_u64(
+            &mut lookup,
+            "GHE_DELIVERY_PRUNE_INTERVAL_SECONDS",
+            DEFAULT_DELIVERY_PRUNE_INTERVAL_SECONDS,
+        )?;
+
         let rust_log = optional_string(&mut lookup, "RUST_LOG")?
             .unwrap_or_else(|| DEFAULT_RUST_LOG.to_owned());
         EnvFilter::try_new(&rust_log).map_err(|_| ConfigError::Invalid {
@@ -142,6 +195,9 @@ impl RuntimeConfig {
             admin_token,
             bind_address,
             shutdown_timeout: Duration::from_secs(shutdown_timeout_seconds),
+            webhook_body_limit_bytes,
+            delivery_retention: Duration::from_secs(delivery_retention_seconds),
+            delivery_prune_interval: Duration::from_secs(delivery_prune_interval_seconds),
             rust_log,
         })
     }
@@ -161,6 +217,9 @@ impl fmt::Debug for RuntimeConfig {
             .field("admin_token", &"[REDACTED]")
             .field("bind_address", &self.bind_address)
             .field("shutdown_timeout", &self.shutdown_timeout)
+            .field("webhook_body_limit_bytes", &self.webhook_body_limit_bytes)
+            .field("delivery_retention", &self.delivery_retention)
+            .field("delivery_prune_interval", &self.delivery_prune_interval)
             .field("rust_log", &self.rust_log)
             .finish()
     }
@@ -212,6 +271,23 @@ fn optional_string(
         .transpose()
 }
 
+fn optional_positive_u64(
+    lookup: &mut impl FnMut(&str) -> Option<OsString>,
+    variable: &'static str,
+    default: u64,
+) -> Result<u64, ConfigError> {
+    let value = optional_string(lookup, variable)?.map_or(Ok(default), |value| {
+        value
+            .parse::<u64>()
+            .map_err(|_| ConfigError::Invalid { variable })
+    })?;
+    if value == 0 {
+        return Err(ConfigError::Invalid { variable });
+    }
+
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, ffi::OsString, net::SocketAddr, path::Path, time::Duration};
@@ -251,6 +327,9 @@ mod tests {
         );
         assert_eq!(config.bind_address(), SocketAddr::from(([0_u16; 8], 8080)));
         assert_eq!(config.shutdown_timeout(), Duration::from_secs(30));
+        assert_eq!(config.webhook_body_limit_bytes(), 2_097_152);
+        assert_eq!(config.delivery_retention(), Duration::from_secs(7 * 86_400));
+        assert_eq!(config.delivery_prune_interval(), Duration::from_secs(3_600));
         assert_eq!(config.rust_log(), "info");
     }
 
@@ -266,6 +345,18 @@ mod tests {
             OsString::from("45"),
         );
         variables.insert(
+            "GHE_WEBHOOK_BODY_LIMIT_BYTES".to_owned(),
+            OsString::from("2097152"),
+        );
+        variables.insert(
+            "GHE_DELIVERY_RETENTION_DAYS".to_owned(),
+            OsString::from("14"),
+        );
+        variables.insert(
+            "GHE_DELIVERY_PRUNE_INTERVAL_SECONDS".to_owned(),
+            OsString::from("120"),
+        );
+        variables.insert(
             "RUST_LOG".to_owned(),
             OsString::from("github_webhook_exporter=debug"),
         );
@@ -277,6 +368,12 @@ mod tests {
             SocketAddr::from(([127, 0, 0, 1], 9000))
         );
         assert_eq!(config.shutdown_timeout(), Duration::from_secs(45));
+        assert_eq!(config.webhook_body_limit_bytes(), 2_097_152);
+        assert_eq!(
+            config.delivery_retention(),
+            Duration::from_secs(14 * 86_400)
+        );
+        assert_eq!(config.delivery_prune_interval(), Duration::from_secs(120));
         assert_eq!(config.rust_log(), "github_webhook_exporter=debug");
     }
 
@@ -302,6 +399,14 @@ mod tests {
             ("GHE_BIND_ADDRESS", "invalid-address"),
             ("GHE_SHUTDOWN_TIMEOUT_SECONDS", "0"),
             ("GHE_SHUTDOWN_TIMEOUT_SECONDS", "not-a-number"),
+            ("GHE_WEBHOOK_BODY_LIMIT_BYTES", "0"),
+            ("GHE_WEBHOOK_BODY_LIMIT_BYTES", "not-a-number"),
+            ("GHE_WEBHOOK_BODY_LIMIT_BYTES", "2097153"),
+            ("GHE_DELIVERY_RETENTION_DAYS", "0"),
+            ("GHE_DELIVERY_RETENTION_DAYS", "not-a-number"),
+            ("GHE_DELIVERY_RETENTION_DAYS", "18446744073709551615"),
+            ("GHE_DELIVERY_PRUNE_INTERVAL_SECONDS", "0"),
+            ("GHE_DELIVERY_PRUNE_INTERVAL_SECONDS", "not-a-number"),
             ("RUST_LOG", "[invalid"),
         ];
 
