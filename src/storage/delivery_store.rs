@@ -3,11 +3,13 @@ use std::fmt;
 use crate::domain::delivery::DeliveryId;
 use sqlx::SqlitePool;
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{format_description::FormatItem, macros::format_description, OffsetDateTime, UtcOffset};
 
 use super::sqlite_is_busy_or_locked;
 
 const DELIVERY_PRUNE_BATCH_SIZE: i64 = 1_000;
+const DELIVERY_TIMESTAMP_FORMAT: &[FormatItem<'static>] =
+    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
 
 /// Whether an atomic delivery claim inserted a new row or found an existing claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,21 +75,20 @@ impl DeliveryStore {
     /// Returns [`DeliveryStoreError::Unavailable`] when SQLite is busy or locked and
     /// [`DeliveryStoreError::Internal`] for other persistence failures.
     pub async fn prune_batch(&self, cutoff: OffsetDateTime) -> Result<u64, DeliveryStoreError> {
-        let cutoff_millis = cutoff
-            .unix_timestamp()
-            .checked_mul(1_000)
-            .and_then(|seconds| seconds.checked_add(i64::from(cutoff.millisecond())))
-            .ok_or(DeliveryStoreError::Internal)?;
+        let cutoff = cutoff
+            .to_offset(UtcOffset::UTC)
+            .format(DELIVERY_TIMESTAMP_FORMAT)
+            .map_err(|_| DeliveryStoreError::Internal)?;
         let result = sqlx::query(
             "DELETE FROM processed_deliveries \
              WHERE delivery_id IN (\
                  SELECT delivery_id FROM processed_deliveries \
-                 WHERE received_at < strftime('%Y-%m-%dT%H:%M:%fZ', ? / 1000.0, 'unixepoch') \
+                 WHERE received_at < ? \
                  ORDER BY received_at, delivery_id \
                  LIMIT ?\
              )",
         )
-        .bind(cutoff_millis)
+        .bind(cutoff)
         .bind(DELIVERY_PRUNE_BATCH_SIZE)
         .execute(&self.pool)
         .await

@@ -100,7 +100,7 @@ Expected: PASS for schema, durability, duplicate, and forbidden-column tests.
 
 **Interfaces:**
 - Produces: `DeliveryStore::prune_batch(OffsetDateTime) -> Result<u64, DeliveryStoreError>`
-- Uses: `const DELIVERY_PRUNE_BATCH_SIZE: u64 = 1_000`
+- Uses: `const DELIVERY_PRUNE_BATCH_SIZE: i64 = 1_000` for SQLite's signed `LIMIT` bind
 
 - [ ] **Step 1: Add failing behavior tests**
 
@@ -113,7 +113,7 @@ Expected: FAIL because pruning and delivery-specific error mapping are incomplet
 
 - [ ] **Step 3: Implement bounded indexed pruning and error mapping**
 
-Add direct `time = { version = "0.3", default-features = false }`. Bind the cutoff as a Unix timestamp and normalize it inside SQLite to the same UTC millisecond text format used by claims, then execute one statement per call:
+Add direct `time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }`. Normalize the cutoff to UTC and format it in Rust using the same fixed-width millisecond text format used by claims, then execute one statement per call:
 
 ```sql
 DELETE FROM processed_deliveries
