@@ -17,7 +17,7 @@ None.
 | `GHE_DATABASE_PATH` | Required path to the SQLite database file. |
 | `GHE_MASTER_KEY` | Required base64 encoding of exactly 32 random bytes. |
 | `GHE_ADMIN_TOKEN` | Required independent, high-entropy bearer token. |
-| `GHE_BIND_ADDRESS` | Optional socket address; default `0.0.0.0:8080`. |
+| `GHE_BIND_ADDRESS` | Optional socket address; default `[::]:8080`. |
 | `RUST_LOG` | Optional tracing filter; default `info`. |
 | `GHE_SHUTDOWN_TIMEOUT_SECONDS` | Optional positive integer; default `30`. |
 

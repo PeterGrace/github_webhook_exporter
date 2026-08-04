@@ -15,7 +15,7 @@ use secrecy::{zeroize::Zeroizing, SecretBox, SecretString};
 use thiserror::Error;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:8080";
+const DEFAULT_BIND_ADDRESS: &str = "[::]:8080";
 const DEFAULT_RUST_LOG: &str = "info";
 const DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: u64 = 30;
 const MASTER_KEY_LENGTH: usize = 32;
@@ -242,10 +242,7 @@ mod tests {
         assert_eq!(config.database_path(), Path::new("/tmp/exporter.db"));
         assert_eq!(config.master_key().expose_secret(), &[7_u8; 32]);
         assert_eq!(config.admin_token().expose_secret(), ADMIN_TOKEN);
-        assert_eq!(
-            config.bind_address(),
-            SocketAddr::from(([0, 0, 0, 0], 8080))
-        );
+        assert_eq!(config.bind_address(), SocketAddr::from(([0_u16; 8], 8080)));
         assert_eq!(config.shutdown_timeout(), Duration::from_secs(30));
         assert_eq!(config.rust_log(), "info");
     }
