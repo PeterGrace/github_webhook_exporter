@@ -6,7 +6,7 @@ use std::fmt;
 pub use admin_auth::{AdminAuthenticator, AuthenticationError};
 pub use secret_cipher::RepositorySecretCipher;
 
-use secrecy::{ExposeSecret, SecretBox, SecretString};
+use secrecy::{zeroize::Zeroizing, ExposeSecret, SecretBox, SecretSlice, SecretString};
 use thiserror::Error;
 
 const MASTER_KEY_LENGTH: usize = 32;
@@ -77,7 +77,7 @@ impl fmt::Debug for AdminToken {
 }
 
 /// A validated plaintext webhook secret held in zeroizing memory.
-pub struct RepositorySecret(SecretString);
+pub struct RepositorySecret(SecretSlice<u8>);
 
 impl RepositorySecret {
     /// Stores a repository webhook secret after validating its byte length.
@@ -87,18 +87,29 @@ impl RepositorySecret {
     /// Returns [`SecurityError::InvalidRepositorySecretLength`] when `secret` is empty or exceeds
     /// 65,536 bytes.
     pub fn new(secret: String) -> Result<Self, SecurityError> {
-        if secret.is_empty() || secret.len() > MAX_REPOSITORY_SECRET_LENGTH {
+        if !valid_repository_secret_bytes(secret.as_bytes()) {
             return Err(SecurityError::InvalidRepositorySecretLength);
         }
 
-        Ok(Self(SecretString::from(secret)))
+        Ok(Self(SecretSlice::from(secret.into_bytes())))
+    }
+
+    pub(crate) fn from_decrypted_bytes(
+        mut secret: Zeroizing<Vec<u8>>,
+    ) -> Result<Self, SecurityError> {
+        if !valid_repository_secret_bytes(&secret) || std::str::from_utf8(&secret).is_err() {
+            return Err(SecurityError::DecryptionFailed);
+        }
+
+        Ok(Self(SecretSlice::from(std::mem::take(&mut *secret))))
     }
 
     /// Explicitly exposes the plaintext secret to cryptographic consumers.
     ///
     /// Callers must not format, serialize, or log the returned value.
     pub fn expose_secret(&self) -> &str {
-        self.0.expose_secret()
+        std::str::from_utf8(self.0.expose_secret())
+            .expect("RepositorySecret validates UTF-8 at construction")
     }
 }
 
@@ -243,6 +254,10 @@ pub enum SecurityError {
     DecryptionFailed,
 }
 
+fn valid_repository_secret_bytes(secret: &[u8]) -> bool {
+    !secret.is_empty() && secret.len() <= MAX_REPOSITORY_SECRET_LENGTH
+}
+
 fn valid_repository_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment.len() <= MAX_REPOSITORY_NAME_SEGMENT_LENGTH
@@ -255,6 +270,7 @@ fn valid_repository_segment(segment: &str) -> bool {
 mod tests {
     use std::fmt;
 
+    use secrecy::zeroize::Zeroizing;
     use static_assertions::assert_not_impl_any;
 
     use super::{
@@ -285,6 +301,19 @@ mod tests {
             AdminToken::new(String::new()).expect_err("empty tokens must be rejected"),
             SecurityError::InvalidAdminToken
         );
+    }
+
+    #[test]
+    fn decrypted_bytes_transfer_directly_into_zeroizing_secret_storage() {
+        let mut decrypted = Zeroizing::new(b"webhook-secret".to_vec());
+        decrypted.shrink_to_fit();
+        let original_allocation = decrypted.as_ptr();
+
+        let secret = RepositorySecret::from_decrypted_bytes(decrypted)
+            .expect("valid decrypted bytes must be accepted");
+
+        assert_eq!(secret.expose_secret(), "webhook-secret");
+        assert_eq!(secret.expose_secret().as_ptr(), original_allocation);
     }
 
     #[test]

@@ -101,12 +101,9 @@ impl RepositorySecretCipher {
                 )
                 .map_err(|_| SecurityError::DecryptionFailed)?,
         );
-        // These checks defend against authenticated values produced outside this implementation;
-        // `encrypt` itself accepts only non-empty, bounded UTF-8 repository secrets.
-        let plaintext = std::str::from_utf8(&plaintext)
-            .map_err(|_| SecurityError::DecryptionFailed)?
-            .to_owned();
-        RepositorySecret::new(plaintext).map_err(|_| SecurityError::DecryptionFailed)
+        // This validates authenticated values produced outside this implementation and transfers
+        // the allocation directly into zeroizing storage without copying the plaintext.
+        RepositorySecret::from_decrypted_bytes(plaintext)
     }
 }
 
