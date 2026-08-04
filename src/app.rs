@@ -1,23 +1,27 @@
 use std::sync::Arc;
 
 use axum::Router;
+use sqlx::SqlitePool;
 use tokio::net::TcpListener;
 
-use crate::{api, security::AdminAuthenticator, storage::RepositoryStore};
+use crate::{api, health, security::AdminAuthenticator, storage::RepositoryStore};
 
 /// Immutable dependencies shared by all HTTP request handlers.
 #[derive(Clone)]
 pub struct AppState {
     repository_store: Arc<RepositoryStore>,
     admin_authenticator: Arc<AdminAuthenticator>,
+    database_pool: SqlitePool,
 }
 
 impl AppState {
     /// Creates application state from initialized repository and authentication services.
     pub fn new(repository_store: RepositoryStore, admin_authenticator: AdminAuthenticator) -> Self {
+        let database_pool = repository_store.pool().clone();
         Self {
             repository_store: Arc::new(repository_store),
             admin_authenticator: Arc::new(admin_authenticator),
+            database_pool,
         }
     }
 
@@ -34,7 +38,7 @@ impl AppState {
 
 /// Builds the composable application router.
 pub fn build_router(state: AppState) -> Router {
-    api::router().with_state(state)
+    health::router(state.database_pool.clone()).merge(api::router().with_state(state))
 }
 
 /// Serves the application router on an already-bound TCP listener.

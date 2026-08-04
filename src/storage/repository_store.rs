@@ -25,6 +25,10 @@ impl RepositoryStore {
         Self { pool, cipher }
     }
 
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     /// Encrypts and inserts a repository configuration in one transaction.
     ///
     /// # Errors
