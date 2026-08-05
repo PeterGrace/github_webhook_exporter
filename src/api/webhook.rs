@@ -13,6 +13,7 @@ use serde::Deserialize;
 use tracing::{error, info};
 
 use crate::{
+    api::merge_group::EventProjection,
     app::AppState,
     domain::delivery::DeliveryId,
     error::AppError,
@@ -45,11 +46,6 @@ struct WebhookRepositoryProjection {
 #[derive(Deserialize)]
 struct RepositoryProjection {
     full_name: String,
-}
-
-#[derive(Deserialize)]
-struct WebhookActionProjection {
-    action: Option<String>,
 }
 
 struct WebhookRequest {
@@ -111,16 +107,19 @@ async fn webhook_handler(
         }
     }
 
-    let action_projection: WebhookActionProjection =
+    let event_projection: EventProjection =
         serde_json::from_slice(&request.body).map_err(|_| AppError::invalid_webhook())?;
 
     match state.delivery_store().claim(&request.delivery_id).await {
         Ok(DeliveryClaim::Duplicate) => state.metrics().record_duplicate(),
-        Ok(DeliveryClaim::New) => state.metrics().observe_event(
-            normalize_event_type(&request.event_type),
-            normalize_action(action_projection.action.as_deref()),
-            request.body.len(),
-        ),
+        Ok(DeliveryClaim::New) => {
+            let event_type = normalize_event_type(&request.event_type);
+            let action = normalize_action(event_projection.action());
+            state
+                .metrics()
+                .observe_event(event_type, action, request.body.len());
+            event_projection.process_merge_group(event_type, action, state.metrics());
+        }
         Err(_) => {
             return Err(unavailable_error(&state, FailureStage::DeliveryClaim));
         }
