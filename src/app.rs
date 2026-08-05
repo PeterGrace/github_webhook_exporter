@@ -314,6 +314,10 @@ mod tests {
             "github_webhook_duplicates_total",
             "github_webhook_processing_failures_total",
             "github_repository_configurations",
+            "github_merge_group_events_total",
+            "github_merge_queue_pr_outcomes_total",
+            "github_merge_queue_attempt_duration_seconds",
+            "github_merge_queue_transition_failures_total",
         ] {
             assert!(
                 exposition.contains(metric_name),

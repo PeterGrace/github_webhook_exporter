@@ -37,6 +37,26 @@ const REQUEST_BODY_SIZE_BUCKETS: [f64; 10] = [
     1_048_576.0,
     2_097_152.0,
 ];
+const MERGE_QUEUE_ATTEMPT_DURATION_BUCKETS: [f64; 15] = [
+    1.0,
+    10.0,
+    60.0,
+    300.0,
+    900.0,
+    3_600.0,
+    10_800.0,
+    21_600.0,
+    43_200.0,
+    86_400.0,
+    259_200.0,
+    604_800.0,
+    2_592_000.0,
+    7_776_000.0,
+    31_536_000.0,
+];
+
+/// Largest merge-queue attempt duration accepted by the metrics sanity check.
+pub const MAX_MERGE_QUEUE_ATTEMPT_DURATION: time::Duration = time::Duration::days(365);
 
 /// A normalized GitHub webhook event type from the fixed v1 vocabulary.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -252,6 +272,170 @@ pub enum FailureStage {
     Metrics,
     /// General database failure.
     Database,
+    /// Durable merge-queue state transition failure.
+    QueueState,
+}
+
+/// A bounded merge-group webhook action.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum MergeGroupAction {
+    /// GitHub requested checks for a newly created merge group.
+    ChecksRequested,
+    /// GitHub destroyed an existing merge group.
+    Destroyed,
+}
+
+impl MergeGroupAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ChecksRequested => "checks_requested",
+            Self::Destroyed => "destroyed",
+        }
+    }
+}
+
+impl EncodeLabelValue for MergeGroupAction {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> fmt::Result {
+        encoder.write_str(self.as_str())
+    }
+}
+
+/// A bounded reason associated with a merge-group action.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum MergeGroupReason {
+    /// No reason applies to a `checks_requested` action.
+    None,
+    /// GitHub destroyed the group after it merged.
+    Merged,
+    /// GitHub destroyed the group after it left the queue.
+    Dequeued,
+    /// GitHub invalidated the group.
+    Invalidated,
+    /// The raw reason was absent or outside the fixed vocabulary.
+    Other,
+}
+
+impl MergeGroupReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Merged => "merged",
+            Self::Dequeued => "dequeued",
+            Self::Invalidated => "invalidated",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl EncodeLabelValue for MergeGroupReason {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> fmt::Result {
+        encoder.write_str(self.as_str())
+    }
+}
+
+/// A bounded terminal merge-queue attempt outcome.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum MergeQueueOutcome {
+    /// The pull request merged successfully.
+    Succeeded,
+    /// Reserved for a future evidence-backed failure classifier.
+    Failed,
+    /// Reserved for a future evidence-backed cancellation classifier.
+    Cancelled,
+    /// The attempt ended without a supported semantic classification.
+    Unknown,
+}
+
+impl MergeQueueOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl EncodeLabelValue for MergeQueueOutcome {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> fmt::Result {
+        encoder.write_str(self.as_str())
+    }
+}
+
+/// A bounded terminal reason for one pull request's queue attempt.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum MergeQueueReason {
+    /// A merged pull-request event proved success.
+    PullRequestMerged,
+    /// A dequeue ended the attempt without evidence for a stronger classification.
+    UnclassifiedDequeue,
+}
+
+impl MergeQueueReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PullRequestMerged => "pull_request_merged",
+            Self::UnclassifiedDequeue => "unclassified_dequeue",
+        }
+    }
+}
+
+impl EncodeLabelValue for MergeQueueReason {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> fmt::Result {
+        encoder.write_str(self.as_str())
+    }
+}
+
+/// An evidence-backed terminal queue completion with an invariant outcome/reason pairing.
+///
+/// Failed and cancelled outcomes remain reserved until a future classifier revision adds explicit
+/// evidence-backed completion variants and reason vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeQueueCompletion {
+    /// A merged pull-request event proves `succeeded` with `pull_request_merged`.
+    PullRequestMerged,
+    /// A dequeue records `unknown` with `unclassified_dequeue`.
+    UnclassifiedDequeue,
+}
+
+impl MergeQueueCompletion {
+    fn labels(self) -> MergeQueueOutcomeLabels {
+        match self {
+            Self::PullRequestMerged => MergeQueueOutcomeLabels {
+                outcome: MergeQueueOutcome::Succeeded,
+                reason: MergeQueueReason::PullRequestMerged,
+            },
+            Self::UnclassifiedDequeue => MergeQueueOutcomeLabels {
+                outcome: MergeQueueOutcome::Unknown,
+                reason: MergeQueueReason::UnclassifiedDequeue,
+            },
+        }
+    }
+}
+
+/// A bounded reason for a rejected or impossible merge-queue transition.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum QueueTransitionFailureReason {
+    /// A completion event had no active durable attempt.
+    MissingActiveAttempt,
+    /// A computed attempt duration was negative or exceeded the sanity ceiling.
+    InvalidDuration,
+}
+
+impl QueueTransitionFailureReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingActiveAttempt => "missing_active_attempt",
+            Self::InvalidDuration => "invalid_duration",
+        }
+    }
+}
+
+impl EncodeLabelValue for QueueTransitionFailureReason {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> fmt::Result {
+        encoder.write_str(self.as_str())
+    }
 }
 
 impl WebhookResult {
@@ -280,6 +464,7 @@ impl FailureStage {
             Self::DeliveryClaim => "delivery_claim",
             Self::Metrics => "metrics",
             Self::Database => "database",
+            Self::QueueState => "queue_state",
         }
     }
 }
@@ -306,6 +491,28 @@ struct FailureLabels {
     stage: FailureStage,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct MergeGroupLabels {
+    action: MergeGroupAction,
+    reason: MergeGroupReason,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct MergeQueueOutcomeLabels {
+    outcome: MergeQueueOutcome,
+    reason: MergeQueueReason,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct MergeQueueDurationLabels {
+    outcome: MergeQueueOutcome,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct QueueTransitionFailureLabels {
+    reason: QueueTransitionFailureReason,
+}
+
 type CounterFamily<L> = Family<L, Counter>;
 type HistogramFamily<L> = Family<L, Histogram, fn() -> Histogram>;
 type RepositoryGauge = Gauge<u64, AtomicU64>;
@@ -329,10 +536,14 @@ struct MetricsInner {
     duplicates: Counter,
     processing_failures: CounterFamily<FailureLabels>,
     repository_configurations: RepositoryGauge,
+    merge_group_events: CounterFamily<MergeGroupLabels>,
+    merge_queue_pr_outcomes: CounterFamily<MergeQueueOutcomeLabels>,
+    merge_queue_attempt_duration: HistogramFamily<MergeQueueDurationLabels>,
+    merge_queue_transition_failures: CounterFamily<QueueTransitionFailureLabels>,
 }
 
 impl Metrics {
-    /// Creates an empty metrics registry containing every Phase 2 instrument.
+    /// Creates an empty metrics registry containing every Phase 2 and Phase 3 instrument.
     pub fn new() -> Self {
         let webhook_requests = CounterFamily::default();
         let webhook_events = CounterFamily::default();
@@ -342,6 +553,12 @@ impl Metrics {
         let duplicates = Counter::default();
         let processing_failures = CounterFamily::default();
         let repository_configurations = RepositoryGauge::default();
+        let merge_group_events = CounterFamily::default();
+        let merge_queue_pr_outcomes = CounterFamily::default();
+        let merge_queue_attempt_duration = HistogramFamily::new_with_constructor(
+            merge_queue_attempt_duration_histogram as fn() -> Histogram,
+        );
+        let merge_queue_transition_failures = CounterFamily::default();
         let mut registry = Registry::with_prefix("github");
 
         // `prometheus-client` omits a labelled family until it owns at least one metric. Seed only
@@ -367,8 +584,46 @@ impl Metrics {
             FailureStage::DeliveryClaim,
             FailureStage::Metrics,
             FailureStage::Database,
+            FailureStage::QueueState,
         ] {
             let _ = processing_failures.get_or_create(&FailureLabels { stage });
+        }
+        let _ = merge_group_events.get_or_create(&MergeGroupLabels {
+            action: MergeGroupAction::ChecksRequested,
+            reason: MergeGroupReason::None,
+        });
+        for reason in [
+            MergeGroupReason::Merged,
+            MergeGroupReason::Dequeued,
+            MergeGroupReason::Invalidated,
+            MergeGroupReason::Other,
+        ] {
+            let _ = merge_group_events.get_or_create(&MergeGroupLabels {
+                action: MergeGroupAction::Destroyed,
+                reason,
+            });
+        }
+        for (outcome, reason) in [
+            (
+                MergeQueueOutcome::Succeeded,
+                MergeQueueReason::PullRequestMerged,
+            ),
+            (
+                MergeQueueOutcome::Unknown,
+                MergeQueueReason::UnclassifiedDequeue,
+            ),
+        ] {
+            let _ =
+                merge_queue_pr_outcomes.get_or_create(&MergeQueueOutcomeLabels { outcome, reason });
+            let _ =
+                merge_queue_attempt_duration.get_or_create(&MergeQueueDurationLabels { outcome });
+        }
+        for reason in [
+            QueueTransitionFailureReason::MissingActiveAttempt,
+            QueueTransitionFailureReason::InvalidDuration,
+        ] {
+            let _ = merge_queue_transition_failures
+                .get_or_create(&QueueTransitionFailureLabels { reason });
         }
 
         registry.register(
@@ -406,6 +661,26 @@ impl Metrics {
             "Current configured repository record count",
             repository_configurations.clone(),
         );
+        registry.register(
+            "merge_group_events",
+            "Merge-group webhook events by bounded action and reason",
+            merge_group_events.clone(),
+        );
+        registry.register(
+            "merge_queue_pr_outcomes",
+            "Completed pull-request queue attempts by bounded outcome and reason",
+            merge_queue_pr_outcomes.clone(),
+        );
+        registry.register(
+            "merge_queue_attempt_duration_seconds",
+            "Valid completed merge-queue attempt duration in seconds by bounded outcome",
+            merge_queue_attempt_duration.clone(),
+        );
+        registry.register(
+            "merge_queue_transition_failures",
+            "Merge-queue transition failures by bounded reason",
+            merge_queue_transition_failures.clone(),
+        );
 
         Self {
             inner: Arc::new(MetricsInner {
@@ -417,6 +692,10 @@ impl Metrics {
                 duplicates,
                 processing_failures,
                 repository_configurations,
+                merge_group_events,
+                merge_queue_pr_outcomes,
+                merge_queue_attempt_duration,
+                merge_queue_transition_failures,
             }),
         }
     }
@@ -452,6 +731,58 @@ impl Metrics {
         self.inner
             .processing_failures
             .get_or_create(&FailureLabels { stage })
+            .inc();
+    }
+
+    /// Records one merge-group event using only bounded action and reason labels.
+    ///
+    /// `checks_requested` always records reason `none`, regardless of the supplied reason. This
+    /// prevents callers from creating unsupported action/reason combinations.
+    pub fn record_merge_group_event(&self, action: MergeGroupAction, reason: MergeGroupReason) {
+        let reason = match action {
+            MergeGroupAction::ChecksRequested => MergeGroupReason::None,
+            MergeGroupAction::Destroyed => reason,
+        };
+        self.inner
+            .merge_group_events
+            .get_or_create(&MergeGroupLabels { action, reason })
+            .inc();
+    }
+
+    /// Records one completed pull-request queue attempt when its duration is sane.
+    ///
+    /// Negative durations and durations above [`MAX_MERGE_QUEUE_ATTEMPT_DURATION`] update only the
+    /// bounded `invalid_duration` transition-failure counter.
+    pub fn record_merge_queue_completion(
+        &self,
+        completion: MergeQueueCompletion,
+        duration: time::Duration,
+    ) {
+        if !(time::Duration::ZERO..=MAX_MERGE_QUEUE_ATTEMPT_DURATION).contains(&duration) {
+            self.record_merge_queue_transition_failure(
+                QueueTransitionFailureReason::InvalidDuration,
+            );
+            return;
+        }
+
+        let labels = completion.labels();
+        self.inner
+            .merge_queue_pr_outcomes
+            .get_or_create(&labels)
+            .inc();
+        self.inner
+            .merge_queue_attempt_duration
+            .get_or_create(&MergeQueueDurationLabels {
+                outcome: labels.outcome,
+            })
+            .observe(duration.as_seconds_f64());
+    }
+
+    /// Increments the merge-queue transition-failure total for a bounded reason.
+    pub fn record_merge_queue_transition_failure(&self, reason: QueueTransitionFailureReason) {
+        self.inner
+            .merge_queue_transition_failures
+            .get_or_create(&QueueTransitionFailureLabels { reason })
             .inc();
     }
 
@@ -505,6 +836,10 @@ fn request_body_size_histogram() -> Histogram {
     Histogram::new(REQUEST_BODY_SIZE_BUCKETS)
 }
 
+fn merge_queue_attempt_duration_histogram() -> Histogram {
+    Histogram::new(MERGE_QUEUE_ATTEMPT_DURATION_BUCKETS)
+}
+
 /// Normalizes an untrusted GitHub event header using the fixed v1 allowlist.
 ///
 /// Values are matched exactly and case-sensitively. Any value outside the allowlist maps to
@@ -533,6 +868,19 @@ pub fn normalize_event_type(raw_event_type: &str) -> EventType {
         "workflow_job" => EventType::WorkflowJob,
         "workflow_run" => EventType::WorkflowRun,
         _ => EventType::Other,
+    }
+}
+
+/// Normalizes an untrusted merge-group destroyed reason using an exact fixed mapping.
+///
+/// Values are matched exactly and case-sensitively. Unsupported raw values are discarded and map
+/// to [`MergeGroupReason::Other`].
+pub fn normalize_merge_group_destroyed_reason(raw_reason: &str) -> MergeGroupReason {
+    match raw_reason {
+        "merged" => MergeGroupReason::Merged,
+        "dequeued" => MergeGroupReason::Dequeued,
+        "invalidated" => MergeGroupReason::Invalidated,
+        _ => MergeGroupReason::Other,
     }
 }
 
@@ -578,8 +926,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        normalize_action, normalize_event_type, Action, EventType, FailureStage, Metrics,
-        WebhookResult,
+        normalize_action, normalize_event_type, normalize_merge_group_destroyed_reason, Action,
+        EventType, FailureStage, MergeGroupAction, MergeGroupReason, MergeQueueCompletion,
+        MergeQueueOutcome, MergeQueueReason, Metrics, QueueTransitionFailureReason, WebhookResult,
     };
 
     #[test]
@@ -771,6 +1120,276 @@ mod tests {
     }
 
     #[test]
+    fn normalize_merge_group_destroyed_reason_uses_exact_bounded_mapping() {
+        let recognized = [
+            ("merged", MergeGroupReason::Merged),
+            ("dequeued", MergeGroupReason::Dequeued),
+            ("invalidated", MergeGroupReason::Invalidated),
+        ];
+
+        for (raw_reason, expected) in recognized {
+            assert_eq!(normalize_merge_group_destroyed_reason(raw_reason), expected);
+        }
+        for raw_reason in [
+            "",
+            "Merged",
+            "unknown",
+            "merged\nrepository=private/repository",
+        ] {
+            assert_eq!(
+                normalize_merge_group_destroyed_reason(raw_reason),
+                MergeGroupReason::Other
+            );
+        }
+    }
+
+    #[test]
+    fn phase_three_vocabularies_encode_only_fixed_label_values() {
+        let metrics = Metrics::new();
+
+        for (action, reason, encoded_action, encoded_reason) in [
+            (
+                MergeGroupAction::ChecksRequested,
+                MergeGroupReason::Other,
+                "checks_requested",
+                "none",
+            ),
+            (
+                MergeGroupAction::Destroyed,
+                MergeGroupReason::Merged,
+                "destroyed",
+                "merged",
+            ),
+            (
+                MergeGroupAction::Destroyed,
+                MergeGroupReason::Dequeued,
+                "destroyed",
+                "dequeued",
+            ),
+            (
+                MergeGroupAction::Destroyed,
+                MergeGroupReason::Invalidated,
+                "destroyed",
+                "invalidated",
+            ),
+            (
+                MergeGroupAction::Destroyed,
+                MergeGroupReason::Other,
+                "destroyed",
+                "other",
+            ),
+        ] {
+            metrics.record_merge_group_event(action, reason);
+            let exposition = metrics.encode().expect("metrics encode into a String");
+            assert!(exposition.contains(&format!(
+                "github_merge_group_events_total{{action=\"{encoded_action}\",reason=\"{encoded_reason}\"}} 1"
+            )));
+        }
+
+        for (outcome, encoded_outcome) in [
+            (MergeQueueOutcome::Succeeded, "succeeded"),
+            (MergeQueueOutcome::Failed, "failed"),
+            (MergeQueueOutcome::Cancelled, "cancelled"),
+            (MergeQueueOutcome::Unknown, "unknown"),
+        ] {
+            assert_eq!(outcome.as_str(), encoded_outcome);
+        }
+        for (reason, encoded_reason) in [
+            (MergeQueueReason::PullRequestMerged, "pull_request_merged"),
+            (
+                MergeQueueReason::UnclassifiedDequeue,
+                "unclassified_dequeue",
+            ),
+        ] {
+            assert_eq!(reason.as_str(), encoded_reason);
+        }
+        for (completion, encoded_outcome, encoded_reason) in [
+            (
+                MergeQueueCompletion::PullRequestMerged,
+                "succeeded",
+                "pull_request_merged",
+            ),
+            (
+                MergeQueueCompletion::UnclassifiedDequeue,
+                "unknown",
+                "unclassified_dequeue",
+            ),
+        ] {
+            metrics.record_merge_queue_completion(completion, time::Duration::seconds(1));
+            let exposition = metrics.encode().expect("metrics encode into a String");
+            assert!(exposition.contains(&format!(
+                "github_merge_queue_pr_outcomes_total{{outcome=\"{encoded_outcome}\",reason=\"{encoded_reason}\"}} 1"
+            )));
+        }
+
+        for (reason, encoded_reason) in [
+            (
+                QueueTransitionFailureReason::MissingActiveAttempt,
+                "missing_active_attempt",
+            ),
+            (
+                QueueTransitionFailureReason::InvalidDuration,
+                "invalid_duration",
+            ),
+        ] {
+            metrics.record_merge_queue_transition_failure(reason);
+            let exposition = metrics.encode().expect("metrics encode into a String");
+            assert!(exposition.contains(&format!(
+                "github_merge_queue_transition_failures_total{{reason=\"{encoded_reason}\"}} 1"
+            )));
+        }
+
+        metrics.record_failure(FailureStage::QueueState);
+        assert!(metrics
+            .encode()
+            .expect("metrics encode into a String")
+            .contains("github_webhook_processing_failures_total{stage=\"queue_state\"} 1"));
+    }
+
+    #[test]
+    fn valid_queue_completions_update_outcome_and_duration_once() {
+        let metrics = Metrics::new();
+
+        metrics.record_merge_queue_completion(
+            MergeQueueCompletion::PullRequestMerged,
+            time::Duration::seconds(90),
+        );
+
+        let exposition = metrics.encode().expect("metrics encode into a String");
+        assert!(exposition.contains(
+            "github_merge_queue_pr_outcomes_total{outcome=\"succeeded\",reason=\"pull_request_merged\"} 1"
+        ));
+        assert!(exposition.contains(
+            "github_merge_queue_attempt_duration_seconds_count{outcome=\"succeeded\"} 1"
+        ));
+        assert!(exposition.contains(
+            "github_merge_queue_attempt_duration_seconds_sum{outcome=\"succeeded\"} 90.0"
+        ));
+        assert!(exposition.contains(
+            "github_merge_queue_transition_failures_total{reason=\"invalid_duration\"} 0"
+        ));
+    }
+
+    #[test]
+    fn queue_duration_sanity_ceiling_is_inclusive() {
+        let metrics = Metrics::new();
+
+        metrics.record_merge_queue_completion(
+            MergeQueueCompletion::PullRequestMerged,
+            time::Duration::days(365),
+        );
+
+        let exposition = metrics.encode().expect("metrics encode into a String");
+        assert!(exposition.contains(
+            "github_merge_queue_attempt_duration_seconds_count{outcome=\"succeeded\"} 1"
+        ));
+        assert!(exposition.contains(
+            "github_merge_queue_transition_failures_total{reason=\"invalid_duration\"} 0"
+        ));
+    }
+
+    #[test]
+    fn long_queue_durations_retain_finite_histogram_resolution() {
+        let metrics = Metrics::new();
+
+        metrics.record_merge_queue_completion(
+            MergeQueueCompletion::UnclassifiedDequeue,
+            time::Duration::days(30),
+        );
+
+        let exposition = metrics.encode().expect("metrics encode into a String");
+        for expected_sample in [
+            "github_merge_queue_attempt_duration_seconds_bucket{le=\"2592000.0\",outcome=\"unknown\"} 1",
+            "github_merge_queue_attempt_duration_seconds_bucket{le=\"31536000.0\",outcome=\"unknown\"} 1",
+        ] {
+            assert!(
+                exposition.contains(expected_sample),
+                "missing sample {expected_sample:?} in:\n{exposition}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_queue_durations_update_only_the_failure_metric() {
+        let metrics = Metrics::new();
+
+        for invalid_duration in [
+            time::Duration::nanoseconds(-1),
+            time::Duration::days(365) + time::Duration::nanoseconds(1),
+        ] {
+            metrics.record_merge_queue_completion(
+                MergeQueueCompletion::UnclassifiedDequeue,
+                invalid_duration,
+            );
+        }
+
+        let exposition = metrics.encode().expect("metrics encode into a String");
+        assert!(exposition.contains(
+            "github_merge_queue_pr_outcomes_total{outcome=\"unknown\",reason=\"unclassified_dequeue\"} 0"
+        ));
+        assert!(exposition
+            .contains("github_merge_queue_attempt_duration_seconds_count{outcome=\"unknown\"} 0"));
+        assert!(exposition.contains(
+            "github_merge_queue_transition_failures_total{reason=\"invalid_duration\"} 2"
+        ));
+    }
+
+    #[test]
+    fn phase_three_updates_are_shared_across_concurrent_clones() {
+        const THREADS: usize = 8;
+        let metrics = Metrics::new();
+        let workers = (0..THREADS)
+            .map(|_| {
+                let worker_metrics = metrics.clone();
+                std::thread::spawn(move || {
+                    worker_metrics.record_merge_group_event(
+                        MergeGroupAction::Destroyed,
+                        MergeGroupReason::Merged,
+                    );
+                    worker_metrics.record_merge_queue_completion(
+                        MergeQueueCompletion::PullRequestMerged,
+                        time::Duration::seconds(1),
+                    );
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker.join().expect("metrics worker completes");
+        }
+
+        let exposition = metrics.encode().expect("metrics encode into a String");
+        assert!(exposition.contains(&format!(
+            "github_merge_group_events_total{{action=\"destroyed\",reason=\"merged\"}} {THREADS}"
+        )));
+        assert!(exposition.contains(&format!(
+            "github_merge_queue_pr_outcomes_total{{outcome=\"succeeded\",reason=\"pull_request_merged\"}} {THREADS}"
+        )));
+        assert!(exposition.contains(&format!(
+            "github_merge_queue_attempt_duration_seconds_count{{outcome=\"succeeded\"}} {THREADS}"
+        )));
+    }
+
+    #[test]
+    fn phase_three_metrics_exist_at_startup() {
+        let exposition = Metrics::new()
+            .encode()
+            .expect("metrics encode into a String");
+
+        for metric_name in [
+            "github_merge_group_events_total",
+            "github_merge_queue_pr_outcomes_total",
+            "github_merge_queue_attempt_duration_seconds",
+            "github_merge_queue_transition_failures_total",
+        ] {
+            assert!(
+                exposition.contains(metric_name),
+                "missing {metric_name:?} in:\n{exposition}"
+            );
+        }
+    }
+
+    #[test]
     fn metric_updates_never_expose_untrusted_values() {
         let forbidden_values = [
             "private/repository",
@@ -783,12 +1402,17 @@ mod tests {
         ];
         let raw_event = format!("unknown-{}", forbidden_values.join("-"));
         let raw_action = format!("unknown-{}", forbidden_values.join("-"));
+        let raw_group_reason = format!("unknown-{}", forbidden_values.join("-"));
         let metrics = Metrics::new();
 
         metrics.observe_event(
             normalize_event_type(&raw_event),
             normalize_action(Some(&raw_action)),
             64,
+        );
+        metrics.record_merge_group_event(
+            MergeGroupAction::Destroyed,
+            normalize_merge_group_destroyed_reason(&raw_group_reason),
         );
 
         let exposition = metrics.encode().expect("metrics encode into a String");
@@ -799,5 +1423,6 @@ mod tests {
         }
         assert!(!exposition.contains(&raw_event));
         assert!(!exposition.contains(&raw_action));
+        assert!(!exposition.contains(&raw_group_reason));
     }
 }
