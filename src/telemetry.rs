@@ -3,6 +3,7 @@ use std::{io, sync::Arc};
 #[cfg(test)]
 mod otlp_test;
 mod queue;
+pub(crate) mod trace;
 
 use opentelemetry::{trace::TracerProvider as _, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;

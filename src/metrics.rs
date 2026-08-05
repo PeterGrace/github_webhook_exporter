@@ -108,7 +108,7 @@ pub enum EventType {
 }
 
 impl EventType {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::BranchProtectionRule => "branch_protection_rule",
             Self::CheckRun => "check_run",
@@ -204,7 +204,7 @@ pub enum Action {
 }
 
 impl Action {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Assigned => "assigned",
             Self::ChecksRequested => "checks_requested",
@@ -286,7 +286,7 @@ pub enum MergeGroupAction {
 }
 
 impl MergeGroupAction {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ChecksRequested => "checks_requested",
             Self::Destroyed => "destroyed",
@@ -316,7 +316,7 @@ pub enum MergeGroupReason {
 }
 
 impl MergeGroupReason {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Merged => "merged",
@@ -347,7 +347,7 @@ pub enum MergeQueueOutcome {
 }
 
 impl MergeQueueOutcome {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
@@ -373,7 +373,7 @@ pub enum MergeQueueReason {
 }
 
 impl MergeQueueReason {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::PullRequestMerged => "pull_request_merged",
             Self::UnclassifiedDequeue => "unclassified_dequeue",
@@ -424,7 +424,7 @@ pub enum QueueTransitionFailureReason {
 }
 
 impl QueueTransitionFailureReason {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::MissingActiveAttempt => "missing_active_attempt",
             Self::InvalidDuration => "invalid_duration",
