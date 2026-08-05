@@ -34,7 +34,7 @@ integers:
 | --- | ---: | --- |
 | `GHE_OTEL_QUEUE_CAPACITY` | `2048` | Maximum admitted records per signal. |
 | `GHE_OTEL_BATCH_SIZE` | `512` | Maximum records per request; no greater than queue capacity. |
-| `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` | `5` | Reserved shared provider-shutdown deadline. |
+| `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` | `5` | Reserved for #36; not yet enforced. |
 
 Invalid requested telemetry configuration fails startup with only the variable name. Collector
 latency or unavailability occurs on dedicated exporter threads and does not change HTTP readiness

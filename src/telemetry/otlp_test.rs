@@ -196,6 +196,7 @@ async fn wait_for_blocked_signals(state: &ReceiverState) {
     }
 }
 
+// Regression check for the OpenTelemetry 0.32 queue-occupancy invariant documented in `queue`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocked_exporters_preserve_exact_bounds_and_export_otlp_protobuf() {
     let (release_exports, _) = watch::channel(false);

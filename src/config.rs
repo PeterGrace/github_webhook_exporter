@@ -366,6 +366,8 @@ impl TelemetryConfig {
             .or_else(|| append_signal_path(generic_endpoint.as_deref(), "v1/logs"));
 
         let generic_headers = validated_headers(lookup, "OTEL_EXPORTER_OTLP_HEADERS")?;
+        // An explicitly empty signal value clears inherited generic headers;
+        // only absence falls back.
         let trace_headers = validated_headers(lookup, "OTEL_EXPORTER_OTLP_TRACES_HEADERS")?
             .unwrap_or_else(|| clone_headers(&generic_headers));
         let log_headers = validated_headers(lookup, "OTEL_EXPORTER_OTLP_LOGS_HEADERS")?
