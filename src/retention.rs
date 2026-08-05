@@ -538,6 +538,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivery_failure_does_not_prevent_queue_pruning_in_the_same_pass() {
+        let (_directory, pool, delivery_store, queue_store) = retention_stores().await;
+        insert_queue_retention_fixtures(&pool).await;
+        sqlx::query("DROP TABLE processed_deliveries")
+            .execute(&pool)
+            .await
+            .expect("delivery table is removed");
+        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let captured_logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(captured_logs.clone())
+            .finish();
+        let config = RetentionConfig::new(
+            Duration::from_millis(10),
+            Duration::from_secs(86_400),
+            Duration::from_secs(90 * 86_400),
+        )
+        .expect("retention configuration is valid");
+        let runner = tokio::spawn(
+            run_retention(delivery_store, queue_store, config, shutdown_receiver)
+                .with_subscriber(subscriber),
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while queue_attempt_count(&pool).await != 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "queue pruning did not finish after the delivery failure"
+            );
+            tokio::task::yield_now().await;
+        }
+        shutdown_sender
+            .send(true)
+            .expect("retention runner receives shutdown");
+        runner.await.expect("retention runner joins");
+
+        let logs = captured_logs.text();
+        assert!(logs.contains("workload=\"delivery\" outcome=\"failed\""));
+        assert!(logs.contains("workload=\"merge_queue\" outcome=\"completed\""));
+    }
+
+    #[tokio::test]
     async fn queue_failure_is_redacted_correlated_and_recovers_at_the_next_interval() {
         let (_directory, pool, delivery_store, queue_store) = retention_stores().await;
         insert_queue_retention_fixtures(&pool).await;
