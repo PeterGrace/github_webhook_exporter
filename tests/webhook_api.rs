@@ -27,6 +27,28 @@ use tracing_subscriber::fmt::MakeWriter;
 const SECRET: &str = "webhook-test-secret";
 const DELIVERY_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 const PAYLOAD: &[u8] = br#"{"action":"opened","repository":{"full_name":"owner/repository"}}"#;
+const MERGE_GROUP_CHECKS_REQUESTED: &[u8] =
+    br#"{"action":"checks_requested","repository":{"full_name":"owner/repository"}}"#;
+const MERGE_GROUP_DESTROYED_MERGED: &[u8] =
+    br#"{"action":"destroyed","reason":"merged","repository":{"full_name":"owner/repository"}}"#;
+const MERGE_GROUP_DESTROYED_DEQUEUED: &[u8] =
+    br#"{"action":"destroyed","reason":"dequeued","repository":{"full_name":"owner/repository"}}"#;
+const MERGE_GROUP_DESTROYED_INVALIDATED: &[u8] = br#"{"action":"destroyed","reason":"invalidated","repository":{"full_name":"owner/repository"}}"#;
+const MERGE_GROUP_DESTROYED_OTHER: &[u8] =
+    br#"{"action":"destroyed","reason":"unknown","repository":{"full_name":"owner/repository"}}"#;
+const MERGE_GROUP_DESTROYED_EMPTY: &[u8] =
+    br#"{"action":"destroyed","reason":"","repository":{"full_name":"owner/repository"}}"#;
+const MERGE_GROUP_DESTROYED_MISSING: &[u8] =
+    br#"{"action":"destroyed","repository":{"full_name":"owner/repository"}}"#;
+const MERGE_GROUP_DESTROYED_NULL: &[u8] =
+    br#"{"action":"destroyed","reason":null,"repository":{"full_name":"owner/repository"}}"#;
+const MERGE_GROUP_DESTROYED_NUMBER: &[u8] =
+    br#"{"action":"destroyed","reason":42,"repository":{"full_name":"owner/repository"}}"#;
+const MERGE_GROUP_DESTROYED_MIXED_CASE: &[u8] =
+    br#"{"action":"destroyed","reason":"Merged","repository":{"full_name":"owner/repository"}}"#;
+const MERGE_GROUP_DESTROYED_MALICIOUS: &[u8] = br#"{"action":"destroyed","reason":"merged\\nsha256=secret-group-sha","merge_group":{"head_sha":"secret-group-sha"},"repository":{"full_name":"owner/repository"}}"#;
+const MERGE_GROUP_UNSUPPORTED_ACTION: &[u8] =
+    br#"{"action":"created","reason":"merged","repository":{"full_name":"owner/repository"}}"#;
 static TRACING_INIT: Once = Once::new();
 
 #[derive(Clone, Default)]
@@ -114,11 +136,20 @@ fn webhook_request(
     repository_secret: &str,
     delivery_id: &str,
 ) -> Request<Body> {
+    webhook_request_for_event(body, repository_secret, delivery_id, "pull_request")
+}
+
+fn webhook_request_for_event(
+    body: &'static [u8],
+    repository_secret: &str,
+    delivery_id: &str,
+    event_type: &str,
+) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/webhooks/github")
         .header(CONTENT_TYPE, "application/json")
-        .header("X-GitHub-Event", "pull_request")
+        .header("X-GitHub-Event", event_type)
         .header("X-GitHub-Delivery", delivery_id)
         .header("X-Hub-Signature-256", signature(repository_secret, body))
         .body(Body::from(body))
@@ -143,6 +174,224 @@ async fn metrics(router: Router) -> String {
         .await
         .expect("metrics request succeeds");
     String::from_utf8(response_body(response).await).expect("metrics are UTF-8")
+}
+
+#[tokio::test]
+async fn supported_merge_group_events_update_bounded_metrics_without_attempt_state() {
+    let app = test_app(2_097_152, Some(true)).await;
+    let cases = [
+        (
+            MERGE_GROUP_CHECKS_REQUESTED,
+            "550e8400-e29b-41d4-a716-446655440001",
+        ),
+        (
+            MERGE_GROUP_DESTROYED_MERGED,
+            "550e8400-e29b-41d4-a716-446655440002",
+        ),
+        (
+            MERGE_GROUP_DESTROYED_DEQUEUED,
+            "550e8400-e29b-41d4-a716-446655440003",
+        ),
+        (
+            MERGE_GROUP_DESTROYED_INVALIDATED,
+            "550e8400-e29b-41d4-a716-446655440004",
+        ),
+        (
+            MERGE_GROUP_DESTROYED_OTHER,
+            "550e8400-e29b-41d4-a716-446655440005",
+        ),
+    ];
+
+    for (body, delivery_id) in cases {
+        let response = app
+            .router
+            .clone()
+            .oneshot(webhook_request_for_event(
+                body,
+                SECRET,
+                delivery_id,
+                "merge_group",
+            ))
+            .await
+            .expect("merge-group webhook request succeeds");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let exposition = metrics(app.router).await;
+    for expected in [
+        "github_webhook_events_total{event_type=\"merge_group\",action=\"checks_requested\"} 1",
+        "github_webhook_events_total{event_type=\"merge_group\",action=\"destroyed\"} 4",
+        "github_merge_group_events_total{action=\"checks_requested\",reason=\"none\"} 1",
+        "github_merge_group_events_total{action=\"destroyed\",reason=\"merged\"} 1",
+        "github_merge_group_events_total{action=\"destroyed\",reason=\"dequeued\"} 1",
+        "github_merge_group_events_total{action=\"destroyed\",reason=\"invalidated\"} 1",
+        "github_merge_group_events_total{action=\"destroyed\",reason=\"other\"} 1",
+    ] {
+        assert!(exposition.contains(expected), "missing {expected:?}");
+    }
+    let attempt_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_queue_attempts")
+        .fetch_one(&app.pool)
+        .await
+        .expect("merge-queue attempt count is readable");
+    assert_eq!(attempt_count, 0);
+}
+
+#[tokio::test]
+async fn merge_group_destroyed_untrusted_reasons_collapse_to_other_without_disclosure() {
+    let captured_logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(captured_logs.clone())
+        .finish();
+    let app = test_app(2_097_152, Some(true)).await;
+    let malicious_signature = signature(SECRET, MERGE_GROUP_DESTROYED_MALICIOUS);
+    let cases = [
+        (
+            MERGE_GROUP_DESTROYED_EMPTY,
+            "550e8400-e29b-41d4-a716-446655440010",
+        ),
+        (
+            MERGE_GROUP_DESTROYED_MISSING,
+            "550e8400-e29b-41d4-a716-446655440011",
+        ),
+        (
+            MERGE_GROUP_DESTROYED_NULL,
+            "550e8400-e29b-41d4-a716-446655440012",
+        ),
+        (
+            MERGE_GROUP_DESTROYED_NUMBER,
+            "550e8400-e29b-41d4-a716-446655440013",
+        ),
+        (
+            MERGE_GROUP_DESTROYED_MIXED_CASE,
+            "550e8400-e29b-41d4-a716-446655440014",
+        ),
+        (
+            MERGE_GROUP_DESTROYED_MALICIOUS,
+            "550e8400-e29b-41d4-a716-446655440015",
+        ),
+    ];
+
+    let response_texts = async {
+        let mut response_texts = Vec::with_capacity(cases.len());
+        for (body, delivery_id) in cases {
+            let response = app
+                .router
+                .clone()
+                .oneshot(webhook_request_for_event(
+                    body,
+                    SECRET,
+                    delivery_id,
+                    "merge_group",
+                ))
+                .await
+                .expect("merge-group webhook request succeeds");
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            response_texts.push(
+                String::from_utf8(response_body(response).await)
+                    .expect("merge-group response is UTF-8"),
+            );
+        }
+        response_texts
+    }
+    .with_subscriber(subscriber)
+    .await;
+
+    let exposition = metrics(app.router).await;
+    assert!(exposition.contains(
+        "github_webhook_events_total{event_type=\"merge_group\",action=\"destroyed\"} 6"
+    ));
+    assert!(exposition
+        .contains("github_merge_group_events_total{action=\"destroyed\",reason=\"other\"} 6"));
+    let logs = captured_logs.text();
+    for output in response_texts
+        .iter()
+        .map(String::as_str)
+        .chain([exposition.as_str(), logs.as_str()])
+    {
+        for forbidden in [
+            "owner/repository",
+            "secret-group-sha",
+            "merged\\nsha256=secret-group-sha",
+            "550e8400-e29b-41d4-a716-446655440015",
+            SECRET,
+            malicious_signature.as_str(),
+            std::str::from_utf8(MERGE_GROUP_DESTROYED_MALICIOUS)
+                .expect("malicious payload is UTF-8"),
+        ] {
+            assert!(!output.contains(forbidden));
+        }
+    }
+    let attempt_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_queue_attempts")
+        .fetch_one(&app.pool)
+        .await
+        .expect("merge-queue attempt count is readable");
+    assert_eq!(attempt_count, 0);
+}
+
+#[tokio::test]
+async fn duplicate_merge_group_delivery_does_not_repeat_event_metrics() {
+    let app = test_app(2_097_152, Some(true)).await;
+
+    for _ in 0..2 {
+        let response = app
+            .router
+            .clone()
+            .oneshot(webhook_request_for_event(
+                MERGE_GROUP_DESTROYED_MERGED,
+                SECRET,
+                "550e8400-e29b-41d4-a716-446655440020",
+                "merge_group",
+            ))
+            .await
+            .expect("merge-group webhook request succeeds");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let exposition = metrics(app.router).await;
+    for expected in [
+        "github_webhook_requests_total{result=\"accepted\"} 2",
+        "github_webhook_duplicates_total 1",
+        "github_webhook_events_total{event_type=\"merge_group\",action=\"destroyed\"} 1",
+        "github_merge_group_events_total{action=\"destroyed\",reason=\"merged\"} 1",
+    ] {
+        assert!(exposition.contains(expected), "missing {expected:?}");
+    }
+}
+
+#[tokio::test]
+async fn unsupported_merge_group_action_updates_only_generic_metrics() {
+    let app = test_app(2_097_152, Some(true)).await;
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(webhook_request_for_event(
+            MERGE_GROUP_UNSUPPORTED_ACTION,
+            SECRET,
+            "550e8400-e29b-41d4-a716-446655440030",
+            "merge_group",
+        ))
+        .await
+        .expect("merge-group webhook request succeeds");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let exposition = metrics(app.router).await;
+    assert!(exposition
+        .contains("github_webhook_events_total{event_type=\"merge_group\",action=\"created\"} 1"));
+    for expected_zero in [
+        "github_merge_group_events_total{action=\"checks_requested\",reason=\"none\"} 0",
+        "github_merge_group_events_total{action=\"destroyed\",reason=\"merged\"} 0",
+        "github_merge_group_events_total{action=\"destroyed\",reason=\"dequeued\"} 0",
+        "github_merge_group_events_total{action=\"destroyed\",reason=\"invalidated\"} 0",
+        "github_merge_group_events_total{action=\"destroyed\",reason=\"other\"} 0",
+    ] {
+        assert!(
+            exposition.contains(expected_zero),
+            "missing {expected_zero:?}"
+        );
+    }
 }
 
 #[tokio::test]

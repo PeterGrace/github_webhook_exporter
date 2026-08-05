@@ -78,6 +78,23 @@ ID appears in the corresponding local structured log for diagnosis. It is genera
 not encode request data, and is never a metric label. Structured logs otherwise contain only
 normalized result/stage values.
 
+### Merge-group statistics
+
+A newly claimed `merge_group.checks_requested` delivery increments
+`github_merge_group_events_total{action="checks_requested",reason="none"}`. A newly claimed
+`merge_group.destroyed` delivery uses action `destroyed` and maps the top-level `reason` exactly and
+case-sensitively to `merged`, `dequeued`, or `invalidated`; missing, non-string, mixed-case, and
+unknown values map to `other`. Unsupported merge-group actions update only the generic webhook
+event metric. Duplicate deliveries update only the webhook request and duplicate counters, so no
+generic or specialized event is counted twice during uninterrupted operation.
+
+Group-level `destroyed` with reason `merged` is the authoritative merge-group success statistic.
+These group metrics remain intentionally separate from per-pull-request queue attempt outcomes. A
+merge group can contain multiple pull requests, and webhook ordering does not provide a reliable
+join, so merge-group deliveries never create or mutate pull-request attempt rows. Raw reasons,
+repository names, group identifiers, and head SHAs are discarded rather than logged or used as
+metric labels.
+
 ## Delivery retention and duplicate semantics
 
 The service retains authenticated delivery claims for `GHE_DELIVERY_RETENTION_DAYS` (default: 7).
