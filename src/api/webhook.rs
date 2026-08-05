@@ -10,10 +10,11 @@ use axum::{
     Router,
 };
 use serde::Deserialize;
+use time::OffsetDateTime;
 use tracing::{error, info};
 
 use crate::{
-    api::merge_group::EventProjection,
+    api::{merge_group::EventProjection, pull_request::QueueProcessor},
     app::AppState,
     domain::delivery::DeliveryId,
     error::AppError,
@@ -90,7 +91,8 @@ async fn webhook_handler(
     State(state): State<AppState>,
     request: WebhookRequest,
 ) -> Result<Response, AppError> {
-    match WebhookAuthenticator::new(state.repository_store())
+    let received_at = OffsetDateTime::now_utc();
+    let repository_id = match WebhookAuthenticator::new(state.repository_store())
         .authenticate(
             &request.repository_name,
             &request.signature,
@@ -98,14 +100,14 @@ async fn webhook_handler(
         )
         .await
     {
-        Ok(()) => {}
+        Ok(repository_id) => repository_id,
         Err(WebhookAuthenticationError::Unauthorized) => {
             return Err(AppError::unauthorized_webhook());
         }
         Err(WebhookAuthenticationError::Unavailable) => {
             return Err(unavailable_error(&state, FailureStage::Authentication));
         }
-    }
+    };
 
     let event_projection: EventProjection =
         serde_json::from_slice(&request.body).map_err(|_| AppError::invalid_webhook())?;
@@ -119,6 +121,19 @@ async fn webhook_handler(
                 .metrics()
                 .observe_event(event_type, action, request.body.len());
             event_projection.process_merge_group(event_type, action, state.metrics());
+            if let Some(pull_request) = event_projection.pull_request() {
+                let processor = QueueProcessor {
+                    repository_id,
+                    event_type,
+                    action,
+                    received_at,
+                    store: state.merge_queue_store(),
+                    metrics: state.metrics(),
+                };
+                if processor.process(pull_request).await.is_err() {
+                    record_queue_state_failure(&state);
+                }
+            }
         }
         Err(_) => {
             return Err(unavailable_error(&state, FailureStage::DeliveryClaim));
@@ -139,6 +154,20 @@ async fn observe_webhook_request(
     metrics.observe_request(result, started_at.elapsed());
     info!(result = result.as_str(), "GitHub webhook request processed");
     response
+}
+
+fn record_queue_state_failure(state: &AppState) {
+    state.metrics().record_failure(FailureStage::QueueState);
+    let error = AppError::webhook_unavailable();
+    let error_correlation_id = error
+        .correlation_id()
+        .expect("webhook dependency failures carry a correlation ID");
+    error!(
+        stage = FailureStage::QueueState.as_str(),
+        result = WebhookResult::Unavailable.as_str(),
+        %error_correlation_id,
+        "GitHub webhook processing failed"
+    );
 }
 
 fn unavailable_error(state: &AppState, stage: FailureStage) -> AppError {

@@ -284,12 +284,15 @@ async fn sequential_transitions_are_exact_and_idempotent() {
     assert_eq!(pending.get::<String, _>("reason_code"), "none");
 
     let merged = QueueCompletion::pull_request_merged(timestamp(COMPLETED_AT));
+    let completed_transition = store
+        .complete(repository_id, number, &merged)
+        .await
+        .expect("merged completion succeeds");
     assert_eq!(
-        store
-            .complete(repository_id, number, &merged)
-            .await
-            .expect("merged completion succeeds"),
-        CompletionTransition::Completed
+        completed_transition,
+        CompletionTransition::Completed {
+            enqueued_at: timestamp(ENQUEUED_AT),
+        }
     );
     assert_eq!(
         store
@@ -327,7 +330,9 @@ async fn sequential_transitions_are_exact_and_idempotent() {
             .complete(repository_id, number, &dequeued)
             .await
             .expect("dequeue completion succeeds"),
-        CompletionTransition::Completed
+        CompletionTransition::Completed {
+            enqueued_at: timestamp("2026-08-05T11:00:00Z"),
+        }
     );
     let outcomes = sqlx::query(
         "SELECT outcome, reason_code FROM merge_queue_attempts \
@@ -424,7 +429,7 @@ async fn concurrent_completions_apply_exactly_one_terminal_transition() {
             .expect("completion task completes")
             .expect("concurrent completion succeeds")
         {
-            CompletionTransition::Completed => completed += 1,
+            CompletionTransition::Completed { .. } => completed += 1,
             CompletionTransition::AlreadyCompleted => already_completed += 1,
             CompletionTransition::MissingActiveAttempt => {
                 panic!("existing attempt was reported missing")
@@ -485,7 +490,9 @@ async fn pending_attempt_survives_reopen_and_completes_later() {
             )
             .await
             .expect("persisted attempt completes"),
-        CompletionTransition::Completed
+        CompletionTransition::Completed {
+            enqueued_at: timestamp(ENQUEUED_AT),
+        }
     );
 }
 

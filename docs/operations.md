@@ -95,6 +95,33 @@ join, so merge-group deliveries never create or mutate pull-request attempt rows
 repository names, group identifiers, and head SHAs are discarded rather than logged or used as
 metric labels.
 
+### Pull-request merge-queue attempts
+
+For a newly claimed `pull_request` delivery, the authenticated repository's durable identifier and
+positive `pull_request.number` select one attempt. `enqueued` creates a pending attempt only when
+none is active. `dequeued` completes an active attempt as `unknown/unclassified_dequeue`;
+`closed` completes it as `succeeded/pull_request_merged` only when `pull_request.merged` is exactly
+`true`. An absent or false merged flag and unsupported actions do not mutate specialized state.
+Raw dequeue reasons are discarded and are never persisted, logged, or used as metric labels.
+
+The processor uses a valid `pull_request.updated_at` for the transition timestamp. Missing,
+malformed, or unrepresentable timestamps fall back to the receipt time captured once for the
+request. Repeated enqueue and already-completed replay are no-ops. A completion with no active or
+completed attempt increments only
+`github_merge_queue_transition_failures_total{reason="missing_active_attempt"}`. Outcome and
+duration metrics update only after SQLite commits a pending-to-completed transition. Negative and
+over-365-day durations are omitted and increment only the bounded `invalid_duration` transition
+failure.
+
+Queue processing begins after the delivery claim commits. A queue-state persistence failure
+therefore still returns `204 No Content`, increments
+`github_webhook_processing_failures_total{stage="queue_state"}`, and emits one redacted local error
+with an opaque correlation ID. GitHub is not asked to redeliver the already claimed delivery: queue
+processing is intentionally at-most-once at this boundary. SQLite state and in-memory Prometheus
+metrics are also not one transaction; a crash after queue state commits but before metrics update
+can undercount an outcome until the process restarts, and Phase 3 does not claim exactly-once
+metrics across crashes.
+
 ## Delivery retention and duplicate semantics
 
 The service retains authenticated delivery claims for `GHE_DELIVERY_RETENTION_DAYS` (default: 7).

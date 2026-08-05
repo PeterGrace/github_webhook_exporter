@@ -1,6 +1,7 @@
 //! Administrator-authenticated configuration and public webhook HTTP APIs.
 
 mod merge_group;
+mod pull_request;
 mod repositories;
 mod webhook;
 
