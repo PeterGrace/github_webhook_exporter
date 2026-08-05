@@ -151,6 +151,13 @@ impl SpanProcessor for BoundarySpanProcessor {
     }
 }
 
+/// Builds the trace processor with the SDK queue bounded by the same admission limit.
+///
+/// Admission increments `pending` before the SDK's non-blocking send, and `pending` is released
+/// only after the SDK receiver has removed a batch. Consequently SDK queue occupancy is never
+/// greater than `pending`: when both limits are `capacity`, this boundary rejects first and the SDK
+/// queue cannot overflow. Provider shutdown must stop producers before disconnecting the SDK queue;
+/// that lifecycle ordering is implemented by the dedicated Phase 4 shutdown work.
 pub(super) fn span_processor<E: SpanExporter + 'static>(
     exporter: E,
     capacity: usize,
@@ -188,6 +195,7 @@ impl<E: LogExporter> LogExporter for BoundaryLogExporter<E> {
         &self,
         batch: LogBatch<'_>,
     ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+        // OpenTelemetry 0.32 exposes no public O(1) `LogBatch::len`; its iterator is exact.
         self.boundary.release(batch.iter().count());
         observe_export(&self.boundary, self.exporter.export(batch))
     }
@@ -235,6 +243,7 @@ impl LogProcessor for BoundaryLogProcessor {
     }
 }
 
+/// Builds the log processor under the same occupancy invariant as [`span_processor`].
 pub(super) fn log_processor<E: LogExporter + 'static>(
     exporter: E,
     capacity: usize,

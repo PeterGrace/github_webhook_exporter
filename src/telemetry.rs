@@ -1,5 +1,7 @@
 use std::{io, sync::Arc};
 
+#[cfg(test)]
+mod otlp_test;
 mod queue;
 
 use opentelemetry::{trace::TracerProvider as _, KeyValue};

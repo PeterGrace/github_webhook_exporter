@@ -38,8 +38,12 @@ integers:
 
 Invalid requested telemetry configuration fails startup with only the variable name. Collector
 latency or unavailability occurs on dedicated exporter threads and does not change HTTP readiness
-or request results. Final graceful provider shutdown, application-wide spans, and telemetry
-failure/drop metrics are delivered by later Phase 4 work.
+or request results. During this interim phase, drop and export-failure counts are internal hooks
+only: they are not yet exposed through Prometheus or direct stderr diagnostics, so collector
+failure can silently discard remote telemetry. Issue
+[#35](https://github.com/PeterGrace/github_webhook_exporter/issues/35) adds those operator-visible
+counters and diagnostics. Final graceful provider shutdown and application-wide spans are also
+delivered by later Phase 4 work.
 
 ## Health endpoints
 
