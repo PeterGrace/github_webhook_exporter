@@ -14,6 +14,37 @@ leave the final in-process value stale, but the next startup reconciles it from 
 process exits nonzero on any startup failure and cannot report false readiness. Local errors
 identify the failed stage without including configured credentials or the database path.
 
+## Remote telemetry
+
+Structured stderr logging is always active. Remote trace and log export is optional and starts only
+when `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or
+`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set. The generic HTTP endpoint receives `/v1/traces` and
+`/v1/logs` automatically; a signal-specific endpoint is used exactly as configured.
+
+The OTLP/HTTP protobuf exporters honor generic and signal-specific endpoint, header, and timeout
+variables. `OTEL_EXPORTER_OTLP_TIMEOUT` and its signal-specific variants are milliseconds. Header
+values are validated but redacted from errors and debug output. `OTEL_SERVICE_NAME` defaults to
+`github-webhook-exporter`; every resource includes the package version. Of the values supplied in
+`OTEL_RESOURCE_ATTRIBUTES`, only `k8s.pod.name` and `k8s.namespace.name` are retained.
+
+Each enabled signal uses a non-blocking bounded queue. These application settings accept positive
+integers:
+
+| Variable | Default | Contract |
+| --- | ---: | --- |
+| `GHE_OTEL_QUEUE_CAPACITY` | `2048` | Maximum admitted records per signal. |
+| `GHE_OTEL_BATCH_SIZE` | `512` | Maximum records per request; no greater than queue capacity. |
+| `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` | `5` | Reserved for #36; not yet enforced. |
+
+Invalid requested telemetry configuration fails startup with only the variable name. Collector
+latency or unavailability occurs on dedicated exporter threads and does not change HTTP readiness
+or request results. During this interim phase, drop and export-failure counts are internal hooks
+only: they are not yet exposed through Prometheus or direct stderr diagnostics, so collector
+failure can silently discard remote telemetry. Issue
+[#35](https://github.com/PeterGrace/github_webhook_exporter/issues/35) adds those operator-visible
+counters and diagnostics. Final graceful provider shutdown and application-wide spans are also
+delivered by later Phase 4 work.
+
 ## Health endpoints
 
 Both health routes are intentionally unauthenticated so an orchestrator can call them without an
