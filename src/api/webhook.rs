@@ -182,13 +182,38 @@ fn map_body_rejection(rejection: BytesRejection) -> AppError {
 }
 
 fn result_for_status(status: StatusCode) -> WebhookResult {
-    match status {
-        StatusCode::NO_CONTENT => WebhookResult::Accepted,
-        StatusCode::BAD_REQUEST => WebhookResult::Malformed,
-        StatusCode::UNAUTHORIZED => WebhookResult::Unauthorized,
-        StatusCode::PAYLOAD_TOO_LARGE => WebhookResult::TooLarge,
-        StatusCode::UNSUPPORTED_MEDIA_TYPE => WebhookResult::Unsupported,
-        StatusCode::SERVICE_UNAVAILABLE => WebhookResult::Unavailable,
-        _ => WebhookResult::Unavailable,
+    let result = match status {
+        StatusCode::NO_CONTENT => Some(WebhookResult::Accepted),
+        StatusCode::BAD_REQUEST => Some(WebhookResult::Malformed),
+        StatusCode::UNAUTHORIZED => Some(WebhookResult::Unauthorized),
+        StatusCode::PAYLOAD_TOO_LARGE => Some(WebhookResult::TooLarge),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => Some(WebhookResult::Unsupported),
+        StatusCode::SERVICE_UNAVAILABLE => Some(WebhookResult::Unavailable),
+        _ => None,
+    };
+    if result.is_none() {
+        error!(
+            status = status.as_u16(),
+            result = WebhookResult::Unavailable.as_str(),
+            "unexpected GitHub webhook response status"
+        );
+    }
+    debug_assert!(
+        result.is_some(),
+        "unexpected GitHub webhook response status: {status}"
+    );
+    result.unwrap_or(WebhookResult::Unavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::result_for_status;
+
+    #[test]
+    #[should_panic(expected = "unexpected GitHub webhook response status")]
+    fn unexpected_response_status_is_visible_in_debug_builds() {
+        let _result = result_for_status(StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
