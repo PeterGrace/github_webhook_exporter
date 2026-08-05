@@ -37,9 +37,22 @@ const REQUEST_BODY_SIZE_BUCKETS: [f64; 10] = [
     1_048_576.0,
     2_097_152.0,
 ];
-const MERGE_QUEUE_ATTEMPT_DURATION_BUCKETS: [f64; 12] = [
-    1.0, 10.0, 60.0, 300.0, 900.0, 3_600.0, 10_800.0, 21_600.0, 43_200.0, 86_400.0, 259_200.0,
+const MERGE_QUEUE_ATTEMPT_DURATION_BUCKETS: [f64; 15] = [
+    1.0,
+    10.0,
+    60.0,
+    300.0,
+    900.0,
+    3_600.0,
+    10_800.0,
+    21_600.0,
+    43_200.0,
+    86_400.0,
+    259_200.0,
     604_800.0,
+    2_592_000.0,
+    7_776_000.0,
+    31_536_000.0,
 ];
 
 /// Largest merge-queue attempt duration accepted by the metrics sanity check.
@@ -1273,6 +1286,27 @@ mod tests {
         assert!(exposition.contains(
             "github_merge_queue_transition_failures_total{reason=\"invalid_duration\"} 0"
         ));
+    }
+
+    #[test]
+    fn long_queue_durations_retain_finite_histogram_resolution() {
+        let metrics = Metrics::new();
+
+        metrics.record_merge_queue_completion(
+            MergeQueueCompletion::UnclassifiedDequeue,
+            time::Duration::days(30),
+        );
+
+        let exposition = metrics.encode().expect("metrics encode into a String");
+        for expected_sample in [
+            "github_merge_queue_attempt_duration_seconds_bucket{le=\"2592000.0\",outcome=\"unknown\"} 1",
+            "github_merge_queue_attempt_duration_seconds_bucket{le=\"31536000.0\",outcome=\"unknown\"} 1",
+        ] {
+            assert!(
+                exposition.contains(expected_sample),
+                "missing sample {expected_sample:?} in:\n{exposition}"
+            );
+        }
     }
 
     #[test]
