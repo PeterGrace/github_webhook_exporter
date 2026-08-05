@@ -53,6 +53,10 @@ impl QueueProcessor<'_> {
             .and_then(|value| QueueTimestamp::parse(value).ok())
             .or_else(|| QueueTimestamp::from_datetime(self.received_at).ok());
         let Some(event_timestamp) = event_timestamp else {
+            // `received_at` comes from `OffsetDateTime::now_utc()` and therefore has a year that
+            // the canonical queue timestamp format can represent. Keep this guard defensive in
+            // case a future caller supplies a synthetic out-of-range receipt timestamp.
+            debug_assert!(false, "request receipt timestamp must be representable");
             return Ok(());
         };
 

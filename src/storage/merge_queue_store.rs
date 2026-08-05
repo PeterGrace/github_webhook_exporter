@@ -123,6 +123,8 @@ impl MergeQueueStore {
         .map_err(map_sqlx_error)?;
 
         let transition = if let Some(enqueued_at) = enqueued_at {
+            // `enqueue` is the only write path and always persists QueueTimestamp's canonical
+            // representation; failure here therefore indicates corrupted durable state.
             CompletionTransition::Completed {
                 enqueued_at: QueueTimestamp::parse(&enqueued_at)
                     .map_err(|_| MergeQueueStoreError::Internal)?,
