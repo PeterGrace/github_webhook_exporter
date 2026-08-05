@@ -374,6 +374,33 @@ impl EncodeLabelValue for MergeQueueReason {
     }
 }
 
+/// An evidence-backed terminal queue completion with an invariant outcome/reason pairing.
+///
+/// Failed and cancelled outcomes remain reserved until a future classifier revision adds explicit
+/// evidence-backed completion variants and reason vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeQueueCompletion {
+    /// A merged pull-request event proves `succeeded` with `pull_request_merged`.
+    PullRequestMerged,
+    /// A dequeue records `unknown` with `unclassified_dequeue`.
+    UnclassifiedDequeue,
+}
+
+impl MergeQueueCompletion {
+    fn labels(self) -> MergeQueueOutcomeLabels {
+        match self {
+            Self::PullRequestMerged => MergeQueueOutcomeLabels {
+                outcome: MergeQueueOutcome::Succeeded,
+                reason: MergeQueueReason::PullRequestMerged,
+            },
+            Self::UnclassifiedDequeue => MergeQueueOutcomeLabels {
+                outcome: MergeQueueOutcome::Unknown,
+                reason: MergeQueueReason::UnclassifiedDequeue,
+            },
+        }
+    }
+}
+
 /// A bounded reason for a rejected or impossible merge-queue transition.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum QueueTransitionFailureReason {
@@ -569,14 +596,6 @@ impl Metrics {
                 MergeQueueReason::PullRequestMerged,
             ),
             (
-                MergeQueueOutcome::Failed,
-                MergeQueueReason::UnclassifiedDequeue,
-            ),
-            (
-                MergeQueueOutcome::Cancelled,
-                MergeQueueReason::UnclassifiedDequeue,
-            ),
-            (
                 MergeQueueOutcome::Unknown,
                 MergeQueueReason::UnclassifiedDequeue,
             ),
@@ -723,8 +742,7 @@ impl Metrics {
     /// bounded `invalid_duration` transition-failure counter.
     pub fn record_merge_queue_completion(
         &self,
-        outcome: MergeQueueOutcome,
-        reason: MergeQueueReason,
+        completion: MergeQueueCompletion,
         duration: time::Duration,
     ) {
         if !(time::Duration::ZERO..=MAX_MERGE_QUEUE_ATTEMPT_DURATION).contains(&duration) {
@@ -734,13 +752,16 @@ impl Metrics {
             return;
         }
 
+        let labels = completion.labels();
         self.inner
             .merge_queue_pr_outcomes
-            .get_or_create(&MergeQueueOutcomeLabels { outcome, reason })
+            .get_or_create(&labels)
             .inc();
         self.inner
             .merge_queue_attempt_duration
-            .get_or_create(&MergeQueueDurationLabels { outcome })
+            .get_or_create(&MergeQueueDurationLabels {
+                outcome: labels.outcome,
+            })
             .observe(duration.as_seconds_f64());
     }
 
@@ -893,8 +914,8 @@ mod tests {
 
     use super::{
         normalize_action, normalize_event_type, normalize_merge_group_destroyed_reason, Action,
-        EventType, FailureStage, MergeGroupAction, MergeGroupReason, MergeQueueOutcome,
-        MergeQueueReason, Metrics, QueueTransitionFailureReason, WebhookResult,
+        EventType, FailureStage, MergeGroupAction, MergeGroupReason, MergeQueueCompletion,
+        MergeQueueOutcome, MergeQueueReason, Metrics, QueueTransitionFailureReason, WebhookResult,
     };
 
     #[test]
@@ -1152,33 +1173,36 @@ mod tests {
             )));
         }
 
-        for (outcome, reason, encoded_outcome, encoded_reason) in [
+        for (outcome, encoded_outcome) in [
+            (MergeQueueOutcome::Succeeded, "succeeded"),
+            (MergeQueueOutcome::Failed, "failed"),
+            (MergeQueueOutcome::Cancelled, "cancelled"),
+            (MergeQueueOutcome::Unknown, "unknown"),
+        ] {
+            assert_eq!(outcome.as_str(), encoded_outcome);
+        }
+        for (reason, encoded_reason) in [
+            (MergeQueueReason::PullRequestMerged, "pull_request_merged"),
             (
-                MergeQueueOutcome::Succeeded,
-                MergeQueueReason::PullRequestMerged,
+                MergeQueueReason::UnclassifiedDequeue,
+                "unclassified_dequeue",
+            ),
+        ] {
+            assert_eq!(reason.as_str(), encoded_reason);
+        }
+        for (completion, encoded_outcome, encoded_reason) in [
+            (
+                MergeQueueCompletion::PullRequestMerged,
                 "succeeded",
                 "pull_request_merged",
             ),
             (
-                MergeQueueOutcome::Failed,
-                MergeQueueReason::UnclassifiedDequeue,
-                "failed",
-                "unclassified_dequeue",
-            ),
-            (
-                MergeQueueOutcome::Cancelled,
-                MergeQueueReason::UnclassifiedDequeue,
-                "cancelled",
-                "unclassified_dequeue",
-            ),
-            (
-                MergeQueueOutcome::Unknown,
-                MergeQueueReason::UnclassifiedDequeue,
+                MergeQueueCompletion::UnclassifiedDequeue,
                 "unknown",
                 "unclassified_dequeue",
             ),
         ] {
-            metrics.record_merge_queue_completion(outcome, reason, time::Duration::seconds(1));
+            metrics.record_merge_queue_completion(completion, time::Duration::seconds(1));
             let exposition = metrics.encode().expect("metrics encode into a String");
             assert!(exposition.contains(&format!(
                 "github_merge_queue_pr_outcomes_total{{outcome=\"{encoded_outcome}\",reason=\"{encoded_reason}\"}} 1"
@@ -1214,8 +1238,7 @@ mod tests {
         let metrics = Metrics::new();
 
         metrics.record_merge_queue_completion(
-            MergeQueueOutcome::Succeeded,
-            MergeQueueReason::PullRequestMerged,
+            MergeQueueCompletion::PullRequestMerged,
             time::Duration::seconds(90),
         );
 
@@ -1239,8 +1262,7 @@ mod tests {
         let metrics = Metrics::new();
 
         metrics.record_merge_queue_completion(
-            MergeQueueOutcome::Succeeded,
-            MergeQueueReason::PullRequestMerged,
+            MergeQueueCompletion::PullRequestMerged,
             time::Duration::days(365),
         );
 
@@ -1262,8 +1284,7 @@ mod tests {
             time::Duration::days(365) + time::Duration::nanoseconds(1),
         ] {
             metrics.record_merge_queue_completion(
-                MergeQueueOutcome::Unknown,
-                MergeQueueReason::UnclassifiedDequeue,
+                MergeQueueCompletion::UnclassifiedDequeue,
                 invalid_duration,
             );
         }
@@ -1292,8 +1313,7 @@ mod tests {
                         MergeGroupReason::Merged,
                     );
                     worker_metrics.record_merge_queue_completion(
-                        MergeQueueOutcome::Succeeded,
-                        MergeQueueReason::PullRequestMerged,
+                        MergeQueueCompletion::PullRequestMerged,
                         time::Duration::seconds(1),
                     );
                 })
