@@ -14,6 +14,8 @@ pub mod error;
 pub mod health;
 /// Operating-system signal normalization for graceful process shutdown.
 pub mod lifecycle;
+/// Bounded Prometheus instruments and label normalization.
+pub mod metrics;
 /// Cryptographic and administrative-authentication security primitives.
 pub mod security;
 /// SQLite startup, migrations, probes, and repository persistence.

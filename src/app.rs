@@ -8,7 +8,12 @@ use axum::Router;
 use sqlx::SqlitePool;
 use tokio::net::TcpListener;
 
-use crate::{api, health, security::AdminAuthenticator, storage::RepositoryStore};
+use crate::{
+    api, health,
+    metrics::{self, Metrics},
+    security::AdminAuthenticator,
+    storage::RepositoryStore,
+};
 
 /// Immutable dependencies shared by all HTTP request handlers.
 #[derive(Clone)]
@@ -16,6 +21,7 @@ pub struct AppState {
     repository_store: Arc<RepositoryStore>,
     admin_authenticator: Arc<AdminAuthenticator>,
     database_pool: SqlitePool,
+    metrics: Metrics,
 }
 
 impl AppState {
@@ -26,6 +32,7 @@ impl AppState {
             repository_store: Arc::new(repository_store),
             admin_authenticator: Arc::new(admin_authenticator),
             database_pool,
+            metrics: Metrics::new(),
         }
     }
 
@@ -38,11 +45,17 @@ impl AppState {
     pub fn admin_authenticator(&self) -> &AdminAuthenticator {
         &self.admin_authenticator
     }
+
+    /// Returns the shared bounded metrics component.
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
+    }
 }
 
 /// Builds the composable application router.
 pub fn build_router(state: AppState) -> Router {
-    health::router(state.database_pool.clone()).merge(api::router().with_state(state))
+    health::router(state.database_pool.clone())
+        .merge(api::router().merge(metrics::router()).with_state(state))
 }
 
 /// The normalized result of serving after a graceful-shutdown request.
@@ -110,9 +123,9 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use axum::{
-        body::Body,
+        body::{to_bytes, Body},
         extract::State,
-        http::{Request, StatusCode},
+        http::{header::CONTENT_TYPE, Request, StatusCode},
         routing::get,
         Router,
     };
@@ -160,6 +173,45 @@ mod tests {
             .expect("router serves request");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_is_public_and_exposes_every_required_instrument() {
+        const OPEN_METRICS_CONTENT_TYPE: &str =
+            "application/openmetrics-text; version=1.0.0; charset=utf-8";
+        let response = build_router(app_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("request is valid"),
+            )
+            .await
+            .expect("router serves request");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE),
+            Some(&OPEN_METRICS_CONTENT_TYPE.parse().expect("header is valid"))
+        );
+        let body = to_bytes(response.into_body(), 128 * 1_024)
+            .await
+            .expect("metrics response body is readable");
+        let exposition = String::from_utf8(body.to_vec()).expect("metrics response is UTF-8");
+        for metric_name in [
+            "github_webhook_requests_total",
+            "github_webhook_events_total",
+            "github_webhook_processing_duration_seconds",
+            "github_webhook_request_body_bytes",
+            "github_webhook_duplicates_total",
+            "github_webhook_processing_failures_total",
+            "github_repository_configurations",
+        ] {
+            assert!(
+                exposition.contains(metric_name),
+                "missing {metric_name:?} in:\n{exposition}"
+            );
+        }
     }
 
     #[derive(Clone)]
