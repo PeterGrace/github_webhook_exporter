@@ -6,5 +6,7 @@ pub mod app;
 pub mod config;
 /// Safe HTTP-facing application errors.
 pub mod error;
+/// Bounded Prometheus instruments and label normalization.
+pub mod metrics;
 /// Local structured tracing initialization.
 pub mod telemetry;
