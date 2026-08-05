@@ -189,19 +189,20 @@ where
     tokio::select! {
         result = &mut server => {
             cancellation_sender.send_replace(true);
-            background
+            let background_result = background
                 .await
-                .map_err(|_| std::io::Error::other("background lifecycle task failed"))?;
-            result.map(|()| ShutdownOutcome::Completed)
+                .map_err(|_| std::io::Error::other("background lifecycle task failed"));
+            prioritize_server_result(result, background_result)
+                .map(|()| ShutdownOutcome::Completed)
         }
         () = &mut shutdown => {
             cancellation_sender.send_replace(true);
             let drain = async {
-                let result = (&mut server).await;
-                (&mut background)
+                let server_result = (&mut server).await;
+                let background_result = (&mut background)
                     .await
-                    .map_err(|_| std::io::Error::other("background lifecycle task failed"))?;
-                result
+                    .map_err(|_| std::io::Error::other("background lifecycle task failed"));
+                prioritize_server_result(server_result, background_result)
             };
             match tokio::time::timeout(shutdown_timeout, drain).await {
                 Ok(result) => result.map(|()| ShutdownOutcome::Completed),
@@ -212,6 +213,13 @@ where
             }
         }
     }
+}
+
+fn prioritize_server_result(
+    server_result: std::io::Result<()>,
+    background_result: std::io::Result<()>,
+) -> std::io::Result<()> {
+    server_result.and(background_result)
 }
 
 #[cfg(test)]
@@ -240,8 +248,8 @@ mod tests {
     };
 
     use super::{
-        build_router, serve_router_with_background_shutdown, serve_router_with_shutdown, AppState,
-        ShutdownOutcome,
+        build_router, prioritize_server_result, serve_router_with_background_shutdown,
+        serve_router_with_shutdown, AppState, ShutdownOutcome,
     };
 
     async fn app_state() -> AppState {
@@ -398,6 +406,21 @@ mod tests {
                 .expect("server runs"),
             ShutdownOutcome::Completed
         );
+    }
+
+    #[test]
+    fn server_io_error_takes_precedence_over_background_join_error() {
+        let error = prioritize_server_result(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "server failure",
+            )),
+            Err(std::io::Error::other("background failure")),
+        )
+        .expect_err("combined lifecycle must fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        assert_eq!(error.to_string(), "server failure");
     }
 
     #[tokio::test]

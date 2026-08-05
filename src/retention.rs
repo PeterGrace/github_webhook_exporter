@@ -62,6 +62,7 @@ pub async fn run_delivery_retention(
 ) {
     let start = Instant::now() + config.interval;
     let mut ticker = tokio::time::interval_at(start, config.interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -131,14 +132,56 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use sqlx::{Row, SqlitePool};
     use tokio::sync::watch;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use crate::storage::{open_database, DeliveryStore};
 
-    use super::{run_delivery_retention, RetentionConfig};
+    use super::{
+        prune_expired_deliveries, run_delivery_retention, RetentionConfig, RetentionError,
+    };
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            let bytes = self.0.lock().expect("captured logs lock is available");
+            String::from_utf8(bytes.clone()).expect("captured logs are UTF-8")
+        }
+    }
+
+    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("captured logs lock was poisoned"))?
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedLogWriter(Arc::clone(&self.0))
+        }
+    }
 
     async fn retention_store() -> (tempfile::TempDir, SqlitePool, DeliveryStore) {
         let directory = tempfile::tempdir().expect("temporary directory is created");
@@ -155,6 +198,55 @@ mod tests {
             .await
             .expect("delivery claims are countable")
             .get("count")
+    }
+
+    #[test]
+    fn configuration_rejects_zero_and_unrepresentable_durations() {
+        assert_eq!(
+            RetentionConfig::new(Duration::ZERO, Duration::from_secs(1)),
+            Err(RetentionError::InvalidInterval)
+        );
+        assert_eq!(
+            RetentionConfig::new(Duration::from_secs(1), Duration::ZERO),
+            Err(RetentionError::InvalidRetention)
+        );
+        assert_eq!(
+            RetentionConfig::new(Duration::from_secs(1), Duration::MAX),
+            Err(RetentionError::InvalidRetention)
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_failure_is_redacted_and_carries_a_correlation_id() {
+        let (_directory, pool, store) = retention_store().await;
+        sqlx::query("DROP TABLE processed_deliveries")
+            .execute(&pool)
+            .await
+            .expect("delivery table is removed");
+        let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let captured_logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(captured_logs.clone())
+            .finish();
+
+        prune_expired_deliveries(&store, time::Duration::days(1), &shutdown_receiver)
+            .with_subscriber(subscriber)
+            .await;
+
+        let logs = captured_logs.text();
+        assert!(logs.contains("outcome=\"failed\""));
+        let correlation_id = logs
+            .split("error_correlation_id=")
+            .nth(1)
+            .and_then(|suffix| suffix.split_whitespace().next())
+            .expect("failure log includes a correlation ID")
+            .trim_matches('"');
+        uuid::Uuid::parse_str(correlation_id).expect("correlation ID is an opaque UUID");
+        for forbidden in ["processed_deliveries", "no such table", "SqliteError"] {
+            assert!(!logs.contains(forbidden));
+        }
     }
 
     #[tokio::test]

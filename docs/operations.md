@@ -8,9 +8,11 @@ and binds the HTTP listener in that order.
 
 A configuration, database-open, migration, or initial repository-count failure is fatal. Before
 binding, the service initializes `github_repository_configurations` from the durable repository
-count, so readiness is never served with a default gauge value. The process exits nonzero on any
-startup failure and cannot report false readiness. Local errors identify the failed stage without
-including configured credentials or the database path.
+count, so readiness is never served with a default gauge value. Successful API creates and deletes
+adjust the in-memory gauge after their SQLite commits. A forced process exit in that narrow gap can
+leave the final in-process value stale, but the next startup reconciles it from durable state. The
+process exits nonzero on any startup failure and cannot report false readiness. Local errors
+identify the failed stage without including configured credentials or the database path.
 
 ## Health endpoints
 
