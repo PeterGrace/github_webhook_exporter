@@ -36,6 +36,8 @@ impl EventProjection {
                 MergeGroupReason::None,
             ),
             Action::Destroyed => {
+                // Missing, non-string, and unknown reasons intentionally share `other`; retaining
+                // their raw distinctions would weaken the bounded metric vocabulary.
                 let reason = self.reason.as_ref().and_then(Value::as_str).map_or(
                     MergeGroupReason::Other,
                     normalize_merge_group_destroyed_reason,
@@ -67,7 +69,9 @@ impl EventProjection {
             | Action::Updated
             | Action::Waiting
             | Action::None
-            | Action::Other => {}
+            | Action::Other => {
+                // Unsupported merge-group actions remain visible only through generic metrics.
+            }
         }
     }
 }
