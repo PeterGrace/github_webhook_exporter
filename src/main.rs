@@ -51,8 +51,9 @@ async fn run() -> Result<()> {
     let retention_config = RetentionConfig::new(
         config.delivery_prune_interval(),
         config.delivery_retention(),
+        config.merge_queue_retention(),
     )
-    .context("failed to initialize delivery retention")?;
+    .context("failed to initialize retention")?;
     let listener = TcpListener::bind(configured_bind_address)
         .await
         .with_context(|| format!("failed to bind HTTP listener at {configured_bind_address}"))?;

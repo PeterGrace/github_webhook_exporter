@@ -320,43 +320,60 @@ async fn pull_request_queue_attempt_completes_after_database_restart() {
         .await
         .expect("repository configuration is created");
     let first_router = router_for_pool(first_pool.clone(), 2_097_152);
-    let enqueue_response = first_router
-        .oneshot(webhook_request(
-            PULL_REQUEST_ENQUEUED,
-            SECRET,
-            "550e8400-e29b-41d4-a716-446655440090",
-        ))
-        .await
-        .expect("enqueue webhook succeeds");
-    assert_eq!(enqueue_response.status(), StatusCode::NO_CONTENT);
+    for _ in 0..2 {
+        let enqueue_response = first_router
+            .clone()
+            .oneshot(webhook_request(
+                PULL_REQUEST_ENQUEUED,
+                SECRET,
+                "550e8400-e29b-41d4-a716-446655440090",
+            ))
+            .await
+            .expect("enqueue webhook succeeds");
+        assert_eq!(enqueue_response.status(), StatusCode::NO_CONTENT);
+    }
+    let first_exposition = metrics(first_router).await;
+    assert!(first_exposition.contains("github_webhook_duplicates_total 1"));
     first_pool.close().await;
 
     let second_pool = open_database(&database_path)
         .await
         .expect("second database instance opens");
     let second_router = router_for_pool(second_pool.clone(), 2_097_152);
-    let completion_response = second_router
-        .clone()
-        .oneshot(webhook_request(
-            PULL_REQUEST_MERGED,
-            SECRET,
-            "550e8400-e29b-41d4-a716-446655440091",
-        ))
-        .await
-        .expect("completion webhook succeeds after restart");
-    assert_eq!(completion_response.status(), StatusCode::NO_CONTENT);
+    for _ in 0..2 {
+        let completion_response = second_router
+            .clone()
+            .oneshot(webhook_request(
+                PULL_REQUEST_MERGED,
+                SECRET,
+                "550e8400-e29b-41d4-a716-446655440091",
+            ))
+            .await
+            .expect("completion webhook succeeds after restart");
+        assert_eq!(completion_response.status(), StatusCode::NO_CONTENT);
+    }
 
-    let outcome: String = sqlx::query_scalar(
-        "SELECT outcome FROM merge_queue_attempts WHERE pull_request_number = 42",
+    let attempt: (i64, String) = sqlx::query_as(
+        "SELECT COUNT(*), outcome FROM merge_queue_attempts WHERE pull_request_number = 42",
     )
     .fetch_one(&second_pool)
     .await
     .expect("completed attempt is readable after restart");
-    assert_eq!(outcome, "succeeded");
+    assert_eq!(attempt, (1, "succeeded".to_owned()));
+    let delivery_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries")
+        .fetch_one(&second_pool)
+        .await
+        .expect("durable delivery claims are countable");
+    assert_eq!(delivery_count, 2);
     let exposition = metrics(second_router).await;
-    assert!(exposition.contains(
-        "github_merge_queue_pr_outcomes_total{outcome=\"succeeded\",reason=\"pull_request_merged\"} 1"
-    ));
+    for expected in [
+        "github_merge_queue_pr_outcomes_total{outcome=\"succeeded\",reason=\"pull_request_merged\"} 1",
+        "github_merge_queue_attempt_duration_seconds_count{outcome=\"succeeded\"} 1",
+        "github_webhook_duplicates_total 1",
+        "github_merge_group_events_total{action=\"destroyed\",reason=\"merged\"} 0",
+    ] {
+        assert!(exposition.contains(expected), "missing {expected:?}");
+    }
 }
 
 #[tokio::test]

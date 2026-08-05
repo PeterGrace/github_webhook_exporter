@@ -11,7 +11,7 @@ use tokio::{net::TcpListener, sync::watch};
 use crate::{
     api, health,
     metrics::{self, Metrics},
-    retention::{run_delivery_retention, RetentionConfig},
+    retention::{run_retention, RetentionConfig},
     security::AdminAuthenticator,
     storage::{DeliveryStore, MergeQueueStore, RepositoryStore},
 };
@@ -131,12 +131,20 @@ where
     S: Future<Output = ()>,
 {
     let delivery_store = state.delivery_store.clone();
+    let merge_queue_store = state.merge_queue_store.clone();
     serve_router_with_background_shutdown(
         listener,
         build_router(state),
         shutdown,
         shutdown_timeout,
-        move |cancellation| run_delivery_retention(delivery_store, retention_config, cancellation),
+        move |cancellation| {
+            run_retention(
+                delivery_store,
+                merge_queue_store,
+                retention_config,
+                cancellation,
+            )
+        },
     )
     .await
 }
@@ -436,18 +444,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graceful_lifecycle_waits_for_active_background_work() {
+    async fn graceful_lifecycle_shares_drain_deadline_with_request_and_background_work() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("ephemeral listener binds");
+        let address = listener.local_addr().expect("listener has an address");
+        let request_state = DrainState {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        let router = Router::new()
+            .route("/slow", get(slow_handler))
+            .with_state(request_state.clone());
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let started = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let background_started = Arc::clone(&started);
-        let background_release = Arc::clone(&release);
+        let background_started = Arc::new(Notify::new());
+        let background_release = Arc::new(Notify::new());
+        let task_background_started = Arc::clone(&background_started);
+        let task_background_release = Arc::clone(&background_release);
         let server = tokio::spawn(serve_router_with_background_shutdown(
             listener,
-            Router::new(),
+            router,
             async move {
                 drop(shutdown_receiver.await);
             },
@@ -458,16 +474,35 @@ mod tests {
                         return;
                     }
                 }
-                background_started.notify_one();
-                background_release.notified().await;
+                task_background_started.notify_one();
+                task_background_release.notified().await;
             },
         ));
+        let mut stream = TcpStream::connect(address)
+            .await
+            .expect("client connects to server");
+        stream
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("request is written");
+        request_state.started.notified().await;
 
         shutdown_sender.send(()).expect("server receives shutdown");
-        started.notified().await;
+        background_started.notified().await;
         assert!(!server.is_finished());
-        release.notify_one();
+        background_release.notify_one();
+        tokio::task::yield_now().await;
+        assert!(!server.is_finished());
+        request_state.release.notify_one();
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("drained response is read");
 
+        assert!(String::from_utf8(response)
+            .expect("response is UTF-8")
+            .starts_with("HTTP/1.1 200 OK\r\n"));
         assert_eq!(
             server
                 .await
