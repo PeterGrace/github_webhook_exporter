@@ -21,6 +21,16 @@ pub enum AppError {
     Authentication(AuthenticationError),
     /// Repository persistence failed.
     RepositoryStore(RepositoryStoreError),
+    /// A GitHub webhook request was malformed.
+    InvalidWebhook,
+    /// A GitHub webhook request failed authentication.
+    UnauthorizedWebhook,
+    /// A GitHub webhook request body exceeded its configured limit.
+    WebhookPayloadTooLarge,
+    /// A GitHub webhook request used an unsupported media type.
+    UnsupportedWebhookMediaType,
+    /// A GitHub webhook dependency was unavailable.
+    WebhookUnavailable,
     /// An unexpected application failure whose details must not reach clients.
     Internal(anyhow::Error),
 }
@@ -41,6 +51,31 @@ impl AppError {
         Self::RepositoryStore(error)
     }
 
+    /// Creates a stable malformed-webhook failure.
+    pub fn invalid_webhook() -> Self {
+        Self::InvalidWebhook
+    }
+
+    /// Creates a stable unauthorized-webhook failure.
+    pub fn unauthorized_webhook() -> Self {
+        Self::UnauthorizedWebhook
+    }
+
+    /// Creates a stable oversized-webhook-payload failure.
+    pub fn webhook_payload_too_large() -> Self {
+        Self::WebhookPayloadTooLarge
+    }
+
+    /// Creates a stable unsupported-webhook-media-type failure.
+    pub fn unsupported_webhook_media_type() -> Self {
+        Self::UnsupportedWebhookMediaType
+    }
+
+    /// Creates a stable retryable webhook-processing failure.
+    pub fn webhook_unavailable() -> Self {
+        Self::WebhookUnavailable
+    }
+
     /// Wraps an unexpected failure for safe response conversion.
     pub fn internal(error: impl Into<anyhow::Error>) -> Self {
         Self::Internal(error.into())
@@ -53,6 +88,13 @@ impl fmt::Debug for AppError {
             Self::InvalidRequest => formatter.write_str("AppError::InvalidRequest"),
             Self::Authentication(_) => formatter.write_str("AppError::Authentication"),
             Self::RepositoryStore(_) => formatter.write_str("AppError::RepositoryStore"),
+            Self::InvalidWebhook => formatter.write_str("AppError::InvalidWebhook"),
+            Self::UnauthorizedWebhook => formatter.write_str("AppError::UnauthorizedWebhook"),
+            Self::WebhookPayloadTooLarge => formatter.write_str("AppError::WebhookPayloadTooLarge"),
+            Self::UnsupportedWebhookMediaType => {
+                formatter.write_str("AppError::UnsupportedWebhookMediaType")
+            }
+            Self::WebhookUnavailable => formatter.write_str("AppError::WebhookUnavailable"),
             Self::Internal(_) => formatter.write_str("AppError::Internal"),
         }
     }
@@ -105,6 +147,31 @@ impl IntoResponse for AppError {
                 | RepositoryStoreError::InternalData
                 | RepositoryStoreError::Internal(_) => internal_response(),
             },
+            Self::InvalidWebhook => error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_webhook",
+                "webhook request is invalid",
+            ),
+            Self::UnauthorizedWebhook => error_response(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "webhook authentication failed",
+            ),
+            Self::WebhookPayloadTooLarge => error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "webhook payload is too large",
+            ),
+            Self::UnsupportedWebhookMediaType => error_response(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+                "content type must be application/json",
+            ),
+            Self::WebhookUnavailable => error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "webhook processing is unavailable",
+            ),
             Self::Internal(_) => internal_response(),
         }
     }

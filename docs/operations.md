@@ -41,6 +41,37 @@ Both responses have empty bodies. Database paths, SQL errors, and internal detai
 to the client. A readiness failure does not terminate the process; it emits a normalized structured
 warning for local diagnosis.
 
+## GitHub webhook endpoint
+
+`POST /webhooks/github` is intentionally unauthenticated at the HTTP layer. GitHub authenticates
+each request with the repository-specific HMAC secret configured through the administrator API.
+The request must include:
+
+- `Content-Type: application/json`
+- a non-empty `X-GitHub-Event`
+- `X-GitHub-Delivery` containing a UUID
+- `X-Hub-Signature-256` containing `sha256=` and exactly 64 hexadecimal characters
+
+The service buffers at most `GHE_WEBHOOK_BODY_LIMIT_BYTES` exact request bytes and initially reads
+only `repository.full_name`. It verifies the HMAC before validating optional top-level `action`
+semantics, then atomically claims the delivery UUID. A new authenticated delivery updates bounded
+event/action and body-size metrics. An authenticated duplicate returns success and updates request
+and duplicate metrics only. Payloads are never persisted.
+
+| Status | Meaning |
+| --- | --- |
+| `204 No Content` | Authenticated new or duplicate delivery. |
+| `400 Bad Request` | Missing/malformed headers, malformed JSON, invalid UUID, or invalid repository identity. |
+| `401 Unauthorized` | Unknown/disabled repository or incorrect signature. |
+| `413 Payload Too Large` | Body exceeds `GHE_WEBHOOK_BODY_LIMIT_BYTES`. |
+| `415 Unsupported Media Type` | Content type is not exactly `application/json`. |
+| `503 Service Unavailable` | SQLite could not load authentication data or claim the delivery. |
+
+Unknown, disabled, and incorrectly signed requests return identical `401` response status, headers,
+and body. Every error body is fixed and excludes repository names, delivery IDs, signatures,
+payload fragments, and storage details. Structured logs contain only normalized result/stage values
+and an opaque correlation ID for internal dependency failures.
+
 ## Graceful shutdown
 
 Tokio listens for both SIGINT and SIGTERM. Either signal follows the same sequence:

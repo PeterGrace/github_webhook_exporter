@@ -255,7 +255,7 @@ pub enum FailureStage {
 }
 
 impl WebhookResult {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
             Self::Malformed => "malformed",
@@ -274,7 +274,7 @@ impl EncodeLabelValue for WebhookResult {
 }
 
 impl FailureStage {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Authentication => "authentication",
             Self::DeliveryClaim => "delivery_claim",
