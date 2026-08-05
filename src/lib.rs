@@ -6,7 +6,7 @@ pub mod api;
 pub mod app;
 /// Typed, validated, and redacted runtime configuration.
 pub mod config;
-/// Validated application-domain values.
+/// Validated delivery, repository, and merge-queue domain values.
 pub mod domain;
 /// Safe HTTP-facing application errors.
 pub mod error;
@@ -20,7 +20,7 @@ pub mod metrics;
 pub mod retention;
 /// Cryptographic and administrative-authentication security primitives.
 pub mod security;
-/// SQLite startup, migrations, probes, and repository persistence.
+/// SQLite startup, migrations, probes, and durable repository, delivery, and queue persistence.
 pub mod storage;
 /// Local structured tracing initialization.
 pub mod telemetry;
