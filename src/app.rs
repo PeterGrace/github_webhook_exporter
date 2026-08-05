@@ -12,7 +12,7 @@ use crate::{
     api, health,
     metrics::{self, Metrics},
     security::AdminAuthenticator,
-    storage::RepositoryStore,
+    storage::{DeliveryStore, RepositoryStore},
 };
 
 /// Immutable dependencies shared by all HTTP request handlers.
@@ -21,18 +21,27 @@ pub struct AppState {
     repository_store: Arc<RepositoryStore>,
     admin_authenticator: Arc<AdminAuthenticator>,
     database_pool: SqlitePool,
+    delivery_store: DeliveryStore,
     metrics: Metrics,
+    webhook_body_limit_bytes: usize,
 }
 
 impl AppState {
     /// Creates application state from initialized repository and authentication services.
-    pub fn new(repository_store: RepositoryStore, admin_authenticator: AdminAuthenticator) -> Self {
+    pub fn new(
+        repository_store: RepositoryStore,
+        admin_authenticator: AdminAuthenticator,
+        webhook_body_limit_bytes: usize,
+    ) -> Self {
         let database_pool = repository_store.pool().clone();
+        let delivery_store = DeliveryStore::new(database_pool.clone());
         Self {
             repository_store: Arc::new(repository_store),
             admin_authenticator: Arc::new(admin_authenticator),
             database_pool,
+            delivery_store,
             metrics: Metrics::new(),
+            webhook_body_limit_bytes,
         }
     }
 
@@ -46,6 +55,11 @@ impl AppState {
         &self.admin_authenticator
     }
 
+    /// Returns durable authenticated-delivery claim persistence.
+    pub fn delivery_store(&self) -> &DeliveryStore {
+        &self.delivery_store
+    }
+
     /// Returns the shared bounded metrics component.
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
@@ -54,8 +68,13 @@ impl AppState {
 
 /// Builds the composable application router.
 pub fn build_router(state: AppState) -> Router {
-    health::router(state.database_pool.clone())
-        .merge(api::router().merge(metrics::router()).with_state(state))
+    let webhook_body_limit_bytes = state.webhook_body_limit_bytes;
+    let webhook_metrics = state.metrics.clone();
+    health::router(state.database_pool.clone()).merge(
+        api::router(webhook_body_limit_bytes, webhook_metrics)
+            .merge(metrics::router())
+            .with_state(state),
+    )
 }
 
 /// The normalized result of serving after a graceful-shutdown request.
@@ -155,6 +174,7 @@ mod tests {
         AppState::new(
             RepositoryStore::new(pool, cipher),
             AdminAuthenticator::new(&token),
+            2_097_152,
         )
     }
 

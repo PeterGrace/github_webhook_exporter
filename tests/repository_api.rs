@@ -35,6 +35,7 @@ fn router_for_pool(pool: SqlitePool) -> Router {
     build_router(AppState::new(
         RepositoryStore::new(pool, cipher),
         AdminAuthenticator::new(&admin_token),
+        2_097_152,
     ))
 }
 

@@ -1,12 +1,13 @@
-//! Authenticated HTTP APIs.
+//! Administrator-authenticated configuration and public webhook HTTP APIs.
 
 mod repositories;
+mod webhook;
 
 use axum::Router;
 
-use crate::app::AppState;
+use crate::{app::AppState, metrics::Metrics};
 
-/// Builds the versioned repository-configuration API router.
-pub fn router() -> Router<AppState> {
-    repositories::router()
+/// Builds the repository-configuration and public GitHub webhook API router.
+pub fn router(body_limit_bytes: usize, metrics: Metrics) -> Router<AppState> {
+    repositories::router().merge(webhook::router(body_limit_bytes, metrics))
 }

@@ -38,6 +38,7 @@ async fn run() -> Result<()> {
     let state = AppState::new(
         RepositoryStore::new(pool, cipher),
         AdminAuthenticator::new(config.admin_token()),
+        config.webhook_body_limit_bytes(),
     );
 
     let configured_bind_address = config.bind_address();
