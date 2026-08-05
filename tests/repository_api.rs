@@ -709,6 +709,108 @@ async fn delete_removes_repositories_and_maps_missing_or_invalid_ids() {
 }
 
 #[tokio::test]
+async fn repository_configuration_gauge_initializes_from_durable_count() {
+    let directory = tempfile::tempdir().expect("temporary directory is created");
+    let pool = open_database(&directory.path().join("gauge.db"))
+        .await
+        .expect("test database opens and migrates");
+    let master_key = MasterKey::from_slice(MASTER_KEY_BYTES).expect("test key is valid");
+    let cipher = RepositorySecretCipher::new(&master_key).expect("test cipher initializes");
+    let store = RepositoryStore::new(pool, cipher);
+    for full_name in ["owner/first", "owner/second"] {
+        store
+            .create(
+                github_webhook_exporter::security::CanonicalRepositoryName::new(full_name)
+                    .expect("repository name is valid"),
+                github_webhook_exporter::security::RepositorySecret::new(format!(
+                    "secret-for-{full_name}"
+                ))
+                .expect("repository secret is valid"),
+                true,
+            )
+            .await
+            .expect("repository fixture is created");
+    }
+    let admin_token = AdminToken::new(ADMIN_TOKEN.to_owned()).expect("test token is valid");
+    let state = AppState::new(store, AdminAuthenticator::new(&admin_token), 2_097_152);
+
+    state
+        .initialize_repository_metrics()
+        .await
+        .expect("repository metrics initialize");
+
+    assert!(metrics_text(build_router(state))
+        .await
+        .contains("github_repository_configurations 2"));
+}
+
+#[tokio::test]
+async fn repository_configuration_gauge_changes_only_after_successful_mutations() {
+    let app = TestApp::new().await;
+
+    let created = app
+        .create(serde_json::json!({
+            "full_name": "owner/repository",
+            "webhook_secret": "repository-secret"
+        }))
+        .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert!(metrics_text(app.router.clone())
+        .await
+        .contains("github_repository_configurations 1"));
+
+    let conflict = app
+        .create(serde_json::json!({
+            "full_name": "OWNER/REPOSITORY",
+            "webhook_secret": "conflicting-secret"
+        }))
+        .await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert!(metrics_text(app.router.clone())
+        .await
+        .contains("github_repository_configurations 1"));
+
+    let deleted = app
+        .request(
+            Method::DELETE,
+            "/api/v1/repositories/1",
+            Some("Bearer independent-admin-token"),
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    assert!(metrics_text(app.router.clone())
+        .await
+        .contains("github_repository_configurations 0"));
+
+    let missing = app
+        .request(
+            Method::DELETE,
+            "/api/v1/repositories/1",
+            Some("Bearer independent-admin-token"),
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert!(metrics_text(app.router)
+        .await
+        .contains("github_repository_configurations 0"));
+}
+
+async fn metrics_text(router: Router) -> String {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .expect("metrics request is valid"),
+        )
+        .await
+        .expect("metrics request succeeds");
+    String::from_utf8(response_body(response).await).expect("metrics response is UTF-8")
+}
+
+#[tokio::test]
 async fn authentication_protects_every_configuration_route() {
     let app = TestApp::new().await;
     let routes = [
@@ -777,10 +879,13 @@ async fn redaction_omits_security_material_from_responses_and_logs() {
     assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let error_body =
         String::from_utf8(response_body(failed).await).expect("error response body is UTF-8");
-    assert_eq!(
-        error_body,
-        r#"{"code":"internal_error","message":"internal server error"}"#
-    );
+    let error_json: Value = serde_json::from_str(&error_body).expect("error response is JSON");
+    assert_eq!(error_json["code"], "internal_error");
+    assert_eq!(error_json["message"], "internal server error");
+    let error_id = error_json["error_id"]
+        .as_str()
+        .expect("internal response includes an error ID");
+    uuid::Uuid::parse_str(error_id).expect("error ID is an opaque UUID");
 
     for response in [&success_body, &error_body] {
         for forbidden in [
@@ -812,4 +917,5 @@ async fn redaction_omits_security_material_from_responses_and_logs() {
         assert!(!logs.contains(forbidden));
     }
     assert!(logs.contains("outcome=\"internal_error\""));
+    assert!(logs.contains(error_id));
 }

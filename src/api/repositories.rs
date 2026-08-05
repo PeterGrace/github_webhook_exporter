@@ -102,6 +102,7 @@ async fn create_repository(
         .create(full_name, webhook_secret, request.enabled)
         .await
         .map_err(AppError::repository_store)?;
+    state.metrics().increment_repository_configurations();
 
     Ok((
         StatusCode::CREATED,
@@ -187,6 +188,7 @@ async fn delete_repository(
         .delete(id)
         .await
         .map_err(AppError::repository_store)?;
+    state.metrics().decrement_repository_configurations();
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

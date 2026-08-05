@@ -347,6 +347,82 @@ async fn exact_body_and_signature_bytes_are_required_by_the_http_endpoint() {
 }
 
 #[tokio::test]
+async fn restart_preserves_configuration_deduplication_and_bounded_metrics() {
+    let directory = tempfile::tempdir().expect("temporary directory is created");
+    let database_path = directory.path().join("restart.sqlite3");
+    let first_pool = open_database(&database_path)
+        .await
+        .expect("first database instance opens");
+    let cipher = RepositorySecretCipher::new(
+        &MasterKey::from_slice(&[7_u8; 32]).expect("test master key is valid"),
+    )
+    .expect("repository cipher initializes");
+    RepositoryStore::new(first_pool.clone(), cipher)
+        .create(
+            CanonicalRepositoryName::new("owner/repository").expect("repository name is valid"),
+            RepositorySecret::new(SECRET.to_owned()).expect("secret is valid"),
+            true,
+        )
+        .await
+        .expect("repository configuration is created");
+    first_pool.close().await;
+
+    let second_pool = open_database(&database_path)
+        .await
+        .expect("second database instance opens");
+    let cipher = RepositorySecretCipher::new(
+        &MasterKey::from_slice(&[7_u8; 32]).expect("test master key is valid"),
+    )
+    .expect("repository cipher initializes");
+    let admin_token = AdminToken::new("admin-token".to_owned()).expect("admin token is valid");
+    let state = AppState::new(
+        RepositoryStore::new(second_pool.clone(), cipher),
+        AdminAuthenticator::new(&admin_token),
+        2_097_152,
+    );
+    state
+        .initialize_repository_metrics()
+        .await
+        .expect("repository metrics initialize after restart");
+    let router = build_router(state);
+
+    for _ in 0..2 {
+        let response = router
+            .clone()
+            .oneshot(webhook_request(PAYLOAD, SECRET, DELIVERY_ID))
+            .await
+            .expect("webhook request succeeds after restart");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let delivery_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries")
+        .fetch_one(&second_pool)
+        .await
+        .expect("delivery count is readable");
+    assert_eq!(delivery_count, 1);
+    let exposition = metrics(router).await;
+    for expected in [
+        "github_repository_configurations 1",
+        "github_webhook_requests_total{result=\"accepted\"} 2",
+        "github_webhook_events_total{event_type=\"pull_request\",action=\"opened\"} 1",
+        "github_webhook_duplicates_total 1",
+    ] {
+        assert!(exposition.contains(expected), "missing {expected:?}");
+    }
+    for forbidden in ["owner/repository", DELIVERY_ID, SECRET, "sha256="] {
+        assert!(!exposition.contains(forbidden));
+    }
+    let persisted_payloads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('processed_deliveries') \
+         WHERE name IN ('payload', 'repository_name', 'signature')",
+    )
+    .fetch_one(&second_pool)
+    .await
+    .expect("delivery schema is inspectable");
+    assert_eq!(persisted_payloads, 0);
+}
+
+#[tokio::test]
 async fn duplicate_delivery_updates_only_request_and_duplicate_metrics() {
     let app = test_app(2_097_152, Some(true)).await;
 
@@ -414,10 +490,17 @@ async fn normalized_logs_responses_and_metrics_exclude_sensitive_values() {
 async fn authentication_and_claim_database_failures_return_service_unavailable() {
     let authentication_app = test_app(2_097_152, Some(true)).await;
     authentication_app.pool.close().await;
+    let authentication_logs = CapturedLogs::default();
+    let authentication_subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(authentication_logs.clone())
+        .finish();
     let authentication_response = authentication_app
         .router
         .clone()
         .oneshot(webhook_request(PAYLOAD, SECRET, DELIVERY_ID))
+        .with_subscriber(authentication_subscriber)
         .await
         .expect("request succeeds");
 
@@ -425,6 +508,14 @@ async fn authentication_and_claim_database_failures_return_service_unavailable()
         authentication_response.status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
+    let authentication_body: serde_json::Value =
+        serde_json::from_slice(&response_body(authentication_response).await)
+            .expect("authentication failure response is JSON");
+    let authentication_error_id = authentication_body["error_id"]
+        .as_str()
+        .expect("authentication failure includes an error ID");
+    uuid::Uuid::parse_str(authentication_error_id).expect("error ID is an opaque UUID");
+    assert!(authentication_logs.text().contains(authentication_error_id));
     let authentication_exposition = metrics(authentication_app.router).await;
     assert!(authentication_exposition
         .contains("github_webhook_processing_failures_total{stage=\"authentication\"} 1"));
@@ -435,14 +526,29 @@ async fn authentication_and_claim_database_failures_return_service_unavailable()
         .execute(&claim_app.pool)
         .await
         .expect("delivery table is removed");
+    let claim_logs = CapturedLogs::default();
+    let claim_subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(claim_logs.clone())
+        .finish();
     let claim_response = claim_app
         .router
         .clone()
         .oneshot(webhook_request(PAYLOAD, SECRET, DELIVERY_ID))
+        .with_subscriber(claim_subscriber)
         .await
         .expect("request succeeds");
 
     assert_eq!(claim_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let claim_body: serde_json::Value =
+        serde_json::from_slice(&response_body(claim_response).await)
+            .expect("claim failure response is JSON");
+    let claim_error_id = claim_body["error_id"]
+        .as_str()
+        .expect("claim failure includes an error ID");
+    uuid::Uuid::parse_str(claim_error_id).expect("error ID is an opaque UUID");
+    assert!(claim_logs.text().contains(claim_error_id));
     let exposition = metrics(claim_app.router).await;
     assert!(
         exposition.contains("github_webhook_processing_failures_total{stage=\"delivery_claim\"} 1")
