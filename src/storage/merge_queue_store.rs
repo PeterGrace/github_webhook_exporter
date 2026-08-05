@@ -25,10 +25,13 @@ pub enum EnqueueTransition {
 }
 
 /// The result of trying to complete one durable merge-queue attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompletionTransition {
     /// One pending attempt changed to the requested terminal state.
-    Completed,
+    Completed {
+        /// The committed attempt's enqueue timestamp, used for bounded duration metrics.
+        enqueued_at: QueueTimestamp,
+    },
     /// A terminal attempt already existed, so persisted state did not change.
     AlreadyCompleted,
     /// No pending or terminal attempt exists for the repository and pull request.
@@ -104,22 +107,26 @@ impl MergeQueueStore {
         completion: &QueueCompletion,
     ) -> Result<CompletionTransition, MergeQueueStoreError> {
         let mut transaction = self.pool.begin().await.map_err(map_sqlx_error)?;
-        let result = sqlx::query(
+        let enqueued_at: Option<String> = sqlx::query_scalar(
             "UPDATE merge_queue_attempts \
              SET completed_at = ?, outcome = ?, reason_code = ? \
-             WHERE repository_id = ? AND pull_request_number = ? AND completed_at IS NULL",
+             WHERE repository_id = ? AND pull_request_number = ? AND completed_at IS NULL \
+             RETURNING enqueued_at",
         )
         .bind(completion.completed_at().as_str())
         .bind(completion.outcome().as_str())
         .bind(completion.reason_code().as_str())
         .bind(repository_id.get())
         .bind(pull_request_number.get())
-        .execute(&mut *transaction)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(map_sqlx_error)?;
 
-        let transition = if result.rows_affected() == 1 {
-            CompletionTransition::Completed
+        let transition = if let Some(enqueued_at) = enqueued_at {
+            CompletionTransition::Completed {
+                enqueued_at: QueueTimestamp::parse(&enqueued_at)
+                    .map_err(|_| MergeQueueStoreError::Internal)?,
+            }
         } else {
             let completed_exists: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM merge_queue_attempts \

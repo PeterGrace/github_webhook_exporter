@@ -1,9 +1,12 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::metrics::{
-    normalize_merge_group_destroyed_reason, Action, EventType, MergeGroupAction, MergeGroupReason,
-    Metrics,
+use crate::{
+    api::pull_request::PullRequestProjection,
+    metrics::{
+        normalize_merge_group_destroyed_reason, Action, EventType, MergeGroupAction,
+        MergeGroupReason, Metrics,
+    },
 };
 
 /// Minimal authenticated payload fields needed for generic action and merge-group processing.
@@ -11,12 +14,18 @@ use crate::metrics::{
 pub(super) struct EventProjection {
     action: Option<String>,
     reason: Option<Value>,
+    pull_request: Option<PullRequestProjection>,
 }
 
 impl EventProjection {
     /// Returns the optional raw action for bounded generic normalization.
     pub(super) fn action(&self) -> Option<&str> {
         self.action.as_deref()
+    }
+
+    /// Returns the optional pull-request projection used for specialized queue processing.
+    pub(super) fn pull_request(&self) -> Option<&PullRequestProjection> {
+        self.pull_request.as_ref()
     }
 
     /// Records a supported specialized merge-group event using only bounded metric labels.

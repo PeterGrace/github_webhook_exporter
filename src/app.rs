@@ -13,7 +13,7 @@ use crate::{
     metrics::{self, Metrics},
     retention::{run_delivery_retention, RetentionConfig},
     security::AdminAuthenticator,
-    storage::{DeliveryStore, RepositoryStore},
+    storage::{DeliveryStore, MergeQueueStore, RepositoryStore},
 };
 
 /// Immutable dependencies shared by all HTTP request handlers.
@@ -23,6 +23,7 @@ pub struct AppState {
     admin_authenticator: Arc<AdminAuthenticator>,
     database_pool: SqlitePool,
     delivery_store: DeliveryStore,
+    merge_queue_store: MergeQueueStore,
     metrics: Metrics,
     webhook_body_limit_bytes: usize,
 }
@@ -36,11 +37,13 @@ impl AppState {
     ) -> Self {
         let database_pool = repository_store.pool().clone();
         let delivery_store = DeliveryStore::new(database_pool.clone());
+        let merge_queue_store = MergeQueueStore::new(database_pool.clone());
         Self {
             repository_store: Arc::new(repository_store),
             admin_authenticator: Arc::new(admin_authenticator),
             database_pool,
             delivery_store,
+            merge_queue_store,
             metrics: Metrics::new(),
             webhook_body_limit_bytes,
         }
@@ -75,6 +78,11 @@ impl AppState {
     /// Returns durable authenticated-delivery claim persistence.
     pub fn delivery_store(&self) -> &DeliveryStore {
         &self.delivery_store
+    }
+
+    /// Returns durable pull-request merge-queue attempt persistence.
+    pub fn merge_queue_store(&self) -> &MergeQueueStore {
+        &self.merge_queue_store
     }
 
     /// Returns the shared bounded metrics component.
