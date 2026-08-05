@@ -122,28 +122,69 @@ join, so merge-group deliveries never create or mutate pull-request attempt rows
 repository names, group identifiers, and head SHAs are discarded rather than logged or used as
 metric labels.
 
-## Delivery retention and duplicate semantics
+### Pull-request merge-queue attempts
 
-The service retains authenticated delivery claims for `GHE_DELIVERY_RETENTION_DAYS` (default: 7).
-One background task starts a pruning pass every `GHE_DELIVERY_PRUNE_INTERVAL_SECONDS` (default:
-3600). A pass uses a fixed cutoff and deletes at most 1,000 expired claims per SQLite operation,
-repeating until a batch deletes fewer than 1,000. Fresh claims are preserved. Failures end only the
-current pass and are reported with normalized structured fields; the next configured interval can
-retry.
+For a newly claimed `pull_request` delivery, the authenticated repository's durable identifier and
+positive `pull_request.number` select one attempt. `enqueued` creates a pending attempt only when
+none is active. `dequeued` completes an active attempt as `unknown/unclassified_dequeue`;
+`closed` completes it as `succeeded/pull_request_merged` only when `pull_request.merged` is exactly
+`true`. An absent or false merged flag and unsupported actions do not mutate specialized state.
+Raw dequeue reasons are discarded and are never persisted, logged, or used as metric labels.
+
+The processor uses a valid `pull_request.updated_at` for the transition timestamp. Missing,
+malformed, or unrepresentable timestamps fall back to the receipt time captured once for the
+request. Repeated enqueue and already-completed replay are no-ops. A completion with no active or
+completed attempt increments only
+`github_merge_queue_transition_failures_total{reason="missing_active_attempt"}`. Outcome and
+duration metrics update only after SQLite commits a pending-to-completed transition. Negative and
+over-365-day durations are omitted and increment only the bounded `invalid_duration` transition
+failure.
+
+Queue processing begins after the delivery claim commits. A queue-state persistence failure
+therefore still returns `204 No Content`, increments
+`github_webhook_processing_failures_total{stage="queue_state"}`, and emits one redacted local error
+with an opaque correlation ID. GitHub is not asked to redeliver the already claimed delivery: queue
+processing is intentionally at-most-once at this boundary. SQLite state and in-memory Prometheus
+metrics are also not one transaction; a crash after queue state commits but before metrics update
+can undercount an outcome until the process restarts, and Phase 3 does not claim exactly-once
+metrics across crashes.
+
+## Delivery and merge-queue retention
+
+The service retains authenticated delivery claims for `GHE_DELIVERY_RETENTION_DAYS` (default: 7)
+and completed pull-request merge-queue attempts for `GHE_MERGE_QUEUE_RETENTION_DAYS` (default:
+90). Both values must be positive integers. Pending merge-queue attempts are retained regardless of
+age so a later completion can correlate across a restart.
+
+One background task starts both pruning workloads every
+`GHE_DELIVERY_PRUNE_INTERVAL_SECONDS` (default: 3600); Phase 3 intentionally has no separate queue
+prune interval. There is no immediate startup pass, and missed ticks are skipped rather than
+replayed in a burst. Each scheduled pass fixes its cutoffs once, then each SQLite operation deletes
+at most 1,000 eligible rows. A workload repeats bounded operations until one deletes fewer than
+1,000 rows. Delivery pruning preserves fresh claims. Queue pruning deletes only attempts with a
+non-null completion time older than its cutoff, preserving fresh completed and all pending
+attempts.
+
+A database failure stops only the affected workload's current pass. Normalized structured logging
+identifies the workload and outcome and includes an opaque correlation ID for failures; it excludes
+SQL text, row identifiers, repository identities, pull-request numbers, timestamps, and payload
+data. The next configured interval retries both workloads.
 
 During uninterrupted operation, a repeated delivery UUID is accepted but changes only request and
-duplicate metrics. A process crash after the durable claim commits and before the in-memory event
-counter changes can undercount that delivery. SQLite and Prometheus are not transactionally
-coupled, so the service explicitly does not promise exactly-once metrics across crashes.
+duplicate metrics. Queue state and specialized metrics update at most once after the durable
+delivery-claim boundary. A process crash after a delivery or queue-state commit but before the
+corresponding in-memory metric update can undercount it. SQLite and Prometheus are not
+transactionally coupled, so the service explicitly does not promise exactly-once metrics across
+crashes.
 
 ## Graceful shutdown
 
 Tokio listens for both SIGINT and SIGTERM. Either signal follows the same sequence:
 
 1. Record the normalized signal in structured stderr logging.
-2. Notify both Axum and the delivery-retention task through one cancellation signal.
-3. Stop accepting new connections and stop scheduling new prune batches.
-4. Allow active requests and an active SQLite prune batch to finish within one shared
+2. Notify both Axum and the shared retention task through one cancellation signal.
+3. Stop accepting new connections and stop scheduling new delivery or queue prune batches.
+4. Allow active requests and active SQLite prune work to finish within one shared
    `GHE_SHUTDOWN_TIMEOUT_SECONDS` deadline.
 5. Exit normally if all lifecycle work completes.
 6. Drop remaining work and record a normalized timeout warning if the shared deadline expires.

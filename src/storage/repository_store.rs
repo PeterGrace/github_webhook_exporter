@@ -13,6 +13,19 @@ use super::sqlite_is_busy_or_locked;
 const RETURNING_COLUMNS: &str = "id, full_name, webhook_secret_ciphertext, \
     webhook_secret_nonce, encryption_version, enabled, created_at, updated_at";
 
+/// Identity and zeroizing secret material for one enabled repository.
+pub(crate) struct RepositoryAuthenticationMaterial {
+    repository_id: RepositoryId,
+    webhook_secret: RepositorySecret,
+}
+
+impl RepositoryAuthenticationMaterial {
+    /// Separates the typed identity from the zeroizing secret for one authentication attempt.
+    pub(crate) fn into_parts(self) -> (RepositoryId, RepositorySecret) {
+        (self.repository_id, self.webhook_secret)
+    }
+}
+
 /// Transactional persistence for encrypted repository configurations.
 pub struct RepositoryStore {
     pool: SqlitePool,
@@ -116,8 +129,18 @@ impl RepositoryStore {
         &self,
         full_name: &CanonicalRepositoryName,
     ) -> Result<RepositorySecret, RepositoryStoreError> {
+        self.authentication_material(full_name)
+            .await
+            .map(|material| material.webhook_secret)
+    }
+
+    /// Loads typed identity and zeroizing secret material for an enabled repository.
+    pub(crate) async fn authentication_material(
+        &self,
+        full_name: &CanonicalRepositoryName,
+    ) -> Result<RepositoryAuthenticationMaterial, RepositoryStoreError> {
         let row = sqlx::query(
-            "SELECT webhook_secret_ciphertext, webhook_secret_nonce, encryption_version \
+            "SELECT id, webhook_secret_ciphertext, webhook_secret_nonce, encryption_version \
              FROM repositories WHERE full_name = ? AND enabled = 1",
         )
         .bind(full_name.as_str())
@@ -125,10 +148,17 @@ impl RepositoryStore {
         .await
         .map_err(map_sqlx_error)?
         .ok_or(RepositoryStoreError::AuthenticationFailed)?;
+        let repository_id = RepositoryId::from_database(row.try_get("id").map_err(map_sqlx_error)?)
+            .ok_or(RepositoryStoreError::InternalData)?;
         let encrypted = decode_encrypted_secret(&row)?;
-        self.cipher
+        let webhook_secret = self
+            .cipher
             .decrypt(full_name, &encrypted)
-            .map_err(RepositoryStoreError::Cryptographic)
+            .map_err(RepositoryStoreError::Cryptographic)?;
+        Ok(RepositoryAuthenticationMaterial {
+            repository_id,
+            webhook_secret,
+        })
     }
 
     /// Fetches repository metadata by identifier after authenticating its stored secret.

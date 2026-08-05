@@ -41,7 +41,10 @@ pub struct PullRequestNumberError;
 
 /// A validated RFC 3339 event timestamp normalized to UTC milliseconds.
 #[derive(Clone, PartialEq, Eq)]
-pub struct QueueTimestamp(String);
+pub struct QueueTimestamp {
+    canonical: String,
+    instant: OffsetDateTime,
+}
 
 impl QueueTimestamp {
     /// Parses and normalizes an RFC 3339 timestamp.
@@ -62,16 +65,21 @@ impl QueueTimestamp {
     /// Returns [`QueueTimestampError`] when the timestamp's year cannot be represented by the
     /// canonical format.
     pub fn from_datetime(timestamp: OffsetDateTime) -> Result<Self, QueueTimestampError> {
-        timestamp
-            .to_offset(UtcOffset::UTC)
+        let instant = timestamp.to_offset(UtcOffset::UTC);
+        let canonical = instant
             .format(QUEUE_TIMESTAMP_FORMAT)
-            .map(Self)
-            .map_err(|_| QueueTimestampError)
+            .map_err(|_| QueueTimestampError)?;
+        Ok(Self { canonical, instant })
     }
 
     /// Returns the canonical UTC timestamp text.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.canonical
+    }
+
+    /// Returns the signed duration from `earlier` to this timestamp.
+    pub fn duration_since(&self, earlier: &Self) -> time::Duration {
+        self.instant - earlier.instant
     }
 }
 

@@ -4,7 +4,10 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use thiserror::Error;
 
-use crate::storage::{RepositoryStore, RepositoryStoreError};
+use crate::{
+    domain::repository::RepositoryId,
+    storage::{RepositoryStore, RepositoryStoreError},
+};
 
 use super::CanonicalRepositoryName;
 
@@ -65,24 +68,28 @@ impl<'store> WebhookAuthenticator<'store> {
     /// wrong secrets, or mismatched signatures. Returns
     /// [`WebhookAuthenticationError::Unavailable`] when authentication material cannot be loaded
     /// or decrypted. Neither failure contains repository, request, signature, or secret values.
+    ///
+    /// Returns the authenticated repository's typed durable identifier on success.
     pub async fn authenticate(
         &self,
         repository_name: &CanonicalRepositoryName,
         signature: &WebhookSignature,
         request_body: &[u8],
-    ) -> Result<(), WebhookAuthenticationError> {
-        let secret = self
+    ) -> Result<RepositoryId, WebhookAuthenticationError> {
+        let (repository_id, secret) = self
             .store
-            .authentication_secret(repository_name)
+            .authentication_material(repository_name)
             .await
-            .map_err(WebhookAuthenticationError::from_store_error)?;
+            .map_err(WebhookAuthenticationError::from_store_error)?
+            .into_parts();
         // HMAC-SHA-256 accepts keys of any length; retain the fallible API mapping so a future
         // implementation change still fails closed.
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.expose_secret().as_bytes())
             .map_err(|_| WebhookAuthenticationError::Unavailable)?;
         mac.update(request_body);
         mac.verify_slice(&signature.0)
-            .map_err(|_| WebhookAuthenticationError::Unauthorized)
+            .map_err(|_| WebhookAuthenticationError::Unauthorized)?;
+        Ok(repository_id)
     }
 }
 
@@ -195,17 +202,20 @@ mod tests {
     async fn authenticator_matches_the_official_github_sha256_fixture() {
         let (_directory, _pool, store) = test_store().await;
         let repository_name = name("github/docs");
-        store
+        let repository_id = store
             .create(repository_name.clone(), secret(GITHUB_SECRET), true)
             .await
-            .expect("repository is created");
+            .expect("repository is created")
+            .id();
         let signature =
             WebhookSignature::parse(GITHUB_SIGNATURE).expect("official GitHub signature is valid");
 
-        WebhookAuthenticator::new(&store)
+        let authenticated_repository_id = WebhookAuthenticator::new(&store)
             .authenticate(&repository_name, &signature, GITHUB_PAYLOAD)
             .await
             .expect("official GitHub fixture authenticates");
+
+        assert_eq!(authenticated_repository_id, repository_id);
     }
 
     #[tokio::test]

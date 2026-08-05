@@ -24,6 +24,7 @@ const DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_WEBHOOK_BODY_LIMIT_BYTES: u64 = 2_097_152;
 const MAX_WEBHOOK_BODY_LIMIT_BYTES: u64 = 2_097_152;
 const DEFAULT_DELIVERY_RETENTION_DAYS: u64 = 7;
+const DEFAULT_MERGE_QUEUE_RETENTION_DAYS: u64 = 90;
 const DEFAULT_DELIVERY_PRUNE_INTERVAL_SECONDS: u64 = 3_600;
 const SECONDS_PER_DAY: u64 = 86_400;
 const MASTER_KEY_LENGTH: usize = 32;
@@ -138,6 +139,7 @@ pub struct RuntimeConfig {
     shutdown_timeout: Duration,
     webhook_body_limit_bytes: usize,
     delivery_retention: Duration,
+    merge_queue_retention: Duration,
     delivery_prune_interval: Duration,
     rust_log: String,
     telemetry: TelemetryConfig,
@@ -189,7 +191,12 @@ impl RuntimeConfig {
         self.delivery_retention
     }
 
-    /// Returns the interval between processed-delivery pruning passes.
+    /// Returns how long completed merge-queue attempts are retained.
+    pub fn merge_queue_retention(&self) -> Duration {
+        self.merge_queue_retention
+    }
+
+    /// Returns the interval between retention pruning passes.
     pub fn delivery_prune_interval(&self) -> Duration {
         self.delivery_prune_interval
     }
@@ -285,6 +292,16 @@ impl RuntimeConfig {
             .ok_or(ConfigError::Invalid {
                 variable: "GHE_DELIVERY_RETENTION_DAYS",
             })?;
+        let merge_queue_retention_days = optional_positive_u64(
+            &mut lookup,
+            "GHE_MERGE_QUEUE_RETENTION_DAYS",
+            DEFAULT_MERGE_QUEUE_RETENTION_DAYS,
+        )?;
+        let merge_queue_retention_seconds = merge_queue_retention_days
+            .checked_mul(SECONDS_PER_DAY)
+            .ok_or(ConfigError::Invalid {
+                variable: "GHE_MERGE_QUEUE_RETENTION_DAYS",
+            })?;
         let delivery_prune_interval_seconds = optional_positive_u64(
             &mut lookup,
             "GHE_DELIVERY_PRUNE_INTERVAL_SECONDS",
@@ -307,6 +324,7 @@ impl RuntimeConfig {
             shutdown_timeout: Duration::from_secs(shutdown_timeout_seconds),
             webhook_body_limit_bytes,
             delivery_retention: Duration::from_secs(delivery_retention_seconds),
+            merge_queue_retention: Duration::from_secs(merge_queue_retention_seconds),
             delivery_prune_interval: Duration::from_secs(delivery_prune_interval_seconds),
             rust_log,
             telemetry,
@@ -403,6 +421,7 @@ impl fmt::Debug for RuntimeConfig {
             .field("shutdown_timeout", &self.shutdown_timeout)
             .field("webhook_body_limit_bytes", &self.webhook_body_limit_bytes)
             .field("delivery_retention", &self.delivery_retention)
+            .field("merge_queue_retention", &self.merge_queue_retention)
             .field("delivery_prune_interval", &self.delivery_prune_interval)
             .field("rust_log", &self.rust_log)
             .field("telemetry", &self.telemetry)
@@ -631,6 +650,10 @@ mod tests {
         assert_eq!(config.shutdown_timeout(), Duration::from_secs(30));
         assert_eq!(config.webhook_body_limit_bytes(), 2_097_152);
         assert_eq!(config.delivery_retention(), Duration::from_secs(7 * 86_400));
+        assert_eq!(
+            config.merge_queue_retention(),
+            Duration::from_secs(90 * 86_400)
+        );
         assert_eq!(config.delivery_prune_interval(), Duration::from_secs(3_600));
         assert_eq!(config.rust_log(), "info");
     }
@@ -655,6 +678,10 @@ mod tests {
             OsString::from("14"),
         );
         variables.insert(
+            "GHE_MERGE_QUEUE_RETENTION_DAYS".to_owned(),
+            OsString::from("180"),
+        );
+        variables.insert(
             "GHE_DELIVERY_PRUNE_INTERVAL_SECONDS".to_owned(),
             OsString::from("120"),
         );
@@ -674,6 +701,10 @@ mod tests {
         assert_eq!(
             config.delivery_retention(),
             Duration::from_secs(14 * 86_400)
+        );
+        assert_eq!(
+            config.merge_queue_retention(),
+            Duration::from_secs(180 * 86_400)
         );
         assert_eq!(config.delivery_prune_interval(), Duration::from_secs(120));
         assert_eq!(config.rust_log(), "github_webhook_exporter=debug");
@@ -707,6 +738,9 @@ mod tests {
             ("GHE_DELIVERY_RETENTION_DAYS", "0"),
             ("GHE_DELIVERY_RETENTION_DAYS", "not-a-number"),
             ("GHE_DELIVERY_RETENTION_DAYS", "18446744073709551615"),
+            ("GHE_MERGE_QUEUE_RETENTION_DAYS", "0"),
+            ("GHE_MERGE_QUEUE_RETENTION_DAYS", "not-a-number"),
+            ("GHE_MERGE_QUEUE_RETENTION_DAYS", "18446744073709551615"),
             ("GHE_DELIVERY_PRUNE_INTERVAL_SECONDS", "0"),
             ("GHE_DELIVERY_PRUNE_INTERVAL_SECONDS", "not-a-number"),
             ("RUST_LOG", "[invalid"),
@@ -724,6 +758,31 @@ mod tests {
                 assert!(!rendered.contains(invalid_value));
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_queue_retention_rejects_non_unicode_without_disclosure() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut variables = required_variables();
+        variables.insert(
+            "GHE_MERGE_QUEUE_RETENTION_DAYS".to_owned(),
+            OsString::from_vec(vec![0xff]),
+        );
+
+        let error = RuntimeConfig::from_map(variables).expect_err("value must be rejected");
+
+        assert_eq!(
+            error,
+            ConfigError::Invalid {
+                variable: "GHE_MERGE_QUEUE_RETENTION_DAYS",
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "environment variable GHE_MERGE_QUEUE_RETENTION_DAYS has an invalid value"
+        );
     }
 
     #[test]

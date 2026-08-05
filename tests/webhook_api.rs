@@ -19,7 +19,7 @@ use github_webhook_exporter::{
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use tower::ServiceExt;
 use tracing::instrument::WithSubscriber;
 use tracing_subscriber::fmt::MakeWriter;
@@ -49,6 +49,14 @@ const MERGE_GROUP_DESTROYED_MIXED_CASE: &[u8] =
 const MERGE_GROUP_DESTROYED_MALICIOUS: &[u8] = br#"{"action":"destroyed","reason":"merged\\nsha256=secret-group-sha","merge_group":{"head_sha":"secret-group-sha"},"repository":{"full_name":"owner/repository"}}"#;
 const MERGE_GROUP_UNSUPPORTED_ACTION: &[u8] =
     br#"{"action":"created","reason":"merged","repository":{"full_name":"owner/repository"}}"#;
+const PULL_REQUEST_ENQUEUED: &[u8] = br#"{"action":"enqueued","pull_request":{"number":42,"updated_at":"2026-08-05T10:00:00Z"},"repository":{"full_name":"owner/repository"}}"#;
+const PULL_REQUEST_DEQUEUED: &[u8] = br#"{"action":"dequeued","reason":"malicious-raw-reason","pull_request":{"number":42,"updated_at":"2026-08-05T10:02:00Z"},"repository":{"full_name":"owner/repository"}}"#;
+const PULL_REQUEST_MERGED: &[u8] = br#"{"action":"closed","pull_request":{"number":42,"updated_at":"2026-08-05T10:03:00Z","merged":true},"repository":{"full_name":"owner/repository"}}"#;
+const PULL_REQUEST_UNMERGED: &[u8] = br#"{"action":"closed","pull_request":{"number":42,"updated_at":"2026-08-05T10:01:00Z","merged":false},"repository":{"full_name":"owner/repository"}}"#;
+const PULL_REQUEST_MALFORMED_TIMESTAMP: &[u8] = br#"{"action":"enqueued","pull_request":{"number":42,"updated_at":"not-a-timestamp"},"repository":{"full_name":"owner/repository"}}"#;
+const PULL_REQUEST_INVALID_NUMBER_TYPE: &[u8] = br#"{"action":"enqueued","pull_request":{"number":"42","updated_at":"2026-08-05T10:00:00Z"},"repository":{"full_name":"owner/repository"}}"#;
+const PULL_REQUEST_ENQUEUED_FUTURE: &[u8] = br#"{"action":"enqueued","pull_request":{"number":43,"updated_at":"2027-08-06T10:00:00Z"},"repository":{"full_name":"owner/repository"}}"#;
+const PULL_REQUEST_DEQUEUED_PAST: &[u8] = br#"{"action":"dequeued","pull_request":{"number":43,"updated_at":"2026-08-05T10:00:00Z"},"repository":{"full_name":"owner/repository"}}"#;
 static TRACING_INIT: Once = Once::new();
 
 #[derive(Clone, Default)]
@@ -89,6 +97,19 @@ struct TestApp {
     _directory: tempfile::TempDir,
     pool: SqlitePool,
     router: Router,
+}
+
+fn router_for_pool(pool: SqlitePool, body_limit: usize) -> Router {
+    let cipher = RepositorySecretCipher::new(
+        &MasterKey::from_slice(&[7_u8; 32]).expect("test master key is valid"),
+    )
+    .expect("repository cipher initializes");
+    let admin_token = AdminToken::new("admin-token".to_owned()).expect("admin token is valid");
+    build_router(AppState::new(
+        RepositoryStore::new(pool, cipher),
+        AdminAuthenticator::new(&admin_token),
+        body_limit,
+    ))
 }
 
 async fn test_app(body_limit: usize, enabled: Option<bool>) -> TestApp {
@@ -174,6 +195,390 @@ async fn metrics(router: Router) -> String {
         .await
         .expect("metrics request succeeds");
     String::from_utf8(response_body(response).await).expect("metrics are UTF-8")
+}
+
+#[tokio::test]
+async fn pull_request_queue_enqueue_and_dequeue_commit_one_unknown_completion() {
+    let app = test_app(2_097_152, Some(true)).await;
+
+    for (body, delivery_id) in [
+        (
+            PULL_REQUEST_ENQUEUED,
+            "550e8400-e29b-41d4-a716-446655440040",
+        ),
+        (
+            PULL_REQUEST_DEQUEUED,
+            "550e8400-e29b-41d4-a716-446655440041",
+        ),
+    ] {
+        let response = app
+            .router
+            .clone()
+            .oneshot(webhook_request(body, SECRET, delivery_id))
+            .await
+            .expect("pull-request webhook request succeeds");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let row = sqlx::query(
+        "SELECT enqueued_at, completed_at, outcome, reason_code FROM merge_queue_attempts",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("completed queue attempt is readable");
+    assert_eq!(
+        row.get::<String, _>("enqueued_at"),
+        "2026-08-05T10:00:00.000Z"
+    );
+    assert_eq!(
+        row.get::<String, _>("completed_at"),
+        "2026-08-05T10:02:00.000Z"
+    );
+    assert_eq!(row.get::<String, _>("outcome"), "unknown");
+    assert_eq!(row.get::<String, _>("reason_code"), "unclassified_dequeue");
+
+    let exposition = metrics(app.router).await;
+    for expected in [
+        "github_merge_queue_pr_outcomes_total{outcome=\"unknown\",reason=\"unclassified_dequeue\"} 1",
+        "github_merge_queue_attempt_duration_seconds_count{outcome=\"unknown\"} 1",
+        "github_merge_queue_attempt_duration_seconds_sum{outcome=\"unknown\"} 120.0",
+    ] {
+        assert!(exposition.contains(expected), "missing {expected:?}");
+    }
+    assert!(!exposition.contains("malicious-raw-reason"));
+}
+
+#[tokio::test]
+async fn pull_request_queue_replays_and_unmerged_close_are_idempotent() {
+    let app = test_app(2_097_152, Some(true)).await;
+    let cases = [
+        (
+            PULL_REQUEST_ENQUEUED,
+            "550e8400-e29b-41d4-a716-446655440050",
+        ),
+        (
+            PULL_REQUEST_ENQUEUED,
+            "550e8400-e29b-41d4-a716-446655440051",
+        ),
+        (
+            PULL_REQUEST_UNMERGED,
+            "550e8400-e29b-41d4-a716-446655440052",
+        ),
+        (PULL_REQUEST_MERGED, "550e8400-e29b-41d4-a716-446655440053"),
+        (PULL_REQUEST_MERGED, "550e8400-e29b-41d4-a716-446655440054"),
+        (PULL_REQUEST_MERGED, "550e8400-e29b-41d4-a716-446655440054"),
+    ];
+
+    for (body, delivery_id) in cases {
+        let response = app
+            .router
+            .clone()
+            .oneshot(webhook_request(body, SECRET, delivery_id))
+            .await
+            .expect("pull-request webhook request succeeds");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS attempt_count, outcome, reason_code FROM merge_queue_attempts",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("queue attempt is readable");
+    assert_eq!(row.get::<i64, _>("attempt_count"), 1);
+    assert_eq!(row.get::<String, _>("outcome"), "succeeded");
+    assert_eq!(row.get::<String, _>("reason_code"), "pull_request_merged");
+
+    let exposition = metrics(app.router).await;
+    for expected in [
+        "github_merge_queue_pr_outcomes_total{outcome=\"succeeded\",reason=\"pull_request_merged\"} 1",
+        "github_merge_queue_attempt_duration_seconds_count{outcome=\"succeeded\"} 1",
+        "github_merge_queue_attempt_duration_seconds_sum{outcome=\"succeeded\"} 180.0",
+        "github_webhook_duplicates_total 1",
+    ] {
+        assert!(exposition.contains(expected), "missing {expected:?}");
+    }
+}
+
+#[tokio::test]
+async fn pull_request_queue_attempt_completes_after_database_restart() {
+    let directory = tempfile::tempdir().expect("temporary directory is created");
+    let database_path = directory.path().join("queue-restart.sqlite3");
+    let first_pool = open_database(&database_path)
+        .await
+        .expect("first database instance opens");
+    let cipher = RepositorySecretCipher::new(
+        &MasterKey::from_slice(&[7_u8; 32]).expect("test master key is valid"),
+    )
+    .expect("repository cipher initializes");
+    RepositoryStore::new(first_pool.clone(), cipher)
+        .create(
+            CanonicalRepositoryName::new("owner/repository").expect("repository name is valid"),
+            RepositorySecret::new(SECRET.to_owned()).expect("secret is valid"),
+            true,
+        )
+        .await
+        .expect("repository configuration is created");
+    let first_router = router_for_pool(first_pool.clone(), 2_097_152);
+    for _ in 0..2 {
+        let enqueue_response = first_router
+            .clone()
+            .oneshot(webhook_request(
+                PULL_REQUEST_ENQUEUED,
+                SECRET,
+                "550e8400-e29b-41d4-a716-446655440090",
+            ))
+            .await
+            .expect("enqueue webhook succeeds");
+        assert_eq!(enqueue_response.status(), StatusCode::NO_CONTENT);
+    }
+    let first_exposition = metrics(first_router).await;
+    assert!(first_exposition.contains("github_webhook_duplicates_total 1"));
+    first_pool.close().await;
+
+    let second_pool = open_database(&database_path)
+        .await
+        .expect("second database instance opens");
+    let second_router = router_for_pool(second_pool.clone(), 2_097_152);
+    for _ in 0..2 {
+        let completion_response = second_router
+            .clone()
+            .oneshot(webhook_request(
+                PULL_REQUEST_MERGED,
+                SECRET,
+                "550e8400-e29b-41d4-a716-446655440091",
+            ))
+            .await
+            .expect("completion webhook succeeds after restart");
+        assert_eq!(completion_response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let attempt: (i64, String) = sqlx::query_as(
+        "SELECT COUNT(*), outcome FROM merge_queue_attempts WHERE pull_request_number = 42",
+    )
+    .fetch_one(&second_pool)
+    .await
+    .expect("completed attempt is readable after restart");
+    assert_eq!(attempt, (1, "succeeded".to_owned()));
+    let delivery_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries")
+        .fetch_one(&second_pool)
+        .await
+        .expect("durable delivery claims are countable");
+    assert_eq!(delivery_count, 2);
+    let exposition = metrics(second_router).await;
+    for expected in [
+        "github_merge_queue_pr_outcomes_total{outcome=\"succeeded\",reason=\"pull_request_merged\"} 1",
+        "github_merge_queue_attempt_duration_seconds_count{outcome=\"succeeded\"} 1",
+        "github_webhook_duplicates_total 1",
+        "github_merge_group_events_total{action=\"destroyed\",reason=\"merged\"} 0",
+    ] {
+        assert!(exposition.contains(expected), "missing {expected:?}");
+    }
+}
+
+#[tokio::test]
+async fn concurrent_pull_request_queue_completions_record_one_outcome() {
+    let app = test_app(2_097_152, Some(true)).await;
+    let enqueue_response = app
+        .router
+        .clone()
+        .oneshot(webhook_request(
+            PULL_REQUEST_ENQUEUED,
+            SECRET,
+            "550e8400-e29b-41d4-a716-446655440090",
+        ))
+        .await
+        .expect("enqueue webhook succeeds");
+    assert_eq!(enqueue_response.status(), StatusCode::NO_CONTENT);
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for index in 0..16 {
+        let router = app.router.clone();
+        tasks.spawn(async move {
+            let delivery_id = format!("550e8400-e29b-41d4-a716-44665544{:04x}", 0x100 + index);
+            router
+                .oneshot(webhook_request(PULL_REQUEST_MERGED, SECRET, &delivery_id))
+                .await
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        let response = result
+            .expect("completion task finishes")
+            .expect("completion webhook succeeds");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    let exposition = metrics(app.router).await;
+    for expected in [
+        "github_merge_queue_pr_outcomes_total{outcome=\"succeeded\",reason=\"pull_request_merged\"} 1",
+        "github_merge_queue_attempt_duration_seconds_count{outcome=\"succeeded\"} 1",
+    ] {
+        assert!(exposition.contains(expected), "missing {expected:?}");
+    }
+}
+
+#[tokio::test]
+async fn pull_request_queue_uses_receipt_fallback_and_rejects_malformed_typed_projection() {
+    let app = test_app(2_097_152, Some(true)).await;
+    let before = time::OffsetDateTime::now_utc();
+    let fallback_response = app
+        .router
+        .clone()
+        .oneshot(webhook_request(
+            PULL_REQUEST_MALFORMED_TIMESTAMP,
+            SECRET,
+            "550e8400-e29b-41d4-a716-446655440060",
+        ))
+        .await
+        .expect("fallback webhook request succeeds");
+    let after = time::OffsetDateTime::now_utc();
+    assert_eq!(fallback_response.status(), StatusCode::NO_CONTENT);
+    let persisted: String = sqlx::query_scalar("SELECT enqueued_at FROM merge_queue_attempts")
+        .fetch_one(&app.pool)
+        .await
+        .expect("fallback timestamp is readable");
+    let persisted =
+        time::OffsetDateTime::parse(&persisted, &time::format_description::well_known::Rfc3339)
+            .expect("fallback timestamp is valid RFC 3339");
+    assert!(persisted >= before - time::Duration::SECOND && persisted <= after);
+
+    let malformed_response = app
+        .router
+        .oneshot(webhook_request(
+            PULL_REQUEST_INVALID_NUMBER_TYPE,
+            SECRET,
+            "550e8400-e29b-41d4-a716-446655440061",
+        ))
+        .await
+        .expect("malformed webhook request completes");
+    assert_eq!(malformed_response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn pull_request_queue_missing_and_invalid_duration_use_only_failure_metrics() {
+    let app = test_app(2_097_152, Some(true)).await;
+    let cases = [
+        (
+            PULL_REQUEST_DEQUEUED,
+            "550e8400-e29b-41d4-a716-446655440070",
+        ),
+        (
+            PULL_REQUEST_ENQUEUED_FUTURE,
+            "550e8400-e29b-41d4-a716-446655440071",
+        ),
+        (
+            PULL_REQUEST_DEQUEUED_PAST,
+            "550e8400-e29b-41d4-a716-446655440072",
+        ),
+    ];
+
+    for (body, delivery_id) in cases {
+        let response = app
+            .router
+            .clone()
+            .oneshot(webhook_request(body, SECRET, delivery_id))
+            .await
+            .expect("pull-request webhook request succeeds");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let exposition = metrics(app.router).await;
+    for expected in [
+        "github_merge_queue_transition_failures_total{reason=\"missing_active_attempt\"} 1",
+        "github_merge_queue_transition_failures_total{reason=\"invalid_duration\"} 1",
+        "github_merge_queue_pr_outcomes_total{outcome=\"unknown\",reason=\"unclassified_dequeue\"} 0",
+        "github_merge_queue_attempt_duration_seconds_count{outcome=\"unknown\"} 0",
+    ] {
+        assert!(exposition.contains(expected), "missing {expected:?}");
+    }
+}
+
+#[tokio::test]
+async fn pull_request_queue_state_failure_is_redacted_observable_and_returns_no_content() {
+    let captured_logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(captured_logs.clone())
+        .finish();
+    let app = test_app(2_097_152, Some(true)).await;
+    let enqueue_response = app
+        .router
+        .clone()
+        .oneshot(webhook_request(
+            PULL_REQUEST_ENQUEUED,
+            SECRET,
+            "550e8400-e29b-41d4-a716-446655440080",
+        ))
+        .await
+        .expect("enqueue webhook succeeds");
+    assert_eq!(enqueue_response.status(), StatusCode::NO_CONTENT);
+    sqlx::query(
+        "CREATE TRIGGER reject_webhook_queue_completion BEFORE UPDATE ON merge_queue_attempts \
+         BEGIN SELECT RAISE(ABORT, 'sensitive-queue-failure'); END",
+    )
+    .execute(&app.pool)
+    .await
+    .expect("queue failure trigger is installed");
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(webhook_request(
+            PULL_REQUEST_DEQUEUED,
+            SECRET,
+            "550e8400-e29b-41d4-a716-446655440081",
+        ))
+        .with_subscriber(subscriber)
+        .await
+        .expect("queue failure webhook completes");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response_text =
+        String::from_utf8(response_body(response).await).expect("response body is UTF-8");
+    let row = sqlx::query("SELECT completed_at, outcome, reason_code FROM merge_queue_attempts")
+        .fetch_one(&app.pool)
+        .await
+        .expect("pending attempt remains readable");
+    assert_eq!(row.get::<Option<String>, _>("completed_at"), None);
+    assert_eq!(row.get::<String, _>("outcome"), "pending");
+    assert_eq!(row.get::<String, _>("reason_code"), "none");
+
+    let replay_response = app
+        .router
+        .clone()
+        .oneshot(webhook_request(
+            PULL_REQUEST_DEQUEUED,
+            SECRET,
+            "550e8400-e29b-41d4-a716-446655440081",
+        ))
+        .await
+        .expect("claimed queue failure replay completes");
+    assert_eq!(replay_response.status(), StatusCode::NO_CONTENT);
+
+    let exposition = metrics(app.router).await;
+    assert!(
+        exposition.contains("github_webhook_processing_failures_total{stage=\"queue_state\"} 1")
+    );
+    assert!(exposition.contains("github_webhook_duplicates_total 1"));
+    assert!(exposition.contains(
+        "github_merge_queue_pr_outcomes_total{outcome=\"unknown\",reason=\"unclassified_dequeue\"} 0"
+    ));
+    let logs = captured_logs.text();
+    assert_eq!(logs.matches("GitHub webhook processing failed").count(), 1);
+    assert!(logs.contains("stage=\"queue_state\""));
+    assert!(logs.contains("error_correlation_id="));
+    for output in [response_text.as_str(), exposition.as_str(), logs.as_str()] {
+        for forbidden in [
+            "owner/repository",
+            "malicious-raw-reason",
+            "sensitive-queue-failure",
+            "550e8400-e29b-41d4-a716-446655440081",
+            SECRET,
+            "sha256=",
+        ] {
+            assert!(!output.contains(forbidden));
+        }
+    }
 }
 
 #[tokio::test]
