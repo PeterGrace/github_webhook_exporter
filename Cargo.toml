@@ -20,9 +20,11 @@ sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "time"] }
 subtle = "2.6"
 thiserror = "2.0.6"
+time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+uuid = { version = "1", default-features = false, features = ["v4"] }
 
 [dev-dependencies]
 static_assertions = "1"
