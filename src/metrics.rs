@@ -455,9 +455,19 @@ impl Metrics {
             .inc();
     }
 
-    /// Replaces the configured-repository gauge with the supplied record count.
+    /// Replaces the configured-repository gauge with the supplied durable record count.
     pub fn set_repository_configurations(&self, count: u64) {
         self.inner.repository_configurations.set(count);
+    }
+
+    /// Increments the configured-repository gauge after a committed create.
+    pub fn increment_repository_configurations(&self) {
+        self.inner.repository_configurations.inc();
+    }
+
+    /// Decrements the configured-repository gauge after a committed delete.
+    pub fn decrement_repository_configurations(&self) {
+        self.inner.repository_configurations.dec();
     }
 
     pub(crate) fn encode(&self) -> Result<String, fmt::Error> {

@@ -8,6 +8,10 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use github_webhook_exporter::{
+    security::{CanonicalRepositoryName, MasterKey, RepositorySecret, RepositorySecretCipher},
+    storage::{open_database, RepositoryStore},
+};
 
 fn configured_command(database_path: &Path, bind_address: SocketAddr) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_github_webhook_exporter"));
@@ -59,6 +63,58 @@ fn database_startup_failure_is_fatal_and_redacted() {
     assert!(!stderr.contains("startup-admin-token-secret"));
     assert!(!stderr.contains(&STANDARD.encode([7_u8; 32])));
     assert!(!stderr.contains(database_path.to_string_lossy().as_ref()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn startup_metrics_are_initialized_before_readiness_is_served() {
+    let directory = tempfile::tempdir().expect("temporary directory is created");
+    let database_path = directory.path().join("exporter.db");
+    let pool = open_database(&database_path)
+        .await
+        .expect("test database opens and migrates");
+    let key = MasterKey::from_slice(&[7_u8; 32]).expect("test key is valid");
+    let cipher = RepositorySecretCipher::new(&key).expect("test cipher initializes");
+    RepositoryStore::new(pool.clone(), cipher)
+        .create(
+            CanonicalRepositoryName::new("owner/persisted").expect("repository name is valid"),
+            RepositorySecret::new("persisted-secret".to_owned())
+                .expect("repository secret is valid"),
+            true,
+        )
+        .await
+        .expect("repository fixture is created");
+    pool.close().await;
+
+    let bind_address = unused_loopback_address();
+    let mut child = configured_command(&database_path, bind_address)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("exporter process starts");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut stream = loop {
+        match TcpStream::connect(bind_address) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                child.kill().expect("stalled exporter is killed");
+                panic!("exporter did not bind before the test deadline: {error}");
+            }
+        }
+    };
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("metrics request is written");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("metrics response is read");
+
+    child.kill().expect("exporter is stopped after assertion");
+    let _output = child.wait_with_output().expect("exporter process exits");
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(response.contains("github_repository_configurations 1"));
 }
 
 #[cfg(unix)]

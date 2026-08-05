@@ -5,6 +5,7 @@ use github_webhook_exporter::{
     app::{self, AppState, ShutdownOutcome},
     config::RuntimeConfig,
     lifecycle,
+    retention::RetentionConfig,
     security::{AdminAuthenticator, RepositorySecretCipher},
     storage::{self, RepositoryStore},
     telemetry,
@@ -40,9 +41,18 @@ async fn run() -> Result<()> {
         AdminAuthenticator::new(config.admin_token()),
         config.webhook_body_limit_bytes(),
     );
+    state
+        .initialize_repository_metrics()
+        .await
+        .context("failed to initialize repository configuration metrics")?;
 
     let configured_bind_address = config.bind_address();
     let shutdown_timeout = config.shutdown_timeout();
+    let retention_config = RetentionConfig::new(
+        config.delivery_prune_interval(),
+        config.delivery_retention(),
+    )
+    .context("failed to initialize delivery retention")?;
     let listener = TcpListener::bind(configured_bind_address)
         .await
         .with_context(|| format!("failed to bind HTTP listener at {configured_bind_address}"))?;
@@ -57,9 +67,15 @@ async fn run() -> Result<()> {
             Err(error) => error!(error = ?error, "failed to wait for shutdown signal"),
         }
     };
-    let outcome = app::serve_with_shutdown(listener, state, shutdown, shutdown_timeout)
-        .await
-        .context("HTTP server failed")?;
+    let outcome = app::serve_with_shutdown(
+        listener,
+        state,
+        shutdown,
+        shutdown_timeout,
+        retention_config,
+    )
+    .await
+    .context("HTTP server failed")?;
     match outcome {
         ShutdownOutcome::Completed => info!("HTTP server stopped"),
         ShutdownOutcome::TimedOut => warn!(

@@ -6,11 +6,12 @@ use std::{
 
 use axum::Router;
 use sqlx::SqlitePool;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::watch};
 
 use crate::{
     api, health,
     metrics::{self, Metrics},
+    retention::{run_delivery_retention, RetentionConfig},
     security::AdminAuthenticator,
     storage::{DeliveryStore, RepositoryStore},
 };
@@ -43,6 +44,22 @@ impl AppState {
             metrics: Metrics::new(),
             webhook_body_limit_bytes,
         }
+    }
+
+    /// Initializes the configured-repository gauge from durable storage.
+    ///
+    /// Call this after migrations and before binding the HTTP listener so readiness cannot be
+    /// served with a stale startup value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted repository persistence error when SQLite cannot count records.
+    pub async fn initialize_repository_metrics(
+        &self,
+    ) -> Result<(), crate::storage::RepositoryStoreError> {
+        let count = self.repository_store.count().await?;
+        self.metrics.set_repository_configurations(count);
+        Ok(())
     }
 
     /// Returns encrypted repository persistence.
@@ -100,13 +117,23 @@ pub async fn serve_with_shutdown<S>(
     state: AppState,
     shutdown: S,
     shutdown_timeout: Duration,
+    retention_config: RetentionConfig,
 ) -> std::io::Result<ShutdownOutcome>
 where
     S: Future<Output = ()>,
 {
-    serve_router_with_shutdown(listener, build_router(state), shutdown, shutdown_timeout).await
+    let delivery_store = state.delivery_store.clone();
+    serve_router_with_background_shutdown(
+        listener,
+        build_router(state),
+        shutdown,
+        shutdown_timeout,
+        move |cancellation| run_delivery_retention(delivery_store, retention_config, cancellation),
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn serve_router_with_shutdown<S>(
     listener: TcpListener,
     router: Router,
@@ -116,25 +143,83 @@ async fn serve_router_with_shutdown<S>(
 where
     S: Future<Output = ()>,
 {
-    let (graceful_sender, graceful_receiver) = tokio::sync::oneshot::channel();
+    serve_router_with_background_shutdown(
+        listener,
+        router,
+        shutdown,
+        shutdown_timeout,
+        |mut cancellation| async move {
+            while !*cancellation.borrow() {
+                if cancellation.changed().await.is_err() {
+                    return;
+                }
+            }
+        },
+    )
+    .await
+}
+
+async fn serve_router_with_background_shutdown<S, F, B>(
+    listener: TcpListener,
+    router: Router,
+    shutdown: S,
+    shutdown_timeout: Duration,
+    background: F,
+) -> std::io::Result<ShutdownOutcome>
+where
+    S: Future<Output = ()>,
+    F: FnOnce(watch::Receiver<bool>) -> B,
+    B: Future<Output = ()> + Send + 'static,
+{
+    let (cancellation_sender, cancellation_receiver) = watch::channel(false);
+    let mut server_cancellation = cancellation_receiver.clone();
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            drop(graceful_receiver.await);
+            while !*server_cancellation.borrow() {
+                if server_cancellation.changed().await.is_err() {
+                    return;
+                }
+            }
         })
         .into_future();
+    let mut background = tokio::spawn(background(cancellation_receiver));
     tokio::pin!(server);
     tokio::pin!(shutdown);
 
     tokio::select! {
-        result = &mut server => result.map(|()| ShutdownOutcome::Completed),
+        result = &mut server => {
+            cancellation_sender.send_replace(true);
+            let background_result = background
+                .await
+                .map_err(|_| std::io::Error::other("background lifecycle task failed"));
+            prioritize_server_result(result, background_result)
+                .map(|()| ShutdownOutcome::Completed)
+        }
         () = &mut shutdown => {
-            let _send_result = graceful_sender.send(());
-            match tokio::time::timeout(shutdown_timeout, &mut server).await {
+            cancellation_sender.send_replace(true);
+            let drain = async {
+                let server_result = (&mut server).await;
+                let background_result = (&mut background)
+                    .await
+                    .map_err(|_| std::io::Error::other("background lifecycle task failed"));
+                prioritize_server_result(server_result, background_result)
+            };
+            match tokio::time::timeout(shutdown_timeout, drain).await {
                 Ok(result) => result.map(|()| ShutdownOutcome::Completed),
-                Err(_) => Ok(ShutdownOutcome::TimedOut),
+                Err(_) => {
+                    background.abort();
+                    Ok(ShutdownOutcome::TimedOut)
+                }
             }
         }
     }
+}
+
+fn prioritize_server_result(
+    server_result: std::io::Result<()>,
+    background_result: std::io::Result<()>,
+) -> std::io::Result<()> {
+    server_result.and(background_result)
 }
 
 #[cfg(test)]
@@ -162,7 +247,10 @@ mod tests {
         storage::RepositoryStore,
     };
 
-    use super::{build_router, serve_router_with_shutdown, AppState, ShutdownOutcome};
+    use super::{
+        build_router, prioritize_server_result, serve_router_with_background_shutdown,
+        serve_router_with_shutdown, AppState, ShutdownOutcome,
+    };
 
     async fn app_state() -> AppState {
         let pool = SqlitePool::connect("sqlite::memory:")
@@ -311,6 +399,63 @@ mod tests {
         assert!(String::from_utf8(response)
             .expect("response is UTF-8")
             .starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(
+            server
+                .await
+                .expect("server task joins")
+                .expect("server runs"),
+            ShutdownOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn server_io_error_takes_precedence_over_background_join_error() {
+        let error = prioritize_server_result(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "server failure",
+            )),
+            Err(std::io::Error::other("background failure")),
+        )
+        .expect_err("combined lifecycle must fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        assert_eq!(error.to_string(), "server failure");
+    }
+
+    #[tokio::test]
+    async fn graceful_lifecycle_waits_for_active_background_work() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral listener binds");
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let background_started = Arc::clone(&started);
+        let background_release = Arc::clone(&release);
+        let server = tokio::spawn(serve_router_with_background_shutdown(
+            listener,
+            Router::new(),
+            async move {
+                drop(shutdown_receiver.await);
+            },
+            Duration::from_secs(2),
+            move |mut cancellation| async move {
+                while !*cancellation.borrow() {
+                    if cancellation.changed().await.is_err() {
+                        return;
+                    }
+                }
+                background_started.notify_one();
+                background_release.notified().await;
+            },
+        ));
+
+        shutdown_sender.send(()).expect("server receives shutdown");
+        started.notified().await;
+        assert!(!server.is_finished());
+        release.notify_one();
+
         assert_eq!(
             server
                 .await

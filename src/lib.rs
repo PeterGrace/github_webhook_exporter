@@ -16,6 +16,8 @@ pub mod health;
 pub mod lifecycle;
 /// Bounded Prometheus instruments and label normalization.
 pub mod metrics;
+/// Scheduled processed-delivery retention.
+pub mod retention;
 /// Cryptographic and administrative-authentication security primitives.
 pub mod security;
 /// SQLite startup, migrations, probes, and repository persistence.

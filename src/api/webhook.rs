@@ -144,14 +144,17 @@ async fn observe_webhook_request(
 
 fn unavailable_error(state: &AppState, stage: FailureStage) -> AppError {
     state.metrics().record_failure(stage);
-    let error_correlation_id = uuid::Uuid::new_v4();
+    let error = AppError::webhook_unavailable();
+    let error_correlation_id = error
+        .correlation_id()
+        .expect("webhook dependency failures carry a correlation ID");
     error!(
         stage = stage.as_str(),
         result = WebhookResult::Unavailable.as_str(),
         %error_correlation_id,
         "GitHub webhook processing failed"
     );
-    AppError::webhook_unavailable()
+    error
 }
 
 fn validate_content_type(parts: &Parts) -> Result<(), AppError> {

@@ -5,13 +5,38 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use tracing::error;
 
 use crate::{
     security::AuthenticationError,
     storage::{RepositoryStoreError, StorageError},
 };
+
+/// An opaque identifier that links one safe error response to local structured logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ErrorCorrelationId(uuid::Uuid);
+
+impl ErrorCorrelationId {
+    pub(crate) fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+impl fmt::Display for ErrorCorrelationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl Serialize for ErrorCorrelationId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
 
 /// An error that can be converted into a safe HTTP response.
 pub enum AppError {
@@ -20,7 +45,12 @@ pub enum AppError {
     /// Administrator authentication failed.
     Authentication(AuthenticationError),
     /// Repository persistence failed.
-    RepositoryStore(RepositoryStoreError),
+    RepositoryStore {
+        /// The typed persistence failure.
+        error: RepositoryStoreError,
+        /// Opaque local correlation for internal/database failures only.
+        correlation_id: Option<ErrorCorrelationId>,
+    },
     /// A GitHub webhook request was malformed.
     InvalidWebhook,
     /// A GitHub webhook request failed authentication.
@@ -30,9 +60,14 @@ pub enum AppError {
     /// A GitHub webhook request used an unsupported media type.
     UnsupportedWebhookMediaType,
     /// A GitHub webhook dependency was unavailable.
-    WebhookUnavailable,
+    WebhookUnavailable(ErrorCorrelationId),
     /// An unexpected application failure whose details must not reach clients.
-    Internal(anyhow::Error),
+    Internal {
+        /// The private application failure.
+        error: anyhow::Error,
+        /// Opaque local correlation shared with the safe response.
+        correlation_id: ErrorCorrelationId,
+    },
 }
 
 impl AppError {
@@ -48,7 +83,20 @@ impl AppError {
 
     /// Wraps a repository persistence failure.
     pub fn repository_store(error: RepositoryStoreError) -> Self {
-        Self::RepositoryStore(error)
+        let correlation_id = match error {
+            RepositoryStoreError::NotFound
+            | RepositoryStoreError::Conflict
+            | RepositoryStoreError::EmptyMutation => None,
+            RepositoryStoreError::AuthenticationFailed
+            | RepositoryStoreError::Cryptographic(_)
+            | RepositoryStoreError::Unavailable
+            | RepositoryStoreError::InternalData
+            | RepositoryStoreError::Internal(_) => Some(ErrorCorrelationId::new()),
+        };
+        Self::RepositoryStore {
+            error,
+            correlation_id,
+        }
     }
 
     /// Creates a stable malformed-webhook failure.
@@ -73,12 +121,31 @@ impl AppError {
 
     /// Creates a stable retryable webhook-processing failure.
     pub fn webhook_unavailable() -> Self {
-        Self::WebhookUnavailable
+        Self::WebhookUnavailable(ErrorCorrelationId::new())
+    }
+
+    /// Returns the opaque correlation ID attached to an internal/database failure.
+    pub fn correlation_id(&self) -> Option<ErrorCorrelationId> {
+        match self {
+            Self::RepositoryStore { correlation_id, .. } => *correlation_id,
+            Self::WebhookUnavailable(correlation_id) | Self::Internal { correlation_id, .. } => {
+                Some(*correlation_id)
+            }
+            Self::InvalidRequest
+            | Self::Authentication(_)
+            | Self::InvalidWebhook
+            | Self::UnauthorizedWebhook
+            | Self::WebhookPayloadTooLarge
+            | Self::UnsupportedWebhookMediaType => None,
+        }
     }
 
     /// Wraps an unexpected failure for safe response conversion.
     pub fn internal(error: impl Into<anyhow::Error>) -> Self {
-        Self::Internal(error.into())
+        Self::Internal {
+            error: error.into(),
+            correlation_id: ErrorCorrelationId::new(),
+        }
     }
 }
 
@@ -87,15 +154,15 @@ impl fmt::Debug for AppError {
         match self {
             Self::InvalidRequest => formatter.write_str("AppError::InvalidRequest"),
             Self::Authentication(_) => formatter.write_str("AppError::Authentication"),
-            Self::RepositoryStore(_) => formatter.write_str("AppError::RepositoryStore"),
+            Self::RepositoryStore { .. } => formatter.write_str("AppError::RepositoryStore"),
             Self::InvalidWebhook => formatter.write_str("AppError::InvalidWebhook"),
             Self::UnauthorizedWebhook => formatter.write_str("AppError::UnauthorizedWebhook"),
             Self::WebhookPayloadTooLarge => formatter.write_str("AppError::WebhookPayloadTooLarge"),
             Self::UnsupportedWebhookMediaType => {
                 formatter.write_str("AppError::UnsupportedWebhookMediaType")
             }
-            Self::WebhookUnavailable => formatter.write_str("AppError::WebhookUnavailable"),
-            Self::Internal(_) => formatter.write_str("AppError::Internal"),
+            Self::WebhookUnavailable(_) => formatter.write_str("AppError::WebhookUnavailable"),
+            Self::Internal { .. } => formatter.write_str("AppError::Internal"),
         }
     }
 }
@@ -127,7 +194,10 @@ impl IntoResponse for AppError {
                     .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
                 response
             }
-            Self::RepositoryStore(error) => match error {
+            Self::RepositoryStore {
+                error,
+                correlation_id,
+            } => match error {
                 RepositoryStoreError::NotFound => {
                     error_response(StatusCode::NOT_FOUND, "not_found", "repository not found")
                 }
@@ -145,7 +215,9 @@ impl IntoResponse for AppError {
                 | RepositoryStoreError::Cryptographic(_)
                 | RepositoryStoreError::Unavailable
                 | RepositoryStoreError::InternalData
-                | RepositoryStoreError::Internal(_) => internal_response(),
+                | RepositoryStoreError::Internal(_) => internal_response(
+                    correlation_id.expect("internal repository errors carry a correlation ID"),
+                ),
             },
             Self::InvalidWebhook => error_response(
                 StatusCode::BAD_REQUEST,
@@ -167,33 +239,69 @@ impl IntoResponse for AppError {
                 "unsupported_media_type",
                 "content type must be application/json",
             ),
-            Self::WebhookUnavailable => error_response(
+            Self::WebhookUnavailable(correlation_id) => correlated_error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "service_unavailable",
                 "webhook processing is unavailable",
+                correlation_id,
             ),
-            Self::Internal(_) => internal_response(),
+            Self::Internal {
+                error: _error,
+                correlation_id,
+            } => internal_response(correlation_id),
         }
     }
 }
 
-fn internal_response() -> Response {
-    error!(outcome = "internal_error", "request failed");
-    error_response(
+fn internal_response(correlation_id: ErrorCorrelationId) -> Response {
+    error!(
+        outcome = "internal_error",
+        %correlation_id,
+        "request failed"
+    );
+    correlated_error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal_error",
         "internal server error",
+        correlation_id,
     )
 }
 
 fn error_response(status: StatusCode, code: &'static str, message: &'static str) -> Response {
-    (status, Json(ErrorResponse { code, message })).into_response()
+    (
+        status,
+        Json(ErrorResponse {
+            code,
+            message,
+            error_id: None,
+        }),
+    )
+        .into_response()
+}
+
+fn correlated_error_response(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+    correlation_id: ErrorCorrelationId,
+) -> Response {
+    (
+        status,
+        Json(ErrorResponse {
+            code,
+            message,
+            error_id: Some(correlation_id),
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Serialize)]
 struct ErrorResponse {
     code: &'static str,
     message: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_id: Option<ErrorCorrelationId>,
 }
 
 impl From<StorageError> for AppError {
@@ -212,6 +320,10 @@ mod tests {
     async fn internal_error_response_hides_source_details() {
         const SENSITIVE_DETAIL: &str = "sensitive-internal-detail";
         let error = AppError::internal(anyhow::anyhow!(SENSITIVE_DETAIL));
+        let correlation_id = error
+            .correlation_id()
+            .expect("internal errors carry a correlation ID")
+            .to_string();
         assert!(!format!("{error:?}").contains(SENSITIVE_DETAIL));
         let response = error.into_response();
 
@@ -220,10 +332,11 @@ mod tests {
             .await
             .expect("response body is readable");
         let body = String::from_utf8(body.to_vec()).expect("response body is UTF-8");
-        assert_eq!(
-            body,
-            r#"{"code":"internal_error","message":"internal server error"}"#
-        );
+        let body_json: serde_json::Value =
+            serde_json::from_str(&body).expect("error response is JSON");
+        assert_eq!(body_json["code"], "internal_error");
+        assert_eq!(body_json["message"], "internal server error");
+        assert_eq!(body_json["error_id"], correlation_id);
         assert!(!body.contains(SENSITIVE_DETAIL));
     }
 }

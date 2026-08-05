@@ -29,6 +29,20 @@ impl RepositoryStore {
         &self.pool
     }
 
+    /// Returns the number of durable repository configurations.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted persistence error when SQLite cannot complete the query, or
+    /// [`RepositoryStoreError::InternalData`] if the count cannot be represented as `u64`.
+    pub async fn count(&self) -> Result<u64, RepositoryStoreError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(map_sqlx_error)?;
+        u64::try_from(count).map_err(|_| RepositoryStoreError::InternalData)
+    }
+
     /// Encrypts and inserts a repository configuration in one transaction.
     ///
     /// # Errors

@@ -2,7 +2,7 @@ use axum::{extract::State, http::StatusCode, routing::get, Router};
 use sqlx::SqlitePool;
 use tracing::warn;
 
-use crate::storage::probe_database;
+use crate::{error::ErrorCorrelationId, storage::probe_database};
 
 /// Builds the unauthenticated health-check router.
 ///
@@ -24,9 +24,11 @@ async fn ready(State(pool): State<SqlitePool>) -> StatusCode {
     match probe_database(&pool).await {
         Ok(()) => StatusCode::OK,
         Err(error) => {
+            let error_correlation_id = ErrorCorrelationId::new();
             warn!(
                 outcome = "not_ready",
                 error = %error,
+                %error_correlation_id,
                 "SQLite readiness probe failed"
             );
             StatusCode::SERVICE_UNAVAILABLE
