@@ -155,6 +155,8 @@ impl MergeQueueStore {
     ) -> Result<u64, MergeQueueStoreError> {
         let cutoff =
             QueueTimestamp::from_datetime(cutoff).map_err(|_| MergeQueueStoreError::Internal)?;
+        // Text ordering is chronological because every store write uses QueueTimestamp's
+        // fixed-width UTC millisecond representation. Do not admit alternate timestamp formats.
         let result = sqlx::query(
             "DELETE FROM merge_queue_attempts \
              WHERE id IN (\

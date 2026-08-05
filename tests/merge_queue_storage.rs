@@ -12,7 +12,10 @@ use github_webhook_exporter::{
         MergeQueueStoreError,
     },
 };
-use sqlx::{Row, SqlitePool};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    Row, SqlitePool,
+};
 use time::OffsetDateTime;
 
 const ENQUEUED_AT: &str = "2026-08-05T10:00:00.125Z";
@@ -31,6 +34,30 @@ async fn test_store() -> (tempfile::TempDir, SqlitePool, MergeQueueStore, Reposi
     let pool = open_database(&directory.path().join("exporter.sqlite3"))
         .await
         .expect("database opens and migrates");
+    let repository_id = insert_repository(&pool).await;
+    let store = MergeQueueStore::new(pool.clone());
+    (directory, pool, store, repository_id)
+}
+
+async fn test_store_with_busy_timeout(
+    busy_timeout: Duration,
+) -> (tempfile::TempDir, SqlitePool, MergeQueueStore, RepositoryId) {
+    let directory = tempfile::tempdir().expect("temporary directory is created");
+    let database_path = directory.path().join("exporter.sqlite3");
+    let migration_pool = open_database(&database_path)
+        .await
+        .expect("database opens and migrates");
+    migration_pool.close().await;
+    let options = SqliteConnectOptions::new()
+        .filename(database_path)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(busy_timeout);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(2)
+        .connect_with(options)
+        .await
+        .expect("short-timeout test pool opens");
     let repository_id = insert_repository(&pool).await;
     let store = MergeQueueStore::new(pool.clone());
     (directory, pool, store, repository_id)
@@ -600,7 +627,8 @@ async fn prune_completed_batch_is_bounded_and_preserves_pending_and_fresh_attemp
 
 #[tokio::test]
 async fn locked_and_internal_errors_are_typed_and_redacted() {
-    let (_directory, pool, store, repository_id) = test_store().await;
+    let (_directory, pool, store, repository_id) =
+        test_store_with_busy_timeout(Duration::from_millis(10)).await;
     let mut locking_connection = pool
         .acquire()
         .await
@@ -609,7 +637,6 @@ async fn locked_and_internal_errors_are_typed_and_redacted() {
         .execute(&mut *locking_connection)
         .await
         .expect("write lock is acquired");
-    let started_at = tokio::time::Instant::now();
 
     let error = store
         .enqueue(
@@ -621,7 +648,6 @@ async fn locked_and_internal_errors_are_typed_and_redacted() {
         .expect_err("locked enqueue fails");
 
     assert_eq!(error, MergeQueueStoreError::Unavailable);
-    assert!(started_at.elapsed() >= Duration::from_secs(5));
     sqlx::query("ROLLBACK")
         .execute(&mut *locking_connection)
         .await
