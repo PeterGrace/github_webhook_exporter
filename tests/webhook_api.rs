@@ -26,6 +26,7 @@ use tracing_subscriber::fmt::MakeWriter;
 
 const SECRET: &str = "webhook-test-secret";
 const DELIVERY_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+const PULL_REQUEST_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 const PAYLOAD: &[u8] = br#"{"action":"opened","repository":{"full_name":"owner/repository"}}"#;
 const MERGE_GROUP_CHECKS_REQUESTED: &[u8] =
     br#"{"action":"checks_requested","repository":{"full_name":"owner/repository"}}"#;
@@ -49,9 +50,9 @@ const MERGE_GROUP_DESTROYED_MIXED_CASE: &[u8] =
 const MERGE_GROUP_DESTROYED_MALICIOUS: &[u8] = br#"{"action":"destroyed","reason":"merged\\nsha256=secret-group-sha","merge_group":{"head_sha":"secret-group-sha"},"repository":{"full_name":"owner/repository"}}"#;
 const MERGE_GROUP_UNSUPPORTED_ACTION: &[u8] =
     br#"{"action":"created","reason":"merged","repository":{"full_name":"owner/repository"}}"#;
-const PULL_REQUEST_ENQUEUED: &[u8] = br#"{"action":"enqueued","pull_request":{"number":42,"updated_at":"2026-08-05T10:00:00Z"},"repository":{"full_name":"owner/repository"}}"#;
-const PULL_REQUEST_DEQUEUED: &[u8] = br#"{"action":"dequeued","reason":"malicious-raw-reason","pull_request":{"number":42,"updated_at":"2026-08-05T10:02:00Z"},"repository":{"full_name":"owner/repository"}}"#;
-const PULL_REQUEST_MERGED: &[u8] = br#"{"action":"closed","pull_request":{"number":42,"updated_at":"2026-08-05T10:03:00Z","merged":true},"repository":{"full_name":"owner/repository"}}"#;
+const PULL_REQUEST_ENQUEUED: &[u8] = br#"{"action":"enqueued","pull_request":{"number":42,"updated_at":"2026-08-05T10:00:00Z","head":{"sha":"0123456789abcdef0123456789abcdef01234567"}},"repository":{"full_name":"owner/repository"}}"#;
+const PULL_REQUEST_DEQUEUED: &[u8] = br#"{"action":"dequeued","reason":"malicious-raw-reason","pull_request":{"number":42,"updated_at":"2026-08-05T10:02:00Z","head":{"sha":"0123456789abcdef0123456789abcdef01234567"}},"repository":{"full_name":"owner/repository"}}"#;
+const PULL_REQUEST_MERGED: &[u8] = br#"{"action":"closed","pull_request":{"number":42,"updated_at":"2026-08-05T10:03:00Z","merged":true,"head":{"sha":"0123456789abcdef0123456789abcdef01234567"}},"repository":{"full_name":"owner/repository"}}"#;
 const PULL_REQUEST_UNMERGED: &[u8] = br#"{"action":"closed","pull_request":{"number":42,"updated_at":"2026-08-05T10:01:00Z","merged":false},"repository":{"full_name":"owner/repository"}}"#;
 const PULL_REQUEST_MALFORMED_TIMESTAMP: &[u8] = br#"{"action":"enqueued","pull_request":{"number":42,"updated_at":"not-a-timestamp"},"repository":{"full_name":"owner/repository"}}"#;
 const PULL_REQUEST_INVALID_NUMBER_TYPE: &[u8] = br#"{"action":"enqueued","pull_request":{"number":"42","updated_at":"2026-08-05T10:00:00Z"},"repository":{"full_name":"owner/repository"}}"#;
@@ -574,6 +575,7 @@ async fn pull_request_queue_state_failure_is_redacted_observable_and_returns_no_
             "sensitive-queue-failure",
             "550e8400-e29b-41d4-a716-446655440081",
             SECRET,
+            PULL_REQUEST_SHA,
             "sha256=",
         ] {
             assert!(!output.contains(forbidden));

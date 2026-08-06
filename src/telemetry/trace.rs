@@ -13,7 +13,10 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::domain::{
     delivery::DeliveryId, merge_queue::PullRequestNumber, repository::RepositoryId,
 };
-use crate::metrics::QueueTransitionFailureReason;
+use crate::metrics::{
+    Action, EventType, MergeGroupAction, MergeGroupReason, MergeQueueCompletion, MergeQueueOutcome,
+    MergeQueueReason,
+};
 use crate::security::CanonicalRepositoryName;
 
 const TELEMETRY_TARGET: &str = "github_webhook_exporter";
@@ -26,6 +29,13 @@ const HTTP_ROUTE_KEY: &str = "http.route";
 const HTTP_RESPONSE_STATUS_CODE_KEY: &str = "http.response.status_code";
 const HTTP_RESULT_KEY: &str = "ghe.http.result";
 const CONFIG_OPERATION_KEY: &str = "ghe.config.operation";
+const WEBHOOK_EVENT_TYPE_KEY: &str = "ghe.webhook.event_type";
+const WEBHOOK_ACTION_KEY: &str = "ghe.webhook.action";
+const QUEUE_ENTITY_KEY: &str = "ghe.queue.entity";
+const MERGE_GROUP_ACTION_KEY: &str = "ghe.merge_group.action";
+const MERGE_GROUP_REASON_KEY: &str = "ghe.merge_group.reason";
+const QUEUE_OUTCOME_KEY: &str = "ghe.queue.outcome";
+const QUEUE_REASON_KEY: &str = "ghe.queue.reason";
 const REPOSITORY_NAME_KEY: &str = "github.repository.name";
 const REPOSITORY_ID_KEY: &str = "github.repository.id";
 const DELIVERY_ID_KEY: &str = "github.delivery.id";
@@ -33,7 +43,8 @@ const PULL_REQUEST_NUMBER_KEY: &str = "github.pull_request.number";
 const COMMIT_SHA_KEY: &str = "github.commit.sha";
 const DB_SYSTEM_NAME_KEY: &str = "db.system.name";
 const DB_OPERATION_NAME_KEY: &str = "db.operation.name";
-const COMMIT_SHA_LENGTH: usize = 40;
+const SHA_1_HEX_LENGTH: usize = 40;
+const SHA_256_HEX_LENGTH: usize = 64;
 
 /// A bounded high-level operation recorded in tracing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,22 +125,39 @@ pub(crate) enum ConfigOperation {
     Delete,
 }
 
+/// A bounded merge-queue entity recorded in tracing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueueEntity {
+    /// A GitHub merge group.
+    MergeGroup,
+    /// A GitHub pull request.
+    PullRequest,
+}
+
+/// A bounded operation failure reason recorded in tracing events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OperationFailureReason {
+    /// Durable merge-queue state could not be updated.
+    QueueState,
+}
+
 /// A bounded commit SHA recorded in tracing.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct CommitSha(String);
 
 impl CommitSha {
-    /// Parses a full 40-character ASCII hexadecimal commit SHA.
+    /// Parses a full SHA-1 or SHA-256 ASCII hexadecimal commit identifier.
     ///
     /// # Errors
     ///
-    /// Returns [`CommitShaError`] when `value` is not exactly 40 ASCII hexadecimal characters.
+    /// Returns [`CommitShaError`] unless `value` contains exactly 40 or 64 ASCII hexadecimal
+    /// characters.
     pub(crate) fn parse(value: &str) -> Result<Self, CommitShaError> {
-        if value.len() != COMMIT_SHA_LENGTH {
+        if !matches!(value.len(), SHA_1_HEX_LENGTH | SHA_256_HEX_LENGTH) {
             return Err(CommitShaError);
         }
 
-        let mut normalized = String::with_capacity(COMMIT_SHA_LENGTH);
+        let mut normalized = String::with_capacity(value.len());
         for byte in value.bytes() {
             if !byte.is_ascii_hexdigit() {
                 return Err(CommitShaError);
@@ -154,7 +182,7 @@ impl fmt::Debug for CommitSha {
 
 /// A malformed commit SHA.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[error("commit SHA is not a valid 40-character hexadecimal string")]
+#[error("commit SHA is not a valid 40- or 64-character hexadecimal string")]
 pub(crate) struct CommitShaError;
 
 /// A bounded SQLite operation recorded in tracing.
@@ -274,6 +302,65 @@ pub(crate) fn set_config_operation(span: &Span, operation: ConfigOperation) {
     span.set_attribute(CONFIG_OPERATION_KEY, operation.as_str());
 }
 
+/// Records the normalized webhook event type and action as OpenTelemetry span attributes.
+///
+/// # Parameters
+///
+/// * `span` - The authenticated webhook processing span.
+/// * `event_type` - The event type from the fixed metrics vocabulary.
+/// * `action` - The action from the fixed metrics vocabulary.
+pub(crate) fn set_webhook_event(span: &Span, event_type: EventType, action: Action) {
+    span.set_attribute(WEBHOOK_EVENT_TYPE_KEY, event_type.as_str());
+    span.set_attribute(WEBHOOK_ACTION_KEY, action.as_str());
+}
+
+/// Records the bounded entity represented by a merge-queue update.
+///
+/// # Parameters
+///
+/// * `span` - The merge-queue update span.
+/// * `entity` - The fixed entity vocabulary value.
+pub(crate) fn set_queue_entity(span: &Span, entity: QueueEntity) {
+    span.set_attribute(QUEUE_ENTITY_KEY, entity.as_str());
+}
+
+/// Records a normalized merge-group transition without accepting raw payload values.
+///
+/// # Parameters
+///
+/// * `span` - The merge-queue update span.
+/// * `action` - The bounded merge-group action.
+/// * `reason` - The bounded merge-group reason.
+pub(crate) fn set_merge_group_transition(
+    span: &Span,
+    action: MergeGroupAction,
+    reason: MergeGroupReason,
+) {
+    span.set_attribute(MERGE_GROUP_ACTION_KEY, action.as_str());
+    span.set_attribute(MERGE_GROUP_REASON_KEY, reason.as_str());
+}
+
+/// Records an invariant merge-queue completion outcome and reason pairing.
+///
+/// # Parameters
+///
+/// * `span` - The merge-queue update span.
+/// * `completion` - The evidence-backed bounded completion classification.
+pub(crate) fn set_merge_queue_completion(span: &Span, completion: MergeQueueCompletion) {
+    let (outcome, reason) = match completion {
+        MergeQueueCompletion::PullRequestMerged => (
+            MergeQueueOutcome::Succeeded,
+            MergeQueueReason::PullRequestMerged,
+        ),
+        MergeQueueCompletion::UnclassifiedDequeue => (
+            MergeQueueOutcome::Unknown,
+            MergeQueueReason::UnclassifiedDequeue,
+        ),
+    };
+    span.set_attribute(QUEUE_OUTCOME_KEY, outcome.as_str());
+    span.set_attribute(QUEUE_REASON_KEY, reason.as_str());
+}
+
 /// Records the canonical repository name as an OpenTelemetry span attribute.
 ///
 /// # Parameters
@@ -363,7 +450,7 @@ pub(crate) fn set_result_status<T, E>(span: &Span, result: &Result<T, E>) {
 ///
 /// * `span` - The active tracing span.
 /// * `reason` - A fixed failure reason from the bounded telemetry vocabulary.
-pub(crate) fn add_failure_event(span: &Span, reason: QueueTransitionFailureReason) {
+pub(crate) fn add_failure_event(span: &Span, reason: OperationFailureReason) {
     span.add_event(
         OPERATION_FAILURE_EVENT,
         vec![KeyValue::new(FAILURE_REASON_KEY, reason.as_str())],
@@ -381,6 +468,25 @@ impl Operation {
             Self::SqliteQuery => "sqlite.query",
             Self::MergeQueueUpdate => "merge_queue.update",
             Self::RetentionRun => "retention.run",
+        }
+    }
+}
+
+impl QueueEntity {
+    /// Returns the fixed queue-entity value.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::MergeGroup => "merge_group",
+            Self::PullRequest => "pull_request",
+        }
+    }
+}
+
+impl OperationFailureReason {
+    /// Returns the fixed operation-failure reason.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::QueueState => "queue_state",
         }
     }
 }
@@ -517,11 +623,11 @@ mod tests {
         set_delivery_id, set_http_method, set_http_response, set_http_route,
         set_pull_request_number, set_repository_id, set_repository_name, set_result_status,
         set_status, CommitSha, ConfigOperation, DatabaseOperation, HttpMethod, HttpResult,
-        Operation, OperationOutcome, COMMIT_SHA_KEY, CONFIG_OPERATION_KEY, DB_OPERATION_NAME_KEY,
-        DB_SYSTEM_NAME_KEY, DELIVERY_ID_KEY, FAILURE_REASON_KEY, HTTP_REQUEST_METHOD_KEY,
-        HTTP_RESPONSE_STATUS_CODE_KEY, HTTP_RESULT_KEY, HTTP_ROUTE_KEY, OPERATION_FAILURE_EVENT,
-        OPERATION_OUTCOME_KEY, PULL_REQUEST_NUMBER_KEY, REPOSITORY_ID_KEY, REPOSITORY_NAME_KEY,
-        SQLITE_SYSTEM_NAME,
+        Operation, OperationFailureReason, OperationOutcome, QueueEntity, COMMIT_SHA_KEY,
+        CONFIG_OPERATION_KEY, DB_OPERATION_NAME_KEY, DB_SYSTEM_NAME_KEY, DELIVERY_ID_KEY,
+        FAILURE_REASON_KEY, HTTP_REQUEST_METHOD_KEY, HTTP_RESPONSE_STATUS_CODE_KEY,
+        HTTP_RESULT_KEY, HTTP_ROUTE_KEY, OPERATION_FAILURE_EVENT, OPERATION_OUTCOME_KEY,
+        PULL_REQUEST_NUMBER_KEY, REPOSITORY_ID_KEY, REPOSITORY_NAME_KEY, SQLITE_SYSTEM_NAME,
     };
 
     const TEST_DELIVERY_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -664,6 +770,19 @@ mod tests {
             assert_eq!(operation.as_str(), expected);
         }
 
+        let queue_entities = [
+            (QueueEntity::MergeGroup, "merge_group"),
+            (QueueEntity::PullRequest, "pull_request"),
+        ];
+        for (entity, expected) in queue_entities {
+            assert_eq!(entity.as_str(), expected);
+        }
+
+        let failure_reasons = [(OperationFailureReason::QueueState, "queue_state")];
+        for (reason, expected) in failure_reasons {
+            assert_eq!(reason.as_str(), expected);
+        }
+
         let database_operations = [
             (DatabaseOperation::RepositoryCount, "repository.count"),
             (DatabaseOperation::RepositoryCreate, "repository.create"),
@@ -795,10 +914,17 @@ mod tests {
     #[test]
     fn commit_sha_parser_rejects_invalid_values_without_echoing_input() {
         let commit_sha = CommitSha::parse("0123456789ABCDEF0123456789abcdef01234567")
-            .expect("mixed-case commit SHA is valid");
+            .expect("mixed-case SHA-1 commit identifier is valid");
         assert_eq!(
             commit_sha.as_str(),
             "0123456789abcdef0123456789abcdef01234567"
+        );
+        let sha_256 =
+            CommitSha::parse("ABCDEF0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789")
+                .expect("mixed-case SHA-256 commit identifier is valid");
+        assert_eq!(
+            sha_256.as_str(),
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
         );
 
         for invalid in [
@@ -811,14 +937,14 @@ mod tests {
             assert!(!rendered.contains(invalid));
             assert_eq!(
                 rendered,
-                "commit SHA is not a valid 40-character hexadecimal string"
+                "commit SHA is not a valid 40- or 64-character hexadecimal string"
             );
         }
 
         let error = CommitSha::parse("").expect_err("empty commit SHA is rejected");
         assert_eq!(
             error.to_string(),
-            "commit SHA is not a valid 40-character hexadecimal string"
+            "commit SHA is not a valid 40- or 64-character hexadecimal string"
         );
     }
 
@@ -842,10 +968,7 @@ mod tests {
             set_pull_request_number(&request_span, pull_request_number);
             set_commit_sha(&request_span, &commit_sha);
             set_status(&request_span, OperationOutcome::Failure);
-            add_failure_event(
-                &request_span,
-                QueueTransitionFailureReason::MissingActiveAttempt,
-            );
+            add_failure_event(&request_span, OperationFailureReason::QueueState);
             drop(request_span);
 
             let database = database_span(DatabaseOperation::RepositoryCreate);
@@ -892,7 +1015,7 @@ mod tests {
             event.name.as_ref() == OPERATION_FAILURE_EVENT
                 && event.attributes.iter().any(|attribute| {
                     attribute.key.as_str() == FAILURE_REASON_KEY
-                        && attribute.value.as_str().as_ref() == "missing_active_attempt"
+                        && attribute.value.as_str().as_ref() == "queue_state"
                 })
         }));
         assert!(

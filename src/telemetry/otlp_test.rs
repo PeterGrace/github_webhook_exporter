@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     ffi::OsString,
-    io,
+    io::{self, Write},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -16,6 +16,7 @@ use axum::{
     routing::post,
     Router,
 };
+use hmac::{Hmac, Mac};
 use opentelemetry_proto::tonic::{
     collector::{logs::v1::ExportLogsServiceRequest, trace::v1::ExportTraceServiceRequest},
     common::v1::any_value::Value as AttributeValue,
@@ -23,6 +24,7 @@ use opentelemetry_proto::tonic::{
 };
 use prost::Message;
 use serde_json::Value;
+use sha2::Sha256;
 use sqlx::SqlitePool;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -30,7 +32,10 @@ use tracing::instrument::WithSubscriber;
 
 use crate::{
     app::{build_router, AppState},
-    security::{AdminAuthenticator, AdminToken, MasterKey, RepositorySecretCipher},
+    security::{
+        AdminAuthenticator, AdminToken, CanonicalRepositoryName, MasterKey, RepositorySecret,
+        RepositorySecretCipher,
+    },
     storage::{open_database, RepositoryStore},
 };
 use tokio::{
@@ -47,6 +52,10 @@ const QUEUE_CAPACITY: usize = 4;
 const SATURATION_RECORDS: usize = 10;
 const ADMIN_TOKEN: &str = "independent-admin-token";
 const MASTER_KEY_BYTES: &[u8; 32] = b"MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM";
+const WEBHOOK_SECRET: &str = "webhook-trace-secret-must-not-appear";
+const WEBHOOK_REPOSITORY: &str = "owner/webhook-private-repository";
+const WEBHOOK_SHA_40: &str = "0123456789ABCDEF0123456789abcdef01234567";
+const WEBHOOK_SHA_64: &str = "ABCDEF0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789";
 
 #[derive(Default)]
 struct Captures {
@@ -133,6 +142,11 @@ fn protobuf_response() -> impl IntoResponse {
 }
 
 fn telemetry_config(endpoint: &str) -> TelemetryConfig {
+    telemetry_config_with_queue_capacity(endpoint, QUEUE_CAPACITY)
+}
+
+fn telemetry_config_with_queue_capacity(endpoint: &str, queue_capacity: usize) -> TelemetryConfig {
+    let queue_capacity = queue_capacity.to_string();
     let values = HashMap::from([
         ("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint),
         ("OTEL_EXPORTER_OTLP_HEADERS", "x-test-token=private-value"),
@@ -142,7 +156,7 @@ fn telemetry_config(endpoint: &str) -> TelemetryConfig {
             "OTEL_RESOURCE_ATTRIBUTES",
             "k8s.pod.name=exporter-0,k8s.namespace.name=tests,forbidden=value",
         ),
-        ("GHE_OTEL_QUEUE_CAPACITY", "4"),
+        ("GHE_OTEL_QUEUE_CAPACITY", queue_capacity.as_str()),
         ("GHE_OTEL_BATCH_SIZE", "1"),
     ]);
     TelemetryConfig::from_lookup(&mut |variable| values.get(variable).map(OsString::from))
@@ -252,13 +266,18 @@ impl RunningReceiver {
         format!("http://{}", self.address)
     }
 
-    fn trace_requests(&self) -> Vec<ExportTraceServiceRequest> {
-        self.state
+    fn captured_requests(
+        &self,
+    ) -> (
+        Vec<ExportTraceServiceRequest>,
+        Vec<ExportLogsServiceRequest>,
+    ) {
+        let captures = self
+            .state
             .captures
             .lock()
-            .expect("capture lock is available")
-            .traces
-            .clone()
+            .expect("capture lock is available");
+        (captures.traces.clone(), captures.logs.clone())
     }
 }
 
@@ -342,7 +361,149 @@ impl RepositoryTraceFixture {
 
     fn force_flush(&self) -> CapturedSpans {
         self.runtime.force_flush().expect("providers flush");
-        CapturedSpans::from_requests(self.receiver.trace_requests())
+        let (traces, logs) = self.receiver.captured_requests();
+        CapturedSpans::from_requests(traces, logs)
+    }
+}
+
+#[derive(Clone, Default)]
+struct CapturedOutput(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedOutput {
+    fn text(&self) -> String {
+        let bytes = self.0.lock().expect("output lock is available").clone();
+        String::from_utf8(bytes).expect("captured output is UTF-8")
+    }
+}
+
+impl Write for CapturedOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("output lock is poisoned"))?
+            .extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedOutput {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+struct WebhookTraceFixture {
+    receiver: RunningReceiver,
+    runtime: super::TelemetryRuntime,
+    dispatch: Dispatch,
+    output: CapturedOutput,
+    router: Router,
+    pool: SqlitePool,
+    _directory: TempDir,
+}
+
+impl WebhookTraceFixture {
+    async fn new() -> Self {
+        let receiver = RunningReceiver::start_released().await;
+        let config = telemetry_config_with_queue_capacity(&receiver.endpoint(), 128);
+        let output = CapturedOutput::default();
+        let (runtime, subscriber) =
+            build_runtime("github_webhook_exporter=info", &config, output.clone())
+                .expect("telemetry runtime initializes");
+        let dispatch = Dispatch::new(subscriber);
+        let directory = tempfile::tempdir().expect("temporary directory is created");
+        let pool = open_database(&directory.path().join("webhook-trace.db"))
+            .await
+            .expect("test database opens and migrates");
+        let master_key = MasterKey::from_slice(MASTER_KEY_BYTES).expect("test key is valid");
+        let cipher = RepositorySecretCipher::new(&master_key).expect("test cipher initializes");
+        let store = RepositoryStore::new(pool.clone(), cipher);
+        store
+            .create(
+                CanonicalRepositoryName::new(WEBHOOK_REPOSITORY)
+                    .expect("test repository name is valid"),
+                RepositorySecret::new(WEBHOOK_SECRET.to_owned())
+                    .expect("test webhook secret is valid"),
+                true,
+            )
+            .await
+            .expect("test repository is created");
+        let admin_token = AdminToken::new(ADMIN_TOKEN.to_owned()).expect("test token is valid");
+        let router = build_router(AppState::new(
+            store,
+            AdminAuthenticator::new(&admin_token),
+            2_097_152,
+        ));
+        Self {
+            receiver,
+            runtime,
+            dispatch,
+            output,
+            router,
+            pool,
+            _directory: directory,
+        }
+    }
+
+    async fn webhook(
+        &self,
+        body: &[u8],
+        event_type: &str,
+        delivery_id: &str,
+        secret: &str,
+    ) -> axum::response::Response {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC key is valid");
+        mac.update(body);
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/webhooks/github")
+            .header(CONTENT_TYPE, "application/json")
+            .header("X-GitHub-Event", event_type)
+            .header("X-GitHub-Delivery", delivery_id)
+            .header("X-Hub-Signature-256", signature)
+            .body(Body::from(body.to_vec()))
+            .expect("webhook request is valid");
+        self.router
+            .clone()
+            .oneshot(request)
+            .with_subscriber(self.dispatch.clone())
+            .await
+            .expect("router serves webhook request")
+    }
+
+    async fn metrics_text(&self) -> String {
+        let response = self
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("metrics request is valid"),
+            )
+            .with_subscriber(self.dispatch.clone())
+            .await
+            .expect("router serves metrics request");
+        String::from_utf8(
+            to_bytes(response.into_body(), 1_000_000)
+                .await
+                .expect("metrics response is readable")
+                .to_vec(),
+        )
+        .expect("metrics response is UTF-8")
+    }
+
+    fn force_flush(&self) -> CapturedSpans {
+        self.runtime.force_flush().expect("providers flush");
+        let (traces, logs) = self.receiver.captured_requests();
+        CapturedSpans::from_requests(traces, logs)
     }
 }
 
@@ -361,10 +522,14 @@ fn router_for_pool(pool: SqlitePool) -> Router {
 struct CapturedSpans {
     spans: Vec<Span>,
     serialized: Vec<u8>,
+    serialized_logs: Vec<u8>,
 }
 
 impl CapturedSpans {
-    fn from_requests(requests: Vec<ExportTraceServiceRequest>) -> Self {
+    fn from_requests(
+        requests: Vec<ExportTraceServiceRequest>,
+        log_requests: Vec<ExportLogsServiceRequest>,
+    ) -> Self {
         let spans = requests
             .iter()
             .flat_map(|request| &request.resource_spans)
@@ -375,7 +540,15 @@ impl CapturedSpans {
             .into_iter()
             .flat_map(|request| request.encode_to_vec())
             .collect();
-        Self { spans, serialized }
+        let serialized_logs = log_requests
+            .into_iter()
+            .flat_map(|request| request.encode_to_vec())
+            .collect();
+        Self {
+            spans,
+            serialized,
+            serialized_logs,
+        }
     }
 
     fn http_request(&self, method: &str, route: &str, status_code: i64) -> &Span {
@@ -388,6 +561,35 @@ impl CapturedSpans {
                     && i64_attribute(span, "http.response.status_code") == Some(status_code)
             })
             .expect("matching HTTP request span is exported")
+    }
+
+    fn webhook_request_for_delivery(&self, delivery_id: &str) -> &Span {
+        self.spans
+            .iter()
+            .find(|span| {
+                span.name == "http.request"
+                    && self.spans.iter().any(|candidate| {
+                        candidate.name == "github.webhook.authenticate"
+                            && candidate.parent_span_id == span.span_id
+                            && string_attribute(candidate, "github.delivery.id")
+                                == Some(delivery_id)
+                    })
+            })
+            .unwrap_or_else(|| {
+                let summary: Vec<_> = self
+                    .spans
+                    .iter()
+                    .map(|span| {
+                        (
+                            span.name.as_str(),
+                            string_attribute(span, "github.delivery.id"),
+                            span.span_id.as_slice(),
+                            span.parent_span_id.as_slice(),
+                        )
+                    })
+                    .collect();
+                panic!("webhook request span for delivery is exported: {summary:?}")
+            })
     }
 
     fn child_named(&self, parent: &Span, name: &str) -> &Span {
@@ -404,6 +606,43 @@ impl CapturedSpans {
             .count()
     }
 
+    fn descendant_named(&self, parent: &Span, name: &str, entity: &str) -> &Span {
+        self.spans
+            .iter()
+            .find(|span| {
+                span.name == name
+                    && (string_attribute(span, "ghe.queue.entity") == Some(entity)
+                        || string_attribute(span, "db.operation.name") == Some(entity))
+                    && self.is_descendant(span, parent)
+            })
+            .expect("matching descendant span is exported")
+    }
+
+    fn descendant_count(&self, parent: &Span, name: &str) -> usize {
+        self.spans
+            .iter()
+            .filter(|span| span.name == name && self.is_descendant(span, parent))
+            .count()
+    }
+
+    fn is_descendant(&self, span: &Span, ancestor: &Span) -> bool {
+        let mut parent_span_id = span.parent_span_id.as_slice();
+        while !parent_span_id.is_empty() {
+            if parent_span_id == ancestor.span_id {
+                return true;
+            }
+            let Some(parent) = self
+                .spans
+                .iter()
+                .find(|candidate| candidate.span_id == parent_span_id)
+            else {
+                return false;
+            };
+            parent_span_id = parent.parent_span_id.as_slice();
+        }
+        false
+    }
+
     fn assert_absent(&self, value: &str) {
         let serialized = String::from_utf8_lossy(&self.serialized);
         assert!(
@@ -411,10 +650,40 @@ impl CapturedSpans {
             "serialized OTLP trace requests must not contain {value:?}"
         );
     }
+
+    fn assert_logs_absent(&self, value: &str) {
+        let serialized = String::from_utf8_lossy(&self.serialized_logs);
+        assert!(
+            !serialized.contains(value),
+            "serialized OTLP log requests must not contain {value:?}"
+        );
+    }
 }
 
 fn string_attribute<'span>(span: &'span Span, key: &str) -> Option<&'span str> {
     span.attributes
+        .iter()
+        .find(|attribute| attribute.key == key)
+        .and_then(|attribute| attribute.value.as_ref())
+        .and_then(|value| match value.value.as_ref() {
+            Some(AttributeValue::StringValue(value)) => Some(value.as_str()),
+            Some(AttributeValue::IntValue(_))
+            | Some(AttributeValue::DoubleValue(_))
+            | Some(AttributeValue::BoolValue(_))
+            | Some(AttributeValue::ArrayValue(_))
+            | Some(AttributeValue::KvlistValue(_))
+            | Some(AttributeValue::BytesValue(_))
+            | Some(AttributeValue::StringValueStrindex(_))
+            | None => None,
+        })
+}
+
+fn event_string_attribute<'event>(
+    event: &'event opentelemetry_proto::tonic::trace::v1::span::Event,
+    key: &str,
+) -> Option<&'event str> {
+    event
+        .attributes
         .iter()
         .find(|attribute| attribute.key == key)
         .and_then(|attribute| attribute.value.as_ref())
@@ -659,6 +928,330 @@ async fn repository_store_failure_marks_http_and_write_spans_without_error_text(
     captured.assert_absent("failure-secret-must-not-appear");
     captured.assert_absent("database");
     captured.assert_absent("sqlite");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_successes_emit_bounded_hierarchy_and_span_only_identifiers() {
+    let fixture = WebhookTraceFixture::new().await;
+    let merge_group_delivery = "550e8400-e29b-41d4-a716-446655440201";
+    let enqueue_delivery = "550e8400-e29b-41d4-a716-446655440202";
+    let dequeue_delivery = "550e8400-e29b-41d4-a716-446655440203";
+    let malformed_sha_delivery = "550e8400-e29b-41d4-a716-446655440204";
+    let merge_group_body = format!(
+        r#"{{"action":"checks_requested","merge_group":{{"head_sha":"{WEBHOOK_SHA_64}"}},"repository":{{"full_name":"{WEBHOOK_REPOSITORY}"}}}}"#
+    );
+    let enqueue_body = format!(
+        r#"{{"action":"enqueued","pull_request":{{"number":42,"updated_at":"2026-08-05T10:00:00Z","head":{{"sha":"{WEBHOOK_SHA_40}"}}}},"repository":{{"full_name":"{WEBHOOK_REPOSITORY}"}}}}"#
+    );
+    let dequeue_body = format!(
+        r#"{{"action":"dequeued","reason":"raw-reason-must-not-appear","pull_request":{{"number":42,"updated_at":"2026-08-05T10:02:00Z","head":{{"sha":"{WEBHOOK_SHA_40}"}}}},"repository":{{"full_name":"{WEBHOOK_REPOSITORY}"}}}}"#
+    );
+    let malformed_sha_body = format!(
+        r#"{{"action":"checks_requested","merge_group":{{"head_sha":"malformed-sha-must-not-appear"}},"repository":{{"full_name":"{WEBHOOK_REPOSITORY}"}}}}"#
+    );
+
+    for (body, event_type, delivery_id) in [
+        (
+            merge_group_body.as_bytes(),
+            "merge_group",
+            merge_group_delivery,
+        ),
+        (enqueue_body.as_bytes(), "pull_request", enqueue_delivery),
+        (dequeue_body.as_bytes(), "pull_request", dequeue_delivery),
+        (
+            malformed_sha_body.as_bytes(),
+            "merge_group",
+            malformed_sha_delivery,
+        ),
+    ] {
+        let response = fixture
+            .webhook(body, event_type, delivery_id, WEBHOOK_SECRET)
+            .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    let repository_id: i64 = sqlx::query_scalar("SELECT id FROM repositories")
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("repository identifier is readable");
+    let exposition = fixture.metrics_text().await;
+    let captured = fixture.force_flush();
+
+    let merge_request = captured.webhook_request_for_delivery(merge_group_delivery);
+    let merge_authenticate = captured.child_named(merge_request, "github.webhook.authenticate");
+    let merge_process = captured.child_named(merge_request, "github.webhook.process");
+    for span in [merge_authenticate, merge_process] {
+        assert_attribute(span, "github.repository.name", WEBHOOK_REPOSITORY);
+        assert_i64_attribute(span, "github.repository.id", repository_id);
+        assert_attribute(span, "github.delivery.id", merge_group_delivery);
+        assert_attribute(span, "ghe.operation.outcome", "success");
+    }
+    assert_attribute(merge_process, "ghe.webhook.event_type", "merge_group");
+    assert_attribute(merge_process, "ghe.webhook.action", "checks_requested");
+    let claim = captured.descendant_named(merge_process, "sqlite.query", "delivery.claim");
+    assert_attribute(claim, "db.operation.name", "delivery.claim");
+    let merge_update =
+        captured.descendant_named(merge_process, "merge_queue.update", "merge_group");
+    assert_attribute(merge_update, "ghe.merge_group.action", "checks_requested");
+    assert_attribute(merge_update, "ghe.merge_group.reason", "none");
+    assert_attribute(
+        merge_update,
+        "github.commit.sha",
+        &WEBHOOK_SHA_64.to_ascii_lowercase(),
+    );
+    assert_attribute(merge_update, "ghe.operation.outcome", "success");
+
+    let enqueue_request = captured.webhook_request_for_delivery(enqueue_delivery);
+    let enqueue_process = captured.child_named(enqueue_request, "github.webhook.process");
+    let enqueue_update =
+        captured.descendant_named(enqueue_process, "merge_queue.update", "pull_request");
+    assert_i64_attribute(enqueue_update, "github.pull_request.number", 42);
+    assert_attribute(enqueue_update, "github.delivery.id", enqueue_delivery);
+    assert_attribute(
+        enqueue_update,
+        "github.commit.sha",
+        &WEBHOOK_SHA_40.to_ascii_lowercase(),
+    );
+    assert_eq!(string_attribute(enqueue_update, "ghe.queue.outcome"), None);
+    assert_eq!(string_attribute(enqueue_update, "ghe.queue.reason"), None);
+    assert_attribute(enqueue_update, "ghe.operation.outcome", "success");
+
+    let dequeue_request = captured.webhook_request_for_delivery(dequeue_delivery);
+    let dequeue_process = captured.child_named(dequeue_request, "github.webhook.process");
+    let dequeue_update =
+        captured.descendant_named(dequeue_process, "merge_queue.update", "pull_request");
+    assert_i64_attribute(dequeue_update, "github.repository.id", repository_id);
+    assert_attribute(dequeue_update, "github.repository.name", WEBHOOK_REPOSITORY);
+    assert_attribute(dequeue_update, "github.delivery.id", dequeue_delivery);
+    assert_i64_attribute(dequeue_update, "github.pull_request.number", 42);
+    assert_attribute(
+        dequeue_update,
+        "github.commit.sha",
+        &WEBHOOK_SHA_40.to_ascii_lowercase(),
+    );
+    assert_attribute(dequeue_update, "ghe.queue.outcome", "unknown");
+    assert_attribute(dequeue_update, "ghe.queue.reason", "unclassified_dequeue");
+    assert_attribute(dequeue_update, "ghe.operation.outcome", "success");
+
+    let malformed_sha_request = captured.webhook_request_for_delivery(malformed_sha_delivery);
+    let malformed_sha_process =
+        captured.child_named(malformed_sha_request, "github.webhook.process");
+    let malformed_sha_update =
+        captured.descendant_named(malformed_sha_process, "merge_queue.update", "merge_group");
+    assert_eq!(
+        string_attribute(malformed_sha_update, "github.commit.sha"),
+        None
+    );
+
+    let output = fixture.output.text();
+    let normalized_sha_40 = WEBHOOK_SHA_40.to_ascii_lowercase();
+    let normalized_sha_64 = WEBHOOK_SHA_64.to_ascii_lowercase();
+    for identifier in [
+        WEBHOOK_REPOSITORY,
+        merge_group_delivery,
+        enqueue_delivery,
+        dequeue_delivery,
+        malformed_sha_delivery,
+        WEBHOOK_SHA_40,
+        WEBHOOK_SHA_64,
+        normalized_sha_40.as_str(),
+        normalized_sha_64.as_str(),
+    ] {
+        captured.assert_logs_absent(identifier);
+        assert!(!output.contains(identifier));
+        assert!(!exposition.contains(identifier));
+    }
+    for forbidden in [
+        WEBHOOK_SECRET,
+        "raw-reason-must-not-appear",
+        "malformed-sha-must-not-appear",
+        "sha256=",
+    ] {
+        captured.assert_absent(forbidden);
+        captured.assert_logs_absent(forbidden);
+        assert!(!output.contains(forbidden));
+        assert!(!exposition.contains(forbidden));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_failures_mark_authentication_and_processing_without_raw_error_data() {
+    let fixture = WebhookTraceFixture::new().await;
+    let unauthorized_delivery = "550e8400-e29b-41d4-a716-446655440211";
+    let malformed_delivery = "550e8400-e29b-41d4-a716-446655440212";
+    let unavailable_delivery = "550e8400-e29b-41d4-a716-446655440213";
+    let normal_body =
+        format!(r#"{{"action":"opened","repository":{{"full_name":"{WEBHOOK_REPOSITORY}"}}}}"#);
+    let malformed_body = format!(
+        r#"{{"action":{{"raw":"action-must-not-appear"}},"repository":{{"full_name":"{WEBHOOK_REPOSITORY}"}}}}"#
+    );
+
+    let unauthorized = fixture
+        .webhook(
+            normal_body.as_bytes(),
+            "pull_request",
+            unauthorized_delivery,
+            "wrong-secret-must-not-appear",
+        )
+        .await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let malformed = fixture
+        .webhook(
+            malformed_body.as_bytes(),
+            "pull_request",
+            malformed_delivery,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    sqlx::query("DROP TABLE processed_deliveries")
+        .execute(&fixture.pool)
+        .await
+        .expect("delivery table is removed");
+    let unavailable = fixture
+        .webhook(
+            normal_body.as_bytes(),
+            "pull_request",
+            unavailable_delivery,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let captured = fixture.force_flush();
+
+    let unauthorized_request = captured.webhook_request_for_delivery(unauthorized_delivery);
+    let unauthorized_authenticate =
+        captured.child_named(unauthorized_request, "github.webhook.authenticate");
+    assert_attribute(
+        unauthorized_authenticate,
+        "ghe.operation.outcome",
+        "failure",
+    );
+    assert_eq!(
+        captured.child_count(unauthorized_request, "github.webhook.process"),
+        0
+    );
+
+    let malformed_request = captured.webhook_request_for_delivery(malformed_delivery);
+    let malformed_authenticate =
+        captured.child_named(malformed_request, "github.webhook.authenticate");
+    assert_attribute(malformed_authenticate, "ghe.operation.outcome", "success");
+    let malformed_process = captured.child_named(malformed_request, "github.webhook.process");
+    assert_attribute(malformed_process, "ghe.operation.outcome", "failure");
+    assert_eq!(
+        captured.descendant_count(malformed_process, "merge_queue.update"),
+        0
+    );
+
+    let unavailable_request = captured.webhook_request_for_delivery(unavailable_delivery);
+    let unavailable_process = captured.child_named(unavailable_request, "github.webhook.process");
+    assert_attribute(unavailable_process, "ghe.operation.outcome", "failure");
+    let failed_claim =
+        captured.descendant_named(unavailable_process, "sqlite.query", "delivery.claim");
+    assert_attribute(failed_claim, "ghe.operation.outcome", "failure");
+
+    for forbidden in [
+        "wrong-secret-must-not-appear",
+        "action-must-not-appear",
+        "processed_deliveries",
+    ] {
+        captured.assert_absent(forbidden);
+        captured.assert_logs_absent(forbidden);
+        assert!(!fixture.output.text().contains(forbidden));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_queue_failure_is_bounded_and_duplicate_has_no_second_update() {
+    let fixture = WebhookTraceFixture::new().await;
+    let enqueue_delivery = "550e8400-e29b-41d4-a716-446655440221";
+    let dequeue_delivery = "550e8400-e29b-41d4-a716-446655440222";
+    let enqueue_body = format!(
+        r#"{{"action":"enqueued","pull_request":{{"number":77,"updated_at":"2026-08-05T10:00:00Z","head":{{"sha":"{WEBHOOK_SHA_40}"}}}},"repository":{{"full_name":"{WEBHOOK_REPOSITORY}"}}}}"#
+    );
+    let dequeue_body = format!(
+        r#"{{"action":"dequeued","reason":"queue-raw-reason-must-not-appear","pull_request":{{"number":77,"updated_at":"2026-08-05T10:01:00Z","head":{{"sha":"{WEBHOOK_SHA_40}"}}}},"repository":{{"full_name":"{WEBHOOK_REPOSITORY}"}}}}"#
+    );
+    let enqueued = fixture
+        .webhook(
+            enqueue_body.as_bytes(),
+            "pull_request",
+            enqueue_delivery,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(enqueued.status(), StatusCode::NO_CONTENT);
+    sqlx::query(
+        "CREATE TRIGGER reject_trace_queue_completion BEFORE UPDATE ON merge_queue_attempts \
+         BEGIN SELECT RAISE(ABORT, 'queue-store-detail-must-not-appear'); END",
+    )
+    .execute(&fixture.pool)
+    .await
+    .expect("queue failure trigger is installed");
+
+    for _ in 0..2 {
+        let response = fixture
+            .webhook(
+                dequeue_body.as_bytes(),
+                "pull_request",
+                dequeue_delivery,
+                WEBHOOK_SECRET,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    let exposition = fixture.metrics_text().await;
+    let captured = fixture.force_flush();
+
+    let matching_updates: Vec<&Span> = captured
+        .spans
+        .iter()
+        .filter(|span| {
+            span.name == "merge_queue.update"
+                && string_attribute(span, "github.delivery.id") == Some(dequeue_delivery)
+        })
+        .collect();
+    assert_eq!(matching_updates.len(), 1);
+    let update = matching_updates[0];
+    assert_attribute(update, "ghe.queue.outcome", "unknown");
+    assert_attribute(update, "ghe.queue.reason", "unclassified_dequeue");
+    assert_attribute(update, "ghe.operation.outcome", "failure");
+    assert_eq!(
+        update.status.as_ref().map(|status| status.code),
+        Some(opentelemetry_proto::tonic::trace::v1::status::StatusCode::Error as i32)
+    );
+    let failure_event = update
+        .events
+        .iter()
+        .find(|event| event.name == "operation.failure")
+        .expect("queue failure event is exported");
+    assert_eq!(
+        event_string_attribute(failure_event, "ghe.failure.reason"),
+        Some("queue_state")
+    );
+    let duplicate_processes = captured
+        .spans
+        .iter()
+        .filter(|span| {
+            span.name == "github.webhook.process"
+                && string_attribute(span, "github.delivery.id") == Some(dequeue_delivery)
+                && string_attribute(span, "ghe.operation.outcome") == Some("duplicate")
+        })
+        .count();
+    assert_eq!(duplicate_processes, 1);
+    assert!(exposition.contains("github_webhook_duplicates_total 1"));
+    assert!(
+        exposition.contains("github_webhook_processing_failures_total{stage=\"queue_state\"} 1")
+    );
+    for forbidden in [
+        "queue-raw-reason-must-not-appear",
+        "queue-store-detail-must-not-appear",
+        WEBHOOK_SECRET,
+    ] {
+        captured.assert_absent(forbidden);
+        captured.assert_logs_absent(forbidden);
+        assert!(!fixture.output.text().contains(forbidden));
+        assert!(!exposition.contains(forbidden));
+    }
 }
 
 // Regression check for the OpenTelemetry 0.32 queue-occupancy invariant documented in `queue`.
