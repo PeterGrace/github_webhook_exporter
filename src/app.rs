@@ -4,9 +4,17 @@ use std::{
     time::Duration,
 };
 
-use axum::Router;
+use axum::{
+    extract::{MatchedPath, Request},
+    http::{Method, StatusCode},
+    middleware::{self, Next},
+    response::Response,
+    Router,
+};
 use sqlx::SqlitePool;
 use tokio::{net::TcpListener, sync::watch};
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::{
     api, health,
@@ -14,7 +22,13 @@ use crate::{
     retention::{run_retention, RetentionConfig},
     security::AdminAuthenticator,
     storage::{DeliveryStore, MergeQueueStore, RepositoryStore},
+    telemetry::trace::{self, Operation, OperationOutcome},
 };
+
+const HTTP_REQUEST_METHOD_KEY: &str = "http.request.method";
+const HTTP_ROUTE_KEY: &str = "http.route";
+const HTTP_RESPONSE_STATUS_CODE_KEY: &str = "http.response.status_code";
+const HTTP_RESULT_KEY: &str = "ghe.http.result";
 
 /// Immutable dependencies shared by all HTTP request handlers.
 #[derive(Clone)]
@@ -95,11 +109,62 @@ impl AppState {
 pub fn build_router(state: AppState) -> Router {
     let webhook_body_limit_bytes = state.webhook_body_limit_bytes;
     let webhook_metrics = state.metrics.clone();
-    health::router(state.database_pool.clone()).merge(
-        api::router(webhook_body_limit_bytes, webhook_metrics)
-            .merge(metrics::router())
-            .with_state(state),
-    )
+    health::router(state.database_pool.clone())
+        .merge(
+            api::router(webhook_body_limit_bytes, webhook_metrics)
+                .merge(metrics::router())
+                .with_state(state),
+        )
+        .layer(middleware::from_fn(observe_http_request))
+}
+
+async fn observe_http_request(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or("unmatched", MatchedPath::as_str);
+    let span = trace::operation_span(Operation::HttpRequest);
+    span.set_attribute(HTTP_REQUEST_METHOD_KEY, bounded_http_method(&method));
+    span.set_attribute(HTTP_ROUTE_KEY, route.to_owned());
+
+    let response = next.run(request).instrument(span.clone()).await;
+    let status = response.status();
+    span.set_attribute(HTTP_RESPONSE_STATUS_CODE_KEY, i64::from(status.as_u16()));
+    span.set_attribute(HTTP_RESULT_KEY, bounded_http_result(status));
+    trace::set_status(&span, http_operation_outcome(status));
+    response
+}
+
+fn bounded_http_method(method: &Method) -> &'static str {
+    match method.as_str() {
+        "GET" => "GET",
+        "POST" => "POST",
+        "PATCH" => "PATCH",
+        "DELETE" => "DELETE",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        "PUT" => "PUT",
+        "TRACE" | "CONNECT" | "" => "other",
+        _custom_method => "other",
+    }
+}
+
+const fn bounded_http_result(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        100..=399 => "success",
+        400..=499 => "client_error",
+        500..=599 => "server_error",
+        0..=99 | 600..=u16::MAX => "other",
+    }
+}
+
+const fn http_operation_outcome(status: StatusCode) -> OperationOutcome {
+    match status.as_u16() {
+        100..=399 => OperationOutcome::Success,
+        400..=u16::MAX => OperationOutcome::Failure,
+        0..=99 => OperationOutcome::Failure,
+    }
 }
 
 /// The normalized result of serving after a graceful-shutdown request.
