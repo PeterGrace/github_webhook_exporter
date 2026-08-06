@@ -1,13 +1,17 @@
 //! Centralized trace policy for bounded span names, statuses, and identifiers.
 #![allow(dead_code)]
 
+use std::fmt;
+
 use opentelemetry::{trace::Status, KeyValue};
+use thiserror::Error;
 use tracing::{info_span, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::domain::{
     delivery::DeliveryId, merge_queue::PullRequestNumber, repository::RepositoryId,
 };
+use crate::metrics::QueueTransitionFailureReason;
 use crate::security::CanonicalRepositoryName;
 
 const TELEMETRY_TARGET: &str = "github_webhook_exporter";
@@ -22,6 +26,7 @@ const PULL_REQUEST_NUMBER_KEY: &str = "github.pull_request.number";
 const COMMIT_SHA_KEY: &str = "github.commit.sha";
 const DB_SYSTEM_NAME_KEY: &str = "db.system.name";
 const DB_OPERATION_NAME_KEY: &str = "db.operation.name";
+const COMMIT_SHA_LENGTH: usize = 40;
 
 /// A bounded high-level operation recorded in tracing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +61,49 @@ pub(crate) enum OperationOutcome {
     /// The operation failed.
     Failure,
 }
+
+/// A bounded commit SHA recorded in tracing.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CommitSha(String);
+
+impl CommitSha {
+    /// Parses a full 40-character ASCII hexadecimal commit SHA.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommitShaError`] when `value` is not exactly 40 ASCII hexadecimal characters.
+    pub(crate) fn parse(value: &str) -> Result<Self, CommitShaError> {
+        if value.len() != COMMIT_SHA_LENGTH {
+            return Err(CommitShaError);
+        }
+
+        let mut normalized = String::with_capacity(COMMIT_SHA_LENGTH);
+        for byte in value.bytes() {
+            if !byte.is_ascii_hexdigit() {
+                return Err(CommitShaError);
+            }
+            normalized.push(byte.to_ascii_lowercase() as char);
+        }
+
+        Ok(Self(normalized))
+    }
+
+    /// Returns the canonical lowercase hexadecimal commit SHA.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CommitSha {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CommitSha([REDACTED])")
+    }
+}
+
+/// A malformed commit SHA.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("commit SHA is not a valid 40-character hexadecimal string")]
+pub(crate) struct CommitShaError;
 
 /// A bounded SQLite operation recorded in tracing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,8 +216,8 @@ pub(crate) fn set_pull_request_number(span: &Span, number: PullRequestNumber) {
 ///
 /// * `span` - The active tracing span.
 /// * `sha` - The validated commit SHA.
-pub(crate) fn set_commit_sha(span: &Span, sha: &str) {
-    span.set_attribute(COMMIT_SHA_KEY, sha.to_owned());
+pub(crate) fn set_commit_sha(span: &Span, sha: &CommitSha) {
+    span.set_attribute(COMMIT_SHA_KEY, sha.as_str().to_owned());
 }
 
 /// Records the bounded terminal outcome and maps failure to an error status.
@@ -195,10 +243,10 @@ pub(crate) fn set_status(span: &Span, outcome: OperationOutcome) {
 ///
 /// * `span` - The active tracing span.
 /// * `reason` - A fixed failure reason from the bounded telemetry vocabulary.
-pub(crate) fn add_failure_event(span: &Span, reason: &'static str) {
+pub(crate) fn add_failure_event(span: &Span, reason: QueueTransitionFailureReason) {
     span.add_event(
         OPERATION_FAILURE_EVENT,
-        vec![KeyValue::new(FAILURE_REASON_KEY, reason)],
+        vec![KeyValue::new(FAILURE_REASON_KEY, reason.as_str())],
     );
 }
 
@@ -268,12 +316,13 @@ mod tests {
     };
     use crate::metrics::{
         Action, EventType, MergeGroupReason, MergeQueueOutcome, MergeQueueReason,
+        QueueTransitionFailureReason,
     };
     use crate::security::CanonicalRepositoryName;
 
     use super::{
         add_failure_event, database_span, operation_span, set_commit_sha, set_delivery_id,
-        set_pull_request_number, set_repository_id, set_repository_name, set_status,
+        set_pull_request_number, set_repository_id, set_repository_name, set_status, CommitSha,
         DatabaseOperation, Operation, OperationOutcome, COMMIT_SHA_KEY, DB_OPERATION_NAME_KEY,
         DB_SYSTEM_NAME_KEY, DELIVERY_ID_KEY, FAILURE_REASON_KEY, OPERATION_FAILURE_EVENT,
         OPERATION_OUTCOME_KEY, PULL_REQUEST_NUMBER_KEY, REPOSITORY_ID_KEY, REPOSITORY_NAME_KEY,
@@ -413,6 +462,36 @@ mod tests {
     }
 
     #[test]
+    fn commit_sha_parser_rejects_invalid_values_without_echoing_input() {
+        let commit_sha = CommitSha::parse("0123456789ABCDEF0123456789abcdef01234567")
+            .expect("mixed-case commit SHA is valid");
+        assert_eq!(
+            commit_sha.as_str(),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+
+        for invalid in [
+            "not-a-sha",
+            "0123456789abcdef0123456789abcdef0123456",
+            "g123456789abcdef0123456789abcdef0123456",
+        ] {
+            let error = CommitSha::parse(invalid).expect_err("invalid commit SHA is rejected");
+            let rendered = format!("{error}");
+            assert!(!rendered.contains(invalid));
+            assert_eq!(
+                rendered,
+                "commit SHA is not a valid 40-character hexadecimal string"
+            );
+        }
+
+        let error = CommitSha::parse("").expect_err("empty commit SHA is rejected");
+        assert_eq!(
+            error.to_string(),
+            "commit SHA is not a valid 40-character hexadecimal string"
+        );
+    }
+
+    #[test]
     fn operation_spans_keep_sensitive_identifiers_out_of_fmt_output_and_export_otlp_attributes() {
         let repository_name = CanonicalRepositoryName::new(TEST_REPOSITORY_NAME)
             .expect("test repository name is valid");
@@ -420,6 +499,7 @@ mod tests {
         let repository_id = RepositoryId::new(42).expect("test repository id is positive");
         let pull_request_number =
             PullRequestNumber::new(17).expect("test pull request number is positive");
+        let commit_sha = CommitSha::parse(TEST_COMMIT_SHA).expect("test commit SHA is valid");
         let output = SharedWriter::default();
         let (dispatch, exporter, provider) = test_subscriber(output.clone());
 
@@ -429,9 +509,12 @@ mod tests {
             set_repository_id(&request_span, repository_id);
             set_delivery_id(&request_span, &delivery_id);
             set_pull_request_number(&request_span, pull_request_number);
-            set_commit_sha(&request_span, TEST_COMMIT_SHA);
+            set_commit_sha(&request_span, &commit_sha);
             set_status(&request_span, OperationOutcome::Failure);
-            add_failure_event(&request_span, "missing_active_attempt");
+            add_failure_event(
+                &request_span,
+                QueueTransitionFailureReason::MissingActiveAttempt,
+            );
             drop(request_span);
 
             let database = database_span(DatabaseOperation::RepositoryCreate);
@@ -502,13 +585,109 @@ mod tests {
 
     #[test]
     fn bounded_metrics_enums_remain_closed_to_untrusted_input() {
-        assert_eq!(EventType::PullRequest.as_str(), "pull_request");
-        assert_eq!(Action::Opened.as_str(), "opened");
-        assert_eq!(MergeGroupReason::Merged.as_str(), "merged");
-        assert_eq!(MergeQueueOutcome::Succeeded.as_str(), "succeeded");
-        assert_eq!(
-            MergeQueueReason::PullRequestMerged.as_str(),
-            "pull_request_merged"
-        );
+        for (event_type, expected) in [
+            (EventType::BranchProtectionRule, "branch_protection_rule"),
+            (EventType::CheckRun, "check_run"),
+            (EventType::CheckSuite, "check_suite"),
+            (EventType::Create, "create"),
+            (EventType::Delete, "delete"),
+            (EventType::Deployment, "deployment"),
+            (EventType::DeploymentStatus, "deployment_status"),
+            (EventType::Discussion, "discussion"),
+            (EventType::DiscussionComment, "discussion_comment"),
+            (EventType::Issues, "issues"),
+            (EventType::IssueComment, "issue_comment"),
+            (EventType::MergeGroup, "merge_group"),
+            (EventType::PullRequest, "pull_request"),
+            (EventType::PullRequestReview, "pull_request_review"),
+            (
+                EventType::PullRequestReviewComment,
+                "pull_request_review_comment",
+            ),
+            (EventType::Push, "push"),
+            (EventType::Release, "release"),
+            (EventType::Repository, "repository"),
+            (EventType::Status, "status"),
+            (EventType::WorkflowJob, "workflow_job"),
+            (EventType::WorkflowRun, "workflow_run"),
+            (EventType::Other, "other"),
+        ] {
+            assert_eq!(event_type.as_str(), expected);
+        }
+
+        for (action, expected) in [
+            (Action::Assigned, "assigned"),
+            (Action::ChecksRequested, "checks_requested"),
+            (Action::Closed, "closed"),
+            (Action::Completed, "completed"),
+            (Action::Created, "created"),
+            (Action::Deleted, "deleted"),
+            (Action::Dequeued, "dequeued"),
+            (Action::Destroyed, "destroyed"),
+            (Action::Edited, "edited"),
+            (Action::Enqueued, "enqueued"),
+            (Action::InProgress, "in_progress"),
+            (Action::Labeled, "labeled"),
+            (Action::Opened, "opened"),
+            (Action::Published, "published"),
+            (Action::Queued, "queued"),
+            (Action::Reopened, "reopened"),
+            (Action::Requested, "requested"),
+            (Action::RequestedAction, "requested_action"),
+            (Action::Rerequested, "rerequested"),
+            (Action::Submitted, "submitted"),
+            (Action::Synchronize, "synchronize"),
+            (Action::Unassigned, "unassigned"),
+            (Action::Unlabeled, "unlabeled"),
+            (Action::Unpublished, "unpublished"),
+            (Action::Updated, "updated"),
+            (Action::Waiting, "waiting"),
+            (Action::None, "none"),
+            (Action::Other, "other"),
+        ] {
+            assert_eq!(action.as_str(), expected);
+        }
+
+        for (reason, expected) in [
+            (MergeGroupReason::None, "none"),
+            (MergeGroupReason::Merged, "merged"),
+            (MergeGroupReason::Dequeued, "dequeued"),
+            (MergeGroupReason::Invalidated, "invalidated"),
+            (MergeGroupReason::Other, "other"),
+        ] {
+            assert_eq!(reason.as_str(), expected);
+        }
+
+        for (outcome, expected) in [
+            (MergeQueueOutcome::Succeeded, "succeeded"),
+            (MergeQueueOutcome::Failed, "failed"),
+            (MergeQueueOutcome::Cancelled, "cancelled"),
+            (MergeQueueOutcome::Unknown, "unknown"),
+        ] {
+            assert_eq!(outcome.as_str(), expected);
+        }
+
+        for (reason, expected) in [
+            (MergeQueueReason::PullRequestMerged, "pull_request_merged"),
+            (
+                MergeQueueReason::UnclassifiedDequeue,
+                "unclassified_dequeue",
+            ),
+        ] {
+            assert_eq!(reason.as_str(), expected);
+        }
+
+        for (reason, expected) in [
+            (
+                QueueTransitionFailureReason::MissingActiveAttempt,
+                "missing_active_attempt",
+            ),
+            (
+                QueueTransitionFailureReason::InvalidDuration,
+                "invalid_duration",
+            ),
+        ] {
+            assert_eq!(reason.as_str(), expected);
+        }
     }
 }
