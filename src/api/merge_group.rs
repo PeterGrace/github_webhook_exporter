@@ -5,8 +5,9 @@ use crate::{
     api::pull_request::PullRequestProjection,
     metrics::{
         normalize_merge_group_destroyed_reason, Action, EventType, MergeGroupAction,
-        MergeGroupReason, Metrics,
+        MergeGroupReason,
     },
+    telemetry::trace::CommitSha,
 };
 
 /// Minimal authenticated payload fields needed for generic action and merge-group processing.
@@ -14,7 +15,21 @@ use crate::{
 pub(super) struct EventProjection {
     action: Option<String>,
     reason: Option<Value>,
+    merge_group: Option<MergeGroupProjection>,
     pull_request: Option<PullRequestProjection>,
+}
+
+#[derive(Deserialize)]
+struct MergeGroupProjection {
+    head_sha: Option<Value>,
+}
+
+/// A normalized authenticated merge-group transition ready for specialized telemetry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MergeGroupTransition {
+    pub(super) action: MergeGroupAction,
+    pub(super) reason: MergeGroupReason,
+    pub(super) head_sha: Option<CommitSha>,
 }
 
 impl EventProjection {
@@ -28,30 +43,26 @@ impl EventProjection {
         self.pull_request.as_ref()
     }
 
-    /// Records a supported specialized merge-group event using only bounded metric labels.
-    pub(super) fn process_merge_group(
+    /// Returns a supported merge-group transition using only bounded semantic values.
+    pub(super) fn merge_group_transition(
         &self,
         event_type: EventType,
         action: Action,
-        metrics: &Metrics,
-    ) {
+    ) -> Option<MergeGroupTransition> {
         if event_type != EventType::MergeGroup {
-            return;
+            return None;
         }
 
-        match action {
-            Action::ChecksRequested => metrics.record_merge_group_event(
-                MergeGroupAction::ChecksRequested,
-                MergeGroupReason::None,
-            ),
+        let (action, reason) = match action {
+            Action::ChecksRequested => (MergeGroupAction::ChecksRequested, MergeGroupReason::None),
             Action::Destroyed => {
                 // Missing, non-string, and unknown reasons intentionally share `other`; retaining
-                // their raw distinctions would weaken the bounded metric vocabulary.
+                // their raw distinctions would weaken the bounded telemetry vocabulary.
                 let reason = self.reason.as_ref().and_then(Value::as_str).map_or(
                     MergeGroupReason::Other,
                     normalize_merge_group_destroyed_reason,
                 );
-                metrics.record_merge_group_event(MergeGroupAction::Destroyed, reason);
+                (MergeGroupAction::Destroyed, reason)
             }
             Action::Assigned
             | Action::Closed
@@ -78,9 +89,18 @@ impl EventProjection {
             | Action::Updated
             | Action::Waiting
             | Action::None
-            | Action::Other => {
-                // Unsupported merge-group actions remain visible only through generic metrics.
-            }
-        }
+            | Action::Other => return None,
+        };
+        let head_sha = self
+            .merge_group
+            .as_ref()
+            .and_then(|group| group.head_sha.as_ref())
+            .and_then(Value::as_str)
+            .and_then(|sha| CommitSha::parse(sha).ok());
+        Some(MergeGroupTransition {
+            action,
+            reason,
+            head_sha,
+        })
     }
 }

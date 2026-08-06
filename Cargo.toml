@@ -8,7 +8,7 @@ authors = ["Peter Grace <pete.grace@gmail.com>"]
 aes = { version = "0.8", features = ["zeroize"] }
 aes-gcm = { version = "0.10", features = ["zeroize"] }
 anyhow = "1"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "tracing"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "matched-path", "tokio", "tracing"] }
 base64 = "0.22"
 hex = "0.4"
 hkdf = "0.12"

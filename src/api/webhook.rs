@@ -11,7 +11,7 @@ use axum::{
 };
 use serde::Deserialize;
 use time::OffsetDateTime;
-use tracing::{error, info};
+use tracing::{error, info, Instrument};
 
 use crate::{
     api::{merge_group::EventProjection, pull_request::QueueProcessor},
@@ -23,6 +23,7 @@ use crate::{
         CanonicalRepositoryName, WebhookAuthenticationError, WebhookAuthenticator, WebhookSignature,
     },
     storage::DeliveryClaim,
+    telemetry::trace::{self, Operation, OperationOutcome, QueueEntity},
 };
 
 const JSON_CONTENT_TYPE: HeaderValue = HeaderValue::from_static("application/json");
@@ -92,55 +93,110 @@ async fn webhook_handler(
     request: WebhookRequest,
 ) -> Result<Response, AppError> {
     let received_at = OffsetDateTime::now_utc();
-    let repository_id = match WebhookAuthenticator::new(state.repository_store())
+    let authentication_span = trace::operation_span(Operation::WebhookAuthenticate);
+    trace::set_repository_name(&authentication_span, &request.repository_name);
+    trace::set_delivery_id(&authentication_span, &request.delivery_id);
+    let authentication = WebhookAuthenticator::new(state.repository_store())
         .authenticate(
             &request.repository_name,
             &request.signature,
             request.body.as_ref(),
         )
-        .await
-    {
-        Ok(repository_id) => repository_id,
+        .instrument(authentication_span.clone())
+        .await;
+    let repository_id = match authentication {
+        Ok(repository_id) => {
+            trace::set_repository_id(&authentication_span, repository_id);
+            trace::set_status(&authentication_span, OperationOutcome::Success);
+            repository_id
+        }
         Err(WebhookAuthenticationError::Unauthorized) => {
+            trace::set_status(&authentication_span, OperationOutcome::Failure);
             return Err(AppError::unauthorized_webhook());
         }
         Err(WebhookAuthenticationError::Unavailable) => {
+            trace::set_status(&authentication_span, OperationOutcome::Failure);
             return Err(unavailable_error(&state, FailureStage::Authentication));
         }
     };
+    drop(authentication_span);
 
-    let event_projection: EventProjection =
-        serde_json::from_slice(&request.body).map_err(|_| AppError::invalid_webhook())?;
+    let process_span = trace::operation_span(Operation::WebhookProcess);
+    trace::set_repository_name(&process_span, &request.repository_name);
+    trace::set_repository_id(&process_span, repository_id);
+    trace::set_delivery_id(&process_span, &request.delivery_id);
+    let processing: Result<OperationOutcome, AppError> = async {
+        let event_projection: EventProjection =
+            serde_json::from_slice(&request.body).map_err(|_| AppError::invalid_webhook())?;
+        let event_type = normalize_event_type(&request.event_type);
+        let action = normalize_action(event_projection.action());
+        trace::set_webhook_event(&process_span, event_type, action);
 
-    match state.delivery_store().claim(&request.delivery_id).await {
-        Ok(DeliveryClaim::Duplicate) => state.metrics().record_duplicate(),
-        Ok(DeliveryClaim::New) => {
-            let event_type = normalize_event_type(&request.event_type);
-            let action = normalize_action(event_projection.action());
-            state
-                .metrics()
-                .observe_event(event_type, action, request.body.len());
-            event_projection.process_merge_group(event_type, action, state.metrics());
-            if let Some(pull_request) = event_projection.pull_request() {
-                let processor = QueueProcessor {
-                    repository_id,
-                    event_type,
-                    action,
-                    received_at,
-                    store: state.merge_queue_store(),
-                    metrics: state.metrics(),
-                };
-                if processor.process(pull_request).await.is_err() {
-                    record_queue_state_failure(&state);
-                }
+        let claim = state.delivery_store().claim(&request.delivery_id).await;
+        match claim {
+            Ok(DeliveryClaim::Duplicate) => {
+                state.metrics().record_duplicate();
+                Ok(OperationOutcome::Duplicate)
             }
-        }
-        Err(_) => {
-            return Err(unavailable_error(&state, FailureStage::DeliveryClaim));
+            Ok(DeliveryClaim::New) => {
+                state
+                    .metrics()
+                    .observe_event(event_type, action, request.body.len());
+                if let Some(transition) =
+                    event_projection.merge_group_transition(event_type, action)
+                {
+                    state
+                        .metrics()
+                        .record_merge_group_event(transition.action, transition.reason);
+                    let update_span = trace::operation_span(Operation::MergeQueueUpdate);
+                    trace::set_queue_entity(&update_span, QueueEntity::MergeGroup);
+                    trace::set_webhook_event(&update_span, event_type, action);
+                    trace::set_merge_group_transition(
+                        &update_span,
+                        transition.action,
+                        transition.reason,
+                    );
+                    trace::set_repository_name(&update_span, &request.repository_name);
+                    trace::set_repository_id(&update_span, repository_id);
+                    trace::set_delivery_id(&update_span, &request.delivery_id);
+                    if let Some(head_sha) = transition.head_sha.as_ref() {
+                        trace::set_commit_sha(&update_span, head_sha);
+                    }
+                    trace::set_status(&update_span, OperationOutcome::Success);
+                }
+                if let Some(pull_request) = event_projection.pull_request() {
+                    let processor = QueueProcessor {
+                        repository_id,
+                        repository_name: &request.repository_name,
+                        delivery_id: &request.delivery_id,
+                        event_type,
+                        action,
+                        received_at,
+                        store: state.merge_queue_store(),
+                        metrics: state.metrics(),
+                    };
+                    if processor.process(pull_request).await.is_err() {
+                        record_queue_state_failure(&state);
+                    }
+                }
+                Ok(OperationOutcome::Success)
+            }
+            Err(_) => Err(unavailable_error(&state, FailureStage::DeliveryClaim)),
         }
     }
+    .instrument(process_span.clone())
+    .await;
 
-    Ok(StatusCode::NO_CONTENT.into_response())
+    match processing {
+        Ok(outcome) => {
+            trace::set_status(&process_span, outcome);
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        Err(error) => {
+            trace::set_status(&process_span, OperationOutcome::Failure);
+            Err(error)
+        }
+    }
 }
 
 async fn observe_webhook_request(
@@ -152,7 +208,11 @@ async fn observe_webhook_request(
     let response = next.run(request).await;
     let result = result_for_status(response.status());
     metrics.observe_request(result, started_at.elapsed());
-    info!(result = result.as_str(), "GitHub webhook request processed");
+    info!(
+        parent: None,
+        result = result.as_str(),
+        "GitHub webhook request processed"
+    );
     response
 }
 
@@ -163,6 +223,7 @@ fn record_queue_state_failure(state: &AppState) {
         .correlation_id()
         .expect("webhook dependency failures carry a correlation ID");
     error!(
+        parent: None,
         stage = FailureStage::QueueState.as_str(),
         result = WebhookResult::Unavailable.as_str(),
         %error_correlation_id,
@@ -177,6 +238,7 @@ fn unavailable_error(state: &AppState, stage: FailureStage) -> AppError {
         .correlation_id()
         .expect("webhook dependency failures carry a correlation ID");
     error!(
+        parent: None,
         stage = stage.as_str(),
         result = WebhookResult::Unavailable.as_str(),
         %error_correlation_id,
@@ -224,6 +286,7 @@ fn result_for_status(status: StatusCode) -> WebhookResult {
     };
     if result.is_none() {
         error!(
+            parent: None,
             status = status.as_u16(),
             result = WebhookResult::Unavailable.as_str(),
             "unexpected GitHub webhook response status"

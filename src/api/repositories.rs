@@ -6,12 +6,14 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use crate::{
     app::AppState,
     domain::repository::{RepositoryId, RepositoryMetadata, RepositoryMutation},
     error::AppError,
     security::{CanonicalRepositoryName, RepositorySecret},
+    telemetry::trace::{self, ConfigOperation, Operation},
 };
 
 pub(super) fn router() -> Router<AppState> {
@@ -97,11 +99,16 @@ async fn create_repository(
         .map_err(|_| AppError::invalid_request())?;
     let webhook_secret =
         RepositorySecret::new(request.webhook_secret).map_err(|_| AppError::invalid_request())?;
-    let metadata = state
+    let write_span = repository_write_span(ConfigOperation::Create);
+    trace::set_repository_name(&write_span, &full_name);
+    let result = state
         .repository_store()
         .create(full_name, webhook_secret, request.enabled)
-        .await
-        .map_err(AppError::repository_store)?;
+        .instrument(write_span.clone())
+        .await;
+    trace::set_result_status(&write_span, &result);
+    let metadata = result.map_err(AppError::repository_store)?;
+    trace::set_repository_id(&write_span, metadata.id());
     state.metrics().increment_repository_configurations();
 
     Ok((
@@ -169,11 +176,17 @@ async fn update_repository(
         mutation = mutation.with_enabled(enabled);
     }
 
-    let metadata = state
+    let write_span = repository_write_span(ConfigOperation::Update);
+    trace::set_repository_id(&write_span, id);
+    let result = state
         .repository_store()
         .update(id, mutation)
-        .await
-        .map_err(AppError::repository_store)?;
+        .instrument(write_span.clone())
+        .await;
+    trace::set_result_status(&write_span, &result);
+    let metadata = result.map_err(AppError::repository_store)?;
+    trace::set_repository_id(&write_span, metadata.id());
+    trace::set_repository_name(&write_span, metadata.canonical_full_name());
     Ok(Json(RepositoryResponse::from(&metadata)).into_response())
 }
 
@@ -183,11 +196,15 @@ async fn delete_repository(
     Path(raw_id): Path<String>,
 ) -> Result<Response, AppError> {
     let id = parse_repository_id(&raw_id)?;
-    state
+    let write_span = repository_write_span(ConfigOperation::Delete);
+    trace::set_repository_id(&write_span, id);
+    let result = state
         .repository_store()
         .delete(id)
-        .await
-        .map_err(AppError::repository_store)?;
+        .instrument(write_span.clone())
+        .await;
+    trace::set_result_status(&write_span, &result);
+    result.map_err(AppError::repository_store)?;
     state.metrics().decrement_repository_configurations();
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -202,4 +219,10 @@ fn parse_repository_id(raw_id: &str) -> Result<RepositoryId, AppError> {
 
 const fn enabled_by_default() -> bool {
     true
+}
+
+fn repository_write_span(operation: ConfigOperation) -> tracing::Span {
+    let span = trace::operation_span(Operation::RepositoryWrite);
+    trace::set_config_operation(&span, operation);
+    span
 }

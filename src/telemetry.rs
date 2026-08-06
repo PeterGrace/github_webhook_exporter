@@ -3,6 +3,7 @@ use std::{io, sync::Arc};
 #[cfg(test)]
 mod otlp_test;
 mod queue;
+pub(crate) mod trace;
 
 use opentelemetry::{trace::TracerProvider as _, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
@@ -188,7 +189,11 @@ where
     let trace_layer = tracer_provider.as_ref().map(|provider| {
         tracing_opentelemetry::layer()
             .with_tracer(provider.tracer(INSTRUMENTATION_SCOPE))
-            .with_filter(filter_fn(application_metadata))
+            .with_location(false)
+            .with_threads(false)
+            .with_target(false)
+            .with_tracked_inactivity(false)
+            .with_filter(filter_fn(application_trace_metadata))
     });
     let log_layer = logger_provider.as_ref().map(|provider| {
         OpenTelemetryTracingBridge::new(provider).with_filter(filter_fn(application_metadata))
@@ -278,6 +283,10 @@ fn telemetry_resource(config: &TelemetryConfig) -> Resource {
 
 fn application_metadata(metadata: &Metadata<'_>) -> bool {
     is_application_target(metadata.target())
+}
+
+fn application_trace_metadata(metadata: &Metadata<'_>) -> bool {
+    metadata.is_span() && application_metadata(metadata)
 }
 
 fn is_application_target(target: &str) -> bool {

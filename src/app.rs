@@ -4,9 +4,15 @@ use std::{
     time::Duration,
 };
 
-use axum::Router;
+use axum::{
+    extract::{MatchedPath, Request},
+    middleware::{self, Next},
+    response::Response,
+    Router,
+};
 use sqlx::SqlitePool;
 use tokio::{net::TcpListener, sync::watch};
+use tracing::Instrument;
 
 use crate::{
     api, health,
@@ -14,6 +20,7 @@ use crate::{
     retention::{run_retention, RetentionConfig},
     security::AdminAuthenticator,
     storage::{DeliveryStore, MergeQueueStore, RepositoryStore},
+    telemetry::trace::{self, Operation},
 };
 
 /// Immutable dependencies shared by all HTTP request handlers.
@@ -95,11 +102,25 @@ impl AppState {
 pub fn build_router(state: AppState) -> Router {
     let webhook_body_limit_bytes = state.webhook_body_limit_bytes;
     let webhook_metrics = state.metrics.clone();
-    health::router(state.database_pool.clone()).merge(
-        api::router(webhook_body_limit_bytes, webhook_metrics)
-            .merge(metrics::router())
-            .with_state(state),
-    )
+    health::router(state.database_pool.clone())
+        .merge(
+            api::router(webhook_body_limit_bytes, webhook_metrics)
+                .merge(metrics::router())
+                .with_state(state),
+        )
+        .layer(middleware::from_fn(observe_http_request))
+}
+
+async fn observe_http_request(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let route = request.extensions().get::<MatchedPath>();
+    let span = trace::operation_span(Operation::HttpRequest);
+    trace::set_http_method(&span, &method);
+    trace::set_http_route(&span, route);
+
+    let response = next.run(request).instrument(span.clone()).await;
+    trace::set_http_response(&span, response.status());
+    response
 }
 
 /// The normalized result of serving after a graceful-shutdown request.

@@ -3,11 +3,12 @@ use std::{future::Future, time::Duration};
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::{sync::watch, time::Instant};
-use tracing::{info, warn};
+use tracing::{info, warn, Instrument};
 
 use crate::{
     error::ErrorCorrelationId,
     storage::{DeliveryStore, DeliveryStoreError, MergeQueueStore, MergeQueueStoreError},
+    telemetry::trace::{self, Operation, OperationOutcome},
 };
 
 const FULL_PRUNE_BATCH_SIZE: u64 = 1_000;
@@ -84,15 +85,40 @@ pub async fn run_retention(
             biased;
             () = wait_for_shutdown(&mut shutdown) => return,
             _ = ticker.tick() => {
-                prune_retention_pass(
+                run_traced_retention_pass(
                     &delivery_store,
                     &merge_queue_store,
                     config,
                     &shutdown,
-                ).await;
+                )
+                .await;
             }
         }
     }
+}
+
+async fn run_traced_retention_pass(
+    delivery_store: &DeliveryStore,
+    merge_queue_store: &MergeQueueStore,
+    config: RetentionConfig,
+    shutdown: &watch::Receiver<bool>,
+) {
+    let retention_span = trace::operation_span(Operation::RetentionRun);
+    let outcome = prune_retention_pass(delivery_store, merge_queue_store, config, shutdown)
+        .instrument(retention_span.clone())
+        .await;
+    trace::set_status(&retention_span, outcome.operation_outcome());
+}
+
+/// Runs exactly one traced retention pass for deterministic test coverage.
+#[cfg(test)]
+pub(crate) async fn run_retention_once(
+    delivery_store: &DeliveryStore,
+    merge_queue_store: &MergeQueueStore,
+    config: RetentionConfig,
+    shutdown: &watch::Receiver<bool>,
+) {
+    run_traced_retention_pass(delivery_store, merge_queue_store, config, shutdown).await;
 }
 
 async fn prune_retention_pass(
@@ -100,23 +126,80 @@ async fn prune_retention_pass(
     merge_queue_store: &MergeQueueStore,
     config: RetentionConfig,
     shutdown: &watch::Receiver<bool>,
-) {
+) -> RetentionPassOutcome {
     let pass_started_at = OffsetDateTime::now_utc();
-    prune_store(
+    prune_retention_workloads(
         delivery_store,
-        pass_started_at.checked_sub(config.delivery_retention),
-        shutdown,
-    )
-    .await;
-    if *shutdown.borrow() {
-        return;
-    }
-    prune_store(
         merge_queue_store,
+        pass_started_at.checked_sub(config.delivery_retention),
         pass_started_at.checked_sub(config.merge_queue_retention),
         shutdown,
     )
-    .await;
+    .await
+}
+
+async fn prune_retention_workloads<D, M>(
+    delivery_store: &D,
+    merge_queue_store: &M,
+    delivery_cutoff: Option<OffsetDateTime>,
+    merge_queue_cutoff: Option<OffsetDateTime>,
+    shutdown: &watch::Receiver<bool>,
+) -> RetentionPassOutcome
+where
+    D: PrunableStore,
+    M: PrunableStore,
+{
+    let delivery_outcome = prune_store(delivery_store, delivery_cutoff, shutdown).await;
+    if *shutdown.borrow() || delivery_outcome == StorePruneOutcome::Cancelled {
+        return RetentionPassOutcome::from_store_outcome(delivery_outcome)
+            .combine(StorePruneOutcome::Cancelled);
+    }
+
+    let merge_queue_outcome = prune_store(merge_queue_store, merge_queue_cutoff, shutdown).await;
+    RetentionPassOutcome::from_store_outcome(delivery_outcome).combine(merge_queue_outcome)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetentionPassOutcome {
+    Success,
+    Cancelled,
+    Failure,
+}
+
+impl RetentionPassOutcome {
+    fn from_store_outcome(outcome: StorePruneOutcome) -> Self {
+        match outcome {
+            StorePruneOutcome::Completed => Self::Success,
+            StorePruneOutcome::Cancelled => Self::Cancelled,
+            StorePruneOutcome::Failed => Self::Failure,
+        }
+    }
+
+    fn combine(self, outcome: StorePruneOutcome) -> Self {
+        match (self, outcome) {
+            (Self::Failure, StorePruneOutcome::Completed | StorePruneOutcome::Cancelled)
+            | (Self::Failure, StorePruneOutcome::Failed)
+            | (Self::Success | Self::Cancelled, StorePruneOutcome::Failed) => Self::Failure,
+            (Self::Cancelled, StorePruneOutcome::Completed | StorePruneOutcome::Cancelled)
+            | (Self::Success, StorePruneOutcome::Cancelled) => Self::Cancelled,
+            (Self::Success, StorePruneOutcome::Completed) => Self::Success,
+        }
+    }
+
+    fn operation_outcome(self) -> OperationOutcome {
+        match self {
+            Self::Success => OperationOutcome::Success,
+            Self::Cancelled => OperationOutcome::Cancelled,
+            Self::Failure => OperationOutcome::Failure,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorePruneOutcome {
+    Completed,
+    Cancelled,
+    Failed,
 }
 
 trait PrunableStore {
@@ -154,14 +237,15 @@ async fn prune_store<S: PrunableStore>(
     store: &S,
     cutoff: Option<OffsetDateTime>,
     shutdown: &watch::Receiver<bool>,
-) {
+) -> StorePruneOutcome {
     let Some(cutoff) = cutoff else {
         warn!(
+            parent: None,
             workload = S::WORKLOAD,
             outcome = "invalid_cutoff",
             "retention pass skipped"
         );
-        return;
+        return StorePruneOutcome::Failed;
     };
     let mut batches = 0_u64;
     let mut deleted = 0_u64;
@@ -169,13 +253,14 @@ async fn prune_store<S: PrunableStore>(
     loop {
         if *shutdown.borrow() {
             info!(
+                parent: None,
                 workload = S::WORKLOAD,
                 outcome = "cancelled",
                 batches,
                 deleted,
                 "retention pass stopped"
             );
-            return;
+            return StorePruneOutcome::Cancelled;
         }
         match store.prune_batch(cutoff).await {
             Ok(batch_deleted) => {
@@ -183,24 +268,26 @@ async fn prune_store<S: PrunableStore>(
                 deleted = deleted.saturating_add(batch_deleted);
                 if batch_deleted < FULL_PRUNE_BATCH_SIZE {
                     info!(
+                        parent: None,
                         workload = S::WORKLOAD,
                         outcome = "completed",
                         batches,
                         deleted,
                         "retention pass finished"
                     );
-                    return;
+                    return StorePruneOutcome::Completed;
                 }
             }
             Err(_error) => {
                 let error_correlation_id = ErrorCorrelationId::new();
                 warn!(
+                    parent: None,
                     workload = S::WORKLOAD,
                     outcome = "failed",
                     %error_correlation_id,
                     "retention pass failed"
                 );
-                return;
+                return StorePruneOutcome::Failed;
             }
         }
     }
@@ -243,7 +330,10 @@ mod tests {
 
     use crate::storage::{open_database, DeliveryStore, MergeQueueStore};
 
-    use super::{prune_expired_deliveries, run_retention, RetentionConfig, RetentionError};
+    use super::{
+        prune_expired_deliveries, run_retention, RetentionConfig, RetentionError,
+        RetentionPassOutcome, StorePruneOutcome,
+    };
 
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
@@ -276,6 +366,76 @@ mod tests {
 
         fn make_writer(&'writer self) -> Self::Writer {
             CapturedLogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    #[test]
+    fn store_outcomes_map_to_bounded_pass_outcomes() {
+        for (store_outcome, expected) in [
+            (StorePruneOutcome::Completed, RetentionPassOutcome::Success),
+            (
+                StorePruneOutcome::Cancelled,
+                RetentionPassOutcome::Cancelled,
+            ),
+            (StorePruneOutcome::Failed, RetentionPassOutcome::Failure),
+        ] {
+            assert_eq!(
+                RetentionPassOutcome::from_store_outcome(store_outcome),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn combined_pass_outcomes_prioritize_failure_then_cancellation() {
+        for (current, store_outcome, expected) in [
+            (
+                RetentionPassOutcome::Success,
+                StorePruneOutcome::Completed,
+                RetentionPassOutcome::Success,
+            ),
+            (
+                RetentionPassOutcome::Success,
+                StorePruneOutcome::Cancelled,
+                RetentionPassOutcome::Cancelled,
+            ),
+            (
+                RetentionPassOutcome::Success,
+                StorePruneOutcome::Failed,
+                RetentionPassOutcome::Failure,
+            ),
+            (
+                RetentionPassOutcome::Cancelled,
+                StorePruneOutcome::Completed,
+                RetentionPassOutcome::Cancelled,
+            ),
+            (
+                RetentionPassOutcome::Cancelled,
+                StorePruneOutcome::Cancelled,
+                RetentionPassOutcome::Cancelled,
+            ),
+            (
+                RetentionPassOutcome::Cancelled,
+                StorePruneOutcome::Failed,
+                RetentionPassOutcome::Failure,
+            ),
+            (
+                RetentionPassOutcome::Failure,
+                StorePruneOutcome::Completed,
+                RetentionPassOutcome::Failure,
+            ),
+            (
+                RetentionPassOutcome::Failure,
+                StorePruneOutcome::Cancelled,
+                RetentionPassOutcome::Failure,
+            ),
+            (
+                RetentionPassOutcome::Failure,
+                StorePruneOutcome::Failed,
+                RetentionPassOutcome::Failure,
+            ),
+        ] {
+            assert_eq!(current.combine(store_outcome), expected);
         }
     }
 
