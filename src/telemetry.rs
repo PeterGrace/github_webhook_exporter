@@ -4,6 +4,7 @@ use std::{io, sync::Arc};
 mod otlp_test;
 mod queue;
 pub(crate) mod trace;
+pub(crate) mod workflow;
 
 use opentelemetry::{trace::TracerProvider as _, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;

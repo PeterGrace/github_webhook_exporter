@@ -1,4 +1,5 @@
 //! Centralized trace policy for bounded span names, statuses, and identifiers.
+#![allow(dead_code)]
 
 use std::fmt;
 
@@ -17,6 +18,9 @@ use crate::metrics::{
     MergeQueueReason,
 };
 use crate::security::CanonicalRepositoryName;
+use crate::telemetry::workflow::{
+    DisplayName, TimingSource, WorkflowConclusion, WorkflowJobId, WorkflowRunAttempt, WorkflowRunId,
+};
 
 const TELEMETRY_TARGET: &str = "github_webhook_exporter";
 const SQLITE_SYSTEM_NAME: &str = "sqlite";
@@ -44,6 +48,118 @@ const DB_SYSTEM_NAME_KEY: &str = "db.system.name";
 const DB_OPERATION_NAME_KEY: &str = "db.operation.name";
 const SHA_1_HEX_LENGTH: usize = 40;
 const SHA_256_HEX_LENGTH: usize = 64;
+const CICD_PIPELINE_NAME_KEY: &str = "cicd.pipeline.name";
+const CICD_PIPELINE_RUN_ID_KEY: &str = "cicd.pipeline.run.id";
+const CICD_PIPELINE_TASK_NAME_KEY: &str = "cicd.pipeline.task.name";
+const CICD_PIPELINE_TASK_RUN_ID_KEY: &str = "cicd.pipeline.task.run.id";
+const CICD_PIPELINE_RESULT_KEY: &str = "cicd.pipeline.result";
+const CICD_PIPELINE_TASK_RUN_RESULT_KEY: &str = "cicd.pipeline.task.run.result";
+const GITHUB_WORKFLOW_CONCLUSION_KEY: &str = "github.workflow.conclusion";
+const GITHUB_WORKFLOW_RUN_ID_KEY: &str = "github.workflow.run.id";
+const GITHUB_WORKFLOW_RUN_ATTEMPT_KEY: &str = "github.workflow.run.attempt";
+const GITHUB_WORKFLOW_JOB_ID_KEY: &str = "github.workflow.job.id";
+const TIMING_SOURCE_KEY: &str = "timing_source";
+
+fn string_key_value(key: &'static str, value: impl Into<String>) -> KeyValue {
+    KeyValue::new(key, value.into())
+}
+
+fn decimal_string_key_value(key: &'static str, value: i64) -> KeyValue {
+    KeyValue::new(key, value.to_string())
+}
+
+fn set_key_value(span: &Span, attribute: KeyValue) {
+    span.set_attribute(attribute.key, attribute.value);
+}
+
+/// Returns the canonical repository-name attribute.
+pub(crate) fn repository_name_attribute(name: &CanonicalRepositoryName) -> KeyValue {
+    string_key_value(REPOSITORY_NAME_KEY, name.as_str())
+}
+
+/// Returns the delivery identifier attribute.
+pub(crate) fn delivery_id_attribute(id: &DeliveryId) -> KeyValue {
+    let mut buffer = uuid::Uuid::encode_buffer();
+    string_key_value(DELIVERY_ID_KEY, id.encode_lower(&mut buffer).to_owned())
+}
+
+/// Returns the pull-request number attribute.
+pub(crate) fn pull_request_number_attribute(number: PullRequestNumber) -> KeyValue {
+    decimal_string_key_value(PULL_REQUEST_NUMBER_KEY, number.get())
+}
+
+/// Returns the commit-SHA attribute.
+pub(crate) fn commit_sha_attribute(sha: &CommitSha) -> KeyValue {
+    string_key_value(COMMIT_SHA_KEY, sha.as_str())
+}
+
+/// Returns the operation-outcome attribute.
+pub(crate) fn operation_outcome_attribute(outcome: OperationOutcome) -> KeyValue {
+    string_key_value(OPERATION_OUTCOME_KEY, outcome.as_str())
+}
+
+/// Returns the workflow display-name attribute.
+pub(crate) fn workflow_name_attribute(name: &DisplayName) -> KeyValue {
+    string_key_value(CICD_PIPELINE_NAME_KEY, name.as_str())
+}
+
+/// Returns the workflow run identifier attribute.
+pub(crate) fn workflow_run_id_attribute(run_id: WorkflowRunId) -> KeyValue {
+    decimal_string_key_value(GITHUB_WORKFLOW_RUN_ID_KEY, run_id.get())
+}
+
+/// Returns the semantic-convention workflow run identifier attribute.
+pub(crate) fn workflow_pipeline_run_id_attribute(run_id: WorkflowRunId) -> KeyValue {
+    decimal_string_key_value(CICD_PIPELINE_RUN_ID_KEY, run_id.get())
+}
+
+/// Returns the workflow run-attempt attribute.
+pub(crate) fn workflow_run_attempt_attribute(run_attempt: WorkflowRunAttempt) -> KeyValue {
+    decimal_string_key_value(GITHUB_WORKFLOW_RUN_ATTEMPT_KEY, run_attempt.get())
+}
+
+/// Returns the workflow job identifier attribute.
+pub(crate) fn workflow_job_id_attribute(job_id: WorkflowJobId) -> KeyValue {
+    decimal_string_key_value(GITHUB_WORKFLOW_JOB_ID_KEY, job_id.get())
+}
+
+/// Returns the workflow job or step display-name attribute.
+pub(crate) fn workflow_task_name_attribute(name: &DisplayName) -> KeyValue {
+    string_key_value(CICD_PIPELINE_TASK_NAME_KEY, name.as_str())
+}
+
+/// Returns the workflow job or step run-identifier attribute.
+pub(crate) fn workflow_task_run_id_attribute(value: impl Into<String>) -> KeyValue {
+    string_key_value(CICD_PIPELINE_TASK_RUN_ID_KEY, value)
+}
+
+/// Returns the workflow conclusion attribute.
+pub(crate) fn workflow_conclusion_attribute(conclusion: WorkflowConclusion) -> KeyValue {
+    string_key_value(GITHUB_WORKFLOW_CONCLUSION_KEY, conclusion.as_str())
+}
+
+/// Returns the semantic-convention pipeline result attribute when one exists.
+pub(crate) fn workflow_pipeline_result_attribute(
+    conclusion: WorkflowConclusion,
+) -> Option<KeyValue> {
+    conclusion
+        .semantic_result()
+        .map(|result| string_key_value(CICD_PIPELINE_RESULT_KEY, result))
+}
+
+/// Returns the semantic-convention task-run result attribute when one exists.
+pub(crate) fn workflow_pipeline_task_run_result_attribute(
+    conclusion: WorkflowConclusion,
+) -> Option<KeyValue> {
+    conclusion
+        .semantic_result()
+        .map(|result| string_key_value(CICD_PIPELINE_TASK_RUN_RESULT_KEY, result))
+}
+
+/// Returns the timing-source attribute.
+pub(crate) fn timing_source_attribute(source: TimingSource) -> KeyValue {
+    string_key_value(TIMING_SOURCE_KEY, source.as_str())
+}
 
 /// A bounded high-level operation recorded in tracing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -387,7 +503,7 @@ pub(crate) fn set_merge_queue_completion(span: &Span, completion: MergeQueueComp
 /// * `span` - The active tracing span.
 /// * `name` - The validated canonical repository name.
 pub(crate) fn set_repository_name(span: &Span, name: &CanonicalRepositoryName) {
-    span.set_attribute(REPOSITORY_NAME_KEY, name.as_str().to_owned());
+    set_key_value(span, repository_name_attribute(name));
 }
 
 /// Records the repository database identifier as an OpenTelemetry span attribute.
@@ -407,8 +523,7 @@ pub(crate) fn set_repository_id(span: &Span, id: RepositoryId) {
 /// * `span` - The active tracing span.
 /// * `id` - The validated delivery UUID.
 pub(crate) fn set_delivery_id(span: &Span, id: &DeliveryId) {
-    let mut buffer = uuid::Uuid::encode_buffer();
-    span.set_attribute(DELIVERY_ID_KEY, id.encode_lower(&mut buffer).to_owned());
+    set_key_value(span, delivery_id_attribute(id));
 }
 
 /// Records the pull-request number as an OpenTelemetry span attribute.
@@ -418,7 +533,7 @@ pub(crate) fn set_delivery_id(span: &Span, id: &DeliveryId) {
 /// * `span` - The active tracing span.
 /// * `number` - The validated positive pull-request number.
 pub(crate) fn set_pull_request_number(span: &Span, number: PullRequestNumber) {
-    span.set_attribute(PULL_REQUEST_NUMBER_KEY, number.get());
+    set_key_value(span, pull_request_number_attribute(number));
 }
 
 /// Records the Git commit SHA as an OpenTelemetry span attribute.
@@ -428,7 +543,7 @@ pub(crate) fn set_pull_request_number(span: &Span, number: PullRequestNumber) {
 /// * `span` - The active tracing span.
 /// * `sha` - The validated commit SHA.
 pub(crate) fn set_commit_sha(span: &Span, sha: &CommitSha) {
-    span.set_attribute(COMMIT_SHA_KEY, sha.as_str().to_owned());
+    set_key_value(span, commit_sha_attribute(sha));
 }
 
 /// Records the bounded terminal outcome and maps failure to an error status.
@@ -438,7 +553,7 @@ pub(crate) fn set_commit_sha(span: &Span, sha: &CommitSha) {
 /// * `span` - The active tracing span.
 /// * `outcome` - The bounded operation outcome.
 pub(crate) fn set_status(span: &Span, outcome: OperationOutcome) {
-    span.set_attribute(OPERATION_OUTCOME_KEY, outcome.as_str());
+    set_key_value(span, operation_outcome_attribute(outcome));
     span.set_status(match outcome {
         OperationOutcome::Failure => Status::error("operation_failed"),
         OperationOutcome::Success
@@ -638,15 +753,27 @@ mod tests {
     use crate::security::CanonicalRepositoryName;
 
     use super::{
-        add_failure_event, database_span, operation_span, set_commit_sha, set_config_operation,
-        set_delivery_id, set_http_method, set_http_response, set_http_route,
-        set_pull_request_number, set_repository_id, set_repository_name, set_result_status,
-        set_status, CommitSha, ConfigOperation, DatabaseOperation, HttpMethod, HttpResult,
-        Operation, OperationFailureReason, OperationOutcome, QueueEntity, COMMIT_SHA_KEY,
-        CONFIG_OPERATION_KEY, DB_OPERATION_NAME_KEY, DB_SYSTEM_NAME_KEY, DELIVERY_ID_KEY,
-        FAILURE_REASON_KEY, HTTP_REQUEST_METHOD_KEY, HTTP_RESPONSE_STATUS_CODE_KEY,
-        HTTP_RESULT_KEY, HTTP_ROUTE_KEY, OPERATION_FAILURE_EVENT, OPERATION_OUTCOME_KEY,
-        PULL_REQUEST_NUMBER_KEY, REPOSITORY_ID_KEY, REPOSITORY_NAME_KEY, SQLITE_SYSTEM_NAME,
+        add_failure_event, commit_sha_attribute, database_span, delivery_id_attribute,
+        operation_outcome_attribute, operation_span, pull_request_number_attribute,
+        repository_name_attribute, set_commit_sha, set_config_operation, set_delivery_id,
+        set_http_method, set_http_response, set_http_route, set_pull_request_number,
+        set_repository_id, set_repository_name, set_result_status, set_status,
+        timing_source_attribute, workflow_conclusion_attribute, workflow_job_id_attribute,
+        workflow_name_attribute, workflow_pipeline_result_attribute,
+        workflow_pipeline_run_id_attribute, workflow_pipeline_task_run_result_attribute,
+        workflow_run_attempt_attribute, workflow_run_id_attribute, workflow_task_name_attribute,
+        workflow_task_run_id_attribute, CommitSha, ConfigOperation, DatabaseOperation, HttpMethod,
+        HttpResult, Operation, OperationFailureReason, OperationOutcome, QueueEntity, TimingSource,
+        WorkflowConclusion, WorkflowJobId, WorkflowRunAttempt, WorkflowRunId,
+        CICD_PIPELINE_NAME_KEY, CICD_PIPELINE_RESULT_KEY, CICD_PIPELINE_RUN_ID_KEY,
+        CICD_PIPELINE_TASK_NAME_KEY, CICD_PIPELINE_TASK_RUN_ID_KEY,
+        CICD_PIPELINE_TASK_RUN_RESULT_KEY, COMMIT_SHA_KEY, CONFIG_OPERATION_KEY,
+        DB_OPERATION_NAME_KEY, DB_SYSTEM_NAME_KEY, DELIVERY_ID_KEY, FAILURE_REASON_KEY,
+        GITHUB_WORKFLOW_CONCLUSION_KEY, GITHUB_WORKFLOW_JOB_ID_KEY,
+        GITHUB_WORKFLOW_RUN_ATTEMPT_KEY, GITHUB_WORKFLOW_RUN_ID_KEY, HTTP_REQUEST_METHOD_KEY,
+        HTTP_RESPONSE_STATUS_CODE_KEY, HTTP_RESULT_KEY, HTTP_ROUTE_KEY, OPERATION_FAILURE_EVENT,
+        OPERATION_OUTCOME_KEY, PULL_REQUEST_NUMBER_KEY, REPOSITORY_ID_KEY, REPOSITORY_NAME_KEY,
+        SQLITE_SYSTEM_NAME, TIMING_SOURCE_KEY,
     };
 
     const TEST_DELIVERY_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -1054,6 +1181,101 @@ mod tests {
         assert!(!stderr.contains("owner/private-repository"));
         assert!(!stderr.contains(TEST_DELIVERY_ID));
         assert!(!stderr.contains(TEST_COMMIT_SHA));
+    }
+
+    #[test]
+    fn workflow_attribute_builders_export_bounded_values() {
+        let repository_name = CanonicalRepositoryName::new(TEST_REPOSITORY_NAME)
+            .expect("test repository name is valid");
+        let delivery_id = DeliveryId::parse(TEST_DELIVERY_ID).expect("test delivery UUID is valid");
+        let commit_sha = CommitSha::parse(TEST_COMMIT_SHA).expect("test commit SHA is valid");
+        let workflow_name = crate::telemetry::workflow::DisplayName::sanitize("Build\nWorkflow")
+            .expect("workflow name sanitizes");
+        let job_name = crate::telemetry::workflow::DisplayName::sanitize("Linux\tJob")
+            .expect("job name sanitizes");
+        let run_id = WorkflowRunId::new(31).expect("workflow run id is positive");
+        let run_attempt = WorkflowRunAttempt::new(2).expect("workflow run attempt is positive");
+        let job_id = WorkflowJobId::new(41).expect("workflow job id is positive");
+        let pull_request_number =
+            PullRequestNumber::new(17).expect("test pull request number is positive");
+
+        let workflow_name_kv = workflow_name_attribute(&workflow_name);
+        assert_eq!(workflow_name_kv.key.as_str(), CICD_PIPELINE_NAME_KEY);
+        assert_eq!(workflow_name_kv.value.as_str().as_ref(), "BuildWorkflow");
+
+        let workflow_task_name_kv = workflow_task_name_attribute(&job_name);
+        assert_eq!(
+            workflow_task_name_kv.key.as_str(),
+            CICD_PIPELINE_TASK_NAME_KEY
+        );
+        assert_eq!(workflow_task_name_kv.value.as_str().as_ref(), "LinuxJob");
+
+        let run_id_kv = workflow_run_id_attribute(run_id);
+        assert_eq!(run_id_kv.key.as_str(), GITHUB_WORKFLOW_RUN_ID_KEY);
+        assert_eq!(run_id_kv.value.as_str().as_ref(), "31");
+
+        let pipeline_run_id_kv = workflow_pipeline_run_id_attribute(run_id);
+        assert_eq!(pipeline_run_id_kv.key.as_str(), CICD_PIPELINE_RUN_ID_KEY);
+        assert_eq!(pipeline_run_id_kv.value.as_str().as_ref(), "31");
+
+        let attempt_kv = workflow_run_attempt_attribute(run_attempt);
+        assert_eq!(attempt_kv.key.as_str(), GITHUB_WORKFLOW_RUN_ATTEMPT_KEY);
+        assert_eq!(attempt_kv.value.as_str().as_ref(), "2");
+
+        let job_id_kv = workflow_job_id_attribute(job_id);
+        assert_eq!(job_id_kv.key.as_str(), GITHUB_WORKFLOW_JOB_ID_KEY);
+        assert_eq!(job_id_kv.value.as_str().as_ref(), "41");
+
+        let task_run_id_kv = workflow_task_run_id_attribute(format!("{}:3", job_id.get()));
+        assert_eq!(task_run_id_kv.key.as_str(), CICD_PIPELINE_TASK_RUN_ID_KEY);
+        assert_eq!(task_run_id_kv.value.as_str().as_ref(), "41:3");
+
+        let conclusion_kv = workflow_conclusion_attribute(WorkflowConclusion::Cancelled);
+        assert_eq!(conclusion_kv.key.as_str(), GITHUB_WORKFLOW_CONCLUSION_KEY);
+        assert_eq!(conclusion_kv.value.as_str().as_ref(), "cancelled");
+
+        let result_kv = workflow_pipeline_result_attribute(WorkflowConclusion::Cancelled)
+            .expect("cancelled has a semantic result");
+        assert_eq!(result_kv.key.as_str(), CICD_PIPELINE_RESULT_KEY);
+        assert_eq!(result_kv.value.as_str().as_ref(), "cancellation");
+
+        let task_result_kv =
+            workflow_pipeline_task_run_result_attribute(WorkflowConclusion::TimedOut)
+                .expect("timed out has a semantic result");
+        assert_eq!(
+            task_result_kv.key.as_str(),
+            CICD_PIPELINE_TASK_RUN_RESULT_KEY
+        );
+        assert_eq!(task_result_kv.value.as_str().as_ref(), "timeout");
+        assert!(workflow_pipeline_result_attribute(WorkflowConclusion::Neutral).is_none());
+        assert!(workflow_pipeline_task_run_result_attribute(WorkflowConclusion::Other).is_none());
+
+        let timing_source_kv = timing_source_attribute(TimingSource::Fallback);
+        assert_eq!(timing_source_kv.key.as_str(), TIMING_SOURCE_KEY);
+        assert_eq!(timing_source_kv.value.as_str().as_ref(), "fallback");
+
+        let repository_name_kv = repository_name_attribute(&repository_name);
+        assert_eq!(repository_name_kv.key.as_str(), REPOSITORY_NAME_KEY);
+        assert_eq!(
+            repository_name_kv.value.as_str().as_ref(),
+            repository_name.as_str()
+        );
+
+        let delivery_id_kv = delivery_id_attribute(&delivery_id);
+        assert_eq!(delivery_id_kv.key.as_str(), DELIVERY_ID_KEY);
+        assert_eq!(delivery_id_kv.value.as_str().as_ref(), TEST_DELIVERY_ID);
+
+        let pull_request_number_kv = pull_request_number_attribute(pull_request_number);
+        assert_eq!(pull_request_number_kv.key.as_str(), PULL_REQUEST_NUMBER_KEY);
+        assert_eq!(pull_request_number_kv.value.as_str().as_ref(), "17");
+
+        let commit_sha_kv = commit_sha_attribute(&commit_sha);
+        assert_eq!(commit_sha_kv.key.as_str(), COMMIT_SHA_KEY);
+        assert_eq!(commit_sha_kv.value.as_str().as_ref(), TEST_COMMIT_SHA);
+
+        let outcome_kv = operation_outcome_attribute(OperationOutcome::Failure);
+        assert_eq!(outcome_kv.key.as_str(), OPERATION_OUTCOME_KEY);
+        assert_eq!(outcome_kv.value.as_str().as_ref(), "failure");
     }
 
     #[test]
