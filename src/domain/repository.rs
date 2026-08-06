@@ -58,6 +58,11 @@ impl RepositoryMetadata {
         self.full_name.as_str()
     }
 
+    /// Returns the validated repository name value object for internal typed integrations.
+    pub(crate) fn canonical_full_name(&self) -> &CanonicalRepositoryName {
+        &self.full_name
+    }
+
     /// Returns whether webhook processing is enabled.
     pub fn enabled(&self) -> bool {
         self.enabled
@@ -129,12 +134,30 @@ impl RepositoryMutation {
 
 #[cfg(test)]
 mod tests {
-    use super::RepositoryId;
+    use crate::security::CanonicalRepositoryName;
+
+    use super::{RepositoryId, RepositoryMetadata};
 
     #[test]
     fn repository_ids_are_positive_sqlite_integers() {
         assert_eq!(RepositoryId::new(1).map(RepositoryId::get), Some(1));
         assert_eq!(RepositoryId::new(0), None);
         assert_eq!(RepositoryId::new(-1), None);
+    }
+
+    #[test]
+    fn repository_metadata_exposes_canonical_name_without_raw_string_setters() {
+        let id = RepositoryId::new(1).expect("repository id is positive");
+        let full_name =
+            CanonicalRepositoryName::new("Owner/Repository").expect("repository name is valid");
+        let metadata = RepositoryMetadata::from_database(
+            id,
+            full_name,
+            true,
+            "2026-08-05T00:00:00Z".to_owned(),
+            "2026-08-05T00:00:00Z".to_owned(),
+        );
+
+        assert_eq!(metadata.canonical_full_name().as_str(), "owner/repository");
     }
 }

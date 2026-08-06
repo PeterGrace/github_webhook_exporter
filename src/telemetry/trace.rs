@@ -3,6 +3,8 @@
 
 use std::fmt;
 
+use axum::extract::MatchedPath;
+use http::{Method, StatusCode};
 use opentelemetry::{trace::Status, KeyValue};
 use thiserror::Error;
 use tracing::{info_span, Span};
@@ -19,6 +21,11 @@ const SQLITE_SYSTEM_NAME: &str = "sqlite";
 const OPERATION_FAILURE_EVENT: &str = "operation.failure";
 const OPERATION_OUTCOME_KEY: &str = "ghe.operation.outcome";
 const FAILURE_REASON_KEY: &str = "ghe.failure.reason";
+const HTTP_REQUEST_METHOD_KEY: &str = "http.request.method";
+const HTTP_ROUTE_KEY: &str = "http.route";
+const HTTP_RESPONSE_STATUS_CODE_KEY: &str = "http.response.status_code";
+const HTTP_RESULT_KEY: &str = "ghe.http.result";
+const CONFIG_OPERATION_KEY: &str = "ghe.config.operation";
 const REPOSITORY_NAME_KEY: &str = "github.repository.name";
 const REPOSITORY_ID_KEY: &str = "github.repository.id";
 const DELIVERY_ID_KEY: &str = "github.delivery.id";
@@ -60,6 +67,51 @@ pub(crate) enum OperationOutcome {
     Cancelled,
     /// The operation failed.
     Failure,
+}
+
+/// A bounded HTTP method recorded in tracing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HttpMethod {
+    /// HTTP GET.
+    Get,
+    /// HTTP POST.
+    Post,
+    /// HTTP PATCH.
+    Patch,
+    /// HTTP DELETE.
+    Delete,
+    /// HTTP HEAD.
+    Head,
+    /// HTTP OPTIONS.
+    Options,
+    /// HTTP PUT.
+    Put,
+    /// Any method outside the approved telemetry vocabulary.
+    Other,
+}
+
+/// A bounded HTTP response class recorded in tracing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HttpResult {
+    /// HTTP informational, success, or redirect response.
+    Success,
+    /// HTTP client error response.
+    ClientError,
+    /// HTTP server error response.
+    ServerError,
+    /// Any extension status code outside the approved response classes.
+    Other,
+}
+
+/// A bounded repository-configuration operation recorded in tracing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigOperation {
+    /// Create a repository configuration.
+    Create,
+    /// Update a repository configuration.
+    Update,
+    /// Delete a repository configuration.
+    Delete,
 }
 
 /// A bounded commit SHA recorded in tracing.
@@ -169,6 +221,59 @@ pub(crate) fn database_span(operation: DatabaseOperation) -> Span {
     span
 }
 
+/// Records the bounded HTTP method as an OpenTelemetry span attribute.
+///
+/// # Parameters
+///
+/// * `span` - The active tracing span.
+/// * `method` - The HTTP method to map into the fixed telemetry vocabulary.
+pub(crate) fn set_http_method(span: &Span, method: &Method) {
+    span.set_attribute(
+        HTTP_REQUEST_METHOD_KEY,
+        HttpMethod::from_method(method).as_str(),
+    );
+}
+
+/// Records the matched route template as an OpenTelemetry span attribute.
+///
+/// # Parameters
+///
+/// * `span` - The active tracing span.
+/// * `matched_path` - The route template captured by Axum, or `None` for unmatched routes.
+///
+/// This helper intentionally accepts only Axum's [`MatchedPath`] or `None`; callers cannot pass
+/// raw request paths, query strings, or arbitrary identifiers into the route attribute.
+pub(crate) fn set_http_route(span: &Span, matched_path: Option<&MatchedPath>) {
+    span.set_attribute(
+        HTTP_ROUTE_KEY,
+        matched_path
+            .map_or("unmatched", MatchedPath::as_str)
+            .to_owned(),
+    );
+}
+
+/// Records the HTTP status code and bounded response class as OpenTelemetry span attributes.
+///
+/// # Parameters
+///
+/// * `span` - The active tracing span.
+/// * `status` - The HTTP response status to classify.
+pub(crate) fn set_http_response(span: &Span, status: StatusCode) {
+    span.set_attribute(HTTP_RESPONSE_STATUS_CODE_KEY, i64::from(status.as_u16()));
+    span.set_attribute(HTTP_RESULT_KEY, HttpResult::from_status(status).as_str());
+    set_status(span, http_operation_outcome(status));
+}
+
+/// Records the bounded repository-configuration operation as an OpenTelemetry span attribute.
+///
+/// # Parameters
+///
+/// * `span` - The active tracing span.
+/// * `operation` - The fixed configuration operation vocabulary value.
+pub(crate) fn set_config_operation(span: &Span, operation: ConfigOperation) {
+    span.set_attribute(CONFIG_OPERATION_KEY, operation.as_str());
+}
+
 /// Records the canonical repository name as an OpenTelemetry span attribute.
 ///
 /// # Parameters
@@ -237,6 +342,21 @@ pub(crate) fn set_status(span: &Span, outcome: OperationOutcome) {
     });
 }
 
+/// Records a success or failure outcome from a typed [`Result`].
+///
+/// # Parameters
+///
+/// * `span` - The active tracing span.
+/// * `result` - The operation result to classify without recording error details.
+pub(crate) fn set_result_status<T, E>(span: &Span, result: &Result<T, E>) {
+    let outcome = if result.is_ok() {
+        OperationOutcome::Success
+    } else {
+        OperationOutcome::Failure
+    };
+    set_status(span, outcome);
+}
+
 /// Adds a bounded failure event to the active span.
 ///
 /// # Parameters
@@ -275,6 +395,78 @@ impl OperationOutcome {
             Self::Cancelled => "cancelled",
             Self::Failure => "failure",
         }
+    }
+}
+
+impl HttpMethod {
+    /// Maps an HTTP method to the fixed telemetry vocabulary.
+    pub(crate) fn from_method(method: &Method) -> Self {
+        match method.as_str() {
+            "GET" => Self::Get,
+            "POST" => Self::Post,
+            "PATCH" => Self::Patch,
+            "DELETE" => Self::Delete,
+            "HEAD" => Self::Head,
+            "OPTIONS" => Self::Options,
+            "PUT" => Self::Put,
+            "TRACE" | "CONNECT" | "" => Self::Other,
+            _custom_method => Self::Other,
+        }
+    }
+
+    /// Returns the fixed HTTP method value.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Patch => "PATCH",
+            Self::Delete => "DELETE",
+            Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
+            Self::Put => "PUT",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl HttpResult {
+    /// Maps an HTTP status code to the fixed telemetry response class.
+    pub(crate) const fn from_status(status: StatusCode) -> Self {
+        match status.as_u16() {
+            100..=399 => Self::Success,
+            400..=499 => Self::ClientError,
+            500..=599 => Self::ServerError,
+            0..=99 | 600..=u16::MAX => Self::Other,
+        }
+    }
+
+    /// Returns the fixed HTTP response class value.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::ClientError => "client_error",
+            Self::ServerError => "server_error",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl ConfigOperation {
+    /// Returns the fixed repository-configuration operation value.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+const fn http_operation_outcome(status: StatusCode) -> OperationOutcome {
+    match status.as_u16() {
+        100..=399 => OperationOutcome::Success,
+        400..=u16::MAX => OperationOutcome::Failure,
+        0..=99 => OperationOutcome::Failure,
     }
 }
 
@@ -321,10 +513,13 @@ mod tests {
     use crate::security::CanonicalRepositoryName;
 
     use super::{
-        add_failure_event, database_span, operation_span, set_commit_sha, set_delivery_id,
-        set_pull_request_number, set_repository_id, set_repository_name, set_status, CommitSha,
-        DatabaseOperation, Operation, OperationOutcome, COMMIT_SHA_KEY, DB_OPERATION_NAME_KEY,
-        DB_SYSTEM_NAME_KEY, DELIVERY_ID_KEY, FAILURE_REASON_KEY, OPERATION_FAILURE_EVENT,
+        add_failure_event, database_span, operation_span, set_commit_sha, set_config_operation,
+        set_delivery_id, set_http_method, set_http_response, set_http_route,
+        set_pull_request_number, set_repository_id, set_repository_name, set_result_status,
+        set_status, CommitSha, ConfigOperation, DatabaseOperation, HttpMethod, HttpResult,
+        Operation, OperationOutcome, COMMIT_SHA_KEY, CONFIG_OPERATION_KEY, DB_OPERATION_NAME_KEY,
+        DB_SYSTEM_NAME_KEY, DELIVERY_ID_KEY, FAILURE_REASON_KEY, HTTP_REQUEST_METHOD_KEY,
+        HTTP_RESPONSE_STATUS_CODE_KEY, HTTP_RESULT_KEY, HTTP_ROUTE_KEY, OPERATION_FAILURE_EVENT,
         OPERATION_OUTCOME_KEY, PULL_REQUEST_NUMBER_KEY, REPOSITORY_ID_KEY, REPOSITORY_NAME_KEY,
         SQLITE_SYSTEM_NAME,
     };
@@ -436,6 +631,39 @@ mod tests {
             assert_eq!(outcome.as_str(), expected);
         }
 
+        let http_methods = [
+            (HttpMethod::Get, "GET"),
+            (HttpMethod::Post, "POST"),
+            (HttpMethod::Patch, "PATCH"),
+            (HttpMethod::Delete, "DELETE"),
+            (HttpMethod::Head, "HEAD"),
+            (HttpMethod::Options, "OPTIONS"),
+            (HttpMethod::Put, "PUT"),
+            (HttpMethod::Other, "other"),
+        ];
+        for (method, expected) in http_methods {
+            assert_eq!(method.as_str(), expected);
+        }
+
+        let http_results = [
+            (HttpResult::Success, "success"),
+            (HttpResult::ClientError, "client_error"),
+            (HttpResult::ServerError, "server_error"),
+            (HttpResult::Other, "other"),
+        ];
+        for (result, expected) in http_results {
+            assert_eq!(result.as_str(), expected);
+        }
+
+        let config_operations = [
+            (ConfigOperation::Create, "create"),
+            (ConfigOperation::Update, "update"),
+            (ConfigOperation::Delete, "delete"),
+        ];
+        for (operation, expected) in config_operations {
+            assert_eq!(operation.as_str(), expected);
+        }
+
         let database_operations = [
             (DatabaseOperation::RepositoryCount, "repository.count"),
             (DatabaseOperation::RepositoryCreate, "repository.create"),
@@ -459,6 +687,109 @@ mod tests {
         for (operation, expected) in database_operations {
             assert_eq!(operation.as_str(), expected);
         }
+    }
+
+    #[test]
+    fn http_and_config_helpers_export_only_bounded_values() {
+        let output = SharedWriter::default();
+        let (dispatch, exporter, provider) = test_subscriber(output);
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            let success_span = operation_span(Operation::HttpRequest);
+            set_http_method(&success_span, &http::Method::POST);
+            set_http_route(&success_span, None);
+            set_http_response(&success_span, http::StatusCode::CREATED);
+            drop(success_span);
+
+            let client_error_span = operation_span(Operation::HttpRequest);
+            set_http_method(
+                &client_error_span,
+                &http::Method::from_bytes(b"BREW").expect("custom method is valid"),
+            );
+            set_http_route(&client_error_span, None);
+            set_http_response(&client_error_span, http::StatusCode::BAD_REQUEST);
+            drop(client_error_span);
+
+            let server_error_span = operation_span(Operation::HttpRequest);
+            set_http_method(&server_error_span, &http::Method::GET);
+            set_http_route(&server_error_span, None);
+            set_http_response(&server_error_span, http::StatusCode::INTERNAL_SERVER_ERROR);
+            drop(server_error_span);
+
+            let other_span = operation_span(Operation::HttpRequest);
+            set_http_method(&other_span, &http::Method::TRACE);
+            set_http_route(&other_span, None);
+            set_http_response(
+                &other_span,
+                http::StatusCode::from_u16(700).expect("700 is an extension status code"),
+            );
+            drop(other_span);
+
+            let repository_span = operation_span(Operation::RepositoryWrite);
+            set_config_operation(&repository_span, ConfigOperation::Update);
+            let result: Result<(), ()> = Err(());
+            set_result_status(&repository_span, &result);
+            drop(repository_span);
+        });
+
+        provider.force_flush().expect("spans flush");
+        let spans = exporter.finished_spans();
+
+        assert!(spans.iter().any(|span| {
+            span.name.as_ref() == "http.request"
+                && span.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == HTTP_REQUEST_METHOD_KEY
+                        && attribute.value.as_str().as_ref() == "POST"
+                })
+                && span.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == HTTP_ROUTE_KEY
+                        && attribute.value.as_str().as_ref() == "unmatched"
+                })
+                && span.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == HTTP_RESPONSE_STATUS_CODE_KEY
+                        && attribute.value.as_str().as_ref() == "201"
+                })
+                && span.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == HTTP_RESULT_KEY
+                        && attribute.value.as_str().as_ref() == HttpResult::Success.as_str()
+                })
+        }));
+        assert!(spans.iter().any(|span| {
+            span.name.as_ref() == "http.request"
+                && span.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == HTTP_REQUEST_METHOD_KEY
+                        && attribute.value.as_str().as_ref() == HttpMethod::Other.as_str()
+                })
+                && span.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == HTTP_RESULT_KEY
+                        && attribute.value.as_str().as_ref() == HttpResult::ClientError.as_str()
+                })
+        }));
+        assert!(spans.iter().any(|span| {
+            span.name.as_ref() == "http.request"
+                && span.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == HTTP_RESULT_KEY
+                        && attribute.value.as_str().as_ref() == HttpResult::ServerError.as_str()
+                })
+        }));
+        assert!(spans.iter().any(|span| {
+            span.name.as_ref() == "http.request"
+                && span.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == HTTP_RESULT_KEY
+                        && attribute.value.as_str().as_ref() == HttpResult::Other.as_str()
+                })
+        }));
+        assert!(spans.iter().any(|span| {
+            span.name.as_ref() == "config.repository.write"
+                && span.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == CONFIG_OPERATION_KEY
+                        && attribute.value.as_str().as_ref() == ConfigOperation::Update.as_str()
+                })
+                && span.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == OPERATION_OUTCOME_KEY
+                        && attribute.value.as_str().as_ref() == OperationOutcome::Failure.as_str()
+                })
+        }));
     }
 
     #[test]
