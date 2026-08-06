@@ -207,7 +207,11 @@ async fn observe_webhook_request(
     let response = next.run(request).await;
     let result = result_for_status(response.status());
     metrics.observe_request(result, started_at.elapsed());
-    info!(result = result.as_str(), "GitHub webhook request processed");
+    info!(
+        parent: None,
+        result = result.as_str(),
+        "GitHub webhook request processed"
+    );
     response
 }
 
@@ -218,6 +222,7 @@ fn record_queue_state_failure(state: &AppState) {
         .correlation_id()
         .expect("webhook dependency failures carry a correlation ID");
     error!(
+        parent: None,
         stage = FailureStage::QueueState.as_str(),
         result = WebhookResult::Unavailable.as_str(),
         %error_correlation_id,
@@ -232,6 +237,7 @@ fn unavailable_error(state: &AppState, stage: FailureStage) -> AppError {
         .correlation_id()
         .expect("webhook dependency failures carry a correlation ID");
     error!(
+        parent: None,
         stage = stage.as_str(),
         result = WebhookResult::Unavailable.as_str(),
         %error_correlation_id,
@@ -279,6 +285,7 @@ fn result_for_status(status: StatusCode) -> WebhookResult {
     };
     if result.is_none() {
         error!(
+            parent: None,
             status = status.as_u16(),
             result = WebhookResult::Unavailable.as_str(),
             "unexpected GitHub webhook response status"

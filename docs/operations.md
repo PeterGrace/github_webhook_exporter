@@ -45,6 +45,49 @@ failure can silently discard remote telemetry. Issue
 counters and diagnostics. Final graceful provider shutdown and application-wide spans are also
 delivered by later Phase 4 work.
 
+## Exported core traces
+
+The core trace vocabulary contains six stable service operations:
+
+- `http.request`: one root for each HTTP request.
+- `github.webhook.authenticate`: repository lookup and HMAC authentication under the request root.
+- `github.webhook.process`: payload projection, durable delivery claim, and bounded event processing
+  under an authenticated request.
+- `config.repository.write`: create, update, or delete persistence under an administrator API
+  request.
+- `sqlite.query`: one child for each logical repository, delivery, or merge-queue store operation.
+- `merge_queue.update`: one specialized merge-group or pull-request transition under webhook
+  processing.
+
+Each scheduled delivery and merge-queue pruning pass emits an independent `retention.run` root.
+Its `delivery.prune` and `merge_queue.prune` SQLite operations are children of that root, even when
+the retention task is started from a context that contains another span.
+
+`http.route` contains the Axum route template, such as `/api/v1/repositories/{id}`. Unmatched
+requests use the fixed value `unmatched`. Raw paths, query strings, and URLs are not trace
+attributes. HTTP methods, response classes, repository operations, webhook event/action values,
+database operations, merge-group reasons, queue outcomes/reasons, terminal outcomes, and failure
+events use closed bounded vocabularies.
+
+Repository names and database identifiers, delivery identifiers, pull-request numbers, and valid
+full commit SHAs are diagnostic trace span attributes only. They are excluded from structured
+stderr, OTLP application logs, and Prometheus exposition. Workflow run, run-attempt, and job
+identifiers remain deferred to issue
+[#10](https://github.com/PeterGrace/github_webhook_exporter/issues/10), which shares the same
+span-only identifier boundary.
+
+Duplicate delivery claims emit an authentication span and a process span with outcome `duplicate`,
+but no second `merge_queue.update` span or specialized outcome. Queue-state persistence failures
+retain the authenticated `204 No Content` response and emit only error status plus an
+`operation.failure` event with bounded reason `queue_state`. A merge-group `destroyed` event with
+reason `dequeued` records normalized group reason `dequeued`; a pull-request dequeue records outcome
+`unknown` and reason `unclassified_dequeue`. Retention roots report only `success`, `cancelled`, or
+`failure` and contain no cutoff or row identifiers.
+
+Trace attributes and events never include request bodies or payload fragments, repository secrets,
+webhook signatures, authorization or OTLP headers, actors, raw URLs, commands, raw actions or
+reasons, SQL statements, database paths, or internal error text.
+
 ## Health endpoints
 
 Both health routes are intentionally unauthenticated so an orchestrator can call them without an

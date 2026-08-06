@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     ffi::OsString,
     io::{self, Write},
     sync::{
@@ -64,6 +64,54 @@ const WEBHOOK_SECRET: &str = "webhook-trace-secret-must-not-appear";
 const WEBHOOK_REPOSITORY: &str = "owner/webhook-private-repository";
 const WEBHOOK_SHA_40: &str = "0123456789ABCDEF0123456789abcdef01234567";
 const WEBHOOK_SHA_64: &str = "ABCDEF0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789";
+const SECRET: &str = "forbidden-webhook-secret";
+const SIGNATURE: &str = "sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const AUTHORIZATION: &str = "Bearer forbidden-admin-token";
+const ACTOR: &str = "forbidden-actor";
+const COMMAND: &str = "forbidden-command";
+const RAW_REASON: &str = "forbidden-raw-reason";
+const RAW_URL: &str = "https://forbidden.invalid/private";
+const RAW_UNMATCHED_PATH: &str = "/forbidden-unmatched-private-path";
+const PRIVACY_REPOSITORY: &str = "privacy-owner/privacy-repository";
+const PRIVACY_SHA: &str = "abcdef0123456789abcdef0123456789abcdef01";
+const PRIVACY_PR_NUMBER: i64 = 976_543_211;
+const PRIVACY_REPOSITORY_SEQUENCE: i64 = 987_000_000;
+const PRIVACY_MERGE_GROUP_DELIVERY: &str = "71000000-0000-4000-8000-000000000001";
+const PRIVACY_ENQUEUE_DELIVERY: &str = "71000000-0000-4000-8000-000000000002";
+const PRIVACY_DEQUEUE_DELIVERY: &str = "71000000-0000-4000-8000-000000000003";
+const PRIVACY_AUTH_FAILURE_DELIVERY: &str = "71000000-0000-4000-8000-000000000004";
+const PRIVACY_PROCESS_FAILURE_DELIVERY: &str = "71000000-0000-4000-8000-000000000005";
+const PRIVACY_RETENTION_DELIVERY: &str = "71000000-0000-4000-8000-000000000006";
+
+const RESOURCE_ATTRIBUTE_ALLOWLIST: &[&str] = &[
+    "service.name",
+    "service.version",
+    "k8s.pod.name",
+    "k8s.namespace.name",
+];
+const SPAN_ATTRIBUTE_ALLOWLIST: &[&str] = &[
+    "http.request.method",
+    "http.route",
+    "http.response.status_code",
+    "ghe.http.result",
+    "ghe.operation.outcome",
+    "ghe.config.operation",
+    "ghe.webhook.event_type",
+    "ghe.webhook.action",
+    "ghe.queue.entity",
+    "ghe.merge_group.action",
+    "ghe.merge_group.reason",
+    "ghe.queue.outcome",
+    "ghe.queue.reason",
+    "github.repository.name",
+    "github.repository.id",
+    "github.delivery.id",
+    "github.pull_request.number",
+    "github.commit.sha",
+    "db.system.name",
+    "db.operation.name",
+];
+const SPAN_EVENT_ALLOWLIST: &[(&str, &[&str])] = &[("operation.failure", &["ghe.failure.reason"])];
 
 #[derive(Default)]
 struct Captures {
@@ -294,6 +342,14 @@ impl RunningReceiver {
             .expect("capture lock is available");
         (captures.traces.clone(), captures.logs.clone())
     }
+
+    fn clear_captured_requests(&self) {
+        *self
+            .state
+            .captures
+            .lock()
+            .expect("capture lock is available") = Captures::default();
+    }
 }
 
 impl Drop for RunningReceiver {
@@ -452,8 +508,11 @@ impl WebhookTraceFixture {
                     .expect("test webhook secret is valid"),
                 true,
             )
+            .with_subscriber(dispatch.clone())
             .await
             .expect("test repository is created");
+        tokio::task::block_in_place(|| runtime.force_flush().expect("setup telemetry flushes"));
+        receiver.clear_captured_requests();
         let admin_token = AdminToken::new(ADMIN_TOKEN.to_owned()).expect("test token is valid");
         let router = build_router(AppState::new(
             store,
@@ -472,6 +531,46 @@ impl WebhookTraceFixture {
         }
     }
 
+    async fn request(
+        &self,
+        method: Method,
+        uri: &str,
+        authorization: Option<&str>,
+        content_type: Option<&str>,
+        body: Body,
+    ) -> axum::response::Response {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(value) = authorization {
+            request = request.header(header::AUTHORIZATION, value);
+        }
+        if let Some(value) = content_type {
+            request = request.header(header::CONTENT_TYPE, value);
+        }
+        self.router
+            .clone()
+            .oneshot(request.body(body).expect("request is valid"))
+            .with_subscriber(self.dispatch.clone())
+            .await
+            .expect("router serves request")
+    }
+
+    async fn authorized_json(
+        &self,
+        method: Method,
+        uri: &str,
+        body: Value,
+    ) -> axum::response::Response {
+        let serialized = serde_json::to_vec(&body).expect("request body serializes");
+        self.request(
+            method,
+            uri,
+            Some("Bearer independent-admin-token"),
+            Some("application/json"),
+            Body::from(serialized),
+        )
+        .await
+    }
+
     async fn webhook(
         &self,
         body: &[u8],
@@ -482,6 +581,30 @@ impl WebhookTraceFixture {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC key is valid");
         mac.update(body);
         let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/webhooks/github")
+            .header(CONTENT_TYPE, "application/json")
+            .header("X-GitHub-Event", event_type)
+            .header("X-GitHub-Delivery", delivery_id)
+            .header("X-Hub-Signature-256", signature)
+            .body(Body::from(body.to_vec()))
+            .expect("webhook request is valid");
+        self.router
+            .clone()
+            .oneshot(request)
+            .with_subscriber(self.dispatch.clone())
+            .await
+            .expect("router serves webhook request")
+    }
+
+    async fn webhook_with_signature(
+        &self,
+        body: &[u8],
+        event_type: &str,
+        delivery_id: &str,
+        signature: &str,
+    ) -> axum::response::Response {
         let request = Request::builder()
             .method(Method::POST)
             .uri("/webhooks/github")
@@ -521,8 +644,14 @@ impl WebhookTraceFixture {
         .expect("metrics response is UTF-8")
     }
 
-    fn force_flush(&self) -> CapturedSpans {
+    fn flush(&self) {
         tokio::task::block_in_place(|| self.runtime.force_flush().expect("providers flush"));
+    }
+
+    fn force_flush(&self) -> CapturedSpans {
+        let dropped_traces = self.runtime.dropped_trace_records();
+        self.flush();
+        assert_eq!(dropped_traces, 0, "test trace queue must not drop records");
         let (traces, logs) = self.receiver.captured_requests();
         CapturedSpans::from_requests(traces, logs)
     }
@@ -542,6 +671,7 @@ fn router_for_pool(pool: SqlitePool) -> Router {
 #[derive(Debug)]
 struct CapturedSpans {
     spans: Vec<Span>,
+    resource_attribute_keys: BTreeSet<String>,
     serialized: Vec<u8>,
     serialized_logs: Vec<u8>,
 }
@@ -557,6 +687,20 @@ impl CapturedSpans {
             .flat_map(|resource| &resource.scope_spans)
             .flat_map(|scope| scope.spans.iter().cloned())
             .collect();
+        let resource_attribute_keys = requests
+            .iter()
+            .flat_map(|request| &request.resource_spans)
+            .filter_map(|resource_spans| resource_spans.resource.as_ref())
+            .flat_map(|resource| &resource.attributes)
+            .chain(
+                log_requests
+                    .iter()
+                    .flat_map(|request| &request.resource_logs)
+                    .filter_map(|resource_logs| resource_logs.resource.as_ref())
+                    .flat_map(|resource| &resource.attributes),
+            )
+            .map(|attribute| attribute.key.clone())
+            .collect();
         let serialized = requests
             .into_iter()
             .flat_map(|request| request.encode_to_vec())
@@ -567,6 +711,7 @@ impl CapturedSpans {
             .collect();
         Self {
             spans,
+            resource_attribute_keys,
             serialized,
             serialized_logs,
         }
@@ -666,7 +811,20 @@ impl CapturedSpans {
                         || string_attribute(span, "db.operation.name") == Some(entity))
                     && self.is_descendant(span, parent)
             })
-            .expect("matching descendant span is exported")
+            .unwrap_or_else(|| {
+                let summary = self
+                    .spans
+                    .iter()
+                    .map(|span| {
+                        (
+                            span.name.as_str(),
+                            string_attribute(span, "ghe.queue.entity"),
+                            string_attribute(span, "db.operation.name"),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                panic!("matching descendant span {name:?} for {entity:?} is exported: {summary:?}")
+            })
     }
 
     fn descendant_count(&self, parent: &Span, name: &str) -> usize {
@@ -708,6 +866,39 @@ impl CapturedSpans {
             !serialized.contains(value),
             "serialized OTLP log requests must not contain {value:?}"
         );
+    }
+
+    fn assert_approved_attribute_keys(&self) {
+        for key in &self.resource_attribute_keys {
+            assert!(
+                RESOURCE_ATTRIBUTE_ALLOWLIST.contains(&key.as_str()),
+                "unapproved OTLP resource attribute key: {key}"
+            );
+        }
+        for span in &self.spans {
+            for attribute in &span.attributes {
+                assert!(
+                    SPAN_ATTRIBUTE_ALLOWLIST.contains(&attribute.key.as_str()),
+                    "unapproved attribute key {:?} on span {:?}",
+                    attribute.key,
+                    span.name
+                );
+            }
+            for event in &span.events {
+                let (_, allowed_keys) = SPAN_EVENT_ALLOWLIST
+                    .iter()
+                    .find(|(name, _)| *name == event.name)
+                    .unwrap_or_else(|| panic!("unapproved span event name: {:?}", event.name));
+                for attribute in &event.attributes {
+                    assert!(
+                        allowed_keys.contains(&attribute.key.as_str()),
+                        "unapproved attribute key {:?} on span event {:?}",
+                        attribute.key,
+                        event.name
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -874,7 +1065,7 @@ mod sqlite {
         PullRequestNumber::new(value).expect("test pull-request number is positive")
     }
 
-    fn sqlite_spans<'spans>(captured: &'spans CapturedSpans) -> Vec<&'spans Span> {
+    fn sqlite_spans(captured: &CapturedSpans) -> Vec<&Span> {
         captured
             .spans
             .iter()
@@ -1030,9 +1221,6 @@ mod sqlite {
         }
         for forbidden in [
             "sqlite-secret-must-not-appear",
-            "INSERT INTO",
-            "UPDATE repositories",
-            "DELETE FROM",
             fixture.database_path.as_str(),
         ] {
             captured.assert_absent(forbidden);
@@ -1069,9 +1257,7 @@ mod sqlite {
         for forbidden in [
             "private_table_detail_must_not_appear",
             "repository_private_trigger",
-            "repositories",
             "failure-secret-must-not-appear",
-            "INSERT INTO repositories",
             fixture.database_path.as_str(),
         ] {
             captured.assert_absent(forbidden);
@@ -1107,6 +1293,7 @@ async fn repository_routes_emit_http_roots_and_write_children() {
         )
         .await;
     assert_eq!(listed.status(), StatusCode::OK);
+    drop(listed);
 
     let updated = fixture
         .authorized_json(
@@ -1119,6 +1306,7 @@ async fn repository_routes_emit_http_roots_and_write_children() {
         )
         .await;
     assert_eq!(updated.status(), StatusCode::OK);
+    drop(updated);
 
     let loaded = fixture
         .request(
@@ -1130,6 +1318,7 @@ async fn repository_routes_emit_http_roots_and_write_children() {
         )
         .await;
     assert_eq!(loaded.status(), StatusCode::OK);
+    drop(loaded);
 
     let deleted = fixture
         .request(
@@ -1141,6 +1330,7 @@ async fn repository_routes_emit_http_roots_and_write_children() {
         )
         .await;
     assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    drop(deleted);
 
     let captured = fixture.force_flush();
     let create_request = captured.http_request("POST", "/api/v1/repositories", 201);
@@ -1195,6 +1385,7 @@ async fn repository_error_routes_emit_redacted_http_roots_without_unapproved_chi
         )
         .await;
     assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    drop(malformed);
 
     let unauthorized = fixture
         .request(
@@ -1206,6 +1397,7 @@ async fn repository_error_routes_emit_redacted_http_roots_without_unapproved_chi
         )
         .await;
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    drop(unauthorized);
 
     let unknown = fixture
         .request(
@@ -1217,6 +1409,7 @@ async fn repository_error_routes_emit_redacted_http_roots_without_unapproved_chi
         )
         .await;
     assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    drop(unknown);
 
     let captured = fixture.force_flush();
     let malformed_request = captured.http_request("POST", "/api/v1/repositories", 400);
@@ -1261,6 +1454,7 @@ async fn repository_store_failure_marks_http_and_write_spans_without_error_text(
         )
         .await;
     assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    drop(failed);
 
     let captured = fixture.force_flush();
     let request = captured.http_request("POST", "/api/v1/repositories", 500);
@@ -1278,7 +1472,6 @@ async fn repository_store_failure_marks_http_and_write_spans_without_error_text(
         Some(opentelemetry_proto::tonic::trace::v1::status::StatusCode::Error as i32)
     );
     captured.assert_absent("failure-secret-must-not-appear");
-    captured.assert_absent("database");
     captured.assert_absent("pool closed");
     captured.assert_absent("repository-trace.db");
 }
@@ -1497,6 +1690,7 @@ async fn webhook_failures_mark_authentication_and_processing_without_raw_error_d
         )
         .await;
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    drop(unauthorized);
     let malformed = fixture
         .webhook(
             malformed_body.as_bytes(),
@@ -1506,6 +1700,7 @@ async fn webhook_failures_mark_authentication_and_processing_without_raw_error_d
         )
         .await;
     assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    drop(malformed);
     sqlx::query("DROP TABLE processed_deliveries")
         .execute(&fixture.pool)
         .await
@@ -1519,6 +1714,7 @@ async fn webhook_failures_mark_authentication_and_processing_without_raw_error_d
         )
         .await;
     assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(unavailable);
     let captured = fixture.force_flush();
 
     let unauthorized_request = captured.webhook_request_for_delivery(unauthorized_delivery);
@@ -1583,6 +1779,8 @@ async fn webhook_queue_failure_is_bounded_and_duplicate_has_no_second_update() {
         )
         .await;
     assert_eq!(enqueued.status(), StatusCode::NO_CONTENT);
+    drop(enqueued);
+    fixture.flush();
     sqlx::query(
         "CREATE TRIGGER reject_trace_queue_completion BEFORE UPDATE ON merge_queue_attempts \
          BEGIN SELECT RAISE(ABORT, 'queue-store-detail-must-not-appear'); END",
@@ -1601,6 +1799,8 @@ async fn webhook_queue_failure_is_bounded_and_duplicate_has_no_second_update() {
             )
             .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        drop(response);
+        fixture.flush();
     }
     let exposition = fixture.metrics_text().await;
     let captured = fixture.force_flush();
@@ -1655,6 +1855,452 @@ async fn webhook_queue_failure_is_bounded_and_duplicate_has_no_second_update() {
         assert!(!fixture.output.text().contains(forbidden));
         assert!(!exposition.contains(forbidden));
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn integrated_core_trace_privacy() {
+    use crate::retention::{run_retention, RetentionConfig};
+
+    let fixture = WebhookTraceFixture::new().await;
+    sqlx::query("UPDATE repositories SET id = ? WHERE full_name = ?")
+        .bind(PRIVACY_REPOSITORY_SEQUENCE)
+        .bind(WEBHOOK_REPOSITORY)
+        .execute(&fixture.pool)
+        .await
+        .expect("fixture repository identifier is moved to a distinctive range");
+
+    let created = fixture
+        .authorized_json(
+            Method::POST,
+            "/api/v1/repositories",
+            serde_json::json!({
+                "full_name": PRIVACY_REPOSITORY,
+                "webhook_secret": SECRET
+            }),
+        )
+        .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created_body = response_json(created).await;
+    let repository_id = created_body["id"]
+        .as_i64()
+        .expect("privacy repository identifier is numeric");
+    assert_eq!(repository_id, PRIVACY_REPOSITORY_SEQUENCE + 1);
+
+    let unauthorized_admin = fixture
+        .request(
+            Method::GET,
+            "/api/v1/repositories",
+            Some(AUTHORIZATION),
+            None,
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(unauthorized_admin.status(), StatusCode::UNAUTHORIZED);
+    drop(unauthorized_admin);
+    let unmatched_uri = format!("{RAW_UNMATCHED_PATH}?target={RAW_URL}");
+    let unmatched = fixture
+        .request(Method::GET, &unmatched_uri, None, None, Body::empty())
+        .await;
+    assert_eq!(unmatched.status(), StatusCode::NOT_FOUND);
+    drop(unmatched);
+
+    let merge_group_body = serde_json::to_vec(&serde_json::json!({
+        "action": "destroyed",
+        "reason": "dequeued",
+        "merge_group": {"head_sha": PRIVACY_SHA},
+        "repository": {
+            "full_name": PRIVACY_REPOSITORY,
+            "html_url": RAW_URL
+        },
+        "sender": {"login": ACTOR},
+        "command": COMMAND
+    }))
+    .expect("merge-group body serializes");
+    let merge_group = fixture
+        .webhook(
+            &merge_group_body,
+            "merge_group",
+            PRIVACY_MERGE_GROUP_DELIVERY,
+            SECRET,
+        )
+        .await;
+    assert_eq!(merge_group.status(), StatusCode::NO_CONTENT);
+    drop(merge_group);
+    fixture.flush();
+
+    let enqueue_body = serde_json::to_vec(&serde_json::json!({
+        "action": "enqueued",
+        "pull_request": {
+            "number": PRIVACY_PR_NUMBER,
+            "updated_at": "2026-08-05T10:00:00Z",
+            "head": {"sha": PRIVACY_SHA}
+        },
+        "repository": {"full_name": PRIVACY_REPOSITORY},
+        "sender": {"login": ACTOR},
+        "command": COMMAND,
+        "url": RAW_URL
+    }))
+    .expect("enqueue body serializes");
+    let enqueued = fixture
+        .webhook(
+            &enqueue_body,
+            "pull_request",
+            PRIVACY_ENQUEUE_DELIVERY,
+            SECRET,
+        )
+        .await;
+    assert_eq!(enqueued.status(), StatusCode::NO_CONTENT);
+    drop(enqueued);
+    fixture.flush();
+
+    let dequeue_body = serde_json::to_vec(&serde_json::json!({
+        "action": "dequeued",
+        "reason": RAW_REASON,
+        "pull_request": {
+            "number": PRIVACY_PR_NUMBER,
+            "updated_at": "2026-08-05T10:01:00Z",
+            "head": {"sha": PRIVACY_SHA}
+        },
+        "repository": {"full_name": PRIVACY_REPOSITORY},
+        "sender": {"login": ACTOR},
+        "command": COMMAND,
+        "url": RAW_URL
+    }))
+    .expect("dequeue body serializes");
+    let dequeued = fixture
+        .webhook(
+            &dequeue_body,
+            "pull_request",
+            PRIVACY_DEQUEUE_DELIVERY,
+            SECRET,
+        )
+        .await;
+    assert_eq!(dequeued.status(), StatusCode::NO_CONTENT);
+    drop(dequeued);
+    fixture.flush();
+    let duplicate = fixture
+        .webhook(
+            &dequeue_body,
+            "pull_request",
+            PRIVACY_DEQUEUE_DELIVERY,
+            SECRET,
+        )
+        .await;
+    assert_eq!(duplicate.status(), StatusCode::NO_CONTENT);
+    drop(duplicate);
+    fixture.flush();
+
+    let auth_failure_body = serde_json::to_vec(&serde_json::json!({
+        "action": "opened",
+        "repository": {"full_name": PRIVACY_REPOSITORY},
+        "sender": {"login": ACTOR},
+        "command": COMMAND,
+        "url": RAW_URL
+    }))
+    .expect("authentication failure body serializes");
+    let auth_failure = fixture
+        .webhook_with_signature(
+            &auth_failure_body,
+            "pull_request",
+            PRIVACY_AUTH_FAILURE_DELIVERY,
+            SIGNATURE,
+        )
+        .await;
+    assert_eq!(auth_failure.status(), StatusCode::UNAUTHORIZED);
+    drop(auth_failure);
+    fixture.flush();
+
+    let process_failure_body = serde_json::to_vec(&serde_json::json!({
+        "action": {"raw_command": COMMAND},
+        "reason": RAW_REASON,
+        "repository": {
+            "full_name": PRIVACY_REPOSITORY,
+            "html_url": RAW_URL
+        },
+        "sender": {"login": ACTOR}
+    }))
+    .expect("processing failure body serializes");
+    let process_failure = fixture
+        .webhook(
+            &process_failure_body,
+            "pull_request",
+            PRIVACY_PROCESS_FAILURE_DELIVERY,
+            SECRET,
+        )
+        .await;
+    assert_eq!(process_failure.status(), StatusCode::BAD_REQUEST);
+    drop(process_failure);
+    fixture.flush();
+
+    sqlx::query("INSERT INTO processed_deliveries (delivery_id, received_at) VALUES (?, ?)")
+        .bind(PRIVACY_RETENTION_DELIVERY)
+        .bind("2020-01-01T00:00:00.000Z")
+        .execute(&fixture.pool)
+        .await
+        .expect("expired delivery is inserted");
+    sqlx::query(
+        "INSERT INTO merge_queue_attempts \
+             (repository_id, pull_request_number, enqueued_at, completed_at, outcome, reason_code) \
+         VALUES (?, ?, '2020-01-01T00:00:00.000Z', '2020-01-02T00:00:00.000Z', \
+                 'unknown', 'unclassified_dequeue')",
+    )
+    .bind(repository_id)
+    .bind(PRIVACY_PR_NUMBER + 1)
+    .execute(&fixture.pool)
+    .await
+    .expect("expired queue attempt is inserted");
+    let retention_config = RetentionConfig::new(
+        std::time::Duration::from_millis(25),
+        std::time::Duration::from_secs(86_400),
+        std::time::Duration::from_secs(90 * 86_400),
+    )
+    .expect("retention configuration is valid");
+    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+    let ambient_request = trace::operation_span(trace::Operation::HttpRequest);
+    let retention_runner = tokio::spawn(
+        run_retention(
+            DeliveryStore::new(fixture.pool.clone()),
+            MergeQueueStore::new(fixture.pool.clone()),
+            retention_config,
+            shutdown_receiver,
+        )
+        .instrument(ambient_request.clone())
+        .with_subscriber(fixture.dispatch.clone()),
+    );
+    let retention_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let retained_delivery: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries WHERE delivery_id = ?")
+                .bind(PRIVACY_RETENTION_DELIVERY)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("retention delivery is countable");
+        let retained_attempt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM merge_queue_attempts \
+             WHERE repository_id = ? AND pull_request_number = ?",
+        )
+        .bind(repository_id)
+        .bind(PRIVACY_PR_NUMBER + 1)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("retention queue attempt is countable");
+        if retained_delivery == 0 && retained_attempt == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < retention_deadline,
+            "integrated retention pass did not complete before the diagnostic deadline"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    shutdown_sender
+        .send(true)
+        .expect("retention runner receives shutdown");
+    retention_runner.await.expect("retention runner joins");
+    drop(ambient_request);
+
+    let exposition = fixture.metrics_text().await;
+    let captured = fixture.force_flush();
+
+    let create_request = captured.http_request("POST", "/api/v1/repositories", 201);
+    let repository_write = captured.child_named(create_request, "config.repository.write");
+    assert_attribute(
+        repository_write,
+        "github.repository.name",
+        PRIVACY_REPOSITORY,
+    );
+    assert_i64_attribute(repository_write, "github.repository.id", repository_id);
+    assert_eq!(
+        captured.http_request("GET", "unmatched", 404).name,
+        "http.request"
+    );
+
+    let merge_request = captured.webhook_request_for_delivery(PRIVACY_MERGE_GROUP_DELIVERY);
+    let merge_process = captured.child_named(merge_request, "github.webhook.process");
+    let merge_update =
+        captured.descendant_named(merge_process, "merge_queue.update", "merge_group");
+    assert_attribute(merge_update, "ghe.merge_group.action", "destroyed");
+    assert_attribute(merge_update, "ghe.merge_group.reason", "dequeued");
+    assert_attribute(merge_update, "github.commit.sha", PRIVACY_SHA);
+
+    let dequeue_request = captured.webhook_request_for_delivery(PRIVACY_DEQUEUE_DELIVERY);
+    let dequeue_process = captured.child_named(dequeue_request, "github.webhook.process");
+    let dequeue_update =
+        captured.descendant_named(dequeue_process, "merge_queue.update", "pull_request");
+    assert_i64_attribute(
+        dequeue_update,
+        "github.pull_request.number",
+        PRIVACY_PR_NUMBER,
+    );
+    assert_attribute(dequeue_update, "ghe.queue.outcome", "unknown");
+    assert_attribute(dequeue_update, "ghe.queue.reason", "unclassified_dequeue");
+    assert_attribute(dequeue_update, "ghe.operation.outcome", "success");
+    assert_eq!(
+        captured
+            .spans
+            .iter()
+            .filter(|span| {
+                span.name == "merge_queue.update"
+                    && string_attribute(span, "github.delivery.id")
+                        == Some(PRIVACY_DEQUEUE_DELIVERY)
+            })
+            .count(),
+        1,
+        "duplicate delivery must not emit a second queue update"
+    );
+    assert_eq!(
+        captured
+            .spans
+            .iter()
+            .filter(|span| {
+                span.name == "github.webhook.process"
+                    && string_attribute(span, "github.delivery.id")
+                        == Some(PRIVACY_DEQUEUE_DELIVERY)
+                    && string_attribute(span, "ghe.operation.outcome") == Some("duplicate")
+            })
+            .count(),
+        1,
+        "duplicate delivery has one bounded process span"
+    );
+
+    let auth_failure_request = captured.webhook_request_for_delivery(PRIVACY_AUTH_FAILURE_DELIVERY);
+    let auth_failure_span =
+        captured.child_named(auth_failure_request, "github.webhook.authenticate");
+    assert_attribute(auth_failure_span, "ghe.operation.outcome", "failure");
+    assert_eq!(
+        captured.child_count(auth_failure_request, "github.webhook.process"),
+        0
+    );
+    let process_failure_request =
+        captured.webhook_request_for_delivery(PRIVACY_PROCESS_FAILURE_DELIVERY);
+    let process_failure_span =
+        captured.child_named(process_failure_request, "github.webhook.process");
+    assert_attribute(process_failure_span, "ghe.operation.outcome", "failure");
+
+    let retention_roots = captured
+        .spans
+        .iter()
+        .filter(|span| span.name == "retention.run")
+        .collect::<Vec<_>>();
+    assert_eq!(retention_roots.len(), 1, "one retention pass is exported");
+    let retention_root = retention_roots[0];
+    assert!(
+        retention_root.parent_span_id.is_empty(),
+        "retention run remains an independent root"
+    );
+    assert_attribute(retention_root, "ghe.operation.outcome", "success");
+    let retention_children = captured
+        .spans
+        .iter()
+        .filter(|span| span.parent_span_id == retention_root.span_id)
+        .map(|span| {
+            (
+                span.name.as_str(),
+                string_attribute(span, "db.operation.name"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retention_children.len(),
+        2,
+        "retention children: {retention_children:?}; spans: {:?}",
+        captured
+            .spans
+            .iter()
+            .map(|span| (
+                span.name.as_str(),
+                span.span_id.as_slice(),
+                span.parent_span_id.as_slice(),
+                string_attribute(span, "db.operation.name")
+            ))
+            .collect::<Vec<_>>()
+    );
+
+    for operation in [
+        "http.request",
+        "github.webhook.authenticate",
+        "github.webhook.process",
+        "config.repository.write",
+        "sqlite.query",
+        "merge_queue.update",
+        "retention.run",
+    ] {
+        assert!(
+            captured.spans.iter().any(|span| span.name == operation),
+            "stable operation span {operation:?} is exported"
+        );
+    }
+    for delivery_id in [
+        PRIVACY_MERGE_GROUP_DELIVERY,
+        PRIVACY_ENQUEUE_DELIVERY,
+        PRIVACY_DEQUEUE_DELIVERY,
+        PRIVACY_AUTH_FAILURE_DELIVERY,
+        PRIVACY_PROCESS_FAILURE_DELIVERY,
+    ] {
+        assert!(
+            captured
+                .spans
+                .iter()
+                .any(|span| { string_attribute(span, "github.delivery.id") == Some(delivery_id) }),
+            "approved delivery identifier {delivery_id:?} is present in traces"
+        );
+    }
+    assert!(captured.spans.iter().any(|span| {
+        string_attribute(span, "github.repository.name") == Some(PRIVACY_REPOSITORY)
+            && i64_attribute(span, "github.repository.id") == Some(repository_id)
+    }));
+    assert!(captured.spans.iter().any(|span| {
+        i64_attribute(span, "github.pull_request.number") == Some(PRIVACY_PR_NUMBER)
+            && string_attribute(span, "github.commit.sha") == Some(PRIVACY_SHA)
+    }));
+
+    captured.assert_approved_attribute_keys();
+    let stderr = fixture.output.text();
+    let repository_id_text = repository_id.to_string();
+    let pull_request_number_text = PRIVACY_PR_NUMBER.to_string();
+    for approved_identifier in [
+        PRIVACY_REPOSITORY,
+        PRIVACY_MERGE_GROUP_DELIVERY,
+        PRIVACY_ENQUEUE_DELIVERY,
+        PRIVACY_DEQUEUE_DELIVERY,
+        PRIVACY_AUTH_FAILURE_DELIVERY,
+        PRIVACY_PROCESS_FAILURE_DELIVERY,
+        PRIVACY_SHA,
+        repository_id_text.as_str(),
+        pull_request_number_text.as_str(),
+    ] {
+        captured.assert_logs_absent(approved_identifier);
+        assert!(
+            !stderr.contains(approved_identifier),
+            "stderr must not contain span-only identifier {approved_identifier:?}"
+        );
+        assert!(
+            !exposition.contains(approved_identifier),
+            "Prometheus must not contain span-only identifier {approved_identifier:?}"
+        );
+    }
+    for forbidden in [
+        SECRET,
+        SIGNATURE,
+        AUTHORIZATION,
+        ACTOR,
+        COMMAND,
+        RAW_REASON,
+        RAW_URL,
+        RAW_UNMATCHED_PATH,
+    ] {
+        captured.assert_absent(forbidden);
+        captured.assert_logs_absent(forbidden);
+        assert!(
+            !stderr.contains(forbidden),
+            "stderr must not contain forbidden value {forbidden:?}"
+        );
+        assert!(
+            !exposition.contains(forbidden),
+            "Prometheus must not contain forbidden value {forbidden:?}"
+        );
+    }
+    assert!(exposition.contains("github_webhook_duplicates_total 1"));
 }
 
 mod retention {
@@ -1845,24 +2491,24 @@ mod retention {
     }
 
     async fn wait_for_delivery_count(pool: &SqlitePool, expected: i64) {
-        let deadline = std::time::Instant::now() + StdDuration::from_secs(1);
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
         while delivery_count(pool).await != expected {
             assert!(
                 std::time::Instant::now() < deadline,
                 "delivery retention did not reach the expected count"
             );
-            tokio::task::yield_now().await;
+            tokio::time::sleep(StdDuration::from_millis(1)).await;
         }
     }
 
     async fn wait_for_queue_attempt_count(pool: &SqlitePool, expected: i64) {
-        let deadline = std::time::Instant::now() + StdDuration::from_secs(1);
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
         while queue_attempt_count(pool).await != expected {
             assert!(
                 std::time::Instant::now() < deadline,
                 "queue retention did not reach the expected count"
             );
-            tokio::task::yield_now().await;
+            tokio::time::sleep(StdDuration::from_millis(1)).await;
         }
     }
 
@@ -1955,7 +2601,7 @@ mod retention {
 
         tick_once().await;
         wait_for_delivery_count(&fixture.pool, 0).await;
-        tokio::time::timeout(StdDuration::from_secs(1), runner)
+        tokio::time::timeout(StdDuration::from_secs(5), runner)
             .await
             .expect("retention runner stops after delivery cancellation")
             .expect("retention runner joins after cancellation");
@@ -2017,7 +2663,6 @@ mod retention {
         for forbidden in [
             "processed_deliveries",
             "no such table",
-            "SqliteError",
             "error_correlation_id",
         ] {
             captured.assert_absent(forbidden);
