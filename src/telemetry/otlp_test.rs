@@ -49,12 +49,12 @@ use tokio::{
     net::TcpListener,
     sync::{watch, Notify},
 };
-use tracing::Dispatch;
+use tracing::{Dispatch, Instrument};
 
 use crate::config::TelemetryConfig;
 use time::{Duration, OffsetDateTime};
 
-use super::{build_runtime, TelemetryState};
+use super::{build_runtime, trace, TelemetryState};
 
 const QUEUE_CAPACITY: usize = 4;
 const SATURATION_RECORDS: usize = 10;
@@ -627,11 +627,27 @@ impl CapturedSpans {
             })
     }
 
+    fn one_named(&self, name: &str) -> &Span {
+        let matches = self
+            .spans
+            .iter()
+            .filter(|span| span.name == name)
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "span count for {name}");
+        matches[0]
+    }
+
     fn child_named(&self, parent: &Span, name: &str) -> &Span {
         self.spans
             .iter()
             .find(|span| span.name == name && span.parent_span_id == parent.span_id)
             .expect("matching child span is exported")
+    }
+
+    fn children<'spans>(&'spans self, parent: &'spans Span) -> impl Iterator<Item = &'spans Span> {
+        self.spans
+            .iter()
+            .filter(move |span| span.parent_span_id == parent.span_id)
     }
 
     fn child_count(&self, parent: &Span, name: &str) -> usize {
@@ -1638,6 +1654,374 @@ async fn webhook_queue_failure_is_bounded_and_duplicate_has_no_second_update() {
         captured.assert_logs_absent(forbidden);
         assert!(!fixture.output.text().contains(forbidden));
         assert!(!exposition.contains(forbidden));
+    }
+}
+
+mod retention {
+    use std::{sync::Arc, time::Duration as StdDuration};
+
+    use tracing_subscriber::fmt::MakeWriter;
+
+    use super::*;
+    use crate::retention::{run_retention, RetentionConfig};
+
+    const RETENTION_TRACE_QUEUE_CAPACITY: usize = 128;
+
+    struct RetentionTraceFixture {
+        _otlp_guard: OtlpTestGuard,
+        receiver: RunningReceiver,
+        runtime: super::super::TelemetryRuntime,
+        dispatch: Dispatch,
+        pool: SqlitePool,
+        delivery_store: DeliveryStore,
+        merge_queue_store: MergeQueueStore,
+        _directory: TempDir,
+    }
+
+    impl RetentionTraceFixture {
+        async fn new() -> Self {
+            Self::new_with_writer(io::sink).await
+        }
+
+        async fn new_with_writer<W>(writer: W) -> Self
+        where
+            W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+        {
+            let otlp_guard = otlp_test_lock().lock_owned().await;
+            let receiver = RunningReceiver::start_released().await;
+            let config = telemetry_config_with_queue_capacity(
+                &receiver.endpoint(),
+                RETENTION_TRACE_QUEUE_CAPACITY,
+            );
+            let (runtime, subscriber) =
+                build_runtime("github_webhook_exporter=info", &config, writer)
+                    .expect("telemetry runtime initializes");
+            let dispatch = Dispatch::new(subscriber);
+            let directory = tempfile::tempdir().expect("temporary directory is created");
+            let database_path = directory.path().join("retention-trace.db");
+            let pool = open_database(&database_path)
+                .await
+                .expect("test database opens and migrates");
+            insert_repository(&pool).await;
+            let delivery_store = DeliveryStore::new(pool.clone());
+            let merge_queue_store = MergeQueueStore::new(pool.clone());
+
+            Self {
+                _otlp_guard: otlp_guard,
+                receiver,
+                runtime,
+                dispatch,
+                pool,
+                delivery_store,
+                merge_queue_store,
+                _directory: directory,
+            }
+        }
+
+        fn spawn_retention(
+            &self,
+            config: RetentionConfig,
+            shutdown: watch::Receiver<bool>,
+        ) -> tokio::task::JoinHandle<()> {
+            let ambient_request = trace::operation_span(trace::Operation::HttpRequest);
+            tokio::spawn(
+                run_retention(
+                    self.delivery_store.clone(),
+                    self.merge_queue_store.clone(),
+                    config,
+                    shutdown,
+                )
+                .instrument(ambient_request)
+                .with_subscriber(self.dispatch.clone()),
+            )
+        }
+
+        fn force_flush(&self) -> CapturedSpans {
+            tokio::task::block_in_place(|| self.runtime.force_flush().expect("providers flush"));
+            let (traces, logs) = self.receiver.captured_requests();
+            CapturedSpans::from_requests(traces, logs)
+        }
+    }
+
+    #[derive(Clone)]
+    struct ShutdownOnDeliveryCompleted {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        shutdown: watch::Sender<bool>,
+    }
+
+    impl ShutdownOnDeliveryCompleted {
+        fn new(shutdown: watch::Sender<bool>) -> Self {
+            Self {
+                bytes: Arc::new(Mutex::new(Vec::new())),
+                shutdown,
+            }
+        }
+    }
+
+    struct ShutdownWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        shutdown: watch::Sender<bool>,
+    }
+
+    impl Write for ShutdownWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            let mut bytes = self
+                .bytes
+                .lock()
+                .map_err(|_| io::Error::other("captured logs lock was poisoned"))?;
+            bytes.extend_from_slice(buffer);
+            let text = String::from_utf8_lossy(&bytes);
+            if text.contains("workload=\"delivery\"")
+                && text.contains("outcome=\"completed\"")
+                && !text.contains("workload=\"merge_queue\"")
+            {
+                let _ignored = self.shutdown.send(true);
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for ShutdownOnDeliveryCompleted {
+        type Writer = ShutdownWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            ShutdownWriter {
+                bytes: Arc::clone(&self.bytes),
+                shutdown: self.shutdown.clone(),
+            }
+        }
+    }
+
+    async fn insert_repository(pool: &SqlitePool) {
+        sqlx::query(
+            "INSERT INTO repositories (id, full_name, webhook_secret_ciphertext, \
+             webhook_secret_nonce, encryption_version, enabled, created_at, updated_at) \
+             VALUES (1, 'owner/retention-trace', X'01', X'02', 1, 1, \
+                     '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+        )
+        .execute(pool)
+        .await
+        .expect("repository fixture is inserted");
+    }
+
+    async fn insert_delivery(pool: &SqlitePool, delivery_id: &str) {
+        sqlx::query("INSERT INTO processed_deliveries (delivery_id, received_at) VALUES (?, ?)")
+            .bind(delivery_id)
+            .bind("2020-01-01T00:00:00.000Z")
+            .execute(pool)
+            .await
+            .expect("delivery fixture is inserted");
+    }
+
+    async fn insert_queue_attempt(pool: &SqlitePool, pull_request_number: i64) {
+        sqlx::query(
+            "INSERT INTO merge_queue_attempts \
+                 (repository_id, pull_request_number, enqueued_at, completed_at, outcome, reason_code) \
+             VALUES (1, ?, '2020-01-01T00:00:00.000Z', '2020-01-02T00:00:00.000Z', \
+                     'unknown', 'unclassified_dequeue')",
+        )
+        .bind(pull_request_number)
+        .execute(pool)
+        .await
+        .expect("queue attempt fixture is inserted");
+    }
+
+    async fn delivery_count(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries")
+            .fetch_one(pool)
+            .await
+            .expect("delivery claims are countable")
+    }
+
+    async fn queue_attempt_count(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM merge_queue_attempts")
+            .fetch_one(pool)
+            .await
+            .expect("queue attempts are countable")
+    }
+
+    async fn wait_for_delivery_count(pool: &SqlitePool, expected: i64) {
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(1);
+        while delivery_count(pool).await != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "delivery retention did not reach the expected count"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn wait_for_queue_attempt_count(pool: &SqlitePool, expected: i64) {
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(1);
+        while queue_attempt_count(pool).await != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "queue retention did not reach the expected count"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn standard_config() -> RetentionConfig {
+        RetentionConfig::new(
+            StdDuration::from_millis(250),
+            StdDuration::from_secs(86_400),
+            StdDuration::from_secs(90 * 86_400),
+        )
+        .expect("retention configuration is valid")
+    }
+
+    fn invalid_cutoff_config() -> RetentionConfig {
+        RetentionConfig::new(
+            StdDuration::from_millis(250),
+            StdDuration::from_secs(100_000_000 * 86_400),
+            StdDuration::from_secs(100_000_000 * 86_400),
+        )
+        .expect("retention configuration is valid")
+    }
+
+    async fn tick_once() {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(StdDuration::from_millis(275)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn stop_runner(shutdown: watch::Sender<bool>, runner: tokio::task::JoinHandle<()>) {
+        let _ignored = shutdown.send(true);
+        runner.await.expect("retention runner joins");
+    }
+
+    fn assert_root_outcome_only(span: &Span, outcome: &str) {
+        assert!(
+            span.parent_span_id.is_empty(),
+            "retention roots must not inherit ambient parents"
+        );
+        assert_attribute(span, "ghe.operation.outcome", outcome);
+        let keys = span
+            .attributes
+            .iter()
+            .map(|attribute| attribute.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, ["ghe.operation.outcome"]);
+    }
+
+    fn assert_sqlite_child(captured: &CapturedSpans, root: &Span, operation: &str, outcome: &str) {
+        let span = captured
+            .children(root)
+            .find(|span| {
+                span.name == "sqlite.query"
+                    && string_attribute(span, "db.operation.name") == Some(operation)
+            })
+            .unwrap_or_else(|| panic!("{operation} sqlite child span is exported"));
+        assert_attribute(span, "ghe.operation.outcome", outcome);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_pass_exports_independent_root_with_prune_children() {
+        let fixture = RetentionTraceFixture::new().await;
+        insert_delivery(&fixture.pool, "30000000-0000-4000-8000-000000000001").await;
+        insert_queue_attempt(&fixture.pool, 3001).await;
+        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let runner = fixture.spawn_retention(standard_config(), shutdown_receiver);
+
+        tick_once().await;
+        wait_for_delivery_count(&fixture.pool, 0).await;
+        wait_for_queue_attempt_count(&fixture.pool, 0).await;
+        stop_runner(shutdown_sender, runner).await;
+        let captured = fixture.force_flush();
+
+        let root = captured.one_named("retention.run");
+        assert_root_outcome_only(root, "success");
+        assert_sqlite_child(&captured, root, "delivery.prune", "success");
+        assert_sqlite_child(&captured, root, "merge_queue.prune", "success");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_after_delivery_exports_cancelled_root_without_queue_child() {
+        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let fixture = RetentionTraceFixture::new_with_writer(ShutdownOnDeliveryCompleted::new(
+            shutdown_sender.clone(),
+        ))
+        .await;
+        insert_delivery(&fixture.pool, "30000000-0000-4000-8000-000000000002").await;
+        insert_queue_attempt(&fixture.pool, 3002).await;
+        let runner = fixture.spawn_retention(standard_config(), shutdown_receiver);
+
+        tick_once().await;
+        wait_for_delivery_count(&fixture.pool, 0).await;
+        tokio::time::timeout(StdDuration::from_secs(1), runner)
+            .await
+            .expect("retention runner stops after delivery cancellation")
+            .expect("retention runner joins after cancellation");
+        let captured = fixture.force_flush();
+
+        let root = captured.one_named("retention.run");
+        assert_root_outcome_only(root, "cancelled");
+        assert_sqlite_child(&captured, root, "delivery.prune", "success");
+        assert_eq!(
+            captured
+                .children(root)
+                .filter(|span| {
+                    span.name == "sqlite.query"
+                        && string_attribute(span, "db.operation.name") == Some("merge_queue.prune")
+                })
+                .count(),
+            0
+        );
+        assert_eq!(queue_attempt_count(&fixture.pool).await, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_cutoff_exports_failure_root_without_cutoff_attributes() {
+        let fixture = RetentionTraceFixture::new().await;
+        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let runner = fixture.spawn_retention(invalid_cutoff_config(), shutdown_receiver);
+
+        tick_once().await;
+        stop_runner(shutdown_sender, runner).await;
+        let captured = fixture.force_flush();
+
+        let root = captured.one_named("retention.run");
+        assert_root_outcome_only(root, "failure");
+        assert_eq!(captured.child_count(root, "sqlite.query"), 0);
+        captured.assert_absent("invalid_cutoff");
+        captured.assert_absent("cutoff");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_store_failure_exports_failure_root_and_preserves_other_workload() {
+        let fixture = RetentionTraceFixture::new().await;
+        insert_queue_attempt(&fixture.pool, 3003).await;
+        sqlx::query("DROP TABLE processed_deliveries")
+            .execute(&fixture.pool)
+            .await
+            .expect("delivery table is removed");
+        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let runner = fixture.spawn_retention(standard_config(), shutdown_receiver);
+
+        tick_once().await;
+        wait_for_queue_attempt_count(&fixture.pool, 0).await;
+        stop_runner(shutdown_sender, runner).await;
+        let captured = fixture.force_flush();
+
+        let root = captured.one_named("retention.run");
+        assert_root_outcome_only(root, "failure");
+        assert_sqlite_child(&captured, root, "delivery.prune", "failure");
+        assert_sqlite_child(&captured, root, "merge_queue.prune", "success");
+        for forbidden in [
+            "processed_deliveries",
+            "no such table",
+            "SqliteError",
+            "error_correlation_id",
+        ] {
+            captured.assert_absent(forbidden);
+        }
     }
 }
 
