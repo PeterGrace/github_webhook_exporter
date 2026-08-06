@@ -72,6 +72,7 @@ const COMMAND: &str = "forbidden-command";
 const RAW_REASON: &str = "forbidden-raw-reason";
 const RAW_URL: &str = "https://forbidden.invalid/private";
 const RAW_UNMATCHED_PATH: &str = "/forbidden-unmatched-private-path";
+const RAW_QUEUE_STORE_DETAIL: &str = "forbidden-queue-store-detail";
 const PRIVACY_REPOSITORY: &str = "privacy-owner/privacy-repository";
 const PRIVACY_SHA: &str = "abcdef0123456789abcdef0123456789abcdef01";
 const PRIVACY_PR_NUMBER: i64 = 976_543_211;
@@ -82,6 +83,9 @@ const PRIVACY_DEQUEUE_DELIVERY: &str = "71000000-0000-4000-8000-000000000003";
 const PRIVACY_AUTH_FAILURE_DELIVERY: &str = "71000000-0000-4000-8000-000000000004";
 const PRIVACY_PROCESS_FAILURE_DELIVERY: &str = "71000000-0000-4000-8000-000000000005";
 const PRIVACY_RETENTION_DELIVERY: &str = "71000000-0000-4000-8000-000000000006";
+const PRIVACY_QUEUE_FAILURE_DELIVERY: &str = "71000000-0000-4000-8000-000000000007";
+const PRIVACY_RETENTION_PR_NUMBER: i64 = PRIVACY_PR_NUMBER + 1;
+const PRIVACY_QUEUE_FAILURE_PR_NUMBER: i64 = PRIVACY_PR_NUMBER + 2;
 
 const RESOURCE_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "service.name",
@@ -654,6 +658,38 @@ impl WebhookTraceFixture {
         assert_eq!(dropped_traces, 0, "test trace queue must not drop records");
         let (traces, logs) = self.receiver.captured_requests();
         CapturedSpans::from_requests(traces, logs)
+    }
+
+    fn finish(self) -> (CapturedSpans, String) {
+        // Destructuring permits the request-serving resources to drop before the providers flush,
+        // so completed failure-path spans cannot remain owned by the in-process router or pool.
+        let Self {
+            _otlp_guard,
+            receiver,
+            runtime,
+            dispatch,
+            output,
+            router,
+            pool,
+            _directory,
+        } = self;
+        drop(router);
+        drop(pool);
+        drop(dispatch);
+        drop(_directory);
+        tokio::task::block_in_place(|| runtime.force_flush().expect("providers flush"));
+        assert_eq!(
+            runtime.dropped_trace_records(),
+            0,
+            "test trace queue must not drop records"
+        );
+        let (traces, logs) = receiver.captured_requests();
+        let captured = CapturedSpans::from_requests(traces, logs);
+        let stderr = output.text();
+        drop(runtime);
+        drop(receiver);
+        drop(_otlp_guard);
+        (captured, stderr)
     }
 }
 
@@ -1857,6 +1893,55 @@ async fn webhook_queue_failure_is_bounded_and_duplicate_has_no_second_update() {
     }
 }
 
+async fn exercise_integrated_queue_failure(fixture: &WebhookTraceFixture, repository_id: i64) {
+    sqlx::query(
+        "INSERT INTO merge_queue_attempts \
+             (repository_id, pull_request_number, enqueued_at, outcome, reason_code) \
+         VALUES (?, ?, '2026-08-05T10:02:00.000Z', 'pending', 'none')",
+    )
+    .bind(repository_id)
+    .bind(PRIVACY_QUEUE_FAILURE_PR_NUMBER)
+    .execute(&fixture.pool)
+    .await
+    .expect("active queue attempt for persistence failure is inserted");
+    sqlx::query(&format!(
+        "CREATE TRIGGER reject_integrated_queue_completion \
+         BEFORE UPDATE ON merge_queue_attempts \
+         BEGIN SELECT RAISE(ABORT, '{RAW_QUEUE_STORE_DETAIL}'); END"
+    ))
+    .execute(&fixture.pool)
+    .await
+    .expect("queue persistence failure trigger is installed");
+    let queue_failure_body = serde_json::to_vec(&serde_json::json!({
+        "action": "dequeued",
+        "reason": RAW_REASON,
+        "pull_request": {
+            "number": PRIVACY_QUEUE_FAILURE_PR_NUMBER,
+            "updated_at": "2026-08-05T10:03:00Z",
+            "head": {"sha": PRIVACY_SHA}
+        },
+        "repository": {"full_name": PRIVACY_REPOSITORY},
+        "sender": {"login": ACTOR},
+        "command": COMMAND,
+        "url": RAW_URL
+    }))
+    .expect("queue persistence failure body serializes");
+    let queue_failure = fixture
+        .webhook(
+            &queue_failure_body,
+            "pull_request",
+            PRIVACY_QUEUE_FAILURE_DELIVERY,
+            SECRET,
+        )
+        .await;
+    assert_eq!(queue_failure.status(), StatusCode::NO_CONTENT);
+    drop(queue_failure);
+    sqlx::query("DROP TRIGGER reject_integrated_queue_completion")
+        .execute(&fixture.pool)
+        .await
+        .expect("queue persistence failure trigger is removed");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integrated_core_trace_privacy() {
     use crate::retention::{run_retention, RetentionConfig};
@@ -1926,7 +2011,6 @@ async fn integrated_core_trace_privacy() {
         .await;
     assert_eq!(merge_group.status(), StatusCode::NO_CONTENT);
     drop(merge_group);
-    fixture.flush();
 
     let enqueue_body = serde_json::to_vec(&serde_json::json!({
         "action": "enqueued",
@@ -1951,7 +2035,6 @@ async fn integrated_core_trace_privacy() {
         .await;
     assert_eq!(enqueued.status(), StatusCode::NO_CONTENT);
     drop(enqueued);
-    fixture.flush();
 
     let dequeue_body = serde_json::to_vec(&serde_json::json!({
         "action": "dequeued",
@@ -1977,7 +2060,6 @@ async fn integrated_core_trace_privacy() {
         .await;
     assert_eq!(dequeued.status(), StatusCode::NO_CONTENT);
     drop(dequeued);
-    fixture.flush();
     let duplicate = fixture
         .webhook(
             &dequeue_body,
@@ -1988,7 +2070,6 @@ async fn integrated_core_trace_privacy() {
         .await;
     assert_eq!(duplicate.status(), StatusCode::NO_CONTENT);
     drop(duplicate);
-    fixture.flush();
 
     let auth_failure_body = serde_json::to_vec(&serde_json::json!({
         "action": "opened",
@@ -2008,7 +2089,6 @@ async fn integrated_core_trace_privacy() {
         .await;
     assert_eq!(auth_failure.status(), StatusCode::UNAUTHORIZED);
     drop(auth_failure);
-    fixture.flush();
 
     let process_failure_body = serde_json::to_vec(&serde_json::json!({
         "action": {"raw_command": COMMAND},
@@ -2030,6 +2110,8 @@ async fn integrated_core_trace_privacy() {
         .await;
     assert_eq!(process_failure.status(), StatusCode::BAD_REQUEST);
     drop(process_failure);
+
+    exercise_integrated_queue_failure(&fixture, repository_id).await;
     fixture.flush();
 
     sqlx::query("INSERT INTO processed_deliveries (delivery_id, received_at) VALUES (?, ?)")
@@ -2045,7 +2127,7 @@ async fn integrated_core_trace_privacy() {
                  'unknown', 'unclassified_dequeue')",
     )
     .bind(repository_id)
-    .bind(PRIVACY_PR_NUMBER + 1)
+    .bind(PRIVACY_RETENTION_PR_NUMBER)
     .execute(&fixture.pool)
     .await
     .expect("expired queue attempt is inserted");
@@ -2080,7 +2162,7 @@ async fn integrated_core_trace_privacy() {
              WHERE repository_id = ? AND pull_request_number = ?",
         )
         .bind(repository_id)
-        .bind(PRIVACY_PR_NUMBER + 1)
+        .bind(PRIVACY_RETENTION_PR_NUMBER)
         .fetch_one(&fixture.pool)
         .await
         .expect("retention queue attempt is countable");
@@ -2100,7 +2182,7 @@ async fn integrated_core_trace_privacy() {
     drop(ambient_request);
 
     let exposition = fixture.metrics_text().await;
-    let captured = fixture.force_flush();
+    let (captured, stderr) = fixture.finish();
 
     let create_request = captured.http_request("POST", "/api/v1/repositories", 201);
     let repository_write = captured.child_named(create_request, "config.repository.write");
@@ -2177,6 +2259,30 @@ async fn integrated_core_trace_privacy() {
         captured.child_named(process_failure_request, "github.webhook.process");
     assert_attribute(process_failure_span, "ghe.operation.outcome", "failure");
 
+    let queue_failure_request =
+        captured.webhook_request_for_delivery(PRIVACY_QUEUE_FAILURE_DELIVERY);
+    let queue_failure_process =
+        captured.child_named(queue_failure_request, "github.webhook.process");
+    let queue_failure_update =
+        captured.descendant_named(queue_failure_process, "merge_queue.update", "pull_request");
+    assert_attribute(queue_failure_update, "ghe.operation.outcome", "failure");
+    assert_eq!(queue_failure_update.events.len(), 1);
+    let queue_failure_event = &queue_failure_update.events[0];
+    assert_eq!(queue_failure_event.name, "operation.failure");
+    assert_eq!(queue_failure_event.attributes.len(), 1);
+    assert_eq!(queue_failure_event.attributes[0].key, "ghe.failure.reason");
+    assert_eq!(
+        event_string_attribute(queue_failure_event, "ghe.failure.reason"),
+        Some("queue_state")
+    );
+    assert_eq!(
+        queue_failure_update
+            .status
+            .as_ref()
+            .map(|status| status.code),
+        Some(opentelemetry_proto::tonic::trace::v1::status::StatusCode::Error as i32)
+    );
+
     let retention_roots = captured
         .spans
         .iter()
@@ -2189,31 +2295,23 @@ async fn integrated_core_trace_privacy() {
         "retention run remains an independent root"
     );
     assert_attribute(retention_root, "ghe.operation.outcome", "success");
-    let retention_children = captured
-        .spans
-        .iter()
-        .filter(|span| span.parent_span_id == retention_root.span_id)
+    let mut retention_children = captured
+        .children(retention_root)
         .map(|span| {
             (
                 span.name.as_str(),
                 string_attribute(span, "db.operation.name"),
+                string_attribute(span, "ghe.operation.outcome"),
             )
         })
         .collect::<Vec<_>>();
+    retention_children.sort_unstable();
     assert_eq!(
-        retention_children.len(),
-        2,
-        "retention children: {retention_children:?}; spans: {:?}",
-        captured
-            .spans
-            .iter()
-            .map(|span| (
-                span.name.as_str(),
-                span.span_id.as_slice(),
-                span.parent_span_id.as_slice(),
-                string_attribute(span, "db.operation.name")
-            ))
-            .collect::<Vec<_>>()
+        retention_children,
+        [
+            ("sqlite.query", Some("delivery.prune"), Some("success")),
+            ("sqlite.query", Some("merge_queue.prune"), Some("success")),
+        ]
     );
 
     for operation in [
@@ -2236,6 +2334,7 @@ async fn integrated_core_trace_privacy() {
         PRIVACY_DEQUEUE_DELIVERY,
         PRIVACY_AUTH_FAILURE_DELIVERY,
         PRIVACY_PROCESS_FAILURE_DELIVERY,
+        PRIVACY_QUEUE_FAILURE_DELIVERY,
     ] {
         assert!(
             captured
@@ -2255,9 +2354,9 @@ async fn integrated_core_trace_privacy() {
     }));
 
     captured.assert_approved_attribute_keys();
-    let stderr = fixture.output.text();
     let repository_id_text = repository_id.to_string();
     let pull_request_number_text = PRIVACY_PR_NUMBER.to_string();
+    let queue_failure_pr_number_text = PRIVACY_QUEUE_FAILURE_PR_NUMBER.to_string();
     for approved_identifier in [
         PRIVACY_REPOSITORY,
         PRIVACY_MERGE_GROUP_DELIVERY,
@@ -2265,9 +2364,11 @@ async fn integrated_core_trace_privacy() {
         PRIVACY_DEQUEUE_DELIVERY,
         PRIVACY_AUTH_FAILURE_DELIVERY,
         PRIVACY_PROCESS_FAILURE_DELIVERY,
+        PRIVACY_QUEUE_FAILURE_DELIVERY,
         PRIVACY_SHA,
         repository_id_text.as_str(),
         pull_request_number_text.as_str(),
+        queue_failure_pr_number_text.as_str(),
     ] {
         captured.assert_logs_absent(approved_identifier);
         assert!(
@@ -2279,6 +2380,7 @@ async fn integrated_core_trace_privacy() {
             "Prometheus must not contain span-only identifier {approved_identifier:?}"
         );
     }
+    let retention_pr_number_text = PRIVACY_RETENTION_PR_NUMBER.to_string();
     for forbidden in [
         SECRET,
         SIGNATURE,
@@ -2288,6 +2390,9 @@ async fn integrated_core_trace_privacy() {
         RAW_REASON,
         RAW_URL,
         RAW_UNMATCHED_PATH,
+        RAW_QUEUE_STORE_DETAIL,
+        PRIVACY_RETENTION_DELIVERY,
+        retention_pr_number_text.as_str(),
     ] {
         captured.assert_absent(forbidden);
         captured.assert_logs_absent(forbidden);
@@ -2301,6 +2406,9 @@ async fn integrated_core_trace_privacy() {
         );
     }
     assert!(exposition.contains("github_webhook_duplicates_total 1"));
+    assert!(
+        exposition.contains("github_webhook_processing_failures_total{stage=\"queue_state\"} 1")
+    );
 }
 
 mod retention {
