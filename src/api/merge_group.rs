@@ -21,7 +21,7 @@ pub(super) struct EventProjection {
 
 #[derive(Deserialize)]
 struct MergeGroupProjection {
-    head_sha: Option<String>,
+    head_sha: Option<Value>,
 }
 
 /// A normalized authenticated merge-group transition ready for specialized telemetry.
@@ -94,7 +94,8 @@ impl EventProjection {
         let head_sha = self
             .merge_group
             .as_ref()
-            .and_then(|group| group.head_sha.as_deref())
+            .and_then(|group| group.head_sha.as_ref())
+            .and_then(Value::as_str)
             .and_then(|sha| CommitSha::parse(sha).ok());
         Some(MergeGroupTransition {
             action,

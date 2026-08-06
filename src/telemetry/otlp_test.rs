@@ -937,6 +937,8 @@ async fn webhook_successes_emit_bounded_hierarchy_and_span_only_identifiers() {
     let enqueue_delivery = "550e8400-e29b-41d4-a716-446655440202";
     let dequeue_delivery = "550e8400-e29b-41d4-a716-446655440203";
     let malformed_sha_delivery = "550e8400-e29b-41d4-a716-446655440204";
+    let non_string_pull_request_sha_delivery = "550e8400-e29b-41d4-a716-446655440205";
+    let non_string_merge_group_sha_delivery = "550e8400-e29b-41d4-a716-446655440206";
     let merge_group_body = format!(
         r#"{{"action":"checks_requested","merge_group":{{"head_sha":"{WEBHOOK_SHA_64}"}},"repository":{{"full_name":"{WEBHOOK_REPOSITORY}"}}}}"#
     );
@@ -948,6 +950,12 @@ async fn webhook_successes_emit_bounded_hierarchy_and_span_only_identifiers() {
     );
     let malformed_sha_body = format!(
         r#"{{"action":"checks_requested","merge_group":{{"head_sha":"malformed-sha-must-not-appear"}},"repository":{{"full_name":"{WEBHOOK_REPOSITORY}"}}}}"#
+    );
+    let non_string_pull_request_sha_body = format!(
+        r#"{{"action":"enqueued","pull_request":{{"number":44,"updated_at":"2026-08-05T10:04:00Z","head":{{"sha":42}}}},"repository":{{"full_name":"{WEBHOOK_REPOSITORY}"}}}}"#
+    );
+    let non_string_merge_group_sha_body = format!(
+        r#"{{"action":"checks_requested","merge_group":{{"head_sha":{{"unexpected":"value"}}}},"repository":{{"full_name":"{WEBHOOK_REPOSITORY}"}}}}"#
     );
 
     for (body, event_type, delivery_id) in [
@@ -962,6 +970,16 @@ async fn webhook_successes_emit_bounded_hierarchy_and_span_only_identifiers() {
             malformed_sha_body.as_bytes(),
             "merge_group",
             malformed_sha_delivery,
+        ),
+        (
+            non_string_pull_request_sha_body.as_bytes(),
+            "pull_request",
+            non_string_pull_request_sha_delivery,
+        ),
+        (
+            non_string_merge_group_sha_body.as_bytes(),
+            "merge_group",
+            non_string_merge_group_sha_delivery,
         ),
     ] {
         let response = fixture
@@ -1042,6 +1060,36 @@ async fn webhook_successes_emit_bounded_hierarchy_and_span_only_identifiers() {
         None
     );
 
+    let non_string_pull_request_sha_request =
+        captured.webhook_request_for_delivery(non_string_pull_request_sha_delivery);
+    let non_string_pull_request_sha_process = captured.child_named(
+        non_string_pull_request_sha_request,
+        "github.webhook.process",
+    );
+    let non_string_pull_request_sha_update = captured.descendant_named(
+        non_string_pull_request_sha_process,
+        "merge_queue.update",
+        "pull_request",
+    );
+    assert_eq!(
+        string_attribute(non_string_pull_request_sha_update, "github.commit.sha"),
+        None
+    );
+
+    let non_string_merge_group_sha_request =
+        captured.webhook_request_for_delivery(non_string_merge_group_sha_delivery);
+    let non_string_merge_group_sha_process =
+        captured.child_named(non_string_merge_group_sha_request, "github.webhook.process");
+    let non_string_merge_group_sha_update = captured.descendant_named(
+        non_string_merge_group_sha_process,
+        "merge_queue.update",
+        "merge_group",
+    );
+    assert_eq!(
+        string_attribute(non_string_merge_group_sha_update, "github.commit.sha"),
+        None
+    );
+
     let output = fixture.output.text();
     let normalized_sha_40 = WEBHOOK_SHA_40.to_ascii_lowercase();
     let normalized_sha_64 = WEBHOOK_SHA_64.to_ascii_lowercase();
@@ -1051,6 +1099,8 @@ async fn webhook_successes_emit_bounded_hierarchy_and_span_only_identifiers() {
         enqueue_delivery,
         dequeue_delivery,
         malformed_sha_delivery,
+        non_string_pull_request_sha_delivery,
+        non_string_merge_group_sha_delivery,
         WEBHOOK_SHA_40,
         WEBHOOK_SHA_64,
         normalized_sha_40.as_str(),

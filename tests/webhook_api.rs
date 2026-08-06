@@ -56,6 +56,8 @@ const PULL_REQUEST_MERGED: &[u8] = br#"{"action":"closed","pull_request":{"numbe
 const PULL_REQUEST_UNMERGED: &[u8] = br#"{"action":"closed","pull_request":{"number":42,"updated_at":"2026-08-05T10:01:00Z","merged":false},"repository":{"full_name":"owner/repository"}}"#;
 const PULL_REQUEST_MALFORMED_TIMESTAMP: &[u8] = br#"{"action":"enqueued","pull_request":{"number":42,"updated_at":"not-a-timestamp"},"repository":{"full_name":"owner/repository"}}"#;
 const PULL_REQUEST_INVALID_NUMBER_TYPE: &[u8] = br#"{"action":"enqueued","pull_request":{"number":"42","updated_at":"2026-08-05T10:00:00Z"},"repository":{"full_name":"owner/repository"}}"#;
+const PULL_REQUEST_NON_STRING_SHA: &[u8] = br#"{"action":"enqueued","pull_request":{"number":44,"updated_at":"2026-08-05T10:04:00Z","head":{"sha":42}},"repository":{"full_name":"owner/repository"}}"#;
+const MERGE_GROUP_NON_STRING_SHA: &[u8] = br#"{"action":"checks_requested","merge_group":{"head_sha":{"unexpected":"value"}},"repository":{"full_name":"owner/repository"}}"#;
 const PULL_REQUEST_ENQUEUED_FUTURE: &[u8] = br#"{"action":"enqueued","pull_request":{"number":43,"updated_at":"2027-08-06T10:00:00Z"},"repository":{"full_name":"owner/repository"}}"#;
 const PULL_REQUEST_DEQUEUED_PAST: &[u8] = br#"{"action":"dequeued","pull_request":{"number":43,"updated_at":"2026-08-05T10:00:00Z"},"repository":{"full_name":"owner/repository"}}"#;
 static TRACING_INIT: Once = Once::new();
@@ -813,6 +815,40 @@ async fn authenticated_enabled_repository_returns_no_content() {
 
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert!(response_body(response).await.is_empty());
+}
+
+#[tokio::test]
+async fn authenticated_non_string_sha_fields_remain_accepted() {
+    let app = test_app(2_097_152, Some(true)).await;
+    let cases = [
+        (
+            PULL_REQUEST_NON_STRING_SHA,
+            "pull_request",
+            "550e8400-e29b-41d4-a716-446655440044",
+        ),
+        (
+            MERGE_GROUP_NON_STRING_SHA,
+            "merge_group",
+            "550e8400-e29b-41d4-a716-446655440045",
+        ),
+    ];
+
+    for (body, event_type, delivery_id) in cases {
+        let response = app
+            .router
+            .clone()
+            .oneshot(webhook_request_for_event(
+                body,
+                SECRET,
+                delivery_id,
+                event_type,
+            ))
+            .await
+            .expect("webhook request succeeds");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(response_body(response).await.is_empty());
+    }
 }
 
 #[tokio::test]

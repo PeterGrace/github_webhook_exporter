@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use serde_json::Value;
 use time::OffsetDateTime;
 use tracing::Instrument;
 
@@ -18,7 +19,7 @@ use crate::{
 
 #[derive(Deserialize)]
 struct HeadProjection {
-    sha: Option<String>,
+    sha: Option<Value>,
 }
 
 /// Minimal authenticated payload fields needed for pull-request queue processing.
@@ -34,7 +35,8 @@ impl PullRequestProjection {
     fn head_sha(&self) -> Option<CommitSha> {
         self.head
             .as_ref()
-            .and_then(|head| head.sha.as_deref())
+            .and_then(|head| head.sha.as_ref())
+            .and_then(Value::as_str)
             .and_then(|sha| CommitSha::parse(sha).ok())
     }
 }
