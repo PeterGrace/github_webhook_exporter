@@ -424,7 +424,7 @@ pub enum QueueTransitionFailureReason {
 }
 
 impl QueueTransitionFailureReason {
-    pub(crate) fn as_str(self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             Self::MissingActiveAttempt => "missing_active_attempt",
             Self::InvalidDuration => "invalid_duration",

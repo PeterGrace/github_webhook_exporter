@@ -193,7 +193,7 @@ where
             .with_threads(false)
             .with_target(false)
             .with_tracked_inactivity(false)
-            .with_filter(filter_fn(application_metadata))
+            .with_filter(filter_fn(application_trace_metadata))
     });
     let log_layer = logger_provider.as_ref().map(|provider| {
         OpenTelemetryTracingBridge::new(provider).with_filter(filter_fn(application_metadata))
@@ -283,6 +283,10 @@ fn telemetry_resource(config: &TelemetryConfig) -> Resource {
 
 fn application_metadata(metadata: &Metadata<'_>) -> bool {
     is_application_target(metadata.target())
+}
+
+fn application_trace_metadata(metadata: &Metadata<'_>) -> bool {
+    metadata.is_span() && application_metadata(metadata)
 }
 
 fn is_application_target(target: &str) -> bool {

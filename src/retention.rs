@@ -85,19 +85,40 @@ pub async fn run_retention(
             biased;
             () = wait_for_shutdown(&mut shutdown) => return,
             _ = ticker.tick() => {
-                let retention_span = trace::operation_span(Operation::RetentionRun);
-                let outcome = prune_retention_pass(
+                run_traced_retention_pass(
                     &delivery_store,
                     &merge_queue_store,
                     config,
                     &shutdown,
                 )
-                .instrument(retention_span.clone())
                 .await;
-                trace::set_status(&retention_span, outcome.operation_outcome());
             }
         }
     }
+}
+
+async fn run_traced_retention_pass(
+    delivery_store: &DeliveryStore,
+    merge_queue_store: &MergeQueueStore,
+    config: RetentionConfig,
+    shutdown: &watch::Receiver<bool>,
+) {
+    let retention_span = trace::operation_span(Operation::RetentionRun);
+    let outcome = prune_retention_pass(delivery_store, merge_queue_store, config, shutdown)
+        .instrument(retention_span.clone())
+        .await;
+    trace::set_status(&retention_span, outcome.operation_outcome());
+}
+
+/// Runs exactly one traced retention pass for deterministic test coverage.
+#[cfg(test)]
+pub(crate) async fn run_retention_once(
+    delivery_store: &DeliveryStore,
+    merge_queue_store: &MergeQueueStore,
+    config: RetentionConfig,
+    shutdown: &watch::Receiver<bool>,
+) {
+    run_traced_retention_pass(delivery_store, merge_queue_store, config, shutdown).await;
 }
 
 async fn prune_retention_pass(

@@ -1,5 +1,4 @@
 //! Centralized trace policy for bounded span names, statuses, and identifiers.
-#![allow(dead_code)]
 
 use std::fmt;
 
@@ -477,6 +476,7 @@ pub(crate) fn add_failure_event(span: &Span, reason: OperationFailureReason) {
     );
 }
 
+#[cfg(test)]
 impl Operation {
     /// Returns the fixed span name for this operation.
     pub(crate) const fn as_str(self) -> &'static str {
@@ -634,7 +634,6 @@ mod tests {
     };
     use crate::metrics::{
         Action, EventType, MergeGroupReason, MergeQueueOutcome, MergeQueueReason,
-        QueueTransitionFailureReason,
     };
     use crate::security::CanonicalRepositoryName;
 
@@ -1146,19 +1145,6 @@ mod tests {
             (
                 MergeQueueReason::UnclassifiedDequeue,
                 "unclassified_dequeue",
-            ),
-        ] {
-            assert_eq!(reason.as_str(), expected);
-        }
-
-        for (reason, expected) in [
-            (
-                QueueTransitionFailureReason::MissingActiveAttempt,
-                "missing_active_attempt",
-            ),
-            (
-                QueueTransitionFailureReason::InvalidDuration,
-                "invalid_duration",
             ),
         ] {
             assert_eq!(reason.as_str(), expected);

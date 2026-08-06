@@ -19,7 +19,8 @@ use axum::{
 use hmac::{Hmac, Mac};
 use opentelemetry_proto::tonic::{
     collector::{logs::v1::ExportLogsServiceRequest, trace::v1::ExportTraceServiceRequest},
-    common::v1::any_value::Value as AttributeValue,
+    common::v1::{any_value::Value as AttributeValue, AnyValue, KeyValue},
+    logs::v1::LogRecord,
     trace::v1::Span,
 };
 use prost::Message;
@@ -29,6 +30,7 @@ use sqlx::SqlitePool;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use tracing::instrument::WithSubscriber;
+use tracing_subscriber::layer::{Context as SubscriberContext, Layer, SubscriberExt};
 
 use crate::{
     app::{build_router, AppState},
@@ -49,7 +51,10 @@ use tokio::{
     net::TcpListener,
     sync::{watch, Notify},
 };
-use tracing::{Dispatch, Instrument};
+use tracing::{
+    span::{Attributes, Id},
+    Dispatch, Instrument, Subscriber,
+};
 
 use crate::config::TelemetryConfig;
 use time::{Duration, OffsetDateTime};
@@ -116,6 +121,13 @@ const SPAN_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "db.operation.name",
 ];
 const SPAN_EVENT_ALLOWLIST: &[(&str, &[&str])] = &[("operation.failure", &["ghe.failure.reason"])];
+const SPAN_ONLY_IDENTIFIER_ATTRIBUTE_KEYS: &[&str] = &[
+    "github.repository.name",
+    "github.repository.id",
+    "github.delivery.id",
+    "github.pull_request.number",
+    "github.commit.sha",
+];
 
 #[derive(Default)]
 struct Captures {
@@ -367,6 +379,7 @@ struct RepositoryTraceFixture {
     receiver: RunningReceiver,
     runtime: super::TelemetryRuntime,
     dispatch: Dispatch,
+    output: CapturedOutput,
     router: Router,
     pool: SqlitePool,
     _directory: TempDir,
@@ -377,8 +390,9 @@ impl RepositoryTraceFixture {
         let otlp_guard = otlp_test_lock().lock_owned().await;
         let receiver = RunningReceiver::start_released().await;
         let config = telemetry_config_with_queue_capacity(&receiver.endpoint(), 128);
+        let output = CapturedOutput::default();
         let (runtime, subscriber) =
-            build_runtime("github_webhook_exporter=info", &config, io::sink)
+            build_runtime("github_webhook_exporter=info", &config, output.clone())
                 .expect("telemetry runtime initializes");
         let dispatch = Dispatch::new(subscriber);
         let directory = tempfile::tempdir().expect("temporary directory is created");
@@ -391,6 +405,7 @@ impl RepositoryTraceFixture {
             receiver,
             runtime,
             dispatch,
+            output,
             router,
             pool,
             _directory: directory,
@@ -476,12 +491,72 @@ impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedOutput {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpanLifecycleEvent {
+    Created,
+    Closed,
+}
+
+#[derive(Default)]
+struct SpanLifecycleState {
+    span_names: HashMap<Id, &'static str>,
+    events: Vec<(&'static str, SpanLifecycleEvent)>,
+}
+
+#[derive(Clone, Default)]
+struct CapturedSpanLifecycles(Arc<Mutex<SpanLifecycleState>>);
+
+impl CapturedSpanLifecycles {
+    fn assert_closed_before_created(&self, closed_name: &str, created_name: &str) {
+        let state = self.0.lock().expect("span lifecycle lock is available");
+        let closed_index = state
+            .events
+            .iter()
+            .position(|event| *event == (closed_name, SpanLifecycleEvent::Closed))
+            .unwrap_or_else(|| panic!("{closed_name} span close is captured"));
+        let created_index = state
+            .events
+            .iter()
+            .position(|event| *event == (created_name, SpanLifecycleEvent::Created))
+            .unwrap_or_else(|| panic!("{created_name} span creation is captured"));
+        assert!(
+            closed_index < created_index,
+            "{closed_name} must close before {created_name} is created"
+        );
+    }
+}
+
+impl<S> Layer<S> for CapturedSpanLifecycles
+where
+    S: Subscriber,
+{
+    fn on_new_span(
+        &self,
+        attributes: &Attributes<'_>,
+        id: &Id,
+        _context: SubscriberContext<'_, S>,
+    ) {
+        let name = attributes.metadata().name();
+        let mut state = self.0.lock().expect("span lifecycle lock is available");
+        state.span_names.insert(id.clone(), name);
+        state.events.push((name, SpanLifecycleEvent::Created));
+    }
+
+    fn on_close(&self, id: Id, _context: SubscriberContext<'_, S>) {
+        let mut state = self.0.lock().expect("span lifecycle lock is available");
+        if let Some(name) = state.span_names.remove(&id) {
+            state.events.push((name, SpanLifecycleEvent::Closed));
+        }
+    }
+}
+
 struct WebhookTraceFixture {
     _otlp_guard: OtlpTestGuard,
     receiver: RunningReceiver,
     runtime: super::TelemetryRuntime,
     dispatch: Dispatch,
     output: CapturedOutput,
+    span_lifecycles: CapturedSpanLifecycles,
     router: Router,
     pool: SqlitePool,
     _directory: TempDir,
@@ -496,7 +571,8 @@ impl WebhookTraceFixture {
         let (runtime, subscriber) =
             build_runtime("github_webhook_exporter=info", &config, output.clone())
                 .expect("telemetry runtime initializes");
-        let dispatch = Dispatch::new(subscriber);
+        let span_lifecycles = CapturedSpanLifecycles::default();
+        let dispatch = Dispatch::new(subscriber.with(span_lifecycles.clone()));
         let directory = tempfile::tempdir().expect("temporary directory is created");
         let pool = open_database(&directory.path().join("webhook-trace.db"))
             .await
@@ -529,6 +605,7 @@ impl WebhookTraceFixture {
             runtime,
             dispatch,
             output,
+            span_lifecycles,
             router,
             pool,
             _directory: directory,
@@ -669,6 +746,7 @@ impl WebhookTraceFixture {
             runtime,
             dispatch,
             output,
+            span_lifecycles: _,
             router,
             pool,
             _directory,
@@ -707,6 +785,7 @@ fn router_for_pool(pool: SqlitePool) -> Router {
 #[derive(Debug)]
 struct CapturedSpans {
     spans: Vec<Span>,
+    log_records: Vec<LogRecord>,
     resource_attribute_keys: BTreeSet<String>,
     serialized: Vec<u8>,
     serialized_logs: Vec<u8>,
@@ -722,6 +801,12 @@ impl CapturedSpans {
             .flat_map(|request| &request.resource_spans)
             .flat_map(|resource| &resource.scope_spans)
             .flat_map(|scope| scope.spans.iter().cloned())
+            .collect();
+        let log_records = log_requests
+            .iter()
+            .flat_map(|request| &request.resource_logs)
+            .flat_map(|resource| &resource.scope_logs)
+            .flat_map(|scope| scope.log_records.iter().cloned())
             .collect();
         let resource_attribute_keys = requests
             .iter()
@@ -747,10 +832,80 @@ impl CapturedSpans {
             .collect();
         Self {
             spans,
+            log_records,
             resource_attribute_keys,
             serialized,
             serialized_logs,
         }
+    }
+
+    fn from_parsed_records(
+        spans: Vec<Span>,
+        log_records: Vec<LogRecord>,
+        serialized: Vec<u8>,
+        serialized_logs: Vec<u8>,
+    ) -> Self {
+        Self {
+            spans,
+            log_records,
+            resource_attribute_keys: BTreeSet::new(),
+            serialized,
+            serialized_logs,
+        }
+    }
+
+    fn trace_attributes(&self) -> impl Iterator<Item = &KeyValue> {
+        self.spans.iter().flat_map(|span| {
+            span.attributes
+                .iter()
+                .chain(span.events.iter().flat_map(|event| event.attributes.iter()))
+                .chain(span.links.iter().flat_map(|link| link.attributes.iter()))
+        })
+    }
+
+    fn log_attributes(&self) -> impl Iterator<Item = &KeyValue> {
+        self.log_records
+            .iter()
+            .flat_map(|record| record.attributes.iter())
+    }
+
+    fn has_trace_i64_attribute(&self, key: &str, value: i64) -> bool {
+        self.trace_attributes()
+            .any(|attribute| i64_key_value(attribute, key) == Some(value))
+    }
+
+    fn has_log_i64_attribute(&self, key: &str, value: i64) -> bool {
+        self.log_attributes()
+            .any(|attribute| i64_key_value(attribute, key) == Some(value))
+    }
+
+    fn has_trace_i64_value(&self, value: i64) -> bool {
+        self.trace_attributes()
+            .any(|attribute| i64_key_value(attribute, &attribute.key) == Some(value))
+    }
+
+    fn has_log_i64_value(&self, value: i64) -> bool {
+        self.log_attributes()
+            .any(|attribute| i64_key_value(attribute, &attribute.key) == Some(value))
+    }
+
+    fn has_trace_string_attribute(&self, key: &str, value: &str) -> bool {
+        self.trace_attributes()
+            .any(|attribute| string_key_value(attribute, key) == Some(value))
+    }
+
+    fn has_log_attribute_key(&self, key: &str) -> bool {
+        self.log_attributes().any(|attribute| attribute.key == key)
+    }
+
+    fn has_log_body(&self, expected: &str) -> bool {
+        self.log_records.iter().any(|record| {
+            record
+                .body
+                .as_ref()
+                .and_then(string_any_value)
+                .is_some_and(|body| body.contains(expected))
+        })
     }
 
     fn http_request(&self, method: &str, route: &str, status_code: i64) -> &Span {
@@ -823,6 +978,13 @@ impl CapturedSpans {
             .iter()
             .find(|span| span.name == name && span.parent_span_id == parent.span_id)
             .expect("matching child span is exported")
+    }
+
+    fn parent_named(&self, child: &Span, name: &str) -> &Span {
+        self.spans
+            .iter()
+            .find(|span| span.name == name && span.span_id == child.parent_span_id)
+            .expect("matching parent span is exported")
     }
 
     fn children<'spans>(&'spans self, parent: &'spans Span) -> impl Iterator<Item = &'spans Span> {
@@ -941,19 +1103,7 @@ impl CapturedSpans {
 fn string_attribute<'span>(span: &'span Span, key: &str) -> Option<&'span str> {
     span.attributes
         .iter()
-        .find(|attribute| attribute.key == key)
-        .and_then(|attribute| attribute.value.as_ref())
-        .and_then(|value| match value.value.as_ref() {
-            Some(AttributeValue::StringValue(value)) => Some(value.as_str()),
-            Some(AttributeValue::IntValue(_))
-            | Some(AttributeValue::DoubleValue(_))
-            | Some(AttributeValue::BoolValue(_))
-            | Some(AttributeValue::ArrayValue(_))
-            | Some(AttributeValue::KvlistValue(_))
-            | Some(AttributeValue::BytesValue(_))
-            | Some(AttributeValue::StringValueStrindex(_))
-            | None => None,
-        })
+        .find_map(|attribute| string_key_value(attribute, key))
 }
 
 fn event_string_attribute<'event>(
@@ -963,26 +1113,46 @@ fn event_string_attribute<'event>(
     event
         .attributes
         .iter()
-        .find(|attribute| attribute.key == key)
-        .and_then(|attribute| attribute.value.as_ref())
-        .and_then(|value| match value.value.as_ref() {
-            Some(AttributeValue::StringValue(value)) => Some(value.as_str()),
-            Some(AttributeValue::IntValue(_))
-            | Some(AttributeValue::DoubleValue(_))
-            | Some(AttributeValue::BoolValue(_))
-            | Some(AttributeValue::ArrayValue(_))
-            | Some(AttributeValue::KvlistValue(_))
-            | Some(AttributeValue::BytesValue(_))
-            | Some(AttributeValue::StringValueStrindex(_))
-            | None => None,
-        })
+        .find_map(|attribute| string_key_value(attribute, key))
+}
+
+fn string_key_value<'attribute>(
+    attribute: &'attribute KeyValue,
+    key: &str,
+) -> Option<&'attribute str> {
+    if attribute.key != key {
+        return None;
+    }
+    attribute.value.as_ref().and_then(string_any_value)
+}
+
+fn string_any_value(value: &AnyValue) -> Option<&str> {
+    match value.value.as_ref() {
+        Some(AttributeValue::StringValue(value)) => Some(value.as_str()),
+        Some(AttributeValue::IntValue(_))
+        | Some(AttributeValue::DoubleValue(_))
+        | Some(AttributeValue::BoolValue(_))
+        | Some(AttributeValue::ArrayValue(_))
+        | Some(AttributeValue::KvlistValue(_))
+        | Some(AttributeValue::BytesValue(_))
+        | Some(AttributeValue::StringValueStrindex(_))
+        | None => None,
+    }
 }
 
 fn i64_attribute(span: &Span, key: &str) -> Option<i64> {
     span.attributes
         .iter()
-        .find(|attribute| attribute.key == key)
-        .and_then(|attribute| attribute.value.as_ref())
+        .find_map(|attribute| i64_key_value(attribute, key))
+}
+
+fn i64_key_value(attribute: &KeyValue, key: &str) -> Option<i64> {
+    if attribute.key != key {
+        return None;
+    }
+    attribute
+        .value
+        .as_ref()
         .and_then(|value| match value.value.as_ref() {
             Some(AttributeValue::IntValue(value)) => Some(*value),
             Some(AttributeValue::StringValue(_))
@@ -1011,6 +1181,49 @@ fn assert_attribute(span: &Span, key: &str, value: &str) {
 
 fn assert_i64_attribute(span: &Span, key: &str, value: i64) {
     assert_eq!(i64_attribute(span, key), Some(value));
+}
+
+#[test]
+fn parsed_numeric_privacy_checks_detect_varint_attributes() {
+    const TRACE_KEY: &str = "github.repository.id";
+    const LOG_KEY: &str = "github.pull_request.number";
+    const TRACE_VALUE: i64 = 987_000_001;
+    const LOG_VALUE: i64 = 976_543_211;
+
+    let trace_span = Span {
+        attributes: vec![KeyValue {
+            key: TRACE_KEY.to_owned(),
+            value: Some(AnyValue {
+                value: Some(AttributeValue::IntValue(TRACE_VALUE)),
+            }),
+            key_strindex: 0,
+        }],
+        ..Span::default()
+    };
+    let log_record = LogRecord {
+        attributes: vec![KeyValue {
+            key: LOG_KEY.to_owned(),
+            value: Some(AnyValue {
+                value: Some(AttributeValue::IntValue(LOG_VALUE)),
+            }),
+            key_strindex: 0,
+        }],
+        ..LogRecord::default()
+    };
+    let serialized_trace = trace_span.encode_to_vec();
+    let serialized_log = log_record.encode_to_vec();
+    assert!(!String::from_utf8_lossy(&serialized_trace).contains(&TRACE_VALUE.to_string()));
+    assert!(!String::from_utf8_lossy(&serialized_log).contains(&LOG_VALUE.to_string()));
+
+    let captured = CapturedSpans::from_parsed_records(
+        vec![trace_span],
+        vec![log_record],
+        serialized_trace,
+        serialized_log,
+    );
+    assert!(captured.has_trace_i64_attribute(TRACE_KEY, TRACE_VALUE));
+    assert!(captured.has_log_i64_attribute(LOG_KEY, LOG_VALUE));
+    assert!(captured.has_log_attribute_key(LOG_KEY));
 }
 
 mod sqlite {
@@ -1510,6 +1723,9 @@ async fn repository_store_failure_marks_http_and_write_spans_without_error_text(
     captured.assert_absent("failure-secret-must-not-appear");
     captured.assert_absent("pool closed");
     captured.assert_absent("repository-trace.db");
+    captured.assert_approved_attribute_keys();
+    assert!(captured.has_log_body("request failed"));
+    assert!(fixture.output.text().contains("request failed"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1573,12 +1789,19 @@ async fn webhook_successes_emit_bounded_hierarchy_and_span_only_identifiers() {
         .fetch_one(&fixture.pool)
         .await
         .expect("repository identifier is readable");
+    fixture
+        .span_lifecycles
+        .assert_closed_before_created("github.webhook.authenticate", "github.webhook.process");
     let exposition = fixture.metrics_text().await;
     let captured = fixture.force_flush();
 
     let merge_request = captured.webhook_request_for_delivery(merge_group_delivery);
     let merge_authenticate = captured.child_named(merge_request, "github.webhook.authenticate");
     let merge_process = captured.child_named(merge_request, "github.webhook.process");
+    assert!(
+        merge_authenticate.end_time_unix_nano <= merge_process.start_time_unix_nano,
+        "authentication must end before webhook processing starts"
+    );
     for span in [merge_authenticate, merge_process] {
         assert_attribute(span, "github.repository.name", WEBHOOK_REPOSITORY);
         assert_i64_attribute(span, "github.repository.id", repository_id);
@@ -1944,7 +2167,7 @@ async fn exercise_integrated_queue_failure(fixture: &WebhookTraceFixture, reposi
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integrated_core_trace_privacy() {
-    use crate::retention::{run_retention, RetentionConfig};
+    use crate::retention::{run_retention_once, RetentionConfig};
 
     let fixture = WebhookTraceFixture::new().await;
     sqlx::query("UPDATE repositories SET id = ? WHERE full_name = ?")
@@ -2132,54 +2355,44 @@ async fn integrated_core_trace_privacy() {
     .await
     .expect("expired queue attempt is inserted");
     let retention_config = RetentionConfig::new(
-        std::time::Duration::from_millis(25),
+        std::time::Duration::from_secs(60),
         std::time::Duration::from_secs(86_400),
         std::time::Duration::from_secs(90 * 86_400),
     )
     .expect("retention configuration is valid");
-    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
-    let ambient_request = trace::operation_span(trace::Operation::HttpRequest);
-    let retention_runner = tokio::spawn(
-        run_retention(
-            DeliveryStore::new(fixture.pool.clone()),
-            MergeQueueStore::new(fixture.pool.clone()),
+    let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
+    let delivery_store = DeliveryStore::new(fixture.pool.clone());
+    let merge_queue_store = MergeQueueStore::new(fixture.pool.clone());
+    async {
+        let ambient_request = trace::operation_span(trace::Operation::HttpRequest);
+        run_retention_once(
+            &delivery_store,
+            &merge_queue_store,
             retention_config,
-            shutdown_receiver,
+            &shutdown_receiver,
         )
-        .instrument(ambient_request.clone())
-        .with_subscriber(fixture.dispatch.clone()),
-    );
-    let retention_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let retained_delivery: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries WHERE delivery_id = ?")
-                .bind(PRIVACY_RETENTION_DELIVERY)
-                .fetch_one(&fixture.pool)
-                .await
-                .expect("retention delivery is countable");
-        let retained_attempt: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM merge_queue_attempts \
-             WHERE repository_id = ? AND pull_request_number = ?",
-        )
-        .bind(repository_id)
-        .bind(PRIVACY_RETENTION_PR_NUMBER)
-        .fetch_one(&fixture.pool)
-        .await
-        .expect("retention queue attempt is countable");
-        if retained_delivery == 0 && retained_attempt == 0 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < retention_deadline,
-            "integrated retention pass did not complete before the diagnostic deadline"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        .instrument(ambient_request)
+        .await;
     }
-    shutdown_sender
-        .send(true)
-        .expect("retention runner receives shutdown");
-    retention_runner.await.expect("retention runner joins");
-    drop(ambient_request);
+    .with_subscriber(fixture.dispatch.clone())
+    .await;
+    let retained_delivery: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries WHERE delivery_id = ?")
+            .bind(PRIVACY_RETENTION_DELIVERY)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("retention delivery is countable");
+    let retained_attempt: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM merge_queue_attempts \
+         WHERE repository_id = ? AND pull_request_number = ?",
+    )
+    .bind(repository_id)
+    .bind(PRIVACY_RETENTION_PR_NUMBER)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("retention queue attempt is countable");
+    assert_eq!(retained_delivery, 0);
+    assert_eq!(retained_attempt, 0);
 
     let exposition = fixture.metrics_text().await;
     let (captured, stderr) = fixture.finish();
@@ -2205,10 +2418,17 @@ async fn integrated_core_trace_privacy() {
     assert_attribute(merge_update, "ghe.merge_group.reason", "dequeued");
     assert_attribute(merge_update, "github.commit.sha", PRIVACY_SHA);
 
-    let dequeue_request = captured.webhook_request_for_delivery(PRIVACY_DEQUEUE_DELIVERY);
-    let dequeue_process = captured.child_named(dequeue_request, "github.webhook.process");
-    let dequeue_update =
-        captured.descendant_named(dequeue_process, "merge_queue.update", "pull_request");
+    let dequeue_update = captured
+        .spans
+        .iter()
+        .find(|span| {
+            span.name == "merge_queue.update"
+                && string_attribute(span, "github.delivery.id") == Some(PRIVACY_DEQUEUE_DELIVERY)
+        })
+        .expect("dequeue update span is exported");
+    let dequeue_process = captured.parent_named(dequeue_update, "github.webhook.process");
+    let dequeue_request = captured.parent_named(dequeue_process, "http.request");
+    assert_attribute(dequeue_request, "http.route", "/webhooks/github");
     assert_i64_attribute(
         dequeue_update,
         "github.pull_request.number",
@@ -2352,11 +2572,49 @@ async fn integrated_core_trace_privacy() {
         i64_attribute(span, "github.pull_request.number") == Some(PRIVACY_PR_NUMBER)
             && string_attribute(span, "github.commit.sha") == Some(PRIVACY_SHA)
     }));
+    assert!(captured.has_trace_i64_attribute(
+        "github.pull_request.number",
+        PRIVACY_QUEUE_FAILURE_PR_NUMBER,
+    ));
 
     captured.assert_approved_attribute_keys();
-    let repository_id_text = repository_id.to_string();
-    let pull_request_number_text = PRIVACY_PR_NUMBER.to_string();
-    let queue_failure_pr_number_text = PRIVACY_QUEUE_FAILURE_PR_NUMBER.to_string();
+    for key in SPAN_ONLY_IDENTIFIER_ATTRIBUTE_KEYS {
+        assert!(
+            !captured.has_log_attribute_key(key),
+            "OTLP logs must not contain span-only identifier key {key:?}"
+        );
+    }
+    for (key, value) in [
+        ("github.repository.id", repository_id),
+        ("github.pull_request.number", PRIVACY_PR_NUMBER),
+        (
+            "github.pull_request.number",
+            PRIVACY_QUEUE_FAILURE_PR_NUMBER,
+        ),
+    ] {
+        assert!(captured.has_trace_i64_attribute(key, value));
+        assert!(
+            !captured.has_log_i64_attribute(key, value),
+            "OTLP logs must not contain span-only integer {key}={value}"
+        );
+        assert!(
+            !captured.has_log_i64_value(value),
+            "OTLP log attributes must not contain span-only integer {value}"
+        );
+    }
+    assert!(
+        !captured.has_trace_i64_value(PRIVACY_RETENTION_PR_NUMBER),
+        "retention pull-request identifiers must not appear in trace attributes"
+    );
+    assert!(
+        !captured.has_log_i64_value(PRIVACY_RETENTION_PR_NUMBER),
+        "retention pull-request identifiers must not appear in log attributes"
+    );
+    assert!(
+        !captured.has_trace_string_attribute("github.delivery.id", PRIVACY_RETENTION_DELIVERY,),
+        "retention delivery identifiers must not appear in trace attributes"
+    );
+
     for approved_identifier in [
         PRIVACY_REPOSITORY,
         PRIVACY_MERGE_GROUP_DELIVERY,
@@ -2366,9 +2624,6 @@ async fn integrated_core_trace_privacy() {
         PRIVACY_PROCESS_FAILURE_DELIVERY,
         PRIVACY_QUEUE_FAILURE_DELIVERY,
         PRIVACY_SHA,
-        repository_id_text.as_str(),
-        pull_request_number_text.as_str(),
-        queue_failure_pr_number_text.as_str(),
     ] {
         captured.assert_logs_absent(approved_identifier);
         assert!(
@@ -2380,7 +2635,15 @@ async fn integrated_core_trace_privacy() {
             "Prometheus must not contain span-only identifier {approved_identifier:?}"
         );
     }
-    let retention_pr_number_text = PRIVACY_RETENTION_PR_NUMBER.to_string();
+    for numeric_identifier in [
+        repository_id,
+        PRIVACY_PR_NUMBER,
+        PRIVACY_QUEUE_FAILURE_PR_NUMBER,
+    ] {
+        let numeric_identifier = numeric_identifier.to_string();
+        assert!(!stderr.contains(&numeric_identifier));
+        assert!(!exposition.contains(&numeric_identifier));
+    }
     for forbidden in [
         SECRET,
         SIGNATURE,
@@ -2392,7 +2655,6 @@ async fn integrated_core_trace_privacy() {
         RAW_UNMATCHED_PATH,
         RAW_QUEUE_STORE_DETAIL,
         PRIVACY_RETENTION_DELIVERY,
-        retention_pr_number_text.as_str(),
     ] {
         captured.assert_absent(forbidden);
         captured.assert_logs_absent(forbidden);
@@ -2405,6 +2667,9 @@ async fn integrated_core_trace_privacy() {
             "Prometheus must not contain forbidden value {forbidden:?}"
         );
     }
+    let retention_pr_number_text = PRIVACY_RETENTION_PR_NUMBER.to_string();
+    assert!(!stderr.contains(&retention_pr_number_text));
+    assert!(!exposition.contains(&retention_pr_number_text));
     assert!(exposition.contains("github_webhook_duplicates_total 1"));
     assert!(
         exposition.contains("github_webhook_processing_failures_total{stage=\"queue_state\"} 1")
@@ -2417,7 +2682,7 @@ mod retention {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
-    use crate::retention::{run_retention, RetentionConfig};
+    use crate::retention::{run_retention_once, RetentionConfig};
 
     const RETENTION_TRACE_QUEUE_CAPACITY: usize = 128;
 
@@ -2472,22 +2737,20 @@ mod retention {
             }
         }
 
-        fn spawn_retention(
-            &self,
-            config: RetentionConfig,
-            shutdown: watch::Receiver<bool>,
-        ) -> tokio::task::JoinHandle<()> {
-            let ambient_request = trace::operation_span(trace::Operation::HttpRequest);
-            tokio::spawn(
-                run_retention(
-                    self.delivery_store.clone(),
-                    self.merge_queue_store.clone(),
+        async fn run_pass(&self, config: RetentionConfig, shutdown: &watch::Receiver<bool>) {
+            async {
+                let ambient_request = trace::operation_span(trace::Operation::HttpRequest);
+                run_retention_once(
+                    &self.delivery_store,
+                    &self.merge_queue_store,
                     config,
                     shutdown,
                 )
                 .instrument(ambient_request)
-                .with_subscriber(self.dispatch.clone()),
-            )
+                .await;
+            }
+            .with_subscriber(self.dispatch.clone())
+            .await;
         }
 
         fn force_flush(&self) -> CapturedSpans {
@@ -2598,31 +2861,9 @@ mod retention {
             .expect("queue attempts are countable")
     }
 
-    async fn wait_for_delivery_count(pool: &SqlitePool, expected: i64) {
-        let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
-        while delivery_count(pool).await != expected {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "delivery retention did not reach the expected count"
-            );
-            tokio::time::sleep(StdDuration::from_millis(1)).await;
-        }
-    }
-
-    async fn wait_for_queue_attempt_count(pool: &SqlitePool, expected: i64) {
-        let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
-        while queue_attempt_count(pool).await != expected {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "queue retention did not reach the expected count"
-            );
-            tokio::time::sleep(StdDuration::from_millis(1)).await;
-        }
-    }
-
     fn standard_config() -> RetentionConfig {
         RetentionConfig::new(
-            StdDuration::from_millis(250),
+            StdDuration::from_secs(60),
             StdDuration::from_secs(86_400),
             StdDuration::from_secs(90 * 86_400),
         )
@@ -2631,24 +2872,11 @@ mod retention {
 
     fn invalid_cutoff_config() -> RetentionConfig {
         RetentionConfig::new(
-            StdDuration::from_millis(250),
+            StdDuration::from_secs(60),
             StdDuration::from_secs(100_000_000 * 86_400),
             StdDuration::from_secs(100_000_000 * 86_400),
         )
         .expect("retention configuration is valid")
-    }
-
-    async fn tick_once() {
-        tokio::task::yield_now().await;
-        tokio::time::sleep(StdDuration::from_millis(275)).await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-    }
-
-    async fn stop_runner(shutdown: watch::Sender<bool>, runner: tokio::task::JoinHandle<()>) {
-        let _ignored = shutdown.send(true);
-        runner.await.expect("retention runner joins");
     }
 
     fn assert_root_outcome_only(span: &Span, outcome: &str) {
@@ -2681,13 +2909,12 @@ mod retention {
         let fixture = RetentionTraceFixture::new().await;
         insert_delivery(&fixture.pool, "30000000-0000-4000-8000-000000000001").await;
         insert_queue_attempt(&fixture.pool, 3001).await;
-        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
-        let runner = fixture.spawn_retention(standard_config(), shutdown_receiver);
-
-        tick_once().await;
-        wait_for_delivery_count(&fixture.pool, 0).await;
-        wait_for_queue_attempt_count(&fixture.pool, 0).await;
-        stop_runner(shutdown_sender, runner).await;
+        let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
+        fixture
+            .run_pass(standard_config(), &shutdown_receiver)
+            .await;
+        assert_eq!(delivery_count(&fixture.pool).await, 0);
+        assert_eq!(queue_attempt_count(&fixture.pool).await, 0);
         let captured = fixture.force_flush();
 
         let root = captured.one_named("retention.run");
@@ -2705,14 +2932,10 @@ mod retention {
         .await;
         insert_delivery(&fixture.pool, "30000000-0000-4000-8000-000000000002").await;
         insert_queue_attempt(&fixture.pool, 3002).await;
-        let runner = fixture.spawn_retention(standard_config(), shutdown_receiver);
-
-        tick_once().await;
-        wait_for_delivery_count(&fixture.pool, 0).await;
-        tokio::time::timeout(StdDuration::from_secs(5), runner)
-            .await
-            .expect("retention runner stops after delivery cancellation")
-            .expect("retention runner joins after cancellation");
+        fixture
+            .run_pass(standard_config(), &shutdown_receiver)
+            .await;
+        assert_eq!(delivery_count(&fixture.pool).await, 0);
         let captured = fixture.force_flush();
 
         let root = captured.one_named("retention.run");
@@ -2734,11 +2957,10 @@ mod retention {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn invalid_cutoff_exports_failure_root_without_cutoff_attributes() {
         let fixture = RetentionTraceFixture::new().await;
-        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
-        let runner = fixture.spawn_retention(invalid_cutoff_config(), shutdown_receiver);
-
-        tick_once().await;
-        stop_runner(shutdown_sender, runner).await;
+        let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
+        fixture
+            .run_pass(invalid_cutoff_config(), &shutdown_receiver)
+            .await;
         let captured = fixture.force_flush();
 
         let root = captured.one_named("retention.run");
@@ -2756,12 +2978,11 @@ mod retention {
             .execute(&fixture.pool)
             .await
             .expect("delivery table is removed");
-        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
-        let runner = fixture.spawn_retention(standard_config(), shutdown_receiver);
-
-        tick_once().await;
-        wait_for_queue_attempt_count(&fixture.pool, 0).await;
-        stop_runner(shutdown_sender, runner).await;
+        let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
+        fixture
+            .run_pass(standard_config(), &shutdown_receiver)
+            .await;
+        assert_eq!(queue_attempt_count(&fixture.pool).await, 0);
         let captured = fixture.force_flush();
 
         let root = captured.one_named("retention.run");

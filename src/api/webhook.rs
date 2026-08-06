@@ -119,6 +119,7 @@ async fn webhook_handler(
             return Err(unavailable_error(&state, FailureStage::Authentication));
         }
     };
+    drop(authentication_span);
 
     let process_span = trace::operation_span(Operation::WebhookProcess);
     trace::set_repository_name(&process_span, &request.repository_name);
