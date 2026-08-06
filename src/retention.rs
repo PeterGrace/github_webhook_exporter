@@ -330,7 +330,10 @@ mod tests {
 
     use crate::storage::{open_database, DeliveryStore, MergeQueueStore};
 
-    use super::{prune_expired_deliveries, run_retention, RetentionConfig, RetentionError};
+    use super::{
+        prune_expired_deliveries, run_retention, RetentionConfig, RetentionError,
+        RetentionPassOutcome, StorePruneOutcome,
+    };
 
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
@@ -363,6 +366,76 @@ mod tests {
 
         fn make_writer(&'writer self) -> Self::Writer {
             CapturedLogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    #[test]
+    fn store_outcomes_map_to_bounded_pass_outcomes() {
+        for (store_outcome, expected) in [
+            (StorePruneOutcome::Completed, RetentionPassOutcome::Success),
+            (
+                StorePruneOutcome::Cancelled,
+                RetentionPassOutcome::Cancelled,
+            ),
+            (StorePruneOutcome::Failed, RetentionPassOutcome::Failure),
+        ] {
+            assert_eq!(
+                RetentionPassOutcome::from_store_outcome(store_outcome),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn combined_pass_outcomes_prioritize_failure_then_cancellation() {
+        for (current, store_outcome, expected) in [
+            (
+                RetentionPassOutcome::Success,
+                StorePruneOutcome::Completed,
+                RetentionPassOutcome::Success,
+            ),
+            (
+                RetentionPassOutcome::Success,
+                StorePruneOutcome::Cancelled,
+                RetentionPassOutcome::Cancelled,
+            ),
+            (
+                RetentionPassOutcome::Success,
+                StorePruneOutcome::Failed,
+                RetentionPassOutcome::Failure,
+            ),
+            (
+                RetentionPassOutcome::Cancelled,
+                StorePruneOutcome::Completed,
+                RetentionPassOutcome::Cancelled,
+            ),
+            (
+                RetentionPassOutcome::Cancelled,
+                StorePruneOutcome::Cancelled,
+                RetentionPassOutcome::Cancelled,
+            ),
+            (
+                RetentionPassOutcome::Cancelled,
+                StorePruneOutcome::Failed,
+                RetentionPassOutcome::Failure,
+            ),
+            (
+                RetentionPassOutcome::Failure,
+                StorePruneOutcome::Completed,
+                RetentionPassOutcome::Failure,
+            ),
+            (
+                RetentionPassOutcome::Failure,
+                StorePruneOutcome::Cancelled,
+                RetentionPassOutcome::Failure,
+            ),
+            (
+                RetentionPassOutcome::Failure,
+                StorePruneOutcome::Failed,
+                RetentionPassOutcome::Failure,
+            ),
+        ] {
+            assert_eq!(current.combine(store_outcome), expected);
         }
     }
 

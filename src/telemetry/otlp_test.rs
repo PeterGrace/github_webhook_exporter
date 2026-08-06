@@ -2059,10 +2059,9 @@ async fn webhook_queue_failure_is_bounded_and_duplicate_has_no_second_update() {
             .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         drop(response);
-        fixture.flush();
     }
     let exposition = fixture.metrics_text().await;
-    let captured = fixture.force_flush();
+    let (captured, stderr) = fixture.finish();
 
     let matching_updates: Vec<&Span> = captured
         .spans
@@ -2111,7 +2110,7 @@ async fn webhook_queue_failure_is_bounded_and_duplicate_has_no_second_update() {
     ] {
         captured.assert_absent(forbidden);
         captured.assert_logs_absent(forbidden);
-        assert!(!fixture.output.text().contains(forbidden));
+        assert!(!stderr.contains(forbidden));
         assert!(!exposition.contains(forbidden));
     }
 }
