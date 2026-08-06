@@ -4,6 +4,7 @@ use crate::{
         CanonicalRepositoryName, EncryptedRepositorySecret, RepositorySecret,
         RepositorySecretCipher, SecurityError,
     },
+    telemetry::trace::{self, DatabaseOperation},
 };
 use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
 use thiserror::Error;
@@ -49,6 +50,11 @@ impl RepositoryStore {
     /// Returns a redacted persistence error when SQLite cannot complete the query, or
     /// [`RepositoryStoreError::InternalData`] if the count cannot be represented as `u64`.
     pub async fn count(&self) -> Result<u64, RepositoryStoreError> {
+        trace::instrument_database_operation(DatabaseOperation::RepositoryCount, self.count_inner())
+            .await
+    }
+
+    async fn count_inner(&self) -> Result<u64, RepositoryStoreError> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories")
             .fetch_one(&self.pool)
             .await
@@ -64,6 +70,19 @@ impl RepositoryStore {
     /// [`RepositoryStoreError::Cryptographic`] when encryption fails, and a redacted persistence
     /// error for SQLite failures.
     pub async fn create(
+        &self,
+        full_name: CanonicalRepositoryName,
+        webhook_secret: RepositorySecret,
+        enabled: bool,
+    ) -> Result<RepositoryMetadata, RepositoryStoreError> {
+        trace::instrument_database_operation(
+            DatabaseOperation::RepositoryCreate,
+            self.create_inner(full_name, webhook_secret, enabled),
+        )
+        .await
+    }
+
+    async fn create_inner(
         &self,
         full_name: CanonicalRepositoryName,
         webhook_secret: RepositorySecret,
@@ -105,6 +124,11 @@ impl RepositoryStore {
     /// Returns a cryptographic failure if any persisted encrypted value is invalid, and a redacted
     /// persistence error when SQLite cannot complete the query.
     pub async fn list(&self) -> Result<Vec<RepositoryMetadata>, RepositoryStoreError> {
+        trace::instrument_database_operation(DatabaseOperation::RepositoryList, self.list_inner())
+            .await
+    }
+
+    async fn list_inner(&self) -> Result<Vec<RepositoryMetadata>, RepositoryStoreError> {
         let query = format!("SELECT {RETURNING_COLUMNS} FROM repositories ORDER BY id");
         sqlx::query(&query)
             .fetch_all(&self.pool)
@@ -129,13 +153,27 @@ impl RepositoryStore {
         &self,
         full_name: &CanonicalRepositoryName,
     ) -> Result<RepositorySecret, RepositoryStoreError> {
-        self.authentication_material(full_name)
-            .await
-            .map(|material| material.webhook_secret)
+        trace::instrument_database_operation(
+            DatabaseOperation::RepositoryAuthenticate,
+            self.authentication_material_inner(full_name),
+        )
+        .await
+        .map(|material| material.webhook_secret)
     }
 
     /// Loads typed identity and zeroizing secret material for an enabled repository.
     pub(crate) async fn authentication_material(
+        &self,
+        full_name: &CanonicalRepositoryName,
+    ) -> Result<RepositoryAuthenticationMaterial, RepositoryStoreError> {
+        trace::instrument_database_operation(
+            DatabaseOperation::RepositoryAuthenticate,
+            self.authentication_material_inner(full_name),
+        )
+        .await
+    }
+
+    async fn authentication_material_inner(
         &self,
         full_name: &CanonicalRepositoryName,
     ) -> Result<RepositoryAuthenticationMaterial, RepositoryStoreError> {
@@ -168,6 +206,14 @@ impl RepositoryStore {
     /// Returns [`RepositoryStoreError::NotFound`] for an unknown identifier, a cryptographic
     /// failure for invalid encrypted storage, or a redacted persistence failure.
     pub async fn get(&self, id: RepositoryId) -> Result<RepositoryMetadata, RepositoryStoreError> {
+        trace::instrument_database_operation(DatabaseOperation::RepositoryGet, self.get_inner(id))
+            .await
+    }
+
+    async fn get_inner(
+        &self,
+        id: RepositoryId,
+    ) -> Result<RepositoryMetadata, RepositoryStoreError> {
         let query = format!("SELECT {RETURNING_COLUMNS} FROM repositories WHERE id = ?");
         let row = sqlx::query(&query)
             .bind(id.get())
@@ -186,6 +232,18 @@ impl RepositoryStore {
     /// [`RepositoryStoreError::NotFound`] for an unknown identifier, and a typed cryptographic or
     /// persistence error when validation or SQLite fails.
     pub async fn update(
+        &self,
+        id: RepositoryId,
+        mutation: RepositoryMutation,
+    ) -> Result<RepositoryMetadata, RepositoryStoreError> {
+        trace::instrument_database_operation(
+            DatabaseOperation::RepositoryUpdate,
+            self.update_inner(id, mutation),
+        )
+        .await
+    }
+
+    async fn update_inner(
         &self,
         id: RepositoryId,
         mutation: RepositoryMutation,
@@ -252,6 +310,14 @@ impl RepositoryStore {
     /// row whose encrypted value cannot be authenticated, and maps SQLite failures to redacted
     /// persistence errors.
     pub async fn delete(&self, id: RepositoryId) -> Result<(), RepositoryStoreError> {
+        trace::instrument_database_operation(
+            DatabaseOperation::RepositoryDelete,
+            self.delete_inner(id),
+        )
+        .await
+    }
+
+    async fn delete_inner(&self, id: RepositoryId) -> Result<(), RepositoryStoreError> {
         let mut transaction = self.pool.begin().await.map_err(map_sqlx_error)?;
         let select = format!("SELECT {RETURNING_COLUMNS} FROM repositories WHERE id = ?");
         let row = sqlx::query(&select)

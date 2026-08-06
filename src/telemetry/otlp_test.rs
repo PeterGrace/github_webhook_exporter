@@ -4,7 +4,7 @@ use std::{
     io::{self, Write},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
 };
 
@@ -32,11 +32,18 @@ use tracing::instrument::WithSubscriber;
 
 use crate::{
     app::{build_router, AppState},
+    domain::{
+        delivery::DeliveryId,
+        merge_queue::{PullRequestNumber, QueueCompletion, QueueTimestamp},
+        repository::RepositoryMutation,
+    },
     security::{
         AdminAuthenticator, AdminToken, CanonicalRepositoryName, MasterKey, RepositorySecret,
         RepositorySecretCipher,
     },
-    storage::{open_database, RepositoryStore},
+    storage::{
+        open_database, DeliveryStore, MergeQueueStore, RepositoryStore, RepositoryStoreError,
+    },
 };
 use tokio::{
     net::TcpListener,
@@ -45,6 +52,7 @@ use tokio::{
 use tracing::Dispatch;
 
 use crate::config::TelemetryConfig;
+use time::{Duration, OffsetDateTime};
 
 use super::{build_runtime, TelemetryState};
 
@@ -71,6 +79,13 @@ struct ReceiverState {
 }
 
 type SharedReceiverState = Arc<ReceiverState>;
+
+type OtlpTestGuard = tokio::sync::OwnedMutexGuard<()>;
+
+fn otlp_test_lock() -> Arc<tokio::sync::Mutex<()>> {
+    static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
+}
 
 async fn receive_traces(
     State(state): State<SharedReceiverState>,
@@ -288,6 +303,7 @@ impl Drop for RunningReceiver {
 }
 
 struct RepositoryTraceFixture {
+    _otlp_guard: OtlpTestGuard,
     receiver: RunningReceiver,
     runtime: super::TelemetryRuntime,
     dispatch: Dispatch,
@@ -298,8 +314,9 @@ struct RepositoryTraceFixture {
 
 impl RepositoryTraceFixture {
     async fn new() -> Self {
+        let otlp_guard = otlp_test_lock().lock_owned().await;
         let receiver = RunningReceiver::start_released().await;
-        let config = telemetry_config(&receiver.endpoint());
+        let config = telemetry_config_with_queue_capacity(&receiver.endpoint(), 128);
         let (runtime, subscriber) =
             build_runtime("github_webhook_exporter=info", &config, io::sink)
                 .expect("telemetry runtime initializes");
@@ -310,6 +327,7 @@ impl RepositoryTraceFixture {
             .expect("test database opens and migrates");
         let router = router_for_pool(pool.clone());
         Self {
+            _otlp_guard: otlp_guard,
             receiver,
             runtime,
             dispatch,
@@ -360,7 +378,7 @@ impl RepositoryTraceFixture {
     }
 
     fn force_flush(&self) -> CapturedSpans {
-        self.runtime.force_flush().expect("providers flush");
+        tokio::task::block_in_place(|| self.runtime.force_flush().expect("providers flush"));
         let (traces, logs) = self.receiver.captured_requests();
         CapturedSpans::from_requests(traces, logs)
     }
@@ -399,6 +417,7 @@ impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedOutput {
 }
 
 struct WebhookTraceFixture {
+    _otlp_guard: OtlpTestGuard,
     receiver: RunningReceiver,
     runtime: super::TelemetryRuntime,
     dispatch: Dispatch,
@@ -410,6 +429,7 @@ struct WebhookTraceFixture {
 
 impl WebhookTraceFixture {
     async fn new() -> Self {
+        let otlp_guard = otlp_test_lock().lock_owned().await;
         let receiver = RunningReceiver::start_released().await;
         let config = telemetry_config_with_queue_capacity(&receiver.endpoint(), 128);
         let output = CapturedOutput::default();
@@ -441,6 +461,7 @@ impl WebhookTraceFixture {
             2_097_152,
         ));
         Self {
+            _otlp_guard: otlp_guard,
             receiver,
             runtime,
             dispatch,
@@ -501,7 +522,7 @@ impl WebhookTraceFixture {
     }
 
     fn force_flush(&self) -> CapturedSpans {
-        self.runtime.force_flush().expect("providers flush");
+        tokio::task::block_in_place(|| self.runtime.force_flush().expect("providers flush"));
         let (traces, logs) = self.receiver.captured_requests();
         CapturedSpans::from_requests(traces, logs)
     }
@@ -560,7 +581,21 @@ impl CapturedSpans {
                     && string_attribute(span, "http.route") == Some(route)
                     && i64_attribute(span, "http.response.status_code") == Some(status_code)
             })
-            .expect("matching HTTP request span is exported")
+            .unwrap_or_else(|| {
+                let summary: Vec<_> = self
+                    .spans
+                    .iter()
+                    .map(|span| {
+                        (
+                            span.name.as_str(),
+                            string_attribute(span, "http.request.method"),
+                            string_attribute(span, "http.route"),
+                            i64_attribute(span, "http.response.status_code"),
+                        )
+                    })
+                    .collect();
+                panic!("matching HTTP request span is exported: {summary:?}")
+            })
     }
 
     fn webhook_request_for_delivery(&self, delivery_id: &str) -> &Span {
@@ -733,6 +768,299 @@ fn assert_attribute(span: &Span, key: &str, value: &str) {
 
 fn assert_i64_attribute(span: &Span, key: &str, value: i64) {
     assert_eq!(i64_attribute(span, key), Some(value));
+}
+
+mod sqlite {
+    use super::*;
+
+    const SQLITE_TRACE_QUEUE_CAPACITY: usize = 128;
+    const ENQUEUED_AT: &str = "2026-08-05T10:00:00.125Z";
+    const COMPLETED_AT: &str = "2026-08-05T10:05:00.875Z";
+
+    struct SqliteTraceFixture {
+        _otlp_guard: OtlpTestGuard,
+        receiver: RunningReceiver,
+        runtime: super::super::TelemetryRuntime,
+        dispatch: Dispatch,
+        pool: SqlitePool,
+        database_path: String,
+        repository_store: RepositoryStore,
+        delivery_store: DeliveryStore,
+        merge_queue_store: MergeQueueStore,
+        _directory: TempDir,
+    }
+
+    impl SqliteTraceFixture {
+        async fn new() -> Self {
+            let otlp_guard = otlp_test_lock().lock_owned().await;
+            let receiver = RunningReceiver::start_released().await;
+            let config = telemetry_config_with_queue_capacity(
+                &receiver.endpoint(),
+                SQLITE_TRACE_QUEUE_CAPACITY,
+            );
+            let (runtime, subscriber) =
+                build_runtime("github_webhook_exporter=info", &config, io::sink)
+                    .expect("telemetry runtime initializes");
+            let dispatch = Dispatch::new(subscriber);
+            let directory = tempfile::tempdir().expect("temporary directory is created");
+            let database_path = directory.path().join("sqlite-trace.db");
+            let pool = open_database(&database_path)
+                .await
+                .expect("test database opens and migrates");
+            let master_key = MasterKey::from_slice(MASTER_KEY_BYTES).expect("test key is valid");
+            let cipher = RepositorySecretCipher::new(&master_key).expect("test cipher initializes");
+            let repository_store = RepositoryStore::new(pool.clone(), cipher);
+            let delivery_store = DeliveryStore::new(pool.clone());
+            let merge_queue_store = MergeQueueStore::new(pool.clone());
+
+            Self {
+                _otlp_guard: otlp_guard,
+                receiver,
+                runtime,
+                dispatch,
+                pool,
+                database_path: database_path.display().to_string(),
+                repository_store,
+                delivery_store,
+                merge_queue_store,
+                _directory: directory,
+            }
+        }
+
+        async fn traced<T>(&self, future: impl std::future::Future<Output = T>) -> T {
+            future.with_subscriber(self.dispatch.clone()).await
+        }
+
+        fn force_flush(&self) -> CapturedSpans {
+            tokio::task::block_in_place(|| self.runtime.force_flush().expect("providers flush"));
+            let (traces, logs) = self.receiver.captured_requests();
+            CapturedSpans::from_requests(traces, logs)
+        }
+    }
+
+    fn name(value: &str) -> CanonicalRepositoryName {
+        CanonicalRepositoryName::new(value).expect("test repository name is valid")
+    }
+
+    fn secret(value: &str) -> RepositorySecret {
+        RepositorySecret::new(value.to_owned()).expect("test repository secret is valid")
+    }
+
+    fn queue_timestamp(value: &str) -> QueueTimestamp {
+        QueueTimestamp::parse(value).expect("test queue timestamp is valid")
+    }
+
+    fn delivery_id(value: &str) -> DeliveryId {
+        DeliveryId::parse(value).expect("test delivery identifier is valid")
+    }
+
+    fn pull_request_number(value: i64) -> PullRequestNumber {
+        PullRequestNumber::new(value).expect("test pull-request number is positive")
+    }
+
+    fn sqlite_spans<'spans>(captured: &'spans CapturedSpans) -> Vec<&'spans Span> {
+        captured
+            .spans
+            .iter()
+            .filter(|span| span.name == "sqlite.query")
+            .collect()
+    }
+
+    fn sqlite_span<'spans>(captured: &'spans CapturedSpans, operation: &str) -> &'spans Span {
+        let matches = sqlite_spans(captured)
+            .into_iter()
+            .filter(|span| string_attribute(span, "db.operation.name") == Some(operation))
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "sqlite span count for {operation}");
+        matches[0]
+    }
+
+    fn assert_bounded_sqlite_span(span: &Span, operation: &str, outcome: &str) {
+        assert_eq!(span.name, "sqlite.query");
+        assert_attribute(span, "db.system.name", "sqlite");
+        assert_attribute(span, "db.operation.name", operation);
+        assert_attribute(span, "ghe.operation.outcome", outcome);
+
+        let mut keys = span
+            .attributes
+            .iter()
+            .map(|attribute| attribute.key.as_str())
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "db.operation.name",
+                "db.system.name",
+                "ghe.operation.outcome",
+            ]
+        );
+        assert!(!keys.iter().any(|key| key.contains("statement")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_operations_emit_one_bounded_sqlite_span_each() {
+        let fixture = SqliteTraceFixture::new().await;
+
+        let created = fixture
+            .traced(fixture.repository_store.create(
+                name("Owner/Repository"),
+                secret("sqlite-secret-must-not-appear"),
+                true,
+            ))
+            .await
+            .expect("repository is created");
+        fixture
+            .traced(fixture.repository_store.count())
+            .await
+            .expect("repositories are counted");
+        fixture
+            .traced(fixture.repository_store.list())
+            .await
+            .expect("repositories are listed");
+        fixture
+            .traced(
+                fixture
+                    .repository_store
+                    .authentication_secret(&name("owner/repository")),
+            )
+            .await
+            .expect("authentication secret is loaded");
+        fixture
+            .traced(fixture.repository_store.get(created.id()))
+            .await
+            .expect("repository is loaded");
+        fixture
+            .traced(
+                fixture
+                    .repository_store
+                    .update(created.id(), RepositoryMutation::new().with_enabled(false)),
+            )
+            .await
+            .expect("repository is updated");
+
+        fixture
+            .traced(
+                fixture
+                    .delivery_store
+                    .claim(&delivery_id("550e8400-e29b-41d4-a716-446655440300")),
+            )
+            .await
+            .expect("delivery is claimed");
+        fixture
+            .traced(
+                fixture
+                    .delivery_store
+                    .prune_batch(OffsetDateTime::now_utc() + Duration::seconds(1)),
+            )
+            .await
+            .expect("delivery claims are pruned");
+
+        let enqueued_at = queue_timestamp(ENQUEUED_AT);
+        let completed_at = queue_timestamp(COMPLETED_AT);
+        let pull_request_number = pull_request_number(42);
+        fixture
+            .traced(fixture.merge_queue_store.enqueue(
+                created.id(),
+                pull_request_number,
+                &enqueued_at,
+            ))
+            .await
+            .expect("queue attempt is enqueued");
+        fixture
+            .traced(fixture.merge_queue_store.complete(
+                created.id(),
+                pull_request_number,
+                &QueueCompletion::pull_request_merged(completed_at),
+            ))
+            .await
+            .expect("queue attempt is completed");
+        fixture
+            .traced(
+                fixture.merge_queue_store.prune_completed_batch(
+                    OffsetDateTime::parse(
+                        "2026-08-05T10:06:00Z",
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                    .expect("cutoff timestamp is valid"),
+                ),
+            )
+            .await
+            .expect("queue attempts are pruned");
+
+        fixture
+            .traced(fixture.repository_store.delete(created.id()))
+            .await
+            .expect("repository is deleted");
+
+        let captured = fixture.force_flush();
+        let expected_operations = [
+            "repository.create",
+            "repository.count",
+            "repository.list",
+            "repository.authenticate",
+            "repository.get",
+            "repository.update",
+            "delivery.claim",
+            "delivery.prune",
+            "merge_queue.enqueue",
+            "merge_queue.complete",
+            "merge_queue.prune",
+            "repository.delete",
+        ];
+        assert_eq!(sqlite_spans(&captured).len(), expected_operations.len());
+        for operation in expected_operations {
+            assert_bounded_sqlite_span(sqlite_span(&captured, operation), operation, "success");
+        }
+        for forbidden in [
+            "sqlite-secret-must-not-appear",
+            "INSERT INTO",
+            "UPDATE repositories",
+            "DELETE FROM",
+            fixture.database_path.as_str(),
+        ] {
+            captured.assert_absent(forbidden);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sqlite_errors_mark_failure_without_database_details() {
+        let fixture = SqliteTraceFixture::new().await;
+        sqlx::query(
+            "CREATE TRIGGER repository_private_trigger BEFORE INSERT ON repositories \
+             BEGIN SELECT RAISE(FAIL, 'private_table_detail_must_not_appear'); END",
+        )
+        .execute(&fixture.pool)
+        .await
+        .expect("failure trigger is installed");
+
+        let result = fixture
+            .traced(fixture.repository_store.create(
+                name("owner/failure"),
+                secret("failure-secret-must-not-appear"),
+                true,
+            ))
+            .await;
+        assert!(matches!(result, Err(RepositoryStoreError::Internal(_))));
+
+        let captured = fixture.force_flush();
+        let span = sqlite_span(&captured, "repository.create");
+        assert_bounded_sqlite_span(span, "repository.create", "failure");
+        assert_eq!(
+            span.status.as_ref().map(|status| status.code),
+            Some(opentelemetry_proto::tonic::trace::v1::status::StatusCode::Error as i32)
+        );
+        for forbidden in [
+            "private_table_detail_must_not_appear",
+            "repository_private_trigger",
+            "repositories",
+            "failure-secret-must-not-appear",
+            "INSERT INTO repositories",
+            fixture.database_path.as_str(),
+        ] {
+            captured.assert_absent(forbidden);
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -925,9 +1253,18 @@ async fn repository_store_failure_marks_http_and_write_spans_without_error_text(
     assert_attribute(write, "ghe.config.operation", "create");
     assert_attribute(write, "github.repository.name", "owner/failure");
     assert_attribute(write, "ghe.operation.outcome", "failure");
+    let sqlite = captured.child_named(write, "sqlite.query");
+    assert_attribute(sqlite, "db.system.name", "sqlite");
+    assert_attribute(sqlite, "db.operation.name", "repository.create");
+    assert_attribute(sqlite, "ghe.operation.outcome", "failure");
+    assert_eq!(
+        sqlite.status.as_ref().map(|status| status.code),
+        Some(opentelemetry_proto::tonic::trace::v1::status::StatusCode::Error as i32)
+    );
     captured.assert_absent("failure-secret-must-not-appear");
     captured.assert_absent("database");
-    captured.assert_absent("sqlite");
+    captured.assert_absent("pool closed");
+    captured.assert_absent("repository-trace.db");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1307,6 +1644,7 @@ async fn webhook_queue_failure_is_bounded_and_duplicate_has_no_second_update() {
 // Regression check for the OpenTelemetry 0.32 queue-occupancy invariant documented in `queue`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocked_exporters_preserve_exact_bounds_and_export_otlp_protobuf() {
+    let _otlp_guard = otlp_test_lock().lock_owned().await;
     let (release_exports, _) = watch::channel(false);
     let state = Arc::new(ReceiverState {
         captures: Mutex::new(Captures::default()),

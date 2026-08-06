@@ -23,7 +23,7 @@ use crate::{
         CanonicalRepositoryName, WebhookAuthenticationError, WebhookAuthenticator, WebhookSignature,
     },
     storage::DeliveryClaim,
-    telemetry::trace::{self, DatabaseOperation, Operation, OperationOutcome, QueueEntity},
+    telemetry::trace::{self, Operation, OperationOutcome, QueueEntity},
 };
 
 const JSON_CONTENT_TYPE: HeaderValue = HeaderValue::from_static("application/json");
@@ -131,13 +131,7 @@ async fn webhook_handler(
         let action = normalize_action(event_projection.action());
         trace::set_webhook_event(&process_span, event_type, action);
 
-        let claim_span = trace::database_span(DatabaseOperation::DeliveryClaim);
-        let claim = state
-            .delivery_store()
-            .claim(&request.delivery_id)
-            .instrument(claim_span.clone())
-            .await;
-        trace::set_result_status(&claim_span, &claim);
+        let claim = state.delivery_store().claim(&request.delivery_id).await;
         match claim {
             Ok(DeliveryClaim::Duplicate) => {
                 state.metrics().record_duplicate();

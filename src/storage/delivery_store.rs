@@ -1,6 +1,9 @@
 use std::fmt;
 
-use crate::domain::delivery::DeliveryId;
+use crate::{
+    domain::delivery::DeliveryId,
+    telemetry::trace::{self, DatabaseOperation},
+};
 use sqlx::SqlitePool;
 use thiserror::Error;
 use time::{format_description::FormatItem, macros::format_description, OffsetDateTime, UtcOffset};
@@ -46,6 +49,17 @@ impl DeliveryStore {
         &self,
         delivery_id: &DeliveryId,
     ) -> Result<DeliveryClaim, DeliveryStoreError> {
+        trace::instrument_database_operation(
+            DatabaseOperation::DeliveryClaim,
+            self.claim_inner(delivery_id),
+        )
+        .await
+    }
+
+    async fn claim_inner(
+        &self,
+        delivery_id: &DeliveryId,
+    ) -> Result<DeliveryClaim, DeliveryStoreError> {
         let mut buffer = uuid::Uuid::encode_buffer();
         let result = sqlx::query(
             "INSERT INTO processed_deliveries (delivery_id, received_at) \
@@ -75,6 +89,14 @@ impl DeliveryStore {
     /// Returns [`DeliveryStoreError::Unavailable`] when SQLite is busy or locked and
     /// [`DeliveryStoreError::Internal`] for other persistence failures.
     pub async fn prune_batch(&self, cutoff: OffsetDateTime) -> Result<u64, DeliveryStoreError> {
+        trace::instrument_database_operation(
+            DatabaseOperation::DeliveryPrune,
+            self.prune_batch_inner(cutoff),
+        )
+        .await
+    }
+
+    async fn prune_batch_inner(&self, cutoff: OffsetDateTime) -> Result<u64, DeliveryStoreError> {
         let cutoff = cutoff
             .to_offset(UtcOffset::UTC)
             .format(DELIVERY_TIMESTAMP_FORMAT)

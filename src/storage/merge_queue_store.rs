@@ -4,11 +4,14 @@ use sqlx::SqlitePool;
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::domain::{
-    merge_queue::{
-        PullRequestNumber, QueueCompletion, QueueOutcome, QueueReasonCode, QueueTimestamp,
+use crate::{
+    domain::{
+        merge_queue::{
+            PullRequestNumber, QueueCompletion, QueueOutcome, QueueReasonCode, QueueTimestamp,
+        },
+        repository::RepositoryId,
     },
-    repository::RepositoryId,
+    telemetry::trace::{self, DatabaseOperation},
 };
 
 use super::sqlite_is_busy_or_locked;
@@ -66,6 +69,19 @@ impl MergeQueueStore {
         pull_request_number: PullRequestNumber,
         enqueued_at: &QueueTimestamp,
     ) -> Result<EnqueueTransition, MergeQueueStoreError> {
+        trace::instrument_database_operation(
+            DatabaseOperation::MergeQueueEnqueue,
+            self.enqueue_inner(repository_id, pull_request_number, enqueued_at),
+        )
+        .await
+    }
+
+    async fn enqueue_inner(
+        &self,
+        repository_id: RepositoryId,
+        pull_request_number: PullRequestNumber,
+        enqueued_at: &QueueTimestamp,
+    ) -> Result<EnqueueTransition, MergeQueueStoreError> {
         let mut transaction = self.pool.begin().await.map_err(map_sqlx_error)?;
         let result = sqlx::query(
             "INSERT INTO merge_queue_attempts \
@@ -101,6 +117,19 @@ impl MergeQueueStore {
     /// Returns [`MergeQueueStoreError::Unavailable`] when SQLite is busy or locked and
     /// [`MergeQueueStoreError::Internal`] for every other persistence or transaction failure.
     pub async fn complete(
+        &self,
+        repository_id: RepositoryId,
+        pull_request_number: PullRequestNumber,
+        completion: &QueueCompletion,
+    ) -> Result<CompletionTransition, MergeQueueStoreError> {
+        trace::instrument_database_operation(
+            DatabaseOperation::MergeQueueComplete,
+            self.complete_inner(repository_id, pull_request_number, completion),
+        )
+        .await
+    }
+
+    async fn complete_inner(
         &self,
         repository_id: RepositoryId,
         pull_request_number: PullRequestNumber,
@@ -159,6 +188,17 @@ impl MergeQueueStore {
     /// Returns [`MergeQueueStoreError::Unavailable`] when SQLite is busy or locked and
     /// [`MergeQueueStoreError::Internal`] for timestamp formatting or other persistence failures.
     pub async fn prune_completed_batch(
+        &self,
+        cutoff: OffsetDateTime,
+    ) -> Result<u64, MergeQueueStoreError> {
+        trace::instrument_database_operation(
+            DatabaseOperation::MergeQueuePrune,
+            self.prune_completed_batch_inner(cutoff),
+        )
+        .await
+    }
+
+    async fn prune_completed_batch_inner(
         &self,
         cutoff: OffsetDateTime,
     ) -> Result<u64, MergeQueueStoreError> {

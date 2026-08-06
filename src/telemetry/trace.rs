@@ -7,7 +7,7 @@ use axum::extract::MatchedPath;
 use http::{Method, StatusCode};
 use opentelemetry::{trace::Status, KeyValue};
 use thiserror::Error;
-use tracing::{info_span, Span};
+use tracing::{info_span, Instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::domain::{
@@ -247,6 +247,26 @@ pub(crate) fn database_span(operation: DatabaseOperation) -> Span {
     span.set_attribute(DB_SYSTEM_NAME_KEY, SQLITE_SYSTEM_NAME);
     span.set_attribute(DB_OPERATION_NAME_KEY, operation.as_str());
     span
+}
+
+/// Instruments one logical SQLite store operation with a bounded database span.
+///
+/// # Parameters
+///
+/// * `operation` - The fixed database operation vocabulary value.
+/// * `future` - The store operation future to execute inside the database span.
+///
+/// # Errors
+///
+/// Returns the exact error produced by `future` after recording only a bounded failure status.
+pub(crate) async fn instrument_database_operation<T, E>(
+    operation: DatabaseOperation,
+    future: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let span = database_span(operation);
+    let result = future.instrument(span.clone()).await;
+    set_result_status(&span, &result);
+    result
 }
 
 /// Records the bounded HTTP method as an OpenTelemetry span attribute.

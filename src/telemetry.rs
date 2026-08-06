@@ -189,6 +189,10 @@ where
     let trace_layer = tracer_provider.as_ref().map(|provider| {
         tracing_opentelemetry::layer()
             .with_tracer(provider.tracer(INSTRUMENTATION_SCOPE))
+            .with_location(false)
+            .with_threads(false)
+            .with_target(false)
+            .with_tracked_inactivity(false)
             .with_filter(filter_fn(application_metadata))
     });
     let log_layer = logger_provider.as_ref().map(|provider| {
