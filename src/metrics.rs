@@ -434,6 +434,7 @@ pub(crate) enum WorkflowTraceRejectionReason {
 }
 
 impl WorkflowTraceRejectionReason {
+    /// Returns the fixed metric/log vocabulary value for this rejection reason.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::TooManySteps => "too_many_steps",
