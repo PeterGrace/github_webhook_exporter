@@ -20,7 +20,10 @@ use crate::{
     retention::{run_retention, RetentionConfig},
     security::AdminAuthenticator,
     storage::{DeliveryStore, MergeQueueStore, RepositoryStore},
-    telemetry::trace::{self, Operation},
+    telemetry::{
+        trace::{self, Operation},
+        WorkflowTraceEmitter,
+    },
 };
 
 /// Immutable dependencies shared by all HTTP request handlers.
@@ -32,6 +35,7 @@ pub struct AppState {
     delivery_store: DeliveryStore,
     merge_queue_store: MergeQueueStore,
     metrics: Metrics,
+    workflow_trace_emitter: WorkflowTraceEmitter,
     webhook_body_limit_bytes: usize,
 }
 
@@ -52,8 +56,18 @@ impl AppState {
             delivery_store,
             merge_queue_store,
             metrics: Metrics::new(),
+            workflow_trace_emitter: WorkflowTraceEmitter::disabled(),
             webhook_body_limit_bytes,
         }
+    }
+
+    /// Returns application state updated with the configured workflow trace emitter.
+    pub fn with_workflow_trace_emitter(
+        mut self,
+        workflow_trace_emitter: WorkflowTraceEmitter,
+    ) -> Self {
+        self.workflow_trace_emitter = workflow_trace_emitter;
+        self
     }
 
     /// Initializes the configured-repository gauge from durable storage.
@@ -95,6 +109,11 @@ impl AppState {
     /// Returns the shared bounded metrics component.
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
+    }
+
+    /// Returns the configured explicit-time historical workflow trace emitter.
+    pub fn workflow_trace_emitter(&self) -> &WorkflowTraceEmitter {
+        &self.workflow_trace_emitter
     }
 }
 

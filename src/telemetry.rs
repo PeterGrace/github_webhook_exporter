@@ -6,13 +6,19 @@ mod queue;
 pub(crate) mod trace;
 pub(crate) mod workflow;
 
+pub use workflow::WorkflowTraceEmitter;
+
 use opentelemetry::{trace::TracerProvider as _, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{
     LogExporter as OtlpLogExporter, SpanExporter as OtlpSpanExporter, WithExportConfig,
     WithHttpConfig,
 };
-use opentelemetry_sdk::{logs::SdkLoggerProvider, trace::SdkTracerProvider, Resource};
+use opentelemetry_sdk::{
+    logs::SdkLoggerProvider,
+    trace::{SdkTracer, SdkTracerProvider},
+    Resource,
+};
 use thiserror::Error;
 use tracing::{Metadata, Subscriber};
 use tracing_subscriber::{
@@ -42,6 +48,7 @@ pub struct TelemetryRuntime {
     state: TelemetryState,
     tracer_provider: Option<SdkTracerProvider>,
     logger_provider: Option<SdkLoggerProvider>,
+    workflow_trace_emitter: WorkflowTraceEmitter,
     trace_queue: Option<Arc<AdmissionBoundary>>,
     log_queue: Option<Arc<AdmissionBoundary>>,
 }
@@ -84,6 +91,11 @@ impl TelemetryRuntime {
     /// Returns the number of log records currently admitted for export.
     pub fn pending_log_records(&self) -> usize {
         self.log_queue.as_ref().map_or(0, |queue| queue.pending())
+    }
+
+    /// Returns the configured explicit-time historical workflow trace emitter.
+    pub fn workflow_trace_emitter(&self) -> WorkflowTraceEmitter {
+        self.workflow_trace_emitter.clone()
     }
 
     /// Requests immediate export of records already accepted by both providers.
@@ -170,14 +182,22 @@ where
 {
     let filter = EnvFilter::try_new(rust_log).map_err(|_| TelemetryError::InvalidFilter)?;
     let resource = telemetry_resource(config);
-    let (tracer_provider, trace_queue) = config
+    let (tracer_provider, trace_tracer, workflow_trace_emitter, trace_queue) = config
         .trace_exporter
         .as_ref()
         .map(|settings| build_trace_provider(settings, config, &resource))
         .transpose()?
-        .map_or((None, None), |(provider, queue)| {
-            (Some(provider), Some(queue))
-        });
+        .map_or(
+            (None, None, WorkflowTraceEmitter::disabled(), None),
+            |(provider, tracer, queue)| {
+                (
+                    Some(provider),
+                    Some(tracer.clone()),
+                    WorkflowTraceEmitter::new(tracer),
+                    Some(queue),
+                )
+            },
+        );
     let (logger_provider, log_queue) = config
         .log_exporter
         .as_ref()
@@ -187,9 +207,9 @@ where
             (Some(provider), Some(queue))
         });
 
-    let trace_layer = tracer_provider.as_ref().map(|provider| {
+    let trace_layer = trace_tracer.map(|tracer| {
         tracing_opentelemetry::layer()
-            .with_tracer(provider.tracer(INSTRUMENTATION_SCOPE))
+            .with_tracer(tracer)
             .with_location(false)
             .with_threads(false)
             .with_target(false)
@@ -219,6 +239,7 @@ where
             state,
             tracer_provider,
             logger_provider,
+            workflow_trace_emitter,
             trace_queue,
             log_queue,
         },
@@ -230,7 +251,7 @@ fn build_trace_provider(
     settings: &ExporterSettings,
     config: &TelemetryConfig,
     resource: &Resource,
-) -> Result<(SdkTracerProvider, Arc<AdmissionBoundary>), TelemetryError> {
+) -> Result<(SdkTracerProvider, SdkTracer, Arc<AdmissionBoundary>), TelemetryError> {
     let exporter = OtlpSpanExporter::builder()
         .with_http()
         .with_endpoint(settings.endpoint())
@@ -244,7 +265,8 @@ fn build_trace_provider(
         .with_resource(resource.clone())
         .with_span_processor(processor)
         .build();
-    Ok((provider, queue))
+    let tracer = provider.tracer(INSTRUMENTATION_SCOPE);
+    Ok((provider, tracer, queue))
 }
 
 fn build_log_provider(
