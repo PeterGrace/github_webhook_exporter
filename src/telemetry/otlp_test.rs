@@ -990,6 +990,22 @@ impl CapturedSpans {
         matches[0]
     }
 
+    fn workflow_step_for_task_run_id<'spans>(
+        &'spans self,
+        job: &'spans Span,
+        task_run_id: &str,
+    ) -> &'spans Span {
+        let matches = self
+            .children(job)
+            .filter(|span| {
+                span.name == "github.workflow.step"
+                    && string_attribute(span, "cicd.pipeline.task.run.id") == Some(task_run_id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "workflow step count for {task_run_id}");
+        matches[0]
+    }
+
     fn one_named(&self, name: &str) -> &Span {
         let matches = self
             .spans
@@ -1306,6 +1322,29 @@ fn assert_metric_line(exposition: &str, expected: &str) {
         exposition.lines().any(|line| line == expected),
         "missing metric line {expected:?}"
     );
+}
+
+fn metric_u64(exposition: &str, series: &str) -> u64 {
+    let prefix = format!("{series} ");
+    exposition
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("missing metric series {series:?}"))
+        .parse()
+        .unwrap_or_else(|_| panic!("metric series {series:?} is an integer"))
+}
+
+fn metric_u64_or_zero(exposition: &str, series: &str) -> u64 {
+    let prefix = format!("{series} ");
+    exposition
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(|value| {
+            value
+                .parse()
+                .unwrap_or_else(|_| panic!("metric series {series:?} is an integer"))
+        })
+        .unwrap_or(0)
 }
 
 #[test]
@@ -2294,6 +2333,7 @@ async fn workflow_conclusions_export_bounded_results_and_statuses() {
         assert_otlp_status(job, *status, description);
         assert_otlp_status(step, *status, description);
     }
+    captured.assert_absent("fixture_private_unknown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2533,63 +2573,81 @@ async fn unsupported_workflow_actions_and_projections_emit_no_historical_trace()
     let fixture = WebhookTraceFixture::new().await;
     let requests = [
         (
+            "550e8400-e29b-41d4-a716-446655440500",
             Some("queued"),
+            "queued",
             serde_json::json!({
                 "id": 501, "run_id": 601, "run_attempt": 1,
                 "completed_at": "2026-08-06T10:05:00Z", "steps": []
             }),
         ),
         (
+            "550e8400-e29b-41d4-a716-446655440501",
             Some("in_progress"),
+            "in_progress",
             serde_json::json!({
                 "id": 502, "run_id": 602, "run_attempt": 1,
                 "completed_at": "2026-08-06T10:05:00Z", "steps": []
             }),
         ),
         (
+            "550e8400-e29b-41d4-a716-446655440502",
             None,
+            "none",
             serde_json::json!({
                 "id": 503, "run_id": 603, "run_attempt": 1,
                 "completed_at": "2026-08-06T10:05:00Z", "steps": []
             }),
         ),
         (
+            "550e8400-e29b-41d4-a716-446655440503",
             Some("fixture_unknown_action"),
+            "other",
             serde_json::json!({
                 "id": 504, "run_id": 604, "run_attempt": 1,
                 "completed_at": "2026-08-06T10:05:00Z", "steps": []
             }),
         ),
         (
+            "550e8400-e29b-41d4-a716-446655440504",
             Some("completed"),
+            "completed",
             serde_json::json!({
                 "id": 0, "run_id": 605, "run_attempt": 1,
                 "completed_at": "2026-08-06T10:05:00Z", "steps": []
             }),
         ),
         (
+            "550e8400-e29b-41d4-a716-446655440505",
             Some("completed"),
+            "completed",
             serde_json::json!({
                 "id": 506, "run_id": "malformed", "run_attempt": 1,
                 "completed_at": "2026-08-06T10:05:00Z", "steps": []
             }),
         ),
         (
+            "550e8400-e29b-41d4-a716-446655440506",
             Some("completed"),
+            "completed",
             serde_json::json!({
                 "id": 507, "run_id": 607,
                 "completed_at": "2026-08-06T10:05:00Z", "steps": []
             }),
         ),
         (
+            "550e8400-e29b-41d4-a716-446655440507",
             Some("completed"),
+            "completed",
             serde_json::json!({
                 "id": 508, "run_id": 608, "run_attempt": 1,
                 "completed_at": "2026-08-06T10:05:00Z", "steps": {}
             }),
         ),
         (
+            "550e8400-e29b-41d4-a716-446655440508",
             Some("completed"),
+            "completed",
             serde_json::json!({
                 "id": 509, "run_id": 609, "run_attempt": 1,
                 "completed_at": "2026-08-06T10:05:00Z",
@@ -2598,44 +2656,63 @@ async fn unsupported_workflow_actions_and_projections_emit_no_historical_trace()
         ),
     ];
 
-    for (index, (action, workflow_job)) in requests.iter().enumerate() {
+    for (delivery_id, action, normalized_action, workflow_job) in &requests {
+        let delivery_id = *delivery_id;
+        let normalized_action = *normalized_action;
+        let event_series = format!(
+            "github_webhook_events_total{{event_type=\"workflow_job\",action=\"{normalized_action}\"}}"
+        );
+        let before = fixture.metrics_text().await;
+        let event_count = metric_u64_or_zero(&before, &event_series);
+        let body_count = metric_u64(&before, "github_webhook_request_body_bytes_count");
+        let accepted_count = metric_u64(
+            &before,
+            "github_webhook_requests_total{result=\"accepted\"}",
+        );
+
         let body = workflow_job_body(*action, workflow_job.clone());
-        let delivery_id = format!("550e8400-e29b-41d4-a716-4466554405{index:02}");
         let response = fixture
-            .webhook(&body, "workflow_job", &delivery_id, WEBHOOK_SECRET)
+            .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
             .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    }
 
-    let claim_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries")
-        .fetch_one(&fixture.pool)
-        .await
-        .expect("delivery claims are countable");
-    assert_eq!(claim_count, requests.len() as i64);
-    let exposition = fixture.metrics_text().await;
-    let captured = fixture.force_flush();
+        let claim_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries WHERE delivery_id = ?")
+                .bind(delivery_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("delivery claim is countable");
+        assert_eq!(claim_count, 1, "durable claim for {delivery_id}");
 
-    assert_eq!(
-        captured
-            .spans
-            .iter()
-            .filter(|span| {
-                span.name == "github.workflow.job" || span.name == "github.workflow.step"
-            })
-            .count(),
-        0,
-        "unsupported actions and malformed projections emit zero historical spans"
-    );
-    for expected in [
-        "github_webhook_events_total{event_type=\"workflow_job\",action=\"queued\"} 1",
-        "github_webhook_events_total{event_type=\"workflow_job\",action=\"in_progress\"} 1",
-        "github_webhook_events_total{event_type=\"workflow_job\",action=\"none\"} 1",
-        "github_webhook_events_total{event_type=\"workflow_job\",action=\"other\"} 1",
-        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 5",
-        "github_webhook_request_body_bytes_count 9",
-        "github_webhook_requests_total{result=\"accepted\"} 9",
-    ] {
-        assert_metric_line(&exposition, expected);
+        let after = fixture.metrics_text().await;
+        assert_eq!(
+            metric_u64(&after, &event_series),
+            event_count + 1,
+            "generic event metric delta for {delivery_id}"
+        );
+        assert_eq!(
+            metric_u64(&after, "github_webhook_request_body_bytes_count"),
+            body_count + 1,
+            "generic body metric delta for {delivery_id}"
+        );
+        assert_eq!(
+            metric_u64(&after, "github_webhook_requests_total{result=\"accepted\"}",),
+            accepted_count + 1,
+            "accepted request metric delta for {delivery_id}"
+        );
+
+        let captured = fixture.force_flush();
+        assert_eq!(
+            captured
+                .spans
+                .iter()
+                .filter(|span| {
+                    span.name == "github.workflow.job" || span.name == "github.workflow.step"
+                })
+                .count(),
+            0,
+            "request {delivery_id} emits no historical workflow span"
+        );
     }
 }
 
@@ -2643,6 +2720,10 @@ async fn unsupported_workflow_actions_and_projections_emit_no_historical_trace()
 async fn duplicate_workflow_delivery_emits_one_historical_trace() {
     let fixture = WebhookTraceFixture::new().await;
     let delivery_id = "550e8400-e29b-41d4-a716-446655440600";
+    let first_step_started_at = "2026-08-06T10:01:00.000000003Z";
+    let first_step_completed_at = "2026-08-06T10:02:00.000000004Z";
+    let second_step_started_at = "2026-08-06T10:03:00.000000005Z";
+    let second_step_completed_at = "2026-08-06T10:04:00.000000006Z";
     let body = workflow_job_body(
         Some("completed"),
         serde_json::json!({
@@ -2656,14 +2737,14 @@ async fn duplicate_workflow_delivery_emits_one_historical_trace() {
                 {
                     "number": 1,
                     "conclusion": "success",
-                    "started_at": "2026-08-06T10:01:00.000000003Z",
-                    "completed_at": "2026-08-06T10:02:00.000000004Z"
+                    "started_at": first_step_started_at,
+                    "completed_at": first_step_completed_at
                 },
                 {
                     "number": 2,
                     "conclusion": "failure",
-                    "started_at": "2026-08-06T10:03:00.000000005Z",
-                    "completed_at": "2026-08-06T10:04:00.000000006Z"
+                    "started_at": second_step_started_at,
+                    "completed_at": second_step_completed_at
                 }
             ]
         }),
@@ -2688,13 +2769,25 @@ async fn duplicate_workflow_delivery_emits_one_historical_trace() {
 
     let job = captured.workflow_job_for_delivery(delivery_id);
     assert_eq!(captured.child_count(job, "github.workflow.step"), 2);
-    assert_eq!(
-        captured
-            .spans
-            .iter()
-            .filter(|span| span.name == "github.workflow.step" && span.trace_id == job.trace_id)
-            .count(),
-        2
+    let first_step = captured.workflow_step_for_task_run_id(job, "701:1");
+    let second_step = captured.workflow_step_for_task_run_id(job, "701:2");
+    assert_attribute(first_step, "github.workflow.conclusion", "success");
+    assert_attribute(first_step, "cicd.pipeline.task.run.result", "success");
+    assert_otlp_status(first_step, OtlpStatusCode::Ok, "");
+    assert_historical_interval(
+        first_step,
+        rfc3339_unix_nanos(first_step_started_at),
+        rfc3339_unix_nanos(first_step_completed_at),
+        "reported",
+    );
+    assert_attribute(second_step, "github.workflow.conclusion", "failure");
+    assert_attribute(second_step, "cicd.pipeline.task.run.result", "failure");
+    assert_otlp_status(second_step, OtlpStatusCode::Error, "workflow_failed");
+    assert_historical_interval(
+        second_step,
+        rfc3339_unix_nanos(second_step_started_at),
+        rfc3339_unix_nanos(second_step_completed_at),
+        "reported",
     );
     for expected in [
         "github_webhook_requests_total{result=\"accepted\"} 2",
