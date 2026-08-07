@@ -133,7 +133,21 @@ impl DiagnosticsObserver {
     }
 
     pub(super) fn drop_record(&self, signal: TelemetrySignal, reason: TelemetryDropReason) {
-        self.inner.metrics.record_telemetry_drop(signal, reason);
+        self.drop_records(signal, reason, 1);
+    }
+
+    pub(super) fn drop_records(
+        &self,
+        signal: TelemetrySignal,
+        reason: TelemetryDropReason,
+        count: u64,
+    ) {
+        if count == 0 {
+            return;
+        }
+        self.inner
+            .metrics
+            .record_telemetry_drops(signal, reason, count);
         let limiter = &self.inner.drop_limiters[drop_index(signal, reason)];
         self.report(limiter, "drop", signal.as_str(), reason.as_str());
     }
@@ -287,10 +301,23 @@ mod tests {
         assert_eq!(sink.lines().len(), 1);
         clock.advance(Duration::from_secs(60));
         observer.drop_record(TelemetrySignal::Trace, TelemetryDropReason::QueueFull);
-        assert_eq!(
-            sink.lines()[1],
-            "telemetry pipeline diagnostic kind=drop signal=trace reason=queue_full suppressed=31\n"
-        );
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|line| line.starts_with(
+            "telemetry pipeline diagnostic kind=drop signal=trace reason=queue_full suppressed="
+        )));
+        let suppressed_total: u64 = lines
+            .iter()
+            .map(|line| {
+                line.trim_end()
+                    .rsplit_once('=')
+                    .expect("diagnostic includes a suppression count")
+                    .1
+                    .parse::<u64>()
+                    .expect("suppression count is numeric")
+            })
+            .sum();
+        assert_eq!(suppressed_total, 31);
     }
 
     #[test]

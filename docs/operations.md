@@ -18,14 +18,28 @@ identify the failed stage without including configured credentials or the databa
 
 Structured stderr logging is always active. Remote trace and log export is optional and starts only
 when `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or
-`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set. The generic HTTP endpoint receives `/v1/traces` and
-`/v1/logs` automatically; a signal-specific endpoint is used exactly as configured.
+`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set. With none of these variables, no remote provider or
+export queue is created and local logging remains fully functional. The generic HTTP endpoint
+receives `/v1/traces` and `/v1/logs` automatically; a signal-specific endpoint is used exactly as
+configured.
 
 The OTLP/HTTP protobuf exporters honor generic and signal-specific endpoint, header, and timeout
 variables. `OTEL_EXPORTER_OTLP_TIMEOUT` and its signal-specific variants are milliseconds. Header
-values are validated but redacted from errors and debug output. `OTEL_SERVICE_NAME` defaults to
-`github-webhook-exporter`; every resource includes the package version. Of the values supplied in
-`OTEL_RESOURCE_ATTRIBUTES`, only `k8s.pod.name` and `k8s.namespace.name` are retained.
+values are percent-decoded, validated, and redacted from errors and debug output. An explicitly
+empty signal-specific header variable clears inherited generic headers. For example:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=https://collector.example.test:4318 \
+OTEL_EXPORTER_OTLP_HEADERS='authorization=Bearer%20redacted-token' \
+OTEL_EXPORTER_OTLP_TIMEOUT=10000 \
+github_webhook_exporter
+```
+
+For independently routed signals, set `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and
+`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` to their complete endpoints, including `/v1/traces` and
+`/v1/logs`. `OTEL_SERVICE_NAME` defaults to `github-webhook-exporter`; every resource includes the
+package version. Of the values supplied in `OTEL_RESOURCE_ATTRIBUTES`, only `k8s.pod.name` and
+`k8s.namespace.name` are retained.
 
 Each enabled signal uses a non-blocking bounded queue. These application settings accept positive
 integers:
@@ -34,7 +48,7 @@ integers:
 | --- | ---: | --- |
 | `GHE_OTEL_QUEUE_CAPACITY` | `2048` | Maximum admitted records per signal. |
 | `GHE_OTEL_BATCH_SIZE` | `512` | Maximum records per request; no greater than queue capacity. |
-| `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` | `5` | Reserved for #36; not yet enforced. |
+| `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` | `5` | One shared trace-and-log shutdown deadline. |
 
 Invalid requested telemetry configuration fails startup with only the variable name. Collector
 latency or unavailability occurs on dedicated exporter threads and does not change HTTP readiness
@@ -65,7 +79,18 @@ misordering. A rising `github_telemetry_dropped_records_total{reason="queue_full
 capacity/tuning signal under load, while `pipeline_closed` before planned shutdown indicates
 incorrect producer lifecycle ordering.
 
-Final graceful provider shutdown remains later Phase 4 work.
+On shutdown, application admission closes before provider workers disconnect. Accepted records
+that export release their pending slots; any slots still pending when shutdown finishes or reaches
+its deadline are atomically counted as `pipeline_closed` drops. Later records are also rejected and
+counted exactly as `pipeline_closed`. Trace and log provider shutdown begins concurrently and shares one
+`GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` deadline. A failed provider is counted with normalized reason
+`shutdown`; a provider unfinished at the deadline is counted with reason `timeout`. Either condition
+uses the same direct, redacted stderr diagnostic path and never changes a successful HTTP drain into
+a process failure.
+
+Repository, delivery, pull-request, commit, workflow, job, and step identifiers remain span-only.
+Allowing these identifiers in local or OTLP application logs is a deferred policy choice and is not
+current behavior.
 
 ## Exported core traces
 
@@ -322,8 +347,13 @@ Tokio listens for both SIGINT and SIGTERM. Either signal follows the same sequen
 3. Stop accepting new connections and stop scheduling new delivery or queue prune batches.
 4. Allow active requests and active SQLite prune work to finish within one shared
    `GHE_SHUTDOWN_TIMEOUT_SECONDS` deadline.
-5. Exit normally if all lifecycle work completes.
-6. Drop remaining work and record a normalized timeout warning if the shared deadline expires.
+5. Record that telemetry provider shutdown is starting, close both telemetry admission boundaries,
+   and begin trace and log provider shutdown concurrently.
+6. Wait at most the separate shared `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` deadline for both providers.
+7. Exit normally after a successful HTTP/retention drain even when telemetry shutdown fails or
+   times out; emit only normalized direct diagnostics and bounded Prometheus accounting.
+8. Preserve a pre-existing startup or server error after telemetry cleanup instead of replacing it
+   with a provider error.
 
 The timeout defaults to 30 seconds and must be a positive integer. For example, to request a
 five-second drain:
@@ -333,7 +363,10 @@ GHE_SHUTDOWN_TIMEOUT_SECONDS=5 github_webhook_exporter
 ```
 
 Service managers should send SIGTERM and configure their own termination grace period to exceed
-this timeout. SIGINT is primarily useful for an interactive local run.
+the sum of `GHE_SHUTDOWN_TIMEOUT_SECONDS` and `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS`, plus a small
+process-exit allowance. SIGINT is primarily useful for an interactive local run. Startup failures
+after telemetry initialization and server errors use the same final provider cleanup path. Repeated
+runtime shutdown calls are idempotent and never invoke either provider twice.
 
 Lifecycle logs contain the bound address, normalized signal kind, completion, and timeout duration.
 They do not log runtime configuration, authorization headers, request bodies, encryption material,

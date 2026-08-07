@@ -365,7 +365,7 @@ mod tests {
     #[tokio::test]
     async fn installed_metrics_are_served() {
         let metrics = Metrics::new();
-        metrics.record_telemetry_drop(TelemetrySignal::Trace, TelemetryDropReason::QueueFull);
+        metrics.record_telemetry_drops(TelemetrySignal::Trace, TelemetryDropReason::QueueFull, 1);
         let response = build_router(app_state().await.with_metrics(metrics))
             .oneshot(
                 Request::builder()

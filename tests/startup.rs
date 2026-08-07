@@ -21,7 +21,14 @@ fn configured_command(database_path: &Path, bind_address: SocketAddr) -> Command
         .env("GHE_MASTER_KEY", STANDARD.encode([7_u8; 32]))
         .env("GHE_ADMIN_TOKEN", "startup-admin-token-secret")
         .env("GHE_BIND_ADDRESS", bind_address.to_string())
-        .env("GHE_SHUTDOWN_TIMEOUT_SECONDS", "2");
+        .env("GHE_SHUTDOWN_TIMEOUT_SECONDS", "2")
+        .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9")
+        .env("OTEL_EXPORTER_OTLP_TIMEOUT", "50")
+        .env(
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "authorization=startup-otlp-header-secret",
+        )
+        .env("GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS", "1");
     command
 }
 
@@ -60,7 +67,9 @@ fn database_startup_failure_is_fatal_and_redacted() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     assert!(stderr.contains("failed to initialize SQLite storage"));
+    assert!(stderr.contains("telemetry provider shutdown"));
     assert!(!stderr.contains("startup-admin-token-secret"));
+    assert!(!stderr.contains("startup-otlp-header-secret"));
     assert!(!stderr.contains(&STANDARD.encode([7_u8; 32])));
     assert!(!stderr.contains(database_path.to_string_lossy().as_ref()));
 }
@@ -146,6 +155,7 @@ fn assert_graceful_signal(signal: &str, expected_signal: &str) {
         .expect("readiness response is read");
     assert!(health_response.starts_with("HTTP/1.1 200 OK\r\n"));
 
+    let shutdown_started = Instant::now();
     let signal_status = Command::new("kill")
         .arg(signal)
         .arg(child.id().to_string())
@@ -157,12 +167,20 @@ fn assert_graceful_signal(signal: &str, expected_signal: &str) {
         .expect("exporter exits after the shutdown signal");
 
     assert!(output.status.success());
+    assert!(shutdown_started.elapsed() < Duration::from_secs(4));
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     assert!(stderr.contains(expected_signal));
     assert!(stderr.contains("HTTP server stopped"));
+    assert!(stderr.contains("telemetry provider shutdown"));
+    for signal in ["trace", "log"] {
+        assert!(stderr.contains(&format!(
+            "telemetry pipeline diagnostic kind=failure signal={signal} reason=transport"
+        )));
+    }
     for captured in [&health_response, &stderr] {
         for forbidden in [
             "startup-admin-token-secret",
+            "startup-otlp-header-secret",
             STANDARD.encode([7_u8; 32]).as_str(),
             "Authorization",
             "webhook_secret",
