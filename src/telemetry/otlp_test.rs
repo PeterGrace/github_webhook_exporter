@@ -19,7 +19,9 @@ use axum::{
 use hmac::{Hmac, Mac};
 use opentelemetry_proto::tonic::{
     collector::{logs::v1::ExportLogsServiceRequest, trace::v1::ExportTraceServiceRequest},
-    common::v1::{any_value::Value as AttributeValue, AnyValue, KeyValue},
+    common::v1::{
+        any_value::Value as AttributeValue, AnyValue, ArrayValue, KeyValue, KeyValueList,
+    },
     logs::v1::LogRecord,
     trace::v1::{status::StatusCode as OtlpStatusCode, Span},
 };
@@ -99,10 +101,13 @@ const WORKFLOW_PRIVACY_PR_NUMBERS: &[i64] = &[812_345_671, 812_345_672];
 const WORKFLOW_PRIVACY_STEP_NUMBER: i64 = 73;
 const WORKFLOW_PRIVACY_SHA: &str = "fedcba9876543210fedcba9876543210fedcba98";
 const WORKFLOW_RAW_NAME: &str = "task6-workflow\nname-sentinel";
+const WORKFLOW_ESCAPED_RAW_NAME: &str = "task6-workflow\\nname-sentinel";
 const WORKFLOW_SANITIZED_NAME: &str = "task6-workflowname-sentinel";
 const WORKFLOW_RAW_JOB_NAME: &str = "task6-job\tname-sentinel";
+const WORKFLOW_ESCAPED_RAW_JOB_NAME: &str = "task6-job\\tname-sentinel";
 const WORKFLOW_SANITIZED_JOB_NAME: &str = "task6-jobname-sentinel";
 const WORKFLOW_RAW_STEP_NAME: &str = "task6-step\rname-sentinel";
+const WORKFLOW_ESCAPED_RAW_STEP_NAME: &str = "task6-step\\rname-sentinel";
 const WORKFLOW_SANITIZED_STEP_NAME: &str = "task6-stepname-sentinel";
 const WORKFLOW_FORBIDDEN_COMMAND: &str = "task6-forbidden-command-sentinel";
 const WORKFLOW_FORBIDDEN_OUTPUT: &str = "task6-forbidden-output-sentinel";
@@ -349,7 +354,7 @@ async fn wait_for_blocked_signals(state: &ReceiverState) {
 struct RunningReceiver {
     state: SharedReceiverState,
     address: std::net::SocketAddr,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RunningReceiver {
@@ -379,7 +384,19 @@ impl RunningReceiver {
         Self {
             state,
             address,
-            task,
+            task: Some(task),
+        }
+    }
+
+    async fn stop(&mut self) {
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        task.abort();
+        match task.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => panic!("test receiver shutdown failed: {error}"),
         }
     }
 
@@ -412,7 +429,9 @@ impl RunningReceiver {
 
 impl Drop for RunningReceiver {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -778,10 +797,10 @@ impl WebhookTraceFixture {
         CapturedSpans::from_requests(traces, logs)
     }
 
-    fn finish_without_force_flush(self) -> String {
+    async fn finish_without_force_flush(self) -> String {
         let Self {
             _otlp_guard,
-            receiver,
+            mut receiver,
             runtime,
             dispatch,
             output,
@@ -794,9 +813,10 @@ impl WebhookTraceFixture {
         drop(pool);
         drop(dispatch);
         drop(_directory);
-        let stderr = output.text();
         drop(runtime);
+        receiver.stop().await;
         drop(receiver);
+        let stderr = output.text();
         drop(_otlp_guard);
         stderr
     }
@@ -850,6 +870,7 @@ fn router_for_pool(pool: SqlitePool) -> Router {
 struct CapturedSpans {
     spans: Vec<Span>,
     log_records: Vec<LogRecord>,
+    log_resource_attributes: Vec<KeyValue>,
     resource_attribute_keys: BTreeSet<String>,
     serialized: Vec<u8>,
     serialized_logs: Vec<u8>,
@@ -871,6 +892,12 @@ impl CapturedSpans {
             .flat_map(|request| &request.resource_logs)
             .flat_map(|resource| &resource.scope_logs)
             .flat_map(|scope| scope.log_records.iter().cloned())
+            .collect();
+        let log_resource_attributes = log_requests
+            .iter()
+            .flat_map(|request| &request.resource_logs)
+            .filter_map(|resource_logs| resource_logs.resource.as_ref())
+            .flat_map(|resource| resource.attributes.iter().cloned())
             .collect();
         let resource_attribute_keys = requests
             .iter()
@@ -897,6 +924,7 @@ impl CapturedSpans {
         Self {
             spans,
             log_records,
+            log_resource_attributes,
             resource_attribute_keys,
             serialized,
             serialized_logs,
@@ -906,12 +934,14 @@ impl CapturedSpans {
     fn from_parsed_records(
         spans: Vec<Span>,
         log_records: Vec<LogRecord>,
+        log_resource_attributes: Vec<KeyValue>,
         serialized: Vec<u8>,
         serialized_logs: Vec<u8>,
     ) -> Self {
         Self {
             spans,
             log_records,
+            log_resource_attributes,
             resource_attribute_keys: BTreeSet::new(),
             serialized,
             serialized_logs,
@@ -931,6 +961,7 @@ impl CapturedSpans {
         self.log_records
             .iter()
             .flat_map(|record| record.attributes.iter())
+            .chain(self.log_resource_attributes.iter())
     }
 
     fn has_trace_attribute_key(&self, key: &str) -> bool {
@@ -964,11 +995,14 @@ impl CapturedSpans {
     }
 
     fn has_log_i64_value(&self, value: i64) -> bool {
-        self.log_attributes().any(|attribute| {
-            i64_key_value(attribute, &attribute.key) == Some(value)
-                || i64_array_key_value(attribute, &attribute.key)
-                    .is_some_and(|values| values.contains(&value))
-        })
+        self.log_attributes()
+            .filter_map(|attribute| attribute.value.as_ref())
+            .chain(
+                self.log_records
+                    .iter()
+                    .filter_map(|record| record.body.as_ref()),
+            )
+            .any(|candidate| any_value_contains_i64(candidate, value))
     }
 
     fn has_trace_string_attribute(&self, key: &str, value: &str) -> bool {
@@ -1255,6 +1289,31 @@ fn string_any_value(value: &AnyValue) -> Option<&str> {
     }
 }
 
+fn any_value_contains_i64(value: &AnyValue, expected: i64) -> bool {
+    match value.value.as_ref() {
+        Some(AttributeValue::StringValue(value)) => value.parse() == Ok(expected),
+        Some(AttributeValue::IntValue(value)) => *value == expected,
+        Some(AttributeValue::DoubleValue(value)) => {
+            let expected_as_f64 = expected as f64;
+            expected_as_f64 as i64 == expected && *value == expected_as_f64
+        }
+        Some(AttributeValue::ArrayValue(values)) => values
+            .values
+            .iter()
+            .any(|value| any_value_contains_i64(value, expected)),
+        Some(AttributeValue::KvlistValue(values)) => values.values.iter().any(|attribute| {
+            attribute
+                .value
+                .as_ref()
+                .is_some_and(|value| any_value_contains_i64(value, expected))
+        }),
+        Some(AttributeValue::BoolValue(_))
+        | Some(AttributeValue::BytesValue(_))
+        | Some(AttributeValue::StringValueStrindex(_))
+        | None => false,
+    }
+}
+
 fn i64_attribute(span: &Span, key: &str) -> Option<i64> {
     span.attributes
         .iter()
@@ -1429,6 +1488,8 @@ fn parsed_numeric_privacy_checks_detect_varint_attributes() {
     const LOG_KEY: &str = "github.pull_request.number";
     const TRACE_VALUE: i64 = 987_000_001;
     const LOG_VALUE: i64 = 976_543_211;
+    const LOG_BODY_VALUE: i64 = 8_123_456_789_013;
+    const LOG_RESOURCE_VALUE: i64 = 8_123_456_789_014;
 
     let trace_span = Span {
         attributes: vec![KeyValue {
@@ -1448,7 +1509,29 @@ fn parsed_numeric_privacy_checks_detect_varint_attributes() {
             }),
             key_strindex: 0,
         }],
+        body: Some(AnyValue {
+            value: Some(AttributeValue::ArrayValue(ArrayValue {
+                values: vec![AnyValue {
+                    value: Some(AttributeValue::KvlistValue(KeyValueList {
+                        values: vec![KeyValue {
+                            key: "nested".to_owned(),
+                            value: Some(AnyValue {
+                                value: Some(AttributeValue::IntValue(LOG_BODY_VALUE)),
+                            }),
+                            key_strindex: 0,
+                        }],
+                    })),
+                }],
+            })),
+        }),
         ..LogRecord::default()
+    };
+    let log_resource_attribute = KeyValue {
+        key: "resource.numeric".to_owned(),
+        value: Some(AnyValue {
+            value: Some(AttributeValue::IntValue(LOG_RESOURCE_VALUE)),
+        }),
+        key_strindex: 0,
     };
     let serialized_trace = trace_span.encode_to_vec();
     let serialized_log = log_record.encode_to_vec();
@@ -1458,11 +1541,14 @@ fn parsed_numeric_privacy_checks_detect_varint_attributes() {
     let captured = CapturedSpans::from_parsed_records(
         vec![trace_span],
         vec![log_record],
+        vec![log_resource_attribute],
         serialized_trace,
         serialized_log,
     );
     assert!(captured.has_trace_i64_attribute(TRACE_KEY, TRACE_VALUE));
     assert!(captured.has_log_i64_attribute(LOG_KEY, LOG_VALUE));
+    assert!(captured.has_log_i64_value(LOG_BODY_VALUE));
+    assert!(captured.has_log_i64_value(LOG_RESOURCE_VALUE));
     assert!(captured.has_log_attribute_key(LOG_KEY));
 }
 
@@ -2449,9 +2535,18 @@ async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent
         .has_trace_i64_array_attribute("github.pull_request.number", WORKFLOW_PRIVACY_PR_NUMBERS,));
     assert!(!captured
         .has_log_i64_array_attribute("github.pull_request.number", WORKFLOW_PRIVACY_PR_NUMBERS,));
-    for pull_request_number in WORKFLOW_PRIVACY_PR_NUMBERS {
-        assert!(!captured.has_log_i64_value(*pull_request_number));
-        let value = pull_request_number.to_string();
+    for numeric_identifier in [
+        WORKFLOW_PRIVACY_RUN_ID,
+        WORKFLOW_PRIVACY_RUN_ATTEMPT,
+        WORKFLOW_PRIVACY_JOB_ID,
+        WORKFLOW_PRIVACY_PR_NUMBERS[0],
+        WORKFLOW_PRIVACY_PR_NUMBERS[1],
+    ] {
+        assert!(
+            !captured.has_log_i64_value(numeric_identifier),
+            "OTLP log bodies, attributes, and resources must not contain numeric workflow identifier {numeric_identifier}"
+        );
+        let value = numeric_identifier.to_string();
         assert!(!stderr.contains(&value));
         assert!(!exposition.contains(&value));
     }
@@ -2484,8 +2579,11 @@ async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent
 
     for forbidden in [
         WORKFLOW_RAW_NAME,
+        WORKFLOW_ESCAPED_RAW_NAME,
         WORKFLOW_RAW_JOB_NAME,
+        WORKFLOW_ESCAPED_RAW_JOB_NAME,
         WORKFLOW_RAW_STEP_NAME,
+        WORKFLOW_ESCAPED_RAW_STEP_NAME,
         WORKFLOW_FORBIDDEN_COMMAND,
         WORKFLOW_FORBIDDEN_OUTPUT,
         WORKFLOW_FORBIDDEN_LOG,
@@ -3098,7 +3196,7 @@ async fn duplicate_workflow_delivery_emits_one_historical_trace() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_collector_does_not_change_completed_workflow_response() {
-    let fixture = WebhookTraceFixture::new().await;
+    let mut fixture = WebhookTraceFixture::new().await;
     let ready_before = fixture
         .request(Method::GET, "/health/ready", None, None, Body::empty())
         .await;
@@ -3109,8 +3207,8 @@ async fn unavailable_collector_does_not_change_completed_workflow_response() {
 
     let collector_endpoint = fixture.receiver.endpoint();
     let collector_address = fixture.receiver.address.to_string();
-    fixture.receiver.task.abort();
-    tokio::task::yield_now().await;
+    fixture.receiver.stop().await;
+    assert!(fixture.receiver.task.is_none());
 
     let body = workflow_job_body(
         Some("completed"),
@@ -3188,7 +3286,7 @@ async fn unavailable_collector_does_not_change_completed_workflow_response() {
     assert_eq!(fixture.runtime.dropped_trace_records(), 0);
     assert_eq!(fixture.runtime.dropped_log_records(), 0);
 
-    let stderr = fixture.finish_without_force_flush();
+    let stderr = fixture.finish_without_force_flush().await;
     let stderr_lowercase = stderr.to_ascii_lowercase();
     for detail in [collector_endpoint.as_str(), collector_address.as_str()] {
         assert!(
