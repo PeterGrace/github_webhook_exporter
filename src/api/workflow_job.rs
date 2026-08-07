@@ -97,22 +97,23 @@ pub(crate) fn project_completed_job(
         parse_timestamp(completed_at.as_ref()),
         received_at,
     );
-    let mut projected_steps = Vec::with_capacity(steps.len());
-    for step in steps {
-        let timing = select_step_timing(
-            parse_timestamp(step.started_at.as_ref()),
-            parse_timestamp(step.completed_at.as_ref()),
-            &timing,
-        );
-        if let Ok(step) = WorkflowStepTrace::new(
-            step.number,
-            sanitize_display_name(step.name.as_ref()),
-            normalize_conclusion(step.conclusion.as_ref()),
-            timing,
-        ) {
-            projected_steps.push(step);
-        }
-    }
+    let projected_steps = steps
+        .into_iter()
+        .map(|step| {
+            let step_timing = select_step_timing(
+                parse_timestamp(step.started_at.as_ref()),
+                parse_timestamp(step.completed_at.as_ref()),
+                &timing,
+            );
+            WorkflowStepTrace::new(
+                step.number,
+                sanitize_display_name(step.name.as_ref()),
+                normalize_conclusion(step.conclusion.as_ref()),
+                step_timing,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
 
     Some(WorkflowJobTrace::new(WorkflowJobTraceParts {
         repository_name: repository_name.clone(),
@@ -124,7 +125,12 @@ pub(crate) fn project_completed_job(
         job_name: sanitize_display_name(name.as_ref()),
         conclusion: normalize_conclusion(conclusion.as_ref()),
         head_sha: parse_commit_sha(head_sha.as_ref()),
-        pull_requests: WorkflowPullRequests::new(positive_pull_requests(&pull_requests)),
+        pull_requests: WorkflowPullRequests::new(
+            pull_requests
+                .iter()
+                .filter_map(|value| PullRequestNumber::new(value.number).ok())
+                .take(20),
+        ),
         timing,
         steps: projected_steps,
     }))
@@ -162,20 +168,6 @@ fn select_step_timing(
     } else {
         HistoricalTiming::fallback(parent.end())
     }
-}
-
-fn positive_pull_requests(values: &[PullRequestProjection]) -> Vec<PullRequestNumber> {
-    let mut pull_requests = Vec::with_capacity(values.len().min(20));
-    for value in values {
-        let Ok(number) = PullRequestNumber::new(value.number) else {
-            continue;
-        };
-        if pull_requests.len() == 20 {
-            break;
-        }
-        pull_requests.push(number);
-    }
-    pull_requests
 }
 
 fn sanitize_display_name(value: Option<&Value>) -> Option<DisplayName> {
@@ -308,6 +300,29 @@ mod tests {
                 }))
                 .is_none(),
                 "accepted invalid ids run_id={run_id} run_attempt={run_attempt} job_id={job_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_positive_step_numbers_reject_entire_projection() {
+        for invalid_step_number in [0, -1] {
+            assert!(
+                project_fixture(json!({
+                    "workflow_job": {
+                        "id": 41,
+                        "run_id": 31,
+                        "run_attempt": 2,
+                        "completed_at": "2026-08-06T10:05:00Z",
+                        "steps": [
+                            {"number": 1},
+                            {"number": invalid_step_number},
+                            {"number": 2}
+                        ]
+                    }
+                }))
+                .is_none(),
+                "accepted invalid step number {invalid_step_number}"
             );
         }
     }

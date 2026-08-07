@@ -272,11 +272,20 @@ fn telemetry_config(endpoint: &str) -> TelemetryConfig {
 }
 
 fn telemetry_config_with_queue_capacity(endpoint: &str, queue_capacity: usize) -> TelemetryConfig {
+    telemetry_config_with_queue_capacity_and_timeout(endpoint, queue_capacity, 2_000)
+}
+
+fn telemetry_config_with_queue_capacity_and_timeout(
+    endpoint: &str,
+    queue_capacity: usize,
+    timeout_millis: u64,
+) -> TelemetryConfig {
     let queue_capacity = queue_capacity.to_string();
+    let timeout_millis = timeout_millis.to_string();
     let values = HashMap::from([
         ("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint),
         ("OTEL_EXPORTER_OTLP_HEADERS", "x-test-token=private-value"),
-        ("OTEL_EXPORTER_OTLP_TIMEOUT", "2000"),
+        ("OTEL_EXPORTER_OTLP_TIMEOUT", timeout_millis.as_str()),
         ("OTEL_SERVICE_NAME", "github-webhook-exporter-test"),
         (
             "OTEL_RESOURCE_ATTRIBUTES",
@@ -345,8 +354,8 @@ fn resource_keys(request: &ExportTraceServiceRequest) -> Vec<&str> {
         .collect()
 }
 
-async fn wait_for_blocked_signals(state: &ReceiverState) {
-    while state.started_requests.load(Ordering::Acquire) < 2 {
+async fn wait_for_started_requests(state: &ReceiverState, target: usize) {
+    while state.started_requests.load(Ordering::Acquire) < target {
         state.request_started.notified().await;
     }
 }
@@ -424,6 +433,14 @@ impl RunningReceiver {
             .captures
             .lock()
             .expect("capture lock is available") = Captures::default();
+    }
+
+    fn set_exports_released(&self, released: bool) {
+        self.state.release_exports.send_replace(released);
+    }
+
+    fn started_request_count(&self) -> usize {
+        self.state.started_requests.load(Ordering::Acquire)
     }
 }
 
@@ -625,9 +642,17 @@ struct WebhookTraceFixture {
 
 impl WebhookTraceFixture {
     async fn new() -> Self {
+        Self::new_with_exporter_timeout(2_000).await
+    }
+
+    async fn new_with_exporter_timeout(timeout_millis: u64) -> Self {
         let otlp_guard = otlp_test_lock().lock_owned().await;
         let receiver = RunningReceiver::start_released().await;
-        let config = telemetry_config_with_queue_capacity(&receiver.endpoint(), 128);
+        let config = telemetry_config_with_queue_capacity_and_timeout(
+            &receiver.endpoint(),
+            128,
+            timeout_millis,
+        );
         let output = CapturedOutput::default();
         let (runtime, subscriber) =
             build_runtime("github_webhook_exporter=info", &config, output.clone())
@@ -2324,6 +2349,7 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
     );
     assert_attribute(job, "cicd.pipeline.name", "BuildWorkflow");
     assert_attribute(job, "cicd.pipeline.task.name", "LinuxJob");
+    assert_attribute(job, "cicd.pipeline.task.run.id", "41");
     assert_attribute(job, "cicd.pipeline.run.id", "31");
     assert_attribute(job, "github.workflow.run.id", "31");
     assert_attribute(job, "github.workflow.run.attempt", "2");
@@ -2487,6 +2513,11 @@ async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent
     assert_attribute(
         job,
         "github.workflow.job.id",
+        &WORKFLOW_PRIVACY_JOB_ID.to_string(),
+    );
+    assert_attribute(
+        job,
+        "cicd.pipeline.task.run.id",
         &WORKFLOW_PRIVACY_JOB_ID.to_string(),
     );
     assert_i64_array_attribute(
@@ -3049,6 +3080,26 @@ async fn unsupported_workflow_actions_and_projections_emit_no_historical_trace()
                 "steps": [{"name": "missing required number"}]
             }),
         ),
+        (
+            "550e8400-e29b-41d4-a716-446655440509",
+            Some("completed"),
+            "completed",
+            serde_json::json!({
+                "id": 510, "run_id": 610, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z",
+                "steps": [{"number": 1}, {"number": 0}, {"number": 2}]
+            }),
+        ),
+        (
+            "550e8400-e29b-41d4-a716-446655440510",
+            Some("completed"),
+            "completed",
+            serde_json::json!({
+                "id": 511, "run_id": 611, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z",
+                "steps": [{"number": 1}, {"number": -1}, {"number": 2}]
+            }),
+        ),
     ];
 
     for (delivery_id, action, normalized_action, workflow_job) in &requests {
@@ -3195,61 +3246,68 @@ async fn duplicate_workflow_delivery_emits_one_historical_trace() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unavailable_collector_does_not_change_completed_workflow_response() {
-    let mut fixture = WebhookTraceFixture::new().await;
+async fn blocked_collector_does_not_change_completed_workflow_response() {
+    const EXPORTER_TIMEOUT_MILLIS: u64 = 10_000;
+    const WEBHOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let fixture = WebhookTraceFixture::new_with_exporter_timeout(EXPORTER_TIMEOUT_MILLIS).await;
     let ready_before = fixture
         .request(Method::GET, "/health/ready", None, None, Body::empty())
         .await;
     assert_eq!(ready_before.status(), StatusCode::OK);
     fixture.flush();
+    fixture.receiver.clear_captured_requests();
     assert_eq!(fixture.runtime.failed_trace_exports(), 0);
     assert_eq!(fixture.runtime.failed_log_exports(), 0);
 
     let collector_endpoint = fixture.receiver.endpoint();
     let collector_address = fixture.receiver.address.to_string();
-    fixture.receiver.stop().await;
-    assert!(fixture.receiver.task.is_none());
+    let started_requests = fixture.receiver.started_request_count();
+    fixture.receiver.set_exports_released(false);
 
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440700";
     let body = workflow_job_body(
         Some("completed"),
         serde_json::json!({
             "id": 901,
             "run_id": 902,
             "run_attempt": 1,
-            "workflow_name": "Unavailable collector workflow",
-            "name": "Unavailable collector job",
+            "workflow_name": "Blocked collector workflow",
+            "name": "Blocked collector job",
             "conclusion": "success",
             "started_at": "2026-08-06T14:00:00Z",
             "completed_at": "2026-08-06T14:05:00Z",
             "steps": [{
                 "number": 1,
-                "name": "Unavailable collector step",
+                "name": "Blocked collector step",
                 "conclusion": "success",
                 "started_at": "2026-08-06T14:01:00Z",
                 "completed_at": "2026-08-06T14:02:00Z"
             }]
         }),
     );
-    let request_started = std::time::Instant::now();
-    let response = fixture
-        .webhook(
-            &body,
-            "workflow_job",
-            "550e8400-e29b-41d4-a716-446655440700",
-            WEBHOOK_SECRET,
-        )
-        .await;
-    let request_elapsed = request_started.elapsed();
+    let response = tokio::time::timeout(
+        WEBHOOK_TIMEOUT,
+        fixture.webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET),
+    )
+    .await
+    .expect("webhook must not wait for the blocked ten-second exporter");
 
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert!(to_bytes(response.into_body(), 1)
         .await
         .expect("workflow response body is readable")
         .is_empty());
-    assert!(
-        request_elapsed < std::time::Duration::from_secs(1),
-        "request path must not wait for the configured two-second exporter timeout: {request_elapsed:?}"
-    );
+
+    tokio::time::timeout(
+        WEBHOOK_TIMEOUT,
+        wait_for_started_requests(&fixture.receiver.state, started_requests + 2),
+    )
+    .await
+    .expect("trace and log exports reach the blocked collector");
+    let (blocked_traces, blocked_logs) = fixture.receiver.captured_requests();
+    assert!(!blocked_traces.is_empty(), "a trace export is blocked");
+    assert!(!blocked_logs.is_empty(), "a log export is blocked");
 
     let ready_after = fixture
         .request(Method::GET, "/health/ready", None, None, Body::empty())
@@ -3269,20 +3327,20 @@ async fn unavailable_collector_does_not_change_completed_workflow_response() {
         .await
         .expect("merge-queue state is countable");
     assert_eq!(merge_queue_rows, 0);
+    assert_eq!(fixture.runtime.state(), TelemetryState::Enabled);
+    assert_eq!(fixture.runtime.failed_trace_exports(), 0);
+    assert_eq!(fixture.runtime.failed_log_exports(), 0);
+    assert_eq!(fixture.runtime.dropped_trace_records(), 0);
+    assert_eq!(fixture.runtime.dropped_log_records(), 0);
 
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while fixture.runtime.failed_trace_exports() == 0
-            || fixture.runtime.failed_log_exports() == 0
-            || fixture.runtime.pending_trace_records() != 0
-            || fixture.runtime.pending_log_records() != 0
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("unavailable collector failures are counted asynchronously");
-    assert!(fixture.runtime.failed_trace_exports() > 0);
-    assert!(fixture.runtime.failed_log_exports() > 0);
+    fixture.receiver.set_exports_released(true);
+    let captured = fixture.force_flush();
+    let job = captured.workflow_job_for_delivery(delivery_id);
+    assert_attribute(job, "cicd.pipeline.task.run.id", "901");
+    assert_eq!(fixture.runtime.pending_trace_records(), 0);
+    assert_eq!(fixture.runtime.pending_log_records(), 0);
+    assert_eq!(fixture.runtime.failed_trace_exports(), 0);
+    assert_eq!(fixture.runtime.failed_log_exports(), 0);
     assert_eq!(fixture.runtime.dropped_trace_records(), 0);
     assert_eq!(fixture.runtime.dropped_log_records(), 0);
 
@@ -4408,7 +4466,7 @@ async fn blocked_exporters_preserve_exact_bounds_and_export_otlp_protobuf() {
     let dispatch = Dispatch::new(subscriber);
 
     emit_records(&dispatch, 0..1);
-    wait_for_blocked_signals(&state).await;
+    wait_for_started_requests(&state, 2).await;
     emit_records(&dispatch, 1..SATURATION_RECORDS + 1);
 
     let expected_drops = (SATURATION_RECORDS - QUEUE_CAPACITY) as u64;

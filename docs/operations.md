@@ -90,9 +90,11 @@ reasons, SQL statements, database paths, or internal error text.
 
 Only an authenticated `workflow_job` webhook whose normalized action is `completed` can emit a
 historical workflow trace. Admission occurs only after the durable delivery claim returns `New`, so
-a duplicate, unsupported action, or malformed specialized projection emits no workflow spans.
-Admission is at most once: after a delivery claim commits, the service does not retry projection or
-emission for that delivery, including after a process interruption. Generic webhook responses and
+a duplicate, unsupported action, or malformed specialized projection emits no workflow spans. A
+zero or negative step number rejects the entire specialized projection; it never produces a partial
+root-and-children trace. Admission is at most once: after a delivery claim commits, the service does
+not retry projection or emission for that delivery, including after a process interruption. Generic
+webhook responses and
 metrics retain their normal behavior.
 
 Each accepted projection creates an independent root named `github.workflow.job`, with a new trace
@@ -117,7 +119,8 @@ all other conclusions leave status unset. Raw unknown conclusions are discarded.
 The workflow root may contain only these validated span-only identifiers: canonical repository
 name, delivery UUID, workflow run ID, positive run attempt, workflow job ID, valid full head SHA,
 and at most the first 20 positive pull-request numbers. The run ID is exported under both
-`cicd.pipeline.run.id` and `github.workflow.run.id`; each step's
+`cicd.pipeline.run.id` and `github.workflow.run.id`. The validated job ID is exported as a decimal
+string under both `github.workflow.job.id` and the root's `cicd.pipeline.task.run.id`; each step's
 `cicd.pipeline.task.run.id` is derived as `<job-id>:<positive-step-number>`. Workflow, job, and step
 display names are span-only. Sanitization removes all Unicode control characters, retains at most
 the first 128 remaining Unicode scalar values, and omits an empty result.

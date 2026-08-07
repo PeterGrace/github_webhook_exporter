@@ -9,6 +9,18 @@
   to the approved fixed attribute policy.
 - Preserved at-most-once delivery admission and the existing non-blocking bounded trace queue.
 
+## Final review fix wave (2026-08-06T22:08:15-04:00)
+
+- Rejected the entire specialized projection when any workflow step number is zero or negative,
+  after preserving durable claim and generic webhook accounting.
+- Added the decimal validated job ID to workflow roots as `cicd.pipeline.task.run.id` through typed,
+  centralized job and step attribute builders.
+- Built the bounded pull-request collection directly from the first 20 retained positive values,
+  removing an intermediate allocation and stopping the scan at the cap.
+- Replaced connection-refusal timing coverage with a receiver that proves trace and log exports are
+  blocked behind withheld responses while the webhook completes under a two-second timeout against
+  a ten-second exporter timeout, then releases both exports for successful deterministic teardown.
+
 ## Privacy and failure isolation
 
 - Kept approved workflow names and identifiers in spans only.
@@ -16,15 +28,15 @@
   and raw unknown conclusions from traces, OTLP logs, structured stderr, and Prometheus exposition.
 - Added integrated in-process OTLP coverage for cross-signal privacy and centralized attribute/event
   allowlists.
-- Added collector-unavailability coverage for the unchanged `204 No Content` response, readiness,
-  generic metrics, and empty merge-queue state, using runtime failure counters without requiring a
-  successful force flush against the unavailable endpoint.
+- Added deterministic blocked-collector coverage for the unchanged `204 No Content` response,
+  readiness, generic metrics, empty merge-queue state, span export, and privacy boundary. Runtime
+  counters prove blocked-then-released exports complete without failures or drops.
 - Documented completed-only admission, trace identity, timing, status, identifiers, name bounds,
   privacy, and collector-failure behavior in `docs/operations.md`.
 
 ## Final validation
 
-Task 7 reran the full gate sequence from a clean state and all checks passed:
+The final review fix wave reran the full gate sequence and all checks passed:
 
 1. `just fmt` -> `cargo fmt --all -- --check` succeeded.
 2. `cargo build` -> finished successfully with no warnings.
@@ -46,11 +58,12 @@ Task 7 reran the full gate sequence from a clean state and all checks passed:
   `telemetry::otlp_test::workflow_conclusions_export_bounded_results_and_statuses`.
 - Unsupported or malformed input:
   `api::workflow_job::tests::malformed_or_non_array_steps_reject_projection`,
-  `api::workflow_job::tests::unsupported_large_fields_have_no_representation_in_the_output_model`, and
-  `telemetry::otlp_test::unsupported_workflow_actions_and_projections_emit_no_historical_trace`.
+  `api::workflow_job::tests::non_positive_step_numbers_reject_entire_projection`,
+  `api::workflow_job::tests::unsupported_large_fields_have_no_representation_in_the_output_model`,
+  and `telemetry::otlp_test::unsupported_workflow_actions_and_projections_emit_no_historical_trace`.
 - Duplicates: `telemetry::otlp_test::duplicate_workflow_delivery_emits_one_historical_trace`.
-- Collector unavailability:
-  `telemetry::otlp_test::unavailable_collector_does_not_change_completed_workflow_response`.
+- Blocked collector isolation:
+  `telemetry::otlp_test::blocked_collector_does_not_change_completed_workflow_response`.
 - Privacy:
   `telemetry::otlp_test::integrated_core_trace_privacy`,
   `telemetry::otlp_test::workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent`, and
@@ -61,7 +74,11 @@ Task 7 reran the full gate sequence from a clean state and all checks passed:
 - `just fmt`: passed.
 - `cargo build`: passed.
 - `cargo clippy --all-targets -- -D warnings`: passed.
-- `just test`: passed with 132 library tests, 0 `src/main.rs` tests, 8 delivery storage tests,
+- `just test`: passed with 133 library tests, 0 `src/main.rs` tests, 8 delivery storage tests,
   10 merge queue storage tests, 18 repository API tests, 5 startup tests, 8 storage tests, and
-  22 webhook API tests.
+  22 webhook API tests (204 total).
 - `cargo doc --no-deps`: passed.
+
+Focused final-review validation also passed: 11 workflow projection tests, 10 workflow emitter/model
+tests, the typed workflow attribute-builder test, all four amended exact OTLP tests, and all 22 OTLP
+module tests.

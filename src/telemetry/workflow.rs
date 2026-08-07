@@ -19,7 +19,8 @@ use super::trace::{
     commit_sha_attribute, delivery_id_attribute, pull_request_numbers_attribute,
     repository_name_attribute, timing_source_attribute, workflow_conclusion_attribute,
     workflow_job_id_attribute, workflow_name_attribute, workflow_pipeline_result_attribute,
-    workflow_pipeline_run_id_attribute, workflow_pipeline_task_run_result_attribute,
+    workflow_pipeline_run_id_attribute, workflow_pipeline_step_task_run_id_attribute,
+    workflow_pipeline_task_run_id_attribute, workflow_pipeline_task_run_result_attribute,
     workflow_run_attempt_attribute, workflow_run_id_attribute, workflow_task_name_attribute,
     CommitSha,
 };
@@ -28,8 +29,7 @@ const MAX_DISPLAY_NAME_LENGTH: usize = 128;
 const MAX_PULL_REQUEST_COUNT: usize = 20;
 const WORKFLOW_JOB_SPAN_NAME: &str = "github.workflow.job";
 const WORKFLOW_STEP_SPAN_NAME: &str = "github.workflow.step";
-const CICD_PIPELINE_TASK_RUN_ID_KEY: &str = "cicd.pipeline.task.run.id";
-const JOB_REQUIRED_ATTRIBUTE_COUNT: usize = 8;
+const JOB_REQUIRED_ATTRIBUTE_COUNT: usize = 9;
 const STEP_REQUIRED_ATTRIBUTE_COUNT: usize = 3;
 
 /// A malformed workflow telemetry value.
@@ -417,6 +417,7 @@ fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
     if let Some(job_name) = job.job_name() {
         attributes.push(workflow_task_name_attribute(job_name));
     }
+    attributes.push(workflow_pipeline_task_run_id_attribute(job.job_id()));
     attributes.push(workflow_job_id_attribute(job.job_id()));
     attributes.push(workflow_conclusion_attribute(job.conclusion()));
     if let Some(result) = workflow_pipeline_result_attribute(job.conclusion()) {
@@ -441,20 +442,13 @@ fn step_attributes(job_id: WorkflowJobId, step: &WorkflowStepTrace) -> Vec<KeyVa
     if let Some(name) = step.name() {
         attributes.push(workflow_task_name_attribute(name));
     }
-    attributes.push(KeyValue::new(
-        CICD_PIPELINE_TASK_RUN_ID_KEY,
-        workflow_step_task_run_id(job_id, step),
-    ));
+    attributes.push(workflow_pipeline_step_task_run_id_attribute(job_id, step));
     attributes.push(workflow_conclusion_attribute(step.conclusion()));
     if let Some(result) = workflow_pipeline_task_run_result_attribute(step.conclusion()) {
         attributes.push(result);
     }
     attributes.push(timing_source_attribute(step.timing().source()));
     attributes
-}
-
-fn workflow_step_task_run_id(job_id: WorkflowJobId, step: &WorkflowStepTrace) -> String {
-    format!("{}:{}", job_id.get(), step.number())
 }
 
 /// A bounded GitHub Actions conclusion.
@@ -1112,6 +1106,7 @@ mod tests {
             "cicd.pipeline.result",
             "cicd.pipeline.run.id",
             "cicd.pipeline.task.name",
+            "cicd.pipeline.task.run.id",
             "github.commit.sha",
             "github.delivery.id",
             "github.pull_request.number",
@@ -1134,6 +1129,7 @@ mod tests {
         assert_string_attribute(job, "github.workflow.run.id", "31");
         assert_string_attribute(job, "github.workflow.run.attempt", "2");
         assert_string_attribute(job, "cicd.pipeline.task.name", "Linux Job");
+        assert_string_attribute(job, "cicd.pipeline.task.run.id", "41");
         assert_string_attribute(job, "github.workflow.job.id", "41");
         assert_string_attribute(job, "github.workflow.conclusion", "failure");
         assert_string_attribute(job, "cicd.pipeline.result", "failure");

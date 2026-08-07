@@ -19,7 +19,8 @@ use crate::metrics::{
 };
 use crate::security::CanonicalRepositoryName;
 use crate::telemetry::workflow::{
-    DisplayName, TimingSource, WorkflowConclusion, WorkflowJobId, WorkflowRunAttempt, WorkflowRunId,
+    DisplayName, TimingSource, WorkflowConclusion, WorkflowJobId, WorkflowRunAttempt,
+    WorkflowRunId, WorkflowStepTrace,
 };
 
 const TELEMETRY_TARGET: &str = "github_webhook_exporter";
@@ -135,6 +136,22 @@ pub(crate) fn workflow_run_attempt_attribute(run_attempt: WorkflowRunAttempt) ->
 /// Returns the workflow job identifier attribute.
 pub(crate) fn workflow_job_id_attribute(job_id: WorkflowJobId) -> KeyValue {
     decimal_string_key_value(GITHUB_WORKFLOW_JOB_ID_KEY, job_id.get())
+}
+
+/// Returns the semantic-convention task-run identifier for a workflow job root.
+pub(crate) fn workflow_pipeline_task_run_id_attribute(job_id: WorkflowJobId) -> KeyValue {
+    decimal_string_key_value(CICD_PIPELINE_TASK_RUN_ID_KEY, job_id.get())
+}
+
+/// Returns the semantic-convention task-run identifier for a workflow step.
+pub(crate) fn workflow_pipeline_step_task_run_id_attribute(
+    job_id: WorkflowJobId,
+    step: &WorkflowStepTrace,
+) -> KeyValue {
+    string_key_value(
+        CICD_PIPELINE_TASK_RUN_ID_KEY,
+        format!("{}:{}", job_id.get(), step.number()),
+    )
 }
 
 /// Returns the workflow job or step display-name attribute.
@@ -769,15 +786,16 @@ mod tests {
         set_pull_request_number, set_repository_id, set_repository_name, set_result_status,
         set_status, timing_source_attribute, workflow_conclusion_attribute,
         workflow_job_id_attribute, workflow_name_attribute, workflow_pipeline_result_attribute,
-        workflow_pipeline_run_id_attribute, workflow_pipeline_task_run_result_attribute,
+        workflow_pipeline_run_id_attribute, workflow_pipeline_step_task_run_id_attribute,
+        workflow_pipeline_task_run_id_attribute, workflow_pipeline_task_run_result_attribute,
         workflow_run_attempt_attribute, workflow_run_id_attribute, workflow_task_name_attribute,
         CommitSha, ConfigOperation, DatabaseOperation, HttpMethod, HttpResult, Operation,
         OperationFailureReason, OperationOutcome, QueueEntity, TimingSource, WorkflowConclusion,
         WorkflowJobId, WorkflowRunAttempt, WorkflowRunId, CICD_PIPELINE_NAME_KEY,
         CICD_PIPELINE_RESULT_KEY, CICD_PIPELINE_RUN_ID_KEY, CICD_PIPELINE_TASK_NAME_KEY,
-        CICD_PIPELINE_TASK_RUN_RESULT_KEY, COMMIT_SHA_KEY, CONFIG_OPERATION_KEY,
-        DB_OPERATION_NAME_KEY, DB_SYSTEM_NAME_KEY, DELIVERY_ID_KEY, FAILURE_REASON_KEY,
-        GITHUB_WORKFLOW_CONCLUSION_KEY, GITHUB_WORKFLOW_JOB_ID_KEY,
+        CICD_PIPELINE_TASK_RUN_ID_KEY, CICD_PIPELINE_TASK_RUN_RESULT_KEY, COMMIT_SHA_KEY,
+        CONFIG_OPERATION_KEY, DB_OPERATION_NAME_KEY, DB_SYSTEM_NAME_KEY, DELIVERY_ID_KEY,
+        FAILURE_REASON_KEY, GITHUB_WORKFLOW_CONCLUSION_KEY, GITHUB_WORKFLOW_JOB_ID_KEY,
         GITHUB_WORKFLOW_RUN_ATTEMPT_KEY, GITHUB_WORKFLOW_RUN_ID_KEY, HTTP_REQUEST_METHOD_KEY,
         HTTP_RESPONSE_STATUS_CODE_KEY, HTTP_RESULT_KEY, HTTP_ROUTE_KEY, OPERATION_FAILURE_EVENT,
         OPERATION_OUTCOME_KEY, PULL_REQUEST_NUMBER_KEY, REPOSITORY_ID_KEY, REPOSITORY_NAME_KEY,
@@ -1233,6 +1251,29 @@ mod tests {
         let job_id_kv = workflow_job_id_attribute(job_id);
         assert_eq!(job_id_kv.key.as_str(), GITHUB_WORKFLOW_JOB_ID_KEY);
         assert_eq!(job_id_kv.value.as_str().as_ref(), "41");
+
+        let job_task_run_id_kv = workflow_pipeline_task_run_id_attribute(job_id);
+        assert_eq!(
+            job_task_run_id_kv.key.as_str(),
+            CICD_PIPELINE_TASK_RUN_ID_KEY
+        );
+        assert_eq!(job_task_run_id_kv.value.as_str().as_ref(), "41");
+
+        let step = crate::telemetry::workflow::WorkflowStepTrace::new(
+            3,
+            None,
+            WorkflowConclusion::Success,
+            crate::telemetry::workflow::HistoricalTiming::fallback(
+                std::time::SystemTime::UNIX_EPOCH,
+            ),
+        )
+        .expect("workflow step number is positive");
+        let step_task_run_id_kv = workflow_pipeline_step_task_run_id_attribute(job_id, &step);
+        assert_eq!(
+            step_task_run_id_kv.key.as_str(),
+            CICD_PIPELINE_TASK_RUN_ID_KEY
+        );
+        assert_eq!(step_task_run_id_kv.value.as_str().as_ref(), "41:3");
 
         let conclusion_kv = workflow_conclusion_attribute(WorkflowConclusion::Cancelled);
         assert_eq!(conclusion_kv.key.as_str(), GITHUB_WORKFLOW_CONCLUSION_KEY);
