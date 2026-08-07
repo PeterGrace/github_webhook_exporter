@@ -1,6 +1,7 @@
-use std::{io, sync::Arc};
+use std::{io, sync::Arc, thread, time::Duration};
 
 mod diagnostics;
+mod http_client;
 #[cfg(test)]
 mod otlp_test;
 mod queue;
@@ -34,6 +35,7 @@ use crate::{
     metrics::Metrics,
 };
 use diagnostics::DiagnosticsObserver;
+use http_client::ObservingHttpClient;
 use queue::AdmissionBoundary;
 
 const INSTRUMENTATION_SCOPE: &str = "github_webhook_exporter";
@@ -264,8 +266,17 @@ fn build_trace_provider(
     resource: &Resource,
     observer: DiagnosticsObserver,
 ) -> Result<(SdkTracerProvider, SdkTracer, Arc<AdmissionBoundary>), TelemetryError> {
+    let http_client =
+        build_blocking_http_client(settings.timeout).map_err(|()| TelemetryError::TraceExporter)?;
+    let http_client = ObservingHttpClient::new(
+        http_client,
+        crate::metrics::TelemetrySignal::Trace,
+        observer.clone(),
+    );
+    let classified_failures = http_client.classified_failures();
     let exporter = OtlpSpanExporter::builder()
         .with_http()
+        .with_http_client(http_client)
         .with_endpoint(settings.endpoint())
         .with_timeout(settings.timeout)
         .with_headers(settings.headers())
@@ -276,6 +287,7 @@ fn build_trace_provider(
         config.queue_capacity(),
         config.batch_size(),
         observer,
+        classified_failures,
     );
     let provider = SdkTracerProvider::builder()
         .with_resource(resource.clone())
@@ -291,8 +303,17 @@ fn build_log_provider(
     resource: &Resource,
     observer: DiagnosticsObserver,
 ) -> Result<(SdkLoggerProvider, Arc<AdmissionBoundary>), TelemetryError> {
+    let http_client =
+        build_blocking_http_client(settings.timeout).map_err(|()| TelemetryError::LogExporter)?;
+    let http_client = ObservingHttpClient::new(
+        http_client,
+        crate::metrics::TelemetrySignal::Log,
+        observer.clone(),
+    );
+    let classified_failures = http_client.classified_failures();
     let exporter = OtlpLogExporter::builder()
         .with_http()
+        .with_http_client(http_client)
         .with_endpoint(settings.endpoint())
         .with_timeout(settings.timeout)
         .with_headers(settings.headers())
@@ -303,12 +324,27 @@ fn build_log_provider(
         config.queue_capacity(),
         config.batch_size(),
         observer,
+        classified_failures,
     );
     let provider = SdkLoggerProvider::builder()
         .with_resource(resource.clone())
         .with_log_processor(processor)
         .build();
     Ok((provider, queue))
+}
+
+fn build_blocking_http_client(timeout: Duration) -> Result<reqwest::blocking::Client, ()> {
+    thread::Builder::new()
+        .name("otlp-http-client-init".to_owned())
+        .spawn(move || {
+            reqwest::blocking::Client::builder()
+                .timeout(timeout)
+                .build()
+        })
+        .map_err(|_| ())?
+        .join()
+        .map_err(|_| ())?
+        .map_err(|_| ())
 }
 
 fn telemetry_resource(config: &TelemetryConfig) -> Resource {

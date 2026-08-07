@@ -3,7 +3,7 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use opentelemetry::{logs::Severity, Context, InstrumentationScope};
 use opentelemetry_sdk::{
-    error::OTelSdkResult,
+    error::{OTelSdkError, OTelSdkResult},
     logs::{
         BatchConfigBuilder as LogBatchConfigBuilder, BatchLogProcessor, LogBatch, LogExporter,
         LogProcessor, SdkLogRecord,
@@ -15,7 +15,7 @@ use opentelemetry_sdk::{
     Resource,
 };
 
-use crate::metrics::{TelemetryDropReason, TelemetrySignal};
+use crate::metrics::{TelemetryDropReason, TelemetryExportFailureReason, TelemetrySignal};
 use crate::telemetry::diagnostics::DiagnosticsObserver;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,11 +124,21 @@ impl AdmissionBoundary {
 
 async fn observe_export(
     boundary: &AdmissionBoundary,
+    classified_failures: &AtomicU64,
     export: impl Future<Output = OTelSdkResult>,
 ) -> OTelSdkResult {
+    let classified_before = classified_failures.load(Ordering::Relaxed);
     let result = export.await;
-    if result.is_err() {
+    if let Err(error) = &result {
         boundary.failed_exports.fetch_add(1, Ordering::Relaxed);
+        if classified_failures.load(Ordering::Relaxed) == classified_before {
+            let reason = match error {
+                OTelSdkError::AlreadyShutdown => TelemetryExportFailureReason::Shutdown,
+                OTelSdkError::Timeout(_) => TelemetryExportFailureReason::Timeout,
+                OTelSdkError::InternalFailure(_) => TelemetryExportFailureReason::Internal,
+            };
+            boundary.observer.export_failure(boundary.signal, reason);
+        }
     }
     result
 }
@@ -137,6 +147,7 @@ async fn observe_export(
 struct BoundarySpanExporter<E> {
     exporter: E,
     boundary: Arc<AdmissionBoundary>,
+    classified_failures: Arc<AtomicU64>,
 }
 
 impl<E: SpanExporter> SpanExporter for BoundarySpanExporter<E> {
@@ -145,7 +156,11 @@ impl<E: SpanExporter> SpanExporter for BoundarySpanExporter<E> {
         batch: Vec<SpanData>,
     ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
         self.boundary.release(batch.len());
-        observe_export(&self.boundary, self.exporter.export(batch))
+        observe_export(
+            &self.boundary,
+            &self.classified_failures,
+            self.exporter.export(batch),
+        )
     }
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
@@ -204,6 +219,7 @@ pub(super) fn span_processor<E: SpanExporter + 'static>(
     capacity: usize,
     batch_size: usize,
     observer: DiagnosticsObserver,
+    classified_failures: Arc<AtomicU64>,
 ) -> (BoundarySpanProcessor, Arc<AdmissionBoundary>) {
     let boundary = Arc::new(AdmissionBoundary::new(
         capacity,
@@ -213,6 +229,7 @@ pub(super) fn span_processor<E: SpanExporter + 'static>(
     let exporter = BoundarySpanExporter {
         exporter,
         boundary: Arc::clone(&boundary),
+        classified_failures,
     };
     let batch_config = TraceBatchConfigBuilder::default()
         .with_max_queue_size(capacity)
@@ -234,6 +251,7 @@ pub(super) fn span_processor<E: SpanExporter + 'static>(
 struct BoundaryLogExporter<E> {
     exporter: E,
     boundary: Arc<AdmissionBoundary>,
+    classified_failures: Arc<AtomicU64>,
 }
 
 impl<E: LogExporter> LogExporter for BoundaryLogExporter<E> {
@@ -243,7 +261,11 @@ impl<E: LogExporter> LogExporter for BoundaryLogExporter<E> {
     ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
         // OpenTelemetry 0.32 exposes no public O(1) `LogBatch::len`; its iterator is exact.
         self.boundary.release(batch.iter().count());
-        observe_export(&self.boundary, self.exporter.export(batch))
+        observe_export(
+            &self.boundary,
+            &self.classified_failures,
+            self.exporter.export(batch),
+        )
     }
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
@@ -296,6 +318,7 @@ pub(super) fn log_processor<E: LogExporter + 'static>(
     capacity: usize,
     batch_size: usize,
     observer: DiagnosticsObserver,
+    classified_failures: Arc<AtomicU64>,
 ) -> (BoundaryLogProcessor, Arc<AdmissionBoundary>) {
     let boundary = Arc::new(AdmissionBoundary::new(
         capacity,
@@ -305,6 +328,7 @@ pub(super) fn log_processor<E: LogExporter + 'static>(
     let exporter = BoundaryLogExporter {
         exporter,
         boundary: Arc::clone(&boundary),
+        classified_failures,
     };
     let batch_config = LogBatchConfigBuilder::default()
         .with_max_queue_size(capacity)
@@ -325,7 +349,7 @@ pub(super) fn log_processor<E: LogExporter + 'static>(
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Barrier},
+        sync::{atomic::AtomicU64, Arc, Barrier},
         thread,
     };
 
@@ -414,7 +438,7 @@ mod tests {
     async fn export_failures_are_counted_by_the_application_hook() {
         let boundary = boundary(1);
 
-        let result = observe_export(&boundary, async {
+        let result = observe_export(&boundary, &AtomicU64::new(0), async {
             Err(OTelSdkError::InternalFailure("private failure".to_owned()))
         })
         .await;

@@ -8,6 +8,7 @@ authors = ["Peter Grace <pete.grace@gmail.com>"]
 aes = { version = "0.8", features = ["zeroize"] }
 aes-gcm = { version = "0.10", features = ["zeroize"] }
 anyhow = "1"
+async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "matched-path", "tokio", "tracing"] }
 base64 = "0.22"
 hex = "0.4"
@@ -16,10 +17,14 @@ hmac = "0.12"
 http = "1"
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.32", default-features = false }
+opentelemetry-http = { version = "0.32", default-features = false, features = ["reqwest-blocking"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "logs"] }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace", "logs"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "logs"] }
 percent-encoding = "2"
 prometheus-client = { version = "0.25.0", default-features = false }
+prost = "0.14"
+reqwest = { version = "0.13", default-features = false, features = ["blocking"] }
 secrecy = "0.10"
 serde = { version = "1.0.216", features = ["derive"] }
 serde_json = "1"
@@ -36,8 +41,6 @@ url = "2"
 uuid = { version = "1", default-features = false, features = ["v4"] }
 
 [dev-dependencies]
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace", "logs"] }
-prost = "0.14"
 static_assertions = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "test-util", "time"] }
