@@ -569,7 +569,31 @@ cargo test telemetry::otlp_test::workflow_job_over_step_limit_emits_actionable_r
 
 Expected: failure because over-limit jobs are still projected and no rejection telemetry exists.
 
-- [ ] **Step 5: Implement webhook admission and warning**
+- [ ] **Step 5: Add the failing duplicate-rejection test**
+
+Add a test that sends the same signed over-limit delivery twice through a limit-2 fixture. Assert:
+
+```text
+accepted webhook requests = 2
+generic workflow_job.completed events = 1
+duplicate deliveries = 1
+workflow step histogram count = 1
+workflow trace rejections = 1
+completed workflow-job trace rejected warning occurrences = 1
+historical workflow spans = 0
+```
+
+Run:
+
+```bash
+cargo test telemetry::otlp_test::duplicate_over_limit_workflow_job_records_one_rejection --lib -- --exact
+```
+
+Expected: failure because workflow admission, rejection metrics, and rejection diagnostics have not
+yet been implemented. The test must retain the correct expected values; never manufacture RED with
+an intentionally false assertion.
+
+- [ ] **Step 6: Implement webhook admission and warning**
 
 Replace the direct completed-job projection block in `src/api/webhook.rs` with this control flow:
 
@@ -626,39 +650,15 @@ warn!(
 Keep this warning out of the active request span by using `parent: None`. Do not construct names,
 SHAs, URLs, or payload-derived text for the warning.
 
-- [ ] **Step 6: Run accepted and rejected integration tests and verify GREEN**
+- [ ] **Step 7: Run accepted, rejected, and duplicate integration tests and verify GREEN**
 
 ```bash
 cargo test telemetry::otlp_test::workflow_job_at_configured_step_limit_exports_complete_trace --lib -- --exact
 cargo test telemetry::otlp_test::workflow_job_over_step_limit_emits_actionable_rejection_without_trace --lib -- --exact
-```
-
-Expected: both tests pass.
-
-- [ ] **Step 7: Add and run duplicate-rejection coverage**
-
-Add a test that sends the same signed over-limit delivery twice through a limit-2 fixture. Assert:
-
-```text
-accepted webhook requests = 2
-generic workflow_job.completed events = 1
-duplicate deliveries = 1
-workflow step histogram count = 1
-workflow trace rejections = 1
-completed workflow-job trace rejected warning occurrences = 1
-historical workflow spans = 0
-```
-
-Run:
-
-```bash
 cargo test telemetry::otlp_test::duplicate_over_limit_workflow_job_records_one_rejection --lib -- --exact
 ```
 
-First verify RED by adding the test before any duplicate-specific correction. If the existing claim
-boundary already makes it GREEN immediately, temporarily assert two histogram observations to
-prove the test detects the boundary, observe the expected failure, then restore the correct
-assertion of one before proceeding.
+Expected: all three tests pass.
 
 - [ ] **Step 8: Run the complete workflow and privacy suites**
 
