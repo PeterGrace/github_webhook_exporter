@@ -5,7 +5,7 @@ use std::fmt;
 
 use axum::extract::MatchedPath;
 use http::{Method, StatusCode};
-use opentelemetry::{trace::Status, KeyValue};
+use opentelemetry::{trace::Status, Array, KeyValue, Value};
 use thiserror::Error;
 use tracing::{info_span, Instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -85,7 +85,21 @@ pub(crate) fn delivery_id_attribute(id: &DeliveryId) -> KeyValue {
 
 /// Returns the pull-request number attribute.
 pub(crate) fn pull_request_number_attribute(number: PullRequestNumber) -> KeyValue {
-    decimal_string_key_value(PULL_REQUEST_NUMBER_KEY, number.get())
+    KeyValue::new(PULL_REQUEST_NUMBER_KEY, number.get())
+}
+
+/// Returns the bounded pull-request number collection attribute for historical workflow roots.
+pub(crate) fn pull_request_numbers_attribute(numbers: &[PullRequestNumber]) -> Option<KeyValue> {
+    if numbers.is_empty() {
+        None
+    } else {
+        Some(KeyValue::new(
+            PULL_REQUEST_NUMBER_KEY,
+            Value::Array(Array::I64(
+                numbers.iter().map(|number| number.get()).collect(),
+            )),
+        ))
+    }
 }
 
 /// Returns the commit-SHA attribute.
@@ -750,11 +764,11 @@ mod tests {
     use super::{
         add_failure_event, commit_sha_attribute, database_span, delivery_id_attribute,
         operation_outcome_attribute, operation_span, pull_request_number_attribute,
-        repository_name_attribute, set_commit_sha, set_config_operation, set_delivery_id,
-        set_http_method, set_http_response, set_http_route, set_pull_request_number,
-        set_repository_id, set_repository_name, set_result_status, set_status,
-        timing_source_attribute, workflow_conclusion_attribute, workflow_job_id_attribute,
-        workflow_name_attribute, workflow_pipeline_result_attribute,
+        pull_request_numbers_attribute, repository_name_attribute, set_commit_sha,
+        set_config_operation, set_delivery_id, set_http_method, set_http_response, set_http_route,
+        set_pull_request_number, set_repository_id, set_repository_name, set_result_status,
+        set_status, timing_source_attribute, workflow_conclusion_attribute,
+        workflow_job_id_attribute, workflow_name_attribute, workflow_pipeline_result_attribute,
         workflow_pipeline_run_id_attribute, workflow_pipeline_task_run_result_attribute,
         workflow_run_attempt_attribute, workflow_run_id_attribute, workflow_task_name_attribute,
         CommitSha, ConfigOperation, DatabaseOperation, HttpMethod, HttpResult, Operation,
@@ -1141,7 +1155,7 @@ mod tests {
         }));
         assert!(request_span.attributes.iter().any(|attribute| {
             attribute.key.as_str() == PULL_REQUEST_NUMBER_KEY
-                && attribute.value.as_str().as_ref() == "17"
+                && matches!(attribute.value, opentelemetry::Value::I64(17))
         }));
         assert!(request_span.attributes.iter().any(|attribute| {
             attribute.key.as_str() == COMMIT_SHA_KEY
@@ -1257,7 +1271,22 @@ mod tests {
 
         let pull_request_number_kv = pull_request_number_attribute(pull_request_number);
         assert_eq!(pull_request_number_kv.key.as_str(), PULL_REQUEST_NUMBER_KEY);
-        assert_eq!(pull_request_number_kv.value.as_str().as_ref(), "17");
+        assert_eq!(pull_request_number_kv.value, opentelemetry::Value::I64(17));
+
+        let pull_request_numbers_kv = pull_request_numbers_attribute(&[
+            pull_request_number,
+            PullRequestNumber::new(23).expect("test pull request number is positive"),
+        ])
+        .expect("bounded pull-request list is present");
+        assert_eq!(
+            pull_request_numbers_kv.key.as_str(),
+            PULL_REQUEST_NUMBER_KEY
+        );
+        assert_eq!(
+            pull_request_numbers_kv.value,
+            opentelemetry::Value::Array(opentelemetry::Array::I64(vec![17, 23]))
+        );
+        assert!(pull_request_numbers_attribute(&[]).is_none());
 
         let commit_sha_kv = commit_sha_attribute(&commit_sha);
         assert_eq!(commit_sha_kv.key.as_str(), COMMIT_SHA_KEY);

@@ -1826,7 +1826,7 @@ async fn webhook_successes_emit_bounded_hierarchy_and_span_only_identifiers() {
     let enqueue_process = captured.child_named(enqueue_request, "github.webhook.process");
     let enqueue_update =
         captured.descendant_named(enqueue_process, "merge_queue.update", "pull_request");
-    assert_attribute(enqueue_update, "github.pull_request.number", "42");
+    assert_i64_attribute(enqueue_update, "github.pull_request.number", 42);
     assert_attribute(enqueue_update, "github.delivery.id", enqueue_delivery);
     assert_attribute(
         enqueue_update,
@@ -1844,7 +1844,7 @@ async fn webhook_successes_emit_bounded_hierarchy_and_span_only_identifiers() {
     assert_i64_attribute(dequeue_update, "github.repository.id", repository_id);
     assert_attribute(dequeue_update, "github.repository.name", WEBHOOK_REPOSITORY);
     assert_attribute(dequeue_update, "github.delivery.id", dequeue_delivery);
-    assert_attribute(dequeue_update, "github.pull_request.number", "42");
+    assert_i64_attribute(dequeue_update, "github.pull_request.number", 42);
     assert_attribute(
         dequeue_update,
         "github.commit.sha",
@@ -2427,10 +2427,10 @@ async fn integrated_core_trace_privacy() {
     let dequeue_process = captured.parent_named(dequeue_update, "github.webhook.process");
     let dequeue_request = captured.parent_named(dequeue_process, "http.request");
     assert_attribute(dequeue_request, "http.route", "/webhooks/github");
-    assert_attribute(
+    assert_i64_attribute(
         dequeue_update,
         "github.pull_request.number",
-        &PRIVACY_PR_NUMBER.to_string(),
+        PRIVACY_PR_NUMBER,
     );
     assert_attribute(dequeue_update, "ghe.queue.outcome", "unknown");
     assert_attribute(dequeue_update, "ghe.queue.reason", "unclassified_dequeue");
@@ -2567,12 +2567,12 @@ async fn integrated_core_trace_privacy() {
             && i64_attribute(span, "github.repository.id") == Some(repository_id)
     }));
     assert!(captured.spans.iter().any(|span| {
-        string_attribute(span, "github.pull_request.number") == Some(&PRIVACY_PR_NUMBER.to_string())
+        i64_attribute(span, "github.pull_request.number") == Some(PRIVACY_PR_NUMBER)
             && string_attribute(span, "github.commit.sha") == Some(PRIVACY_SHA)
     }));
-    assert!(captured.has_trace_string_attribute(
+    assert!(captured.has_trace_i64_attribute(
         "github.pull_request.number",
-        &PRIVACY_QUEUE_FAILURE_PR_NUMBER.to_string(),
+        PRIVACY_QUEUE_FAILURE_PR_NUMBER,
     ));
 
     captured.assert_approved_attribute_keys();
@@ -2582,19 +2582,22 @@ async fn integrated_core_trace_privacy() {
             "OTLP logs must not contain span-only identifier key {key:?}"
         );
     }
-    assert!(captured.has_trace_i64_attribute("github.repository.id", repository_id));
-    assert!(
-        !captured.has_log_i64_attribute("github.repository.id", repository_id),
-        "OTLP logs must not contain span-only integer github.repository.id={repository_id}"
-    );
-    assert!(
-        !captured.has_log_i64_value(repository_id),
-        "OTLP log attributes must not contain span-only integer {repository_id}"
-    );
-    for value in [PRIVACY_PR_NUMBER, PRIVACY_QUEUE_FAILURE_PR_NUMBER] {
+    for (key, value) in [
+        ("github.repository.id", repository_id),
+        ("github.pull_request.number", PRIVACY_PR_NUMBER),
+        (
+            "github.pull_request.number",
+            PRIVACY_QUEUE_FAILURE_PR_NUMBER,
+        ),
+    ] {
+        assert!(captured.has_trace_i64_attribute(key, value));
         assert!(
-            captured.has_trace_string_attribute("github.pull_request.number", &value.to_string(),),
-            "approved pull-request identifier {value} is present in traces"
+            !captured.has_log_i64_attribute(key, value),
+            "OTLP logs must not contain span-only integer {key}={value}"
+        );
+        assert!(
+            !captured.has_log_i64_value(value),
+            "OTLP log attributes must not contain span-only integer {value}"
         );
     }
     assert!(

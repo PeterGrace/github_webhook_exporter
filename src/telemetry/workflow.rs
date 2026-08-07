@@ -16,9 +16,9 @@ use crate::{
 };
 
 use super::trace::{
-    commit_sha_attribute, delivery_id_attribute, repository_name_attribute,
-    timing_source_attribute, workflow_conclusion_attribute, workflow_job_id_attribute,
-    workflow_name_attribute, workflow_pipeline_result_attribute,
+    commit_sha_attribute, delivery_id_attribute, pull_request_numbers_attribute,
+    repository_name_attribute, timing_source_attribute, workflow_conclusion_attribute,
+    workflow_job_id_attribute, workflow_name_attribute, workflow_pipeline_result_attribute,
     workflow_pipeline_run_id_attribute, workflow_pipeline_task_run_result_attribute,
     workflow_run_attempt_attribute, workflow_run_id_attribute, workflow_task_name_attribute,
     CommitSha,
@@ -404,7 +404,7 @@ fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
             + usize::from(job.job_name().is_some())
             + usize::from(job.conclusion().semantic_result().is_some())
             + usize::from(job.head_sha().is_some())
-            + job.pull_requests().len(),
+            + usize::from(!job.pull_requests().is_empty()),
     );
     attributes.push(repository_name_attribute(job.repository_name()));
     attributes.push(delivery_id_attribute(&job.delivery_id()));
@@ -425,10 +425,8 @@ fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
     if let Some(head_sha) = job.head_sha() {
         attributes.push(commit_sha_attribute(head_sha));
     }
-    for pull_request_number in job.pull_requests() {
-        attributes.push(super::trace::pull_request_number_attribute(
-            *pull_request_number,
-        ));
+    if let Some(pull_request_numbers) = pull_request_numbers_attribute(job.pull_requests()) {
+        attributes.push(pull_request_numbers);
     }
     attributes.push(timing_source_attribute(job.timing().source()));
     attributes
@@ -692,7 +690,7 @@ mod tests {
 
     use opentelemetry::{
         trace::{SpanId, Status, TraceContextExt, Tracer, TracerProvider as _},
-        Context, Value,
+        Array, Context, Value,
     };
     use opentelemetry_sdk::{
         error::OTelSdkResult,
@@ -1023,8 +1021,10 @@ mod tests {
         let job_id = WorkflowJobId::new(41).expect("job id is valid");
         let head_sha = CommitSha::parse("0123456789abcdef0123456789abcdef01234567")
             .expect("commit sha is valid");
-        let pull_request_number =
-            PullRequestNumber::new(7).expect("pull request number is positive");
+        let first_pull_request_number =
+            PullRequestNumber::new(7).expect("first pull request number is positive");
+        let second_pull_request_number =
+            PullRequestNumber::new(11).expect("second pull request number is positive");
         let job = WorkflowJobTrace::new(WorkflowJobTraceParts {
             repository_name,
             delivery_id,
@@ -1035,7 +1035,10 @@ mod tests {
             job_name: DisplayName::sanitize("Linux Job"),
             conclusion: WorkflowConclusion::Failure,
             head_sha: Some(head_sha),
-            pull_requests: WorkflowPullRequests::new([pull_request_number]),
+            pull_requests: WorkflowPullRequests::new([
+                first_pull_request_number,
+                second_pull_request_number,
+            ]),
             timing: job_timing.clone(),
             steps: vec![
                 WorkflowStepTrace::new(
@@ -1139,7 +1142,7 @@ mod tests {
             "github.commit.sha",
             "0123456789abcdef0123456789abcdef01234567",
         );
-        assert_string_attribute(job, "github.pull_request.number", "7");
+        assert_i64_array_attribute(job, "github.pull_request.number", &[7, 11]);
         assert_string_attribute(job, "timing_source", "reported");
 
         let expected_step_keys = BTreeSet::from([
@@ -1200,6 +1203,14 @@ mod tests {
         assert_eq!(
             attribute(span, key).map(Value::as_str).as_deref(),
             Some(expected),
+            "unexpected attribute {key}"
+        );
+    }
+
+    fn assert_i64_array_attribute(span: &SpanData, key: &str, expected: &[i64]) {
+        assert_eq!(
+            attribute(span, key),
+            Some(&Value::Array(Array::I64(expected.to_vec()))),
             "unexpected attribute {key}"
         );
     }
