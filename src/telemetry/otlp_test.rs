@@ -36,6 +36,7 @@ use tracing_subscriber::layer::{Context as SubscriberContext, Layer, SubscriberE
 
 use crate::{
     app::{build_router, AppState},
+    config::DEFAULT_WORKFLOW_JOB_MAX_STEPS,
     domain::{
         delivery::DeliveryId,
         merge_queue::{PullRequestNumber, QueueCompletion, QueueTimestamp},
@@ -681,8 +682,13 @@ impl WebhookTraceFixture {
         receiver.clear_captured_requests();
         let admin_token = AdminToken::new(ADMIN_TOKEN.to_owned()).expect("test token is valid");
         let router = build_router(
-            AppState::new(store, AdminAuthenticator::new(&admin_token), 2_097_152)
-                .with_workflow_trace_emitter(runtime.workflow_trace_emitter()),
+            AppState::new(
+                store,
+                AdminAuthenticator::new(&admin_token),
+                2_097_152,
+                DEFAULT_WORKFLOW_JOB_MAX_STEPS,
+            )
+            .with_workflow_trace_emitter(runtime.workflow_trace_emitter()),
         );
         Self {
             _otlp_guard: otlp_guard,
@@ -888,6 +894,7 @@ fn router_for_pool(pool: SqlitePool) -> Router {
         RepositoryStore::new(pool, cipher),
         AdminAuthenticator::new(&admin_token),
         2_097_152,
+        DEFAULT_WORKFLOW_JOB_MAX_STEPS,
     ))
 }
 

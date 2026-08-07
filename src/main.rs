@@ -41,6 +41,7 @@ async fn run() -> Result<()> {
         RepositoryStore::new(pool, cipher),
         AdminAuthenticator::new(config.admin_token()),
         config.webhook_body_limit_bytes(),
+        config.workflow_job_max_steps(),
     )
     .with_workflow_trace_emitter(telemetry_runtime.workflow_trace_emitter());
     state

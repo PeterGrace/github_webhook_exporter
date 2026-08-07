@@ -37,6 +37,7 @@ pub struct AppState {
     metrics: Metrics,
     workflow_trace_emitter: WorkflowTraceEmitter,
     webhook_body_limit_bytes: usize,
+    workflow_job_max_steps: usize,
 }
 
 impl AppState {
@@ -45,6 +46,7 @@ impl AppState {
         repository_store: RepositoryStore,
         admin_authenticator: AdminAuthenticator,
         webhook_body_limit_bytes: usize,
+        workflow_job_max_steps: usize,
     ) -> Self {
         let database_pool = repository_store.pool().clone();
         let delivery_store = DeliveryStore::new(database_pool.clone());
@@ -58,6 +60,7 @@ impl AppState {
             metrics: Metrics::new(),
             workflow_trace_emitter: WorkflowTraceEmitter::disabled(),
             webhook_body_limit_bytes,
+            workflow_job_max_steps,
         }
     }
 
@@ -114,6 +117,11 @@ impl AppState {
     /// Returns the configured explicit-time historical workflow trace emitter.
     pub fn workflow_trace_emitter(&self) -> &WorkflowTraceEmitter {
         &self.workflow_trace_emitter
+    }
+
+    /// Returns the maximum reported steps accepted for one completed workflow-job trace.
+    pub fn workflow_job_max_steps(&self) -> usize {
+        self.workflow_job_max_steps
     }
 }
 
@@ -319,6 +327,7 @@ mod tests {
             RepositoryStore::new(pool, cipher),
             AdminAuthenticator::new(&token),
             2_097_152,
+            256,
         )
     }
 
@@ -337,6 +346,13 @@ mod tests {
             .expect("router serves request");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn application_state_exposes_workflow_job_step_limit() {
+        let state = app_state().await;
+
+        assert_eq!(state.workflow_job_max_steps(), 256);
     }
 
     #[tokio::test]
