@@ -684,6 +684,16 @@ mod tests {
     }
 
     #[test]
+    fn valid_minimum_workflow_job_max_steps_is_accepted() {
+        let mut variables = required_variables();
+        variables.insert("GHE_WORKFLOW_JOB_MAX_STEPS".to_owned(), OsString::from("1"));
+
+        let config = RuntimeConfig::from_map(variables).expect("minimum step limit is valid");
+
+        assert_eq!(config.workflow_job_max_steps(), 1);
+    }
+
+    #[test]
     fn valid_overrides_replace_defaults() {
         let mut variables = required_variables();
         variables.insert(

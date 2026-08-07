@@ -409,6 +409,38 @@ mod tests {
     }
 
     #[test]
+    fn admission_rejects_malformed_json_bytes() {
+        assert!(inspect_completed_job(b"{").is_none());
+    }
+
+    #[test]
+    fn admission_rejects_missing_workflow_job() {
+        let body = serde_json::to_vec(&json!({})).expect("fixture serializes");
+
+        assert!(inspect_completed_job(&body).is_none());
+    }
+
+    #[test]
+    fn admission_rejects_null_workflow_job() {
+        let body = serde_json::to_vec(&json!({"workflow_job": null})).expect("fixture serializes");
+
+        assert!(inspect_completed_job(&body).is_none());
+    }
+
+    #[test]
+    fn admission_rejects_wrong_type_workflow_job_envelopes() {
+        for workflow_job in [json!("wrong type"), json!([]), json!(42)] {
+            let body = serde_json::to_vec(&json!({"workflow_job": workflow_job}))
+                .expect("fixture serializes");
+
+            assert!(
+                inspect_completed_job(&body).is_none(),
+                "wrong-type workflow_job envelope was admitted: {body:?}"
+            );
+        }
+    }
+
+    #[test]
     fn admission_missing_steps_defaults_to_zero() {
         let body = serde_json::to_vec(&json!({
             "workflow_job": {

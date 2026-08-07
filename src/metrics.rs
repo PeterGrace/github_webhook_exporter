@@ -594,8 +594,6 @@ impl Metrics {
         let workflow_job_steps = Histogram::new(WORKFLOW_JOB_STEP_BUCKETS);
         let workflow_trace_rejections = CounterFamily::default();
         let mut registry = Registry::with_prefix("github");
-        let _ = Self::observe_workflow_job_steps as fn(&Self, usize);
-        let _ = Self::record_workflow_trace_rejection as fn(&Self, WorkflowTraceRejectionReason);
 
         // `prometheus-client` omits a labelled family until it owns at least one metric. Seed only
         // bounded zero-valued labels so every required family exists before the first webhook.
