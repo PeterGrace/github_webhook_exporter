@@ -782,18 +782,44 @@ impl WebhookTraceFixture {
         delivery_id: &str,
         secret: &str,
     ) -> axum::response::Response {
+        self.webhook_with_authorization(body, event_type, delivery_id, secret, None)
+            .await
+    }
+
+    async fn webhook_with_authorization(
+        &self,
+        body: &[u8],
+        event_type: &str,
+        delivery_id: &str,
+        secret: &str,
+        authorization: Option<&str>,
+    ) -> axum::response::Response {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC key is valid");
         mac.update(body);
         let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method(Method::POST)
             .uri("/webhooks/github")
             .header(CONTENT_TYPE, "application/json")
             .header("X-GitHub-Event", event_type)
             .header("X-GitHub-Delivery", delivery_id)
-            .header("X-Hub-Signature-256", signature)
+            .header("X-Hub-Signature-256", signature);
+        if let Some(value) = authorization {
+            request = request.header(header::AUTHORIZATION, value);
+        }
+        let request = request
             .body(Body::from(body.to_vec()))
             .expect("webhook request is valid");
+        if let Some(expected) = authorization {
+            assert_eq!(
+                request
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected),
+                "webhook Authorization header contains the sentinel before submission"
+            );
+        }
         self.router
             .clone()
             .oneshot(request)
@@ -2525,6 +2551,7 @@ async fn workflow_job_over_step_limit_emits_actionable_rejection_without_trace()
     const FORBIDDEN_ACTOR: &str = "rejection-actor-sentinel";
     const FORBIDDEN_COMMAND: &str = "secret-command";
     const FORBIDDEN_OUTPUT: &str = "secret-output";
+    const FORBIDDEN_LOGS: &str = "secret-logs";
     const FORBIDDEN_RAW_URL: &str = "https://rejection-raw-url.invalid/private";
     const FORBIDDEN_DERIVED_URL: &str = "https://rejection-derived-url.invalid/private";
     const FORBIDDEN_PAYLOAD_FRAGMENT: &str = "rejection-payload-fragment-sentinel";
@@ -2548,6 +2575,7 @@ async fn workflow_job_over_step_limit_emits_actionable_rejection_without_trace()
             "actor": {"login": FORBIDDEN_ACTOR},
             "commands": [FORBIDDEN_COMMAND],
             "output": FORBIDDEN_OUTPUT,
+            "logs": FORBIDDEN_LOGS,
             "url": FORBIDDEN_RAW_URL,
             "html_url": FORBIDDEN_DERIVED_URL,
             "raw_payload_fragment": FORBIDDEN_PAYLOAD_FRAGMENT,
@@ -2564,8 +2592,20 @@ async fn workflow_job_over_step_limit_emits_actionable_rejection_without_trace()
         REPOSITORY_NAME,
     );
 
+    let serialized_body = String::from_utf8(body.clone()).expect("webhook body is UTF-8");
+    assert!(
+        serialized_body.contains(FORBIDDEN_LOGS),
+        "serialized webhook body contains the logs sentinel before submission"
+    );
+    let authorization_header = format!("Bearer {FORBIDDEN_AUTHORIZATION}");
     let response = fixture
-        .webhook(&body, "workflow_job", DELIVERY_ID, WEBHOOK_SECRET)
+        .webhook_with_authorization(
+            &body,
+            "workflow_job",
+            DELIVERY_ID,
+            WEBHOOK_SECRET,
+            Some(&authorization_header),
+        )
         .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     drop(response);
@@ -2680,6 +2720,7 @@ async fn workflow_job_over_step_limit_emits_actionable_rejection_without_trace()
         FORBIDDEN_ACTOR,
         FORBIDDEN_COMMAND,
         FORBIDDEN_OUTPUT,
+        FORBIDDEN_LOGS,
         FORBIDDEN_RAW_URL,
         FORBIDDEN_DERIVED_URL,
         FORBIDDEN_PAYLOAD_FRAGMENT,
