@@ -2738,12 +2738,29 @@ async fn workflow_job_over_step_limit_emits_actionable_rejection_without_trace()
         assert!(!exposition.contains(identifier));
     }
     for identifier in [WORKFLOW_RUN_ID, WORKFLOW_JOB_ID] {
+        let identifier_text = identifier.to_string();
+        assert!(
+            !exposition.lines().any(|line| {
+                if line.starts_with('#') {
+                    return false;
+                }
+
+                let Some((metric_series, _sample_value)) = line.rsplit_once(' ') else {
+                    return false;
+                };
+                metric_series.contains(&identifier_text)
+            }),
+            "Prometheus metric series and labels must not contain workflow identifier {identifier}"
+        );
+
         let identifier_value = identifier as f64;
         assert!(
             !exposition.lines().any(|line| {
-                line.rsplit_once(' ')
-                    .and_then(|(_, value)| value.parse::<f64>().ok())
-                    .is_some_and(|value| value == identifier_value)
+                !line.starts_with('#')
+                    && line
+                        .rsplit_once(' ')
+                        .and_then(|(_, value)| value.parse::<f64>().ok())
+                        .is_some_and(|value| value == identifier_value)
             }),
             "Prometheus sample values must not contain workflow identifier {identifier}"
         );
