@@ -9,6 +9,7 @@ use axum::{
     routing::post,
     Router,
 };
+use opentelemetry::Context;
 use serde::Deserialize;
 use time::OffsetDateTime;
 use tracing::{error, info, warn, Instrument};
@@ -238,6 +239,7 @@ fn record_workflow_trace_rejection(
     state
         .metrics()
         .record_workflow_trace_rejection(WorkflowTraceRejectionReason::TooManySteps);
+    let _parentless_context = Context::new().attach();
     let mut delivery_buffer = uuid::Uuid::encode_buffer();
     warn!(
         parent: None,

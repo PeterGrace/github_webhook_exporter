@@ -1093,6 +1093,19 @@ impl CapturedSpans {
         })
     }
 
+    fn workflow_rejection_log(&self) -> &LogRecord {
+        let matches = self
+            .log_records
+            .iter()
+            .filter(|record| {
+                record.body.as_ref().and_then(string_any_value)
+                    == Some("completed workflow-job trace rejected")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "workflow rejection warning count");
+        matches[0]
+    }
+
     fn http_request(&self, method: &str, route: &str, status_code: i64) -> &Span {
         self.spans
             .iter()
@@ -2504,8 +2517,21 @@ async fn workflow_job_over_step_limit_emits_actionable_rejection_without_trace()
     const WORKFLOW_RUN_ATTEMPT: i64 = 2;
     const WORKFLOW_JOB_ID: i64 = 9901;
     const DELIVERY_ID: &str = "550e8400-e29b-41d4-a716-446655440801";
+    const FORBIDDEN_WORKFLOW_NAME: &str = "rejection-workflow-name-sentinel";
+    const FORBIDDEN_JOB_NAME: &str = "rejection-job-name-sentinel";
+    const FORBIDDEN_STEP_NAME: &str = "rejection-step-name-sentinel";
+    const FORBIDDEN_SHA: &str = "rejection-sha-sentinel";
+    const FORBIDDEN_PR: &str = "rejection-pr-sentinel";
+    const FORBIDDEN_ACTOR: &str = "rejection-actor-sentinel";
     const FORBIDDEN_COMMAND: &str = "secret-command";
     const FORBIDDEN_OUTPUT: &str = "secret-output";
+    const FORBIDDEN_RAW_URL: &str = "https://rejection-raw-url.invalid/private";
+    const FORBIDDEN_DERIVED_URL: &str = "https://rejection-derived-url.invalid/private";
+    const FORBIDDEN_PAYLOAD_FRAGMENT: &str = "rejection-payload-fragment-sentinel";
+    const FORBIDDEN_SIGNATURE: &str = "rejection-signature-sentinel";
+    const FORBIDDEN_AUTHORIZATION: &str = "rejection-authorization-sentinel";
+    const FORBIDDEN_REPOSITORY_SECRET: &str = "rejection-repository-secret-sentinel";
+    const FORBIDDEN_COLLECTOR_DETAILS: &str = "rejection-collector-details-sentinel";
 
     let fixture = WebhookTraceFixture::new_with_workflow_job_max_steps(2).await;
     let body = workflow_job_body_for_repository(
@@ -2515,10 +2541,22 @@ async fn workflow_job_over_step_limit_emits_actionable_rejection_without_trace()
             "run_id": WORKFLOW_RUN_ID,
             "run_attempt": WORKFLOW_RUN_ATTEMPT,
             "conclusion": "success",
+            "workflow_name": FORBIDDEN_WORKFLOW_NAME,
+            "name": FORBIDDEN_JOB_NAME,
+            "head_sha": FORBIDDEN_SHA,
+            "pull_requests": [{"number": 123, "sentinel": FORBIDDEN_PR}],
+            "actor": {"login": FORBIDDEN_ACTOR},
             "commands": [FORBIDDEN_COMMAND],
             "output": FORBIDDEN_OUTPUT,
+            "url": FORBIDDEN_RAW_URL,
+            "html_url": FORBIDDEN_DERIVED_URL,
+            "raw_payload_fragment": FORBIDDEN_PAYLOAD_FRAGMENT,
+            "signature": FORBIDDEN_SIGNATURE,
+            "authorization": FORBIDDEN_AUTHORIZATION,
+            "repository_secret": FORBIDDEN_REPOSITORY_SECRET,
+            "collector_details": FORBIDDEN_COLLECTOR_DETAILS,
             "steps": [
-                {"number": 1, "conclusion": "success"},
+                {"number": 1, "name": FORBIDDEN_STEP_NAME, "conclusion": "success"},
                 {"number": 2, "conclusion": "success"},
                 {"number": 3, "conclusion": "success"}
             ]
@@ -2585,6 +2623,37 @@ async fn workflow_job_over_step_limit_emits_actionable_rejection_without_trace()
         );
     }
     assert!(stderr.contains("completed workflow-job trace rejected"));
+    let rejection_log = captured.workflow_rejection_log();
+    assert!(
+        rejection_log.trace_id.is_empty() || rejection_log.trace_id.iter().all(|byte| *byte == 0),
+        "rejection warning trace ID must be absent or zero: {:?}",
+        rejection_log.trace_id
+    );
+    assert!(
+        rejection_log.span_id.is_empty() || rejection_log.span_id.iter().all(|byte| *byte == 0),
+        "rejection warning span ID must be absent or zero: {:?}",
+        rejection_log.span_id
+    );
+    let mut rejection_attribute_keys = rejection_log
+        .attributes
+        .iter()
+        .map(|attribute| attribute.key.as_str())
+        .collect::<Vec<_>>();
+    rejection_attribute_keys.sort_unstable();
+    assert_eq!(
+        rejection_attribute_keys,
+        vec![
+            "delivery_id",
+            "reason",
+            "repository_name",
+            "step_count",
+            "step_limit",
+            "workflow_job_id",
+            "workflow_run_attempt",
+            "workflow_run_id",
+        ],
+        "rejection warning custom OTLP attributes"
+    );
     assert!(captured.has_log_body("completed workflow-job trace rejected"));
     assert!(captured.has_log_string_attribute("reason", "too_many_steps"));
     assert!(captured.has_log_string_attribute("repository_name", REPOSITORY_NAME));
@@ -2602,7 +2671,23 @@ async fn workflow_job_over_step_limit_emits_actionable_rejection_without_trace()
         );
     }
 
-    for forbidden in [FORBIDDEN_COMMAND, FORBIDDEN_OUTPUT] {
+    for forbidden in [
+        FORBIDDEN_WORKFLOW_NAME,
+        FORBIDDEN_JOB_NAME,
+        FORBIDDEN_STEP_NAME,
+        FORBIDDEN_SHA,
+        FORBIDDEN_PR,
+        FORBIDDEN_ACTOR,
+        FORBIDDEN_COMMAND,
+        FORBIDDEN_OUTPUT,
+        FORBIDDEN_RAW_URL,
+        FORBIDDEN_DERIVED_URL,
+        FORBIDDEN_PAYLOAD_FRAGMENT,
+        FORBIDDEN_SIGNATURE,
+        FORBIDDEN_AUTHORIZATION,
+        FORBIDDEN_REPOSITORY_SECRET,
+        FORBIDDEN_COLLECTOR_DETAILS,
+    ] {
         captured.assert_absent(forbidden);
         captured.assert_logs_absent(forbidden);
         assert!(!stderr.contains(forbidden));
