@@ -491,11 +491,12 @@ mod tests {
             ("GHE_OTEL_QUEUE_CAPACITY", "4"),
             ("GHE_OTEL_BATCH_SIZE", "1"),
         ]);
+        let metrics = Metrics::new();
         let (runtime, subscriber) = build_runtime(
             "github_webhook_exporter=info",
             &config,
             output.clone(),
-            Metrics::new(),
+            metrics.clone(),
         )
         .expect("enabled runtime builds");
 
@@ -505,6 +506,10 @@ mod tests {
 
         assert_eq!(runtime.state(), TelemetryState::Enabled);
         assert!(output.contents().contains("local-enabled-event"));
+        runtime.force_flush().expect("provider workers flush");
+        assert!(metrics.encode().expect("metrics encode").contains(
+            "github_telemetry_export_failures_total{signal=\"log\",reason=\"transport\"} 1"
+        ));
     }
 
     #[test]
