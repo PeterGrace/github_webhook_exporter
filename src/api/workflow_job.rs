@@ -1,6 +1,12 @@
-use std::time::{Duration, SystemTime};
+use std::{
+    fmt,
+    time::{Duration, SystemTime},
+};
 
-use serde::Deserialize;
+use serde::{
+    de::{Error as _, IgnoredAny, SeqAccess, Visitor},
+    Deserialize, Deserializer,
+};
 use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -17,6 +23,55 @@ use crate::{
     },
 };
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StepCount(usize);
+
+impl<'de> Deserialize<'de> for StepCount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct StepCountVisitor;
+
+        impl<'de> Visitor<'de> for StepCountVisitor {
+            type Value = StepCount;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an array of workflow steps")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut count = 0usize;
+                while sequence.next_element::<IgnoredAny>()?.is_some() {
+                    count = count
+                        .checked_add(1)
+                        .ok_or_else(|| A::Error::custom("workflow step count overflow"))?;
+                }
+                Ok(StepCount(count))
+            }
+        }
+
+        deserializer.deserialize_seq(StepCountVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct WorkflowJobAdmissionEnvelope {
+    workflow_job: WorkflowJobAdmissionProjection,
+}
+
+#[derive(Deserialize)]
+struct WorkflowJobAdmissionProjection {
+    id: i64,
+    run_id: i64,
+    run_attempt: i64,
+    #[serde(default)]
+    steps: StepCount,
+}
+
 #[derive(Deserialize)]
 struct WorkflowJobEnvelope {
     workflow_job: WorkflowJobProjection,
@@ -24,9 +79,6 @@ struct WorkflowJobEnvelope {
 
 #[derive(Deserialize)]
 struct WorkflowJobProjection {
-    id: i64,
-    run_id: i64,
-    run_attempt: i64,
     workflow_name: Option<Value>,
     name: Option<Value>,
     conclusion: Option<Value>,
@@ -53,6 +105,74 @@ struct WorkflowStepProjection {
     completed_at: Option<Value>,
 }
 
+/// Admission-only view of a completed workflow-job payload.
+///
+/// This bounded representation retains only validated identifiers plus the counted number of step
+/// entries, making retention of step payloads unrepresentable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct WorkflowJobAdmission {
+    run_id: WorkflowRunId,
+    run_attempt: WorkflowRunAttempt,
+    job_id: WorkflowJobId,
+    step_count: usize,
+}
+
+impl WorkflowJobAdmission {
+    /// Returns the validated workflow run identifier retained by this admission view.
+    pub(super) fn run_id(&self) -> WorkflowRunId {
+        self.run_id
+    }
+
+    /// Returns the validated workflow run attempt retained by this admission view.
+    pub(super) fn run_attempt(&self) -> WorkflowRunAttempt {
+        self.run_attempt
+    }
+
+    /// Returns the validated workflow job identifier retained by this admission view.
+    pub(super) fn job_id(&self) -> WorkflowJobId {
+        self.job_id
+    }
+
+    /// Returns the number of reported workflow-job steps counted during admission.
+    pub(super) fn step_count(&self) -> usize {
+        self.step_count
+    }
+}
+
+impl fmt::Debug for WorkflowJobAdmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkflowJobAdmission")
+            .field("run_id", &"<redacted>")
+            .field("run_attempt", &"<redacted>")
+            .field("job_id", &"<redacted>")
+            .field("step_count", &self.step_count)
+            .finish()
+    }
+}
+
+/// Inspects a completed workflow-job payload without retaining any individual step elements.
+///
+/// # Parameters
+///
+/// * `body` - The authenticated JSON request body.
+///
+/// # Returns
+///
+/// A bounded admission view containing validated positive identifiers and the counted number of
+/// reported steps. Returns `None` when the payload wrapper is malformed, any required identifier is
+/// non-positive, or `steps` is present with a non-array value.
+pub(super) fn inspect_completed_job(body: &[u8]) -> Option<WorkflowJobAdmission> {
+    let envelope: WorkflowJobAdmissionEnvelope = serde_json::from_slice(body).ok()?;
+
+    Some(WorkflowJobAdmission {
+        run_id: WorkflowRunId::new(envelope.workflow_job.run_id).ok()?,
+        run_attempt: WorkflowRunAttempt::new(envelope.workflow_job.run_attempt).ok()?,
+        job_id: WorkflowJobId::new(envelope.workflow_job.id).ok()?,
+        step_count: envelope.workflow_job.steps.0,
+    })
+}
+
 /// Projects one authenticated completed workflow-job payload into the bounded workflow model.
 ///
 /// # Parameters
@@ -73,11 +193,9 @@ pub(crate) fn project_completed_job(
     received_at: OffsetDateTime,
 ) -> Option<WorkflowJobTrace> {
     let received_at = offset_datetime_to_system_time(received_at)?;
+    let admission = inspect_completed_job(body)?;
     let envelope: WorkflowJobEnvelope = serde_json::from_slice(body).ok()?;
     let WorkflowJobProjection {
-        id,
-        run_id,
-        run_attempt,
         workflow_name,
         name,
         conclusion,
@@ -86,33 +204,34 @@ pub(crate) fn project_completed_job(
         completed_at,
         pull_requests,
         steps,
+        ..
     } = envelope.workflow_job;
 
-    let run_id = WorkflowRunId::new(run_id).ok()?;
-    let run_attempt = WorkflowRunAttempt::new(run_attempt).ok()?;
-    let job_id = WorkflowJobId::new(id).ok()?;
+    let run_id = admission.run_id();
+    let run_attempt = admission.run_attempt();
+    let job_id = admission.job_id();
     let timing = select_job_timing(
         parse_timestamp(started_at.as_ref()),
         parse_timestamp(completed_at.as_ref()),
         received_at,
     );
-    let projected_steps = steps
-        .into_iter()
-        .map(|step| {
-            let step_timing = select_step_timing(
-                parse_timestamp(step.started_at.as_ref()),
-                parse_timestamp(step.completed_at.as_ref()),
-                &timing,
-            );
+    let mut projected_steps = Vec::with_capacity(admission.step_count());
+    for step in steps {
+        let step_timing = select_step_timing(
+            parse_timestamp(step.started_at.as_ref()),
+            parse_timestamp(step.completed_at.as_ref()),
+            &timing,
+        );
+        projected_steps.push(
             WorkflowStepTrace::new(
                 step.number,
                 sanitize_display_name(step.name.as_ref()),
                 normalize_conclusion(step.conclusion.as_ref()),
                 step_timing,
             )
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
+            .ok()?,
+        );
+    }
 
     Some(WorkflowJobTrace::new(WorkflowJobTraceParts {
         repository_name: repository_name.clone(),
@@ -210,7 +329,10 @@ mod tests {
     use serde_json::{json, Value};
     use time::{macros::datetime, OffsetDateTime};
 
-    use super::{offset_datetime_to_system_time, project_completed_job};
+    use super::{
+        inspect_completed_job, offset_datetime_to_system_time, project_completed_job,
+        WorkflowJobAdmission,
+    };
     use crate::{
         domain::delivery::DeliveryId,
         security::CanonicalRepositoryName,
@@ -235,6 +357,99 @@ mod tests {
 
     fn project_fixture(body: Value) -> Option<crate::telemetry::workflow::WorkflowJobTrace> {
         project_fixture_at(body, datetime!(2026-08-06 10:06:00 UTC))
+    }
+
+    fn render_admission(admission: &WorkflowJobAdmission) -> String {
+        format!("{admission:?}")
+    }
+
+    #[test]
+    fn admission_counts_steps_and_validates_identifiers() {
+        let body = serde_json::to_vec(&json!({
+            "workflow_job": {
+                "id": 41,
+                "run_id": 31,
+                "run_attempt": 2,
+                "steps": [{"secret": "first"}, {"secret": "second"}]
+            }
+        }))
+        .expect("fixture serializes");
+
+        let admission = inspect_completed_job(&body).expect("admission is structurally valid");
+
+        assert_eq!(admission.run_id().get(), 31);
+        assert_eq!(admission.run_attempt().get(), 2);
+        assert_eq!(admission.job_id().get(), 41);
+        assert_eq!(admission.step_count(), 2);
+        assert!(!render_admission(&admission).contains("first"));
+    }
+
+    #[test]
+    fn admission_missing_steps_defaults_to_zero() {
+        let body = serde_json::to_vec(&json!({
+            "workflow_job": {
+                "id": 41,
+                "run_id": 31,
+                "run_attempt": 2
+            }
+        }))
+        .expect("fixture serializes");
+
+        let admission = inspect_completed_job(&body).expect("missing steps defaults to zero");
+
+        assert_eq!(admission.step_count(), 0);
+    }
+
+    #[test]
+    fn admission_rejects_non_array_steps_and_invalid_required_ids() {
+        let non_array_steps = serde_json::to_vec(&json!({
+            "workflow_job": {
+                "id": 41,
+                "run_id": 31,
+                "run_attempt": 2,
+                "steps": {}
+            }
+        }))
+        .expect("fixture serializes");
+        assert!(inspect_completed_job(&non_array_steps).is_none());
+
+        for (run_id, run_attempt, job_id) in [(0, 2, 41), (31, 0, 41), (31, 2, 0)] {
+            let body = serde_json::to_vec(&json!({
+                "workflow_job": {
+                    "id": job_id,
+                    "run_id": run_id,
+                    "run_attempt": run_attempt,
+                    "steps": []
+                }
+            }))
+            .expect("fixture serializes");
+            assert!(
+                inspect_completed_job(&body).is_none(),
+                "accepted invalid ids run_id={run_id} run_attempt={run_attempt} job_id={job_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn admission_counts_large_step_arrays_without_debug_leaks() {
+        let secret = "forbidden step payload";
+        let steps = (0..2_048)
+            .map(|index| json!({"index": index, "secret": secret}))
+            .collect::<Vec<_>>();
+        let body = serde_json::to_vec(&json!({
+            "workflow_job": {
+                "id": 41,
+                "run_id": 31,
+                "run_attempt": 2,
+                "steps": steps
+            }
+        }))
+        .expect("fixture serializes");
+
+        let admission = inspect_completed_job(&body).expect("large step array is counted");
+
+        assert_eq!(admission.step_count(), 2_048);
+        assert!(!render_admission(&admission).contains(secret));
     }
 
     #[test]
