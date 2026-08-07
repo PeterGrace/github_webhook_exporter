@@ -115,6 +115,8 @@ async fn startup_metrics_are_initialized_before_readiness_is_served() {
     let _output = child.wait_with_output().expect("exporter process exits");
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
     assert!(response.contains("github_repository_configurations 1"));
+    assert!(response.contains("github_workflow_job_steps"));
+    assert!(response.contains("github_workflow_job_trace_rejections_total"));
 }
 
 #[cfg(unix)]

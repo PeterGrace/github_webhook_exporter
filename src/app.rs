@@ -390,6 +390,8 @@ mod tests {
             "github_merge_queue_pr_outcomes_total",
             "github_merge_queue_attempt_duration_seconds",
             "github_merge_queue_transition_failures_total",
+            "github_workflow_job_steps",
+            "github_workflow_job_trace_rejections_total",
         ] {
             assert!(
                 exposition.contains(metric_name),

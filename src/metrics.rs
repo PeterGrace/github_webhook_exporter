@@ -54,6 +54,9 @@ const MERGE_QUEUE_ATTEMPT_DURATION_BUCKETS: [f64; 15] = [
     7_776_000.0,
     31_536_000.0,
 ];
+const WORKFLOW_JOB_STEP_BUCKETS: [f64; 10] = [
+    0.0, 5.0, 10.0, 20.0, 40.0, 64.0, 128.0, 256.0, 512.0, 1_024.0,
+];
 
 /// Largest merge-queue attempt duration accepted by the metrics sanity check.
 pub const MAX_MERGE_QUEUE_ATTEMPT_DURATION: time::Duration = time::Duration::days(365);
@@ -423,6 +426,27 @@ pub enum QueueTransitionFailureReason {
     InvalidDuration,
 }
 
+/// A bounded reason for rejecting a workflow-job trace.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum WorkflowTraceRejectionReason {
+    /// The trace reported more steps than the configured maximum.
+    TooManySteps,
+}
+
+impl WorkflowTraceRejectionReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::TooManySteps => "too_many_steps",
+        }
+    }
+}
+
+impl EncodeLabelValue for WorkflowTraceRejectionReason {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> fmt::Result {
+        encoder.write_str(self.as_str())
+    }
+}
+
 impl QueueTransitionFailureReason {
     fn as_str(self) -> &'static str {
         match self {
@@ -513,6 +537,11 @@ struct QueueTransitionFailureLabels {
     reason: QueueTransitionFailureReason,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct WorkflowTraceRejectionLabels {
+    reason: WorkflowTraceRejectionReason,
+}
+
 type CounterFamily<L> = Family<L, Counter>;
 type HistogramFamily<L> = Family<L, Histogram, fn() -> Histogram>;
 type RepositoryGauge = Gauge<u64, AtomicU64>;
@@ -540,6 +569,8 @@ struct MetricsInner {
     merge_queue_pr_outcomes: CounterFamily<MergeQueueOutcomeLabels>,
     merge_queue_attempt_duration: HistogramFamily<MergeQueueDurationLabels>,
     merge_queue_transition_failures: CounterFamily<QueueTransitionFailureLabels>,
+    workflow_job_steps: Histogram,
+    workflow_trace_rejections: CounterFamily<WorkflowTraceRejectionLabels>,
 }
 
 impl Metrics {
@@ -559,7 +590,11 @@ impl Metrics {
             merge_queue_attempt_duration_histogram as fn() -> Histogram,
         );
         let merge_queue_transition_failures = CounterFamily::default();
+        let workflow_job_steps = Histogram::new(WORKFLOW_JOB_STEP_BUCKETS);
+        let workflow_trace_rejections = CounterFamily::default();
         let mut registry = Registry::with_prefix("github");
+        let _ = Self::observe_workflow_job_steps as fn(&Self, usize);
+        let _ = Self::record_workflow_trace_rejection as fn(&Self, WorkflowTraceRejectionReason);
 
         // `prometheus-client` omits a labelled family until it owns at least one metric. Seed only
         // bounded zero-valued labels so every required family exists before the first webhook.
@@ -625,6 +660,9 @@ impl Metrics {
             let _ = merge_queue_transition_failures
                 .get_or_create(&QueueTransitionFailureLabels { reason });
         }
+        let _ = workflow_trace_rejections.get_or_create(&WorkflowTraceRejectionLabels {
+            reason: WorkflowTraceRejectionReason::TooManySteps,
+        });
 
         registry.register(
             "webhook_requests",
@@ -681,6 +719,16 @@ impl Metrics {
             "Merge-queue transition failures by bounded reason",
             merge_queue_transition_failures.clone(),
         );
+        registry.register(
+            "workflow_job_steps",
+            "Reported step count for structurally valid newly claimed completed workflow jobs",
+            workflow_job_steps.clone(),
+        );
+        registry.register(
+            "workflow_job_trace_rejections",
+            "Completed workflow-job traces rejected by bounded reason",
+            workflow_trace_rejections.clone(),
+        );
 
         Self {
             inner: Arc::new(MetricsInner {
@@ -696,6 +744,8 @@ impl Metrics {
                 merge_queue_pr_outcomes,
                 merge_queue_attempt_duration,
                 merge_queue_transition_failures,
+                workflow_job_steps,
+                workflow_trace_rejections,
             }),
         }
     }
@@ -783,6 +833,19 @@ impl Metrics {
         self.inner
             .merge_queue_transition_failures
             .get_or_create(&QueueTransitionFailureLabels { reason })
+            .inc();
+    }
+
+    /// Observes the step count reported by one structurally valid completed workflow job.
+    pub(crate) fn observe_workflow_job_steps(&self, step_count: usize) {
+        self.inner.workflow_job_steps.observe(step_count as f64);
+    }
+
+    /// Increments the bounded counter for one rejected workflow-job trace.
+    pub(crate) fn record_workflow_trace_rejection(&self, reason: WorkflowTraceRejectionReason) {
+        self.inner
+            .workflow_trace_rejections
+            .get_or_create(&WorkflowTraceRejectionLabels { reason })
             .inc();
     }
 
@@ -929,6 +992,7 @@ mod tests {
         normalize_action, normalize_event_type, normalize_merge_group_destroyed_reason, Action,
         EventType, FailureStage, MergeGroupAction, MergeGroupReason, MergeQueueCompletion,
         MergeQueueOutcome, MergeQueueReason, Metrics, QueueTransitionFailureReason, WebhookResult,
+        WorkflowTraceRejectionReason,
     };
 
     #[test]
@@ -1052,6 +1116,32 @@ mod tests {
     }
 
     #[test]
+    fn workflow_job_metrics_observe_sizes_and_bounded_rejections() {
+        let metrics = Metrics::new();
+
+        metrics.observe_workflow_job_steps(0);
+        metrics.observe_workflow_job_steps(36);
+        metrics.observe_workflow_job_steps(1_500);
+        metrics.record_workflow_trace_rejection(WorkflowTraceRejectionReason::TooManySteps);
+
+        let exposition = metrics.encode().expect("metrics encode");
+        for sample in [
+            "github_workflow_job_steps_bucket{le=\"0.0\"} 1",
+            "github_workflow_job_steps_bucket{le=\"40.0\"} 2",
+            "github_workflow_job_steps_bucket{le=\"1024.0\"} 2",
+            "github_workflow_job_steps_bucket{le=\"+Inf\"} 3",
+            "github_workflow_job_steps_count 3",
+            "github_workflow_job_steps_sum 1536.0",
+            "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 1",
+        ] {
+            assert!(
+                exposition.contains(sample),
+                "missing {sample:?} in:\n{exposition}"
+            );
+        }
+    }
+
+    #[test]
     fn every_result_and_failure_stage_encodes_to_the_fixed_vocabulary() {
         let metrics = Metrics::new();
         let results = [
@@ -1098,6 +1188,10 @@ mod tests {
                 for _ in 0..UPDATES_PER_THREAD {
                     worker_metrics.record_duplicate();
                     worker_metrics.observe_event(EventType::Push, Action::None, 128);
+                    worker_metrics.observe_workflow_job_steps(1);
+                    worker_metrics.record_workflow_trace_rejection(
+                        WorkflowTraceRejectionReason::TooManySteps,
+                    );
                 }
             }));
         }
@@ -1116,6 +1210,13 @@ mod tests {
         )));
         assert!(exposition.contains(&format!(
             "github_webhook_request_body_bytes_count {expected_updates}"
+        )));
+        assert!(exposition.contains(&format!(
+            "github_workflow_job_steps_count {expected_updates}"
+        )));
+        assert!(exposition.contains(&format!(
+            "github_workflow_job_trace_rejections_total{{reason=\"too_many_steps\"}} \
+             {expected_updates}"
         )));
     }
 
@@ -1381,6 +1482,8 @@ mod tests {
             "github_merge_queue_pr_outcomes_total",
             "github_merge_queue_attempt_duration_seconds",
             "github_merge_queue_transition_failures_total",
+            "github_workflow_job_steps",
+            "github_workflow_job_trace_rejections_total",
         ] {
             assert!(
                 exposition.contains(metric_name),
@@ -1414,10 +1517,15 @@ mod tests {
             MergeGroupAction::Destroyed,
             normalize_merge_group_destroyed_reason(&raw_group_reason),
         );
+        metrics.observe_workflow_job_steps(36);
+        metrics.record_workflow_trace_rejection(WorkflowTraceRejectionReason::TooManySteps);
 
         let exposition = metrics.encode().expect("metrics encode into a String");
         assert!(exposition
             .contains("github_webhook_events_total{event_type=\"other\",action=\"other\"} 1"));
+        assert!(exposition.contains("github_workflow_job_steps_count 1"));
+        assert!(exposition
+            .contains("github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 1"));
         for forbidden_value in forbidden_values {
             assert!(!exposition.contains(forbidden_value));
         }
