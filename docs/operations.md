@@ -81,8 +81,10 @@ incorrect producer lifecycle ordering.
 
 On shutdown, application admission closes before provider workers disconnect. Accepted records
 that export release their pending slots; any slots still pending when shutdown finishes or reaches
-its deadline are atomically counted as `pipeline_closed` drops. Later records are also rejected and
-counted exactly as `pipeline_closed`. Trace and log provider shutdown begins concurrently and shares one
+its deadline are atomically counted as `pipeline_closed` drops. A finalization gate prevents a
+late shutdown worker from exporting a batch after its slots were counted as dropped. Later records
+are also rejected and counted exactly as `pipeline_closed`. Trace and log provider shutdown begins
+concurrently and shares one
 `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` deadline. A failed provider is counted with normalized reason
 `shutdown`; a provider unfinished at the deadline is counted with reason `timeout`. Either condition
 uses the same direct, redacted stderr diagnostic path and never changes a successful HTTP drain into

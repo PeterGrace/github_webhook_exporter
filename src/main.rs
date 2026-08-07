@@ -42,7 +42,9 @@ async fn run() -> Result<()> {
         telemetry_shutdown_timeout_seconds = telemetry_shutdown_timeout.as_secs(),
         "telemetry provider shutdown starting"
     );
-    let _shutdown_outcome = telemetry_runtime.shutdown(telemetry_shutdown_timeout);
+    let _shutdown_task =
+        tokio::task::spawn_blocking(move || telemetry_runtime.shutdown(telemetry_shutdown_timeout))
+            .await;
 
     service_result
 }
