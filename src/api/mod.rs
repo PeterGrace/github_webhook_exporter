@@ -4,6 +4,7 @@ mod merge_group;
 mod pull_request;
 mod repositories;
 mod webhook;
+mod workflow_job;
 
 use axum::Router;
 
