@@ -14,11 +14,14 @@ use time::OffsetDateTime;
 use tracing::{error, info, Instrument};
 
 use crate::{
-    api::{merge_group::EventProjection, pull_request::QueueProcessor},
+    api::{merge_group::EventProjection, pull_request::QueueProcessor, workflow_job},
     app::AppState,
     domain::delivery::DeliveryId,
     error::AppError,
-    metrics::{normalize_action, normalize_event_type, FailureStage, Metrics, WebhookResult},
+    metrics::{
+        normalize_action, normalize_event_type, Action, EventType, FailureStage, Metrics,
+        WebhookResult,
+    },
     security::{
         CanonicalRepositoryName, WebhookAuthenticationError, WebhookAuthenticator, WebhookSignature,
     },
@@ -142,6 +145,16 @@ async fn webhook_handler(
                 state
                     .metrics()
                     .observe_event(event_type, action, request.body.len());
+                if event_type == EventType::WorkflowJob && action == Action::Completed {
+                    if let Some(workflow_trace) = workflow_job::project_completed_job(
+                        request.body.as_ref(),
+                        &request.repository_name,
+                        &request.delivery_id,
+                        received_at,
+                    ) {
+                        state.workflow_trace_emitter().emit(&workflow_trace);
+                    }
+                }
                 if let Some(transition) =
                     event_projection.merge_group_transition(event_type, action)
                 {

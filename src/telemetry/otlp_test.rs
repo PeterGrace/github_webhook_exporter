@@ -57,7 +57,7 @@ use tracing::{
 };
 
 use crate::config::TelemetryConfig;
-use time::{Duration, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use super::{build_runtime, trace, TelemetryState};
 
@@ -117,6 +117,17 @@ const SPAN_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "github.delivery.id",
     "github.pull_request.number",
     "github.commit.sha",
+    "cicd.pipeline.name",
+    "cicd.pipeline.run.id",
+    "cicd.pipeline.task.name",
+    "cicd.pipeline.task.run.id",
+    "cicd.pipeline.result",
+    "cicd.pipeline.task.run.result",
+    "github.workflow.conclusion",
+    "github.workflow.run.id",
+    "github.workflow.run.attempt",
+    "github.workflow.job.id",
+    "timing_source",
     "db.system.name",
     "db.operation.name",
 ];
@@ -1145,6 +1156,42 @@ fn i64_attribute(span: &Span, key: &str) -> Option<i64> {
         .find_map(|attribute| i64_key_value(attribute, key))
 }
 
+fn i64_array_attribute(span: &Span, key: &str) -> Option<Vec<i64>> {
+    span.attributes.iter().find_map(|attribute| {
+        if attribute.key != key {
+            return None;
+        }
+        let values = attribute
+            .value
+            .as_ref()
+            .and_then(|value| match value.value.as_ref() {
+                Some(AttributeValue::ArrayValue(values)) => Some(&values.values),
+                Some(AttributeValue::StringValue(_))
+                | Some(AttributeValue::IntValue(_))
+                | Some(AttributeValue::DoubleValue(_))
+                | Some(AttributeValue::BoolValue(_))
+                | Some(AttributeValue::KvlistValue(_))
+                | Some(AttributeValue::BytesValue(_))
+                | Some(AttributeValue::StringValueStrindex(_))
+                | None => None,
+            })?;
+        values
+            .iter()
+            .map(|value| match value.value.as_ref() {
+                Some(AttributeValue::IntValue(value)) => Some(*value),
+                Some(AttributeValue::StringValue(_))
+                | Some(AttributeValue::DoubleValue(_))
+                | Some(AttributeValue::BoolValue(_))
+                | Some(AttributeValue::ArrayValue(_))
+                | Some(AttributeValue::KvlistValue(_))
+                | Some(AttributeValue::BytesValue(_))
+                | Some(AttributeValue::StringValueStrindex(_))
+                | None => None,
+            })
+            .collect()
+    })
+}
+
 fn i64_key_value(attribute: &KeyValue, key: &str) -> Option<i64> {
     if attribute.key != key {
         return None;
@@ -1180,6 +1227,16 @@ fn assert_attribute(span: &Span, key: &str, value: &str) {
 
 fn assert_i64_attribute(span: &Span, key: &str, value: i64) {
     assert_eq!(i64_attribute(span, key), Some(value));
+}
+
+fn assert_i64_array_attribute(span: &Span, key: &str, value: &[i64]) {
+    assert_eq!(i64_array_attribute(span, key), Some(value.to_vec()));
+}
+
+fn rfc3339_unix_nanos(value: &str) -> u64 {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .expect("timestamp is RFC3339")
+        .unix_timestamp_nanos() as u64
 }
 
 #[test]
@@ -1925,6 +1982,135 @@ async fn webhook_successes_emit_bounded_hierarchy_and_span_only_identifiers() {
         assert!(!output.contains(forbidden));
         assert!(!exposition.contains(forbidden));
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_job_completed_exports_one_independent_historical_trace() {
+    let fixture = WebhookTraceFixture::new().await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440207";
+    let job_started_at = "2026-08-06T10:00:00.123456789Z";
+    let first_step_started_at = "2026-08-06T10:00:01.000000001Z";
+    let first_step_completed_at = "2026-08-06T10:00:02.000000002Z";
+    let second_step_started_at = "2026-08-06T10:00:03.000000003Z";
+    let second_step_completed_at = "2026-08-06T10:00:04.000000004Z";
+    let job_completed_at = "2026-08-06T10:05:00.987654321Z";
+    let pull_requests = (1..=25)
+        .map(|number| serde_json::json!({"number": number}))
+        .collect::<Vec<_>>();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "action": "completed",
+        "workflow_job": {
+            "id": 41,
+            "run_id": 31,
+            "run_attempt": 2,
+            "workflow_name": "Build\nWorkflow",
+            "name": "Linux\tJob",
+            "conclusion": "success",
+            "head_sha": WEBHOOK_SHA_40,
+            "started_at": job_started_at,
+            "completed_at": job_completed_at,
+            "pull_requests": pull_requests,
+            "steps": [
+                {
+                    "number": 2,
+                    "name": "Run\tTests",
+                    "conclusion": "success",
+                    "started_at": first_step_started_at,
+                    "completed_at": first_step_completed_at
+                },
+                {
+                    "number": 1,
+                    "name": "Check\nout",
+                    "conclusion": "success",
+                    "started_at": second_step_started_at,
+                    "completed_at": second_step_completed_at
+                }
+            ]
+        },
+        "repository": {
+            "full_name": WEBHOOK_REPOSITORY
+        }
+    }))
+    .expect("workflow-job payload serializes");
+
+    let response = fixture
+        .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    let captured = fixture.force_flush();
+    let request = captured.webhook_request_for_delivery(delivery_id);
+    let job = captured.one_named("github.workflow.job");
+    assert!(job.parent_span_id.is_empty());
+    assert_eq!(captured.child_count(job, "github.workflow.step"), 2);
+    assert_ne!(job.trace_id, request.trace_id);
+    assert_attribute(job, "github.repository.name", WEBHOOK_REPOSITORY);
+    assert_attribute(job, "github.delivery.id", delivery_id);
+    assert_attribute(
+        job,
+        "github.commit.sha",
+        &WEBHOOK_SHA_40.to_ascii_lowercase(),
+    );
+    assert_attribute(job, "cicd.pipeline.name", "BuildWorkflow");
+    assert_attribute(job, "cicd.pipeline.task.name", "LinuxJob");
+    assert_attribute(job, "cicd.pipeline.run.id", "31");
+    assert_attribute(job, "github.workflow.run.id", "31");
+    assert_attribute(job, "github.workflow.run.attempt", "2");
+    assert_attribute(job, "github.workflow.job.id", "41");
+    assert_attribute(job, "github.workflow.conclusion", "success");
+    assert_attribute(job, "cicd.pipeline.result", "success");
+    assert_attribute(job, "timing_source", "reported");
+    assert_i64_array_attribute(
+        job,
+        "github.pull_request.number",
+        &(1..=20).collect::<Vec<_>>(),
+    );
+    assert_eq!(job.start_time_unix_nano, rfc3339_unix_nanos(job_started_at));
+    assert_eq!(job.end_time_unix_nano, rfc3339_unix_nanos(job_completed_at));
+
+    let steps = captured
+        .children(job)
+        .filter(|span| span.name == "github.workflow.step")
+        .collect::<Vec<_>>();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].parent_span_id, job.span_id);
+    assert_eq!(steps[1].parent_span_id, job.span_id);
+    assert_eq!(steps[0].trace_id, job.trace_id);
+    assert_eq!(steps[1].trace_id, job.trace_id);
+    assert_eq!(
+        steps
+            .iter()
+            .map(|span| string_attribute(span, "cicd.pipeline.task.run.id"))
+            .collect::<Vec<_>>(),
+        vec![Some("41:2"), Some("41:1")]
+    );
+    assert_attribute(steps[0], "cicd.pipeline.task.name", "RunTests");
+    assert_attribute(steps[0], "github.workflow.conclusion", "success");
+    assert_attribute(steps[0], "cicd.pipeline.task.run.result", "success");
+    assert_attribute(steps[0], "timing_source", "reported");
+    assert_eq!(
+        steps[0].start_time_unix_nano,
+        rfc3339_unix_nanos(first_step_started_at)
+    );
+    assert_eq!(
+        steps[0].end_time_unix_nano,
+        rfc3339_unix_nanos(first_step_completed_at)
+    );
+    assert_attribute(steps[1], "cicd.pipeline.task.name", "Checkout");
+    assert_attribute(steps[1], "github.workflow.conclusion", "success");
+    assert_attribute(steps[1], "cicd.pipeline.task.run.result", "success");
+    assert_attribute(steps[1], "timing_source", "reported");
+    assert_eq!(
+        steps[1].start_time_unix_nano,
+        rfc3339_unix_nanos(second_step_started_at)
+    );
+    assert_eq!(
+        steps[1].end_time_unix_nano,
+        rfc3339_unix_nanos(second_step_completed_at)
+    );
+
+    captured.assert_approved_attribute_keys();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
