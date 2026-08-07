@@ -70,6 +70,7 @@ const ADMIN_TOKEN: &str = "independent-admin-token";
 const MASTER_KEY_BYTES: &[u8; 32] = b"MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM";
 const WEBHOOK_SECRET: &str = "webhook-trace-secret-must-not-appear";
 const WEBHOOK_REPOSITORY: &str = "owner/webhook-private-repository";
+const ACTIONABLE_REPOSITORY: &str = "owner/repository";
 const WEBHOOK_SHA_40: &str = "0123456789ABCDEF0123456789abcdef01234567";
 const WEBHOOK_SHA_64: &str = "ABCDEF0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789";
 const SECRET: &str = "forbidden-webhook-secret";
@@ -643,10 +644,28 @@ struct WebhookTraceFixture {
 
 impl WebhookTraceFixture {
     async fn new() -> Self {
-        Self::new_with_exporter_timeout(2_000).await
+        Self::new_with_exporter_timeout_and_step_limit(2_000, DEFAULT_WORKFLOW_JOB_MAX_STEPS, false)
+            .await
+    }
+
+    async fn new_with_workflow_job_max_steps(workflow_job_max_steps: usize) -> Self {
+        Self::new_with_exporter_timeout_and_step_limit(2_000, workflow_job_max_steps, true).await
     }
 
     async fn new_with_exporter_timeout(timeout_millis: u64) -> Self {
+        Self::new_with_exporter_timeout_and_step_limit(
+            timeout_millis,
+            DEFAULT_WORKFLOW_JOB_MAX_STEPS,
+            false,
+        )
+        .await
+    }
+
+    async fn new_with_exporter_timeout_and_step_limit(
+        timeout_millis: u64,
+        workflow_job_max_steps: usize,
+        include_actionable_repository: bool,
+    ) -> Self {
         let otlp_guard = otlp_test_lock().lock_owned().await;
         let receiver = RunningReceiver::start_released().await;
         let config = telemetry_config_with_queue_capacity_and_timeout(
@@ -678,6 +697,19 @@ impl WebhookTraceFixture {
             .with_subscriber(dispatch.clone())
             .await
             .expect("test repository is created");
+        if include_actionable_repository {
+            store
+                .create(
+                    CanonicalRepositoryName::new(ACTIONABLE_REPOSITORY)
+                        .expect("test repository name is valid"),
+                    RepositorySecret::new(WEBHOOK_SECRET.to_owned())
+                        .expect("test webhook secret is valid"),
+                    true,
+                )
+                .with_subscriber(dispatch.clone())
+                .await
+                .expect("test repository is created");
+        }
         tokio::task::block_in_place(|| runtime.force_flush().expect("setup telemetry flushes"));
         receiver.clear_captured_requests();
         let admin_token = AdminToken::new(ADMIN_TOKEN.to_owned()).expect("test token is valid");
@@ -686,7 +718,7 @@ impl WebhookTraceFixture {
                 store,
                 AdminAuthenticator::new(&admin_token),
                 2_097_152,
-                DEFAULT_WORKFLOW_JOB_MAX_STEPS,
+                workflow_job_max_steps,
             )
             .with_workflow_trace_emitter(runtime.workflow_trace_emitter()),
         );
@@ -1014,6 +1046,11 @@ impl CapturedSpans {
     fn has_log_i64_attribute(&self, key: &str, value: i64) -> bool {
         self.log_attributes()
             .any(|attribute| i64_key_value(attribute, key) == Some(value))
+    }
+
+    fn has_log_string_attribute(&self, key: &str, value: &str) -> bool {
+        self.log_attributes()
+            .any(|attribute| string_key_value(attribute, key) == Some(value))
     }
 
     fn has_trace_i64_value(&self, value: i64) -> bool {
@@ -1440,6 +1477,14 @@ fn rfc3339_unix_nanos(value: &str) -> u64 {
 }
 
 fn workflow_job_body(action: Option<&str>, workflow_job: Value) -> Vec<u8> {
+    workflow_job_body_for_repository(action, workflow_job, WEBHOOK_REPOSITORY)
+}
+
+fn workflow_job_body_for_repository(
+    action: Option<&str>,
+    workflow_job: Value,
+    repository_name: &str,
+) -> Vec<u8> {
     let mut payload = serde_json::Map::with_capacity(3);
     if let Some(action) = action {
         payload.insert("action".to_owned(), Value::String(action.to_owned()));
@@ -1447,7 +1492,7 @@ fn workflow_job_body(action: Option<&str>, workflow_job: Value) -> Vec<u8> {
     payload.insert("workflow_job".to_owned(), workflow_job);
     payload.insert(
         "repository".to_owned(),
-        serde_json::json!({"full_name": WEBHOOK_REPOSITORY}),
+        serde_json::json!({"full_name": repository_name}),
     );
     serde_json::to_vec(&Value::Object(payload)).expect("workflow-job payload serializes")
 }
@@ -2417,6 +2462,161 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_job_at_configured_step_limit_exports_complete_trace() {
+    let fixture = WebhookTraceFixture::new_with_workflow_job_max_steps(2).await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440800";
+    let body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 9900,
+            "run_id": 8800,
+            "run_attempt": 1,
+            "conclusion": "success",
+            "steps": [
+                {"number": 1, "conclusion": "success"},
+                {"number": 2, "conclusion": "success"}
+            ]
+        }),
+    );
+
+    let response = fixture
+        .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    let exposition = fixture.metrics_text().await;
+    let captured = fixture.force_flush();
+    let job = captured.workflow_job_for_delivery(delivery_id);
+    assert_eq!(captured.child_count(job, "github.workflow.step"), 2);
+    assert_metric_line(&exposition, "github_workflow_job_steps_count 1");
+    assert_metric_line(&exposition, "github_workflow_job_steps_sum 2.0");
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 0",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_job_over_step_limit_emits_actionable_rejection_without_trace() {
+    const REPOSITORY_NAME: &str = "owner/repository";
+    const WORKFLOW_RUN_ID: i64 = 8801;
+    const WORKFLOW_RUN_ATTEMPT: i64 = 2;
+    const WORKFLOW_JOB_ID: i64 = 9901;
+    const DELIVERY_ID: &str = "550e8400-e29b-41d4-a716-446655440801";
+    const FORBIDDEN_COMMAND: &str = "secret-command";
+    const FORBIDDEN_OUTPUT: &str = "secret-output";
+
+    let fixture = WebhookTraceFixture::new_with_workflow_job_max_steps(2).await;
+    let body = workflow_job_body_for_repository(
+        Some("completed"),
+        serde_json::json!({
+            "id": WORKFLOW_JOB_ID,
+            "run_id": WORKFLOW_RUN_ID,
+            "run_attempt": WORKFLOW_RUN_ATTEMPT,
+            "conclusion": "success",
+            "commands": [FORBIDDEN_COMMAND],
+            "output": FORBIDDEN_OUTPUT,
+            "steps": [
+                {"number": 1, "conclusion": "success"},
+                {"number": 2, "conclusion": "success"},
+                {"number": 3, "conclusion": "success"}
+            ]
+        }),
+        REPOSITORY_NAME,
+    );
+
+    let response = fixture
+        .webhook(&body, "workflow_job", DELIVERY_ID, WEBHOOK_SECRET)
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    let claim_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries WHERE delivery_id = ?")
+            .bind(DELIVERY_ID)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("durable delivery claim is countable");
+    assert_eq!(claim_count, 1);
+
+    let exposition = fixture.metrics_text().await;
+    let captured = fixture.force_flush();
+    let stderr = fixture.output.text();
+    assert_eq!(
+        captured
+            .spans
+            .iter()
+            .filter(|span| {
+                (span.name == "github.workflow.job" || span.name == "github.workflow.step")
+                    && string_attribute(span, "github.delivery.id") == Some(DELIVERY_ID)
+            })
+            .count(),
+        0,
+        "over-limit delivery emits no historical workflow spans"
+    );
+    assert_metric_line(&exposition, "github_workflow_job_steps_count 1");
+    assert_metric_line(&exposition, "github_workflow_job_steps_sum 3.0");
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 1",
+    );
+
+    for approved in [
+        "reason",
+        "too_many_steps",
+        "repository_name",
+        REPOSITORY_NAME,
+        "workflow_run_id",
+        "workflow_run_attempt",
+        "workflow_job_id",
+        "delivery_id",
+        DELIVERY_ID,
+        "step_count",
+        "step_limit",
+        "8801",
+        "2",
+        "9901",
+        "3",
+    ] {
+        assert!(
+            stderr.contains(approved),
+            "stderr contains approved field or value {approved:?}"
+        );
+    }
+    assert!(stderr.contains("completed workflow-job trace rejected"));
+    assert!(captured.has_log_body("completed workflow-job trace rejected"));
+    assert!(captured.has_log_string_attribute("reason", "too_many_steps"));
+    assert!(captured.has_log_string_attribute("repository_name", REPOSITORY_NAME));
+    assert!(captured.has_log_string_attribute("delivery_id", DELIVERY_ID));
+    for (key, value) in [
+        ("workflow_run_id", WORKFLOW_RUN_ID),
+        ("workflow_run_attempt", WORKFLOW_RUN_ATTEMPT),
+        ("workflow_job_id", WORKFLOW_JOB_ID),
+        ("step_count", 3),
+        ("step_limit", 2),
+    ] {
+        assert!(
+            captured.has_log_i64_attribute(key, value),
+            "OTLP logs contain approved field {key:?}"
+        );
+    }
+
+    for forbidden in [FORBIDDEN_COMMAND, FORBIDDEN_OUTPUT] {
+        captured.assert_absent(forbidden);
+        captured.assert_logs_absent(forbidden);
+        assert!(!stderr.contains(forbidden));
+        assert!(!exposition.contains(forbidden));
+    }
+    for identifier in [REPOSITORY_NAME, DELIVERY_ID] {
+        assert!(!exposition.contains(identifier));
+    }
+    for identifier in [WORKFLOW_RUN_ID, WORKFLOW_JOB_ID] {
+        assert!(!exposition.contains(&identifier.to_string()));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent() {
     let required_workflow_span_only_keys = [
         "cicd.pipeline.name",
@@ -3250,6 +3450,91 @@ async fn duplicate_workflow_delivery_emits_one_historical_trace() {
     ] {
         assert_metric_line(&exposition, expected);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_over_limit_workflow_job_records_one_rejection() {
+    let fixture = WebhookTraceFixture::new_with_workflow_job_max_steps(2).await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440802";
+    let body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 9902,
+            "run_id": 8802,
+            "run_attempt": 1,
+            "conclusion": "success",
+            "steps": [
+                {"number": 1, "conclusion": "success"},
+                {"number": 2, "conclusion": "success"},
+                {"number": 3, "conclusion": "success"}
+            ]
+        }),
+    );
+
+    for _ in 0..2 {
+        let response = fixture
+            .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
+            .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let claim_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries WHERE delivery_id = ?")
+            .bind(delivery_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("durable delivery claim is countable");
+    assert_eq!(claim_count, 1);
+
+    let exposition = fixture.metrics_text().await;
+    let captured = fixture.force_flush();
+    let stderr = fixture.output.text();
+    assert_metric_line(
+        &exposition,
+        "github_webhook_requests_total{result=\"accepted\"} 2",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 1",
+    );
+    assert_metric_line(&exposition, "github_webhook_duplicates_total 1");
+    assert_metric_line(&exposition, "github_workflow_job_steps_count 1");
+    assert_metric_line(&exposition, "github_workflow_job_steps_sum 3.0");
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 1",
+    );
+    assert_eq!(
+        captured
+            .spans
+            .iter()
+            .filter(|span| span.name == "github.workflow.job" || span.name == "github.workflow.step")
+            .count(),
+        0,
+        "over-limit duplicate delivery emits no historical workflow spans"
+    );
+    assert_eq!(
+        stderr
+            .matches("completed workflow-job trace rejected")
+            .count(),
+        1,
+        "duplicate delivery emits one completed workflow-job rejection warning"
+    );
+    assert_eq!(
+        captured
+            .log_records
+            .iter()
+            .filter(|record| {
+                record
+                    .body
+                    .as_ref()
+                    .and_then(string_any_value)
+                    .is_some_and(|body| body.contains("completed workflow-job trace rejected"))
+            })
+            .count(),
+        1,
+        "duplicate delivery exports one completed workflow-job rejection warning"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

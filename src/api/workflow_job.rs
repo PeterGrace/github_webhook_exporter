@@ -196,12 +196,6 @@ pub(super) fn inspect_completed_job(body: &[u8]) -> Option<WorkflowJobAdmission>
     })
 }
 
-const _: fn(&[u8]) -> Option<WorkflowJobAdmission> = inspect_completed_job;
-const _: fn(&WorkflowJobAdmission) -> WorkflowRunId = WorkflowJobAdmission::run_id;
-const _: fn(&WorkflowJobAdmission) -> WorkflowRunAttempt = WorkflowJobAdmission::run_attempt;
-const _: fn(&WorkflowJobAdmission) -> WorkflowJobId = WorkflowJobAdmission::job_id;
-const _: fn(&WorkflowJobAdmission) -> usize = WorkflowJobAdmission::step_count;
-
 /// Projects one authenticated completed workflow-job payload into the bounded workflow model.
 ///
 /// # Parameters

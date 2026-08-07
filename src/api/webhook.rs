@@ -11,7 +11,7 @@ use axum::{
 };
 use serde::Deserialize;
 use time::OffsetDateTime;
-use tracing::{error, info, Instrument};
+use tracing::{error, info, warn, Instrument};
 
 use crate::{
     api::{merge_group::EventProjection, pull_request::QueueProcessor, workflow_job},
@@ -20,7 +20,7 @@ use crate::{
     error::AppError,
     metrics::{
         normalize_action, normalize_event_type, Action, EventType, FailureStage, Metrics,
-        WebhookResult,
+        WebhookResult, WorkflowTraceRejectionReason,
     },
     security::{
         CanonicalRepositoryName, WebhookAuthenticationError, WebhookAuthenticator, WebhookSignature,
@@ -146,13 +146,29 @@ async fn webhook_handler(
                     .metrics()
                     .observe_event(event_type, action, request.body.len());
                 if event_type == EventType::WorkflowJob && action == Action::Completed {
-                    if let Some(workflow_trace) = workflow_job::project_completed_job(
-                        request.body.as_ref(),
-                        &request.repository_name,
-                        &request.delivery_id,
-                        received_at,
-                    ) {
-                        state.workflow_trace_emitter().emit(&workflow_trace);
+                    if let Some(admission) =
+                        workflow_job::inspect_completed_job(request.body.as_ref())
+                    {
+                        state
+                            .metrics()
+                            .observe_workflow_job_steps(admission.step_count());
+                        let step_limit = state.workflow_job_max_steps();
+                        if admission.step_count() > step_limit {
+                            record_workflow_trace_rejection(
+                                &state,
+                                &request.repository_name,
+                                &request.delivery_id,
+                                &admission,
+                                step_limit,
+                            );
+                        } else if let Some(workflow_trace) = workflow_job::project_completed_job(
+                            request.body.as_ref(),
+                            &request.repository_name,
+                            &request.delivery_id,
+                            received_at,
+                        ) {
+                            state.workflow_trace_emitter().emit(&workflow_trace);
+                        }
                     }
                 }
                 if let Some(transition) =
@@ -210,6 +226,31 @@ async fn webhook_handler(
             Err(error)
         }
     }
+}
+
+fn record_workflow_trace_rejection(
+    state: &AppState,
+    repository_name: &CanonicalRepositoryName,
+    delivery_id: &DeliveryId,
+    admission: &workflow_job::WorkflowJobAdmission,
+    step_limit: usize,
+) {
+    state
+        .metrics()
+        .record_workflow_trace_rejection(WorkflowTraceRejectionReason::TooManySteps);
+    let mut delivery_buffer = uuid::Uuid::encode_buffer();
+    warn!(
+        parent: None,
+        reason = WorkflowTraceRejectionReason::TooManySteps.as_str(),
+        repository_name = repository_name.as_str(),
+        workflow_run_id = admission.run_id().get(),
+        workflow_run_attempt = admission.run_attempt().get(),
+        workflow_job_id = admission.job_id().get(),
+        delivery_id = delivery_id.encode_lower(&mut delivery_buffer),
+        step_count = admission.step_count(),
+        step_limit,
+        "completed workflow-job trace rejected"
+    );
 }
 
 async fn observe_webhook_request(
