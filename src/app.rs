@@ -64,6 +64,12 @@ impl AppState {
         }
     }
 
+    /// Returns application state updated with a shared metrics registry.
+    pub fn with_metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     /// Returns application state updated with the configured workflow trace emitter.
     pub fn with_workflow_trace_emitter(
         mut self,
@@ -307,6 +313,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::{
+        metrics::{Metrics, TelemetryDropReason, TelemetrySignal},
         security::{AdminAuthenticator, AdminToken, MasterKey, RepositorySecretCipher},
         storage::RepositoryStore,
     };
@@ -353,6 +360,29 @@ mod tests {
         let state = app_state().await;
 
         assert_eq!(state.workflow_job_max_steps(), 256);
+    }
+
+    #[tokio::test]
+    async fn installed_metrics_are_served() {
+        let metrics = Metrics::new();
+        metrics.record_telemetry_drop(TelemetrySignal::Trace, TelemetryDropReason::QueueFull);
+        let response = build_router(app_state().await.with_metrics(metrics))
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("request is valid"),
+            )
+            .await
+            .expect("router serves request");
+        let body = to_bytes(response.into_body(), 128 * 1_024)
+            .await
+            .expect("metrics response body is readable");
+        let exposition = String::from_utf8(body.to_vec()).expect("metrics response is UTF-8");
+
+        assert!(exposition.contains(
+            "github_telemetry_dropped_records_total{signal=\"trace\",reason=\"queue_full\"} 1"
+        ));
     }
 
     #[tokio::test]

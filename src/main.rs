@@ -5,6 +5,7 @@ use github_webhook_exporter::{
     app::{self, AppState, ShutdownOutcome},
     config::RuntimeConfig,
     lifecycle,
+    metrics::Metrics,
     retention::RetentionConfig,
     security::{AdminAuthenticator, RepositorySecretCipher},
     storage::{self, RepositoryStore},
@@ -29,6 +30,7 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     let config = RuntimeConfig::from_env().context("failed to load runtime configuration")?;
+    let metrics = Metrics::new();
     let telemetry_runtime = telemetry::init(config.rust_log(), config.telemetry())
         .context("failed to initialize telemetry")?;
 
@@ -43,6 +45,7 @@ async fn run() -> Result<()> {
         config.webhook_body_limit_bytes(),
         config.workflow_job_max_steps(),
     )
+    .with_metrics(metrics)
     .with_workflow_trace_emitter(telemetry_runtime.workflow_trace_emitter());
     state
         .initialize_repository_metrics()
