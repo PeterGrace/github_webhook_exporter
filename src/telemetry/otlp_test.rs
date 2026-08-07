@@ -21,7 +21,7 @@ use opentelemetry_proto::tonic::{
     collector::{logs::v1::ExportLogsServiceRequest, trace::v1::ExportTraceServiceRequest},
     common::v1::{any_value::Value as AttributeValue, AnyValue, KeyValue},
     logs::v1::LogRecord,
-    trace::v1::Span,
+    trace::v1::{status::StatusCode as OtlpStatusCode, Span},
 };
 use prost::Message;
 use serde_json::Value;
@@ -973,6 +973,23 @@ impl CapturedSpans {
             })
     }
 
+    fn workflow_job_for_delivery(&self, delivery_id: &str) -> &Span {
+        let matches = self
+            .spans
+            .iter()
+            .filter(|span| {
+                span.name == "github.workflow.job"
+                    && string_attribute(span, "github.delivery.id") == Some(delivery_id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
+            1,
+            "workflow job span count for {delivery_id}"
+        );
+        matches[0]
+    }
+
     fn one_named(&self, name: &str) -> &Span {
         let matches = self
             .spans
@@ -1237,6 +1254,58 @@ fn rfc3339_unix_nanos(value: &str) -> u64 {
     OffsetDateTime::parse(value, &Rfc3339)
         .expect("timestamp is RFC3339")
         .unix_timestamp_nanos() as u64
+}
+
+fn workflow_job_body(action: Option<&str>, workflow_job: Value) -> Vec<u8> {
+    let mut payload = serde_json::Map::with_capacity(3);
+    if let Some(action) = action {
+        payload.insert("action".to_owned(), Value::String(action.to_owned()));
+    }
+    payload.insert("workflow_job".to_owned(), workflow_job);
+    payload.insert(
+        "repository".to_owned(),
+        serde_json::json!({"full_name": WEBHOOK_REPOSITORY}),
+    );
+    serde_json::to_vec(&Value::Object(payload)).expect("workflow-job payload serializes")
+}
+
+fn assert_otlp_status(span: &Span, code: OtlpStatusCode, description: &str) {
+    let status = span.status.as_ref().expect("span status is exported");
+    assert_eq!(status.code, code as i32, "status code for {}", span.name);
+    assert_eq!(
+        status.message, description,
+        "status description for {}",
+        span.name
+    );
+}
+
+fn assert_historical_interval(span: &Span, start: u64, end: u64, source: &str) {
+    assert_eq!(
+        span.start_time_unix_nano, start,
+        "start time for {}",
+        span.name
+    );
+    assert_eq!(span.end_time_unix_nano, end, "end time for {}", span.name);
+    assert_attribute(span, "timing_source", source);
+    for timestamp in [start, end] {
+        assert!(
+            OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp)).is_ok(),
+            "{} timestamp is a valid Unix nanosecond value",
+            span.name
+        );
+    }
+}
+
+fn current_unix_nanos() -> u64 {
+    u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos())
+        .expect("current test time is after the Unix epoch")
+}
+
+fn assert_metric_line(exposition: &str, expected: &str) {
+    assert!(
+        exposition.lines().any(|line| line == expected),
+        "missing metric line {expected:?}"
+    );
 }
 
 #[test]
@@ -2111,6 +2180,530 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
     );
 
     captured.assert_approved_attribute_keys();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_conclusions_export_bounded_results_and_statuses() {
+    let fixture = WebhookTraceFixture::new().await;
+    let cases = [
+        (
+            "success",
+            "success",
+            Some("success"),
+            OtlpStatusCode::Ok,
+            "",
+        ),
+        (
+            "failure",
+            "failure",
+            Some("failure"),
+            OtlpStatusCode::Error,
+            "workflow_failed",
+        ),
+        (
+            "cancelled",
+            "cancelled",
+            Some("cancellation"),
+            OtlpStatusCode::Unset,
+            "",
+        ),
+        (
+            "skipped",
+            "skipped",
+            Some("skip"),
+            OtlpStatusCode::Unset,
+            "",
+        ),
+        (
+            "timed_out",
+            "timed_out",
+            Some("timeout"),
+            OtlpStatusCode::Error,
+            "workflow_failed",
+        ),
+        ("neutral", "neutral", None, OtlpStatusCode::Unset, ""),
+        (
+            "fixture_private_unknown",
+            "other",
+            None,
+            OtlpStatusCode::Unset,
+            "",
+        ),
+    ];
+
+    for (index, (raw, _, _, _, _)) in cases.iter().enumerate() {
+        let body = workflow_job_body(
+            Some("completed"),
+            serde_json::json!({
+                "id": 100 + index,
+                "run_id": 200 + index,
+                "run_attempt": 1,
+                "conclusion": raw,
+                "started_at": "2026-08-06T10:00:00.000000001Z",
+                "completed_at": "2026-08-06T10:00:01.000000002Z",
+                "steps": [{
+                    "number": 1,
+                    "conclusion": raw,
+                    "started_at": "2026-08-06T10:00:00.100000003Z",
+                    "completed_at": "2026-08-06T10:00:00.900000004Z"
+                }]
+            }),
+        );
+        let delivery_id = format!("550e8400-e29b-41d4-a716-4466554403{index:02}");
+        let response = fixture
+            .webhook(&body, "workflow_job", &delivery_id, WEBHOOK_SECRET)
+            .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let captured = fixture.force_flush();
+    assert_eq!(
+        captured
+            .spans
+            .iter()
+            .filter(|span| span.name == "github.workflow.job")
+            .count(),
+        cases.len()
+    );
+    assert_eq!(
+        captured
+            .spans
+            .iter()
+            .filter(|span| span.name == "github.workflow.step")
+            .count(),
+        cases.len()
+    );
+
+    for (index, (_, normalized, semantic_result, status, description)) in cases.iter().enumerate() {
+        let delivery_id = format!("550e8400-e29b-41d4-a716-4466554403{index:02}");
+        let job = captured.workflow_job_for_delivery(&delivery_id);
+        let step = captured.child_named(job, "github.workflow.step");
+
+        assert_attribute(job, "github.workflow.conclusion", normalized);
+        assert_attribute(step, "github.workflow.conclusion", normalized);
+        // These exact presence/absence assertions exercise WorkflowConclusion::semantic_result.
+        assert_eq!(
+            string_attribute(job, "cicd.pipeline.result"),
+            *semantic_result
+        );
+        assert_eq!(
+            string_attribute(step, "cicd.pipeline.task.run.result"),
+            *semantic_result
+        );
+        // These protobuf assertions exercise WorkflowConclusion::status.
+        assert_otlp_status(job, *status, description);
+        assert_otlp_status(step, *status, description);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_timing_uses_reported_and_bounded_fallback_intervals() {
+    let fixture = WebhookTraceFixture::new().await;
+    let reported_delivery = "550e8400-e29b-41d4-a716-446655440400";
+    let malformed_completion_delivery = "550e8400-e29b-41d4-a716-446655440401";
+    let missing_delivery = "550e8400-e29b-41d4-a716-446655440402";
+    let malformed_receipt_delivery = "550e8400-e29b-41d4-a716-446655440403";
+    let reversed_delivery = "550e8400-e29b-41d4-a716-446655440404";
+    let job_started_at = "2026-08-06T10:00:00.123456789Z";
+    let job_completed_at = "2026-08-06T10:05:00.987654321Z";
+    let step_started_at = "2026-08-06T10:01:00.111111111Z";
+    let step_completed_at = "2026-08-06T10:02:00.222222222Z";
+    let reported_body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 410,
+            "run_id": 310,
+            "run_attempt": 2,
+            "started_at": job_started_at,
+            "completed_at": job_completed_at,
+            "steps": [
+                {
+                    "number": 1,
+                    "started_at": step_started_at,
+                    "completed_at": step_completed_at
+                },
+                {
+                    "number": 2,
+                    "started_at": "not-a-timestamp",
+                    "completed_at": "also-not-a-timestamp"
+                },
+                {"number": 3},
+                {
+                    "number": 4,
+                    "started_at": "2026-08-06T10:03:00.000000004Z",
+                    "completed_at": "2026-08-06T10:02:00.000000005Z"
+                },
+                {
+                    "number": 5,
+                    "started_at": "2026-08-06T09:59:59.000000006Z",
+                    "completed_at": "2026-08-06T10:01:00.000000007Z"
+                }
+            ]
+        }),
+    );
+    let response = fixture
+        .webhook(
+            &reported_body,
+            "workflow_job",
+            reported_delivery,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let malformed_completion_at = "2026-08-06T11:05:00.333333333Z";
+    let malformed_completion_body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 411,
+            "run_id": 311,
+            "run_attempt": 1,
+            "started_at": "not-a-timestamp",
+            "completed_at": malformed_completion_at,
+            "steps": []
+        }),
+    );
+    let response = fixture
+        .webhook(
+            &malformed_completion_body,
+            "workflow_job",
+            malformed_completion_delivery,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let missing_body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 412,
+            "run_id": 312,
+            "run_attempt": 1,
+            "steps": []
+        }),
+    );
+    let missing_request_started = current_unix_nanos();
+    let response = fixture
+        .webhook(
+            &missing_body,
+            "workflow_job",
+            missing_delivery,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    let missing_request_completed = current_unix_nanos();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let malformed_receipt_body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 413,
+            "run_id": 313,
+            "run_attempt": 1,
+            "started_at": "not-a-timestamp",
+            "completed_at": {"invalid": true},
+            "steps": []
+        }),
+    );
+    let malformed_request_started = current_unix_nanos();
+    let response = fixture
+        .webhook(
+            &malformed_receipt_body,
+            "workflow_job",
+            malformed_receipt_delivery,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    let malformed_request_completed = current_unix_nanos();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let reversed_completion_at = "2026-08-06T12:04:00.444444444Z";
+    let reversed_body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 414,
+            "run_id": 314,
+            "run_attempt": 1,
+            "started_at": "2026-08-06T12:05:00.555555555Z",
+            "completed_at": reversed_completion_at,
+            "steps": []
+        }),
+    );
+    let response = fixture
+        .webhook(
+            &reversed_body,
+            "workflow_job",
+            reversed_delivery,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let captured = fixture.force_flush();
+    let reported_job = captured.workflow_job_for_delivery(reported_delivery);
+    let reported_job_end = rfc3339_unix_nanos(job_completed_at);
+    assert_historical_interval(
+        reported_job,
+        rfc3339_unix_nanos(job_started_at),
+        reported_job_end,
+        "reported",
+    );
+    let steps = captured
+        .children(reported_job)
+        .filter(|span| span.name == "github.workflow.step")
+        .collect::<Vec<_>>();
+    assert_eq!(steps.len(), 5);
+    let step_by_number = |number: i64| {
+        let task_run_id = format!("410:{number}");
+        steps
+            .iter()
+            .copied()
+            .find(|span| {
+                string_attribute(span, "cicd.pipeline.task.run.id") == Some(task_run_id.as_str())
+            })
+            .unwrap_or_else(|| panic!("workflow step {task_run_id} is exported"))
+    };
+    assert_historical_interval(
+        step_by_number(1),
+        rfc3339_unix_nanos(step_started_at),
+        rfc3339_unix_nanos(step_completed_at),
+        "reported",
+    );
+    for number in 2..=5 {
+        assert_historical_interval(
+            step_by_number(number),
+            reported_job_end,
+            reported_job_end,
+            "fallback",
+        );
+    }
+
+    let malformed_completion = captured.workflow_job_for_delivery(malformed_completion_delivery);
+    let malformed_completion_at = rfc3339_unix_nanos(malformed_completion_at);
+    assert_historical_interval(
+        malformed_completion,
+        malformed_completion_at,
+        malformed_completion_at,
+        "fallback",
+    );
+
+    let missing = captured.workflow_job_for_delivery(missing_delivery);
+    assert_eq!(missing.start_time_unix_nano, missing.end_time_unix_nano);
+    assert!(
+        (missing_request_started..=missing_request_completed)
+            .contains(&missing.start_time_unix_nano),
+        "missing timestamps fall back to the exact bounded receipt instant"
+    );
+    assert_historical_interval(
+        missing,
+        missing.start_time_unix_nano,
+        missing.end_time_unix_nano,
+        "fallback",
+    );
+
+    let malformed_receipt = captured.workflow_job_for_delivery(malformed_receipt_delivery);
+    assert_eq!(
+        malformed_receipt.start_time_unix_nano,
+        malformed_receipt.end_time_unix_nano
+    );
+    assert!(
+        (malformed_request_started..=malformed_request_completed)
+            .contains(&malformed_receipt.start_time_unix_nano),
+        "malformed timestamps fall back to the exact bounded receipt instant"
+    );
+    assert_historical_interval(
+        malformed_receipt,
+        malformed_receipt.start_time_unix_nano,
+        malformed_receipt.end_time_unix_nano,
+        "fallback",
+    );
+
+    let reversed = captured.workflow_job_for_delivery(reversed_delivery);
+    let reversed_completion_at = rfc3339_unix_nanos(reversed_completion_at);
+    assert_historical_interval(
+        reversed,
+        reversed_completion_at,
+        reversed_completion_at,
+        "fallback",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsupported_workflow_actions_and_projections_emit_no_historical_trace() {
+    let fixture = WebhookTraceFixture::new().await;
+    let requests = [
+        (
+            Some("queued"),
+            serde_json::json!({
+                "id": 501, "run_id": 601, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z", "steps": []
+            }),
+        ),
+        (
+            Some("in_progress"),
+            serde_json::json!({
+                "id": 502, "run_id": 602, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z", "steps": []
+            }),
+        ),
+        (
+            None,
+            serde_json::json!({
+                "id": 503, "run_id": 603, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z", "steps": []
+            }),
+        ),
+        (
+            Some("fixture_unknown_action"),
+            serde_json::json!({
+                "id": 504, "run_id": 604, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z", "steps": []
+            }),
+        ),
+        (
+            Some("completed"),
+            serde_json::json!({
+                "id": 0, "run_id": 605, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z", "steps": []
+            }),
+        ),
+        (
+            Some("completed"),
+            serde_json::json!({
+                "id": 506, "run_id": "malformed", "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z", "steps": []
+            }),
+        ),
+        (
+            Some("completed"),
+            serde_json::json!({
+                "id": 507, "run_id": 607,
+                "completed_at": "2026-08-06T10:05:00Z", "steps": []
+            }),
+        ),
+        (
+            Some("completed"),
+            serde_json::json!({
+                "id": 508, "run_id": 608, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z", "steps": {}
+            }),
+        ),
+        (
+            Some("completed"),
+            serde_json::json!({
+                "id": 509, "run_id": 609, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z",
+                "steps": [{"name": "missing required number"}]
+            }),
+        ),
+    ];
+
+    for (index, (action, workflow_job)) in requests.iter().enumerate() {
+        let body = workflow_job_body(*action, workflow_job.clone());
+        let delivery_id = format!("550e8400-e29b-41d4-a716-4466554405{index:02}");
+        let response = fixture
+            .webhook(&body, "workflow_job", &delivery_id, WEBHOOK_SECRET)
+            .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let claim_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries")
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("delivery claims are countable");
+    assert_eq!(claim_count, requests.len() as i64);
+    let exposition = fixture.metrics_text().await;
+    let captured = fixture.force_flush();
+
+    assert_eq!(
+        captured
+            .spans
+            .iter()
+            .filter(|span| {
+                span.name == "github.workflow.job" || span.name == "github.workflow.step"
+            })
+            .count(),
+        0,
+        "unsupported actions and malformed projections emit zero historical spans"
+    );
+    for expected in [
+        "github_webhook_events_total{event_type=\"workflow_job\",action=\"queued\"} 1",
+        "github_webhook_events_total{event_type=\"workflow_job\",action=\"in_progress\"} 1",
+        "github_webhook_events_total{event_type=\"workflow_job\",action=\"none\"} 1",
+        "github_webhook_events_total{event_type=\"workflow_job\",action=\"other\"} 1",
+        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 5",
+        "github_webhook_request_body_bytes_count 9",
+        "github_webhook_requests_total{result=\"accepted\"} 9",
+    ] {
+        assert_metric_line(&exposition, expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_workflow_delivery_emits_one_historical_trace() {
+    let fixture = WebhookTraceFixture::new().await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440600";
+    let body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 701,
+            "run_id": 801,
+            "run_attempt": 1,
+            "conclusion": "success",
+            "started_at": "2026-08-06T10:00:00.000000001Z",
+            "completed_at": "2026-08-06T10:05:00.000000002Z",
+            "steps": [
+                {
+                    "number": 1,
+                    "conclusion": "success",
+                    "started_at": "2026-08-06T10:01:00.000000003Z",
+                    "completed_at": "2026-08-06T10:02:00.000000004Z"
+                },
+                {
+                    "number": 2,
+                    "conclusion": "failure",
+                    "started_at": "2026-08-06T10:03:00.000000005Z",
+                    "completed_at": "2026-08-06T10:04:00.000000006Z"
+                }
+            ]
+        }),
+    );
+
+    for _ in 0..2 {
+        let response = fixture
+            .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
+            .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let claim_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries WHERE delivery_id = ?")
+            .bind(delivery_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("durable delivery claim is countable");
+    assert_eq!(claim_count, 1);
+    let exposition = fixture.metrics_text().await;
+    let captured = fixture.force_flush();
+
+    let job = captured.workflow_job_for_delivery(delivery_id);
+    assert_eq!(captured.child_count(job, "github.workflow.step"), 2);
+    assert_eq!(
+        captured
+            .spans
+            .iter()
+            .filter(|span| span.name == "github.workflow.step" && span.trace_id == job.trace_id)
+            .count(),
+        2
+    );
+    for expected in [
+        "github_webhook_requests_total{result=\"accepted\"} 2",
+        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 1",
+        "github_webhook_request_body_bytes_count 1",
+        "github_webhook_duplicates_total 1",
+    ] {
+        assert_metric_line(&exposition, expected);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
