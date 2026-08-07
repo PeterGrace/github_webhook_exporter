@@ -128,11 +128,6 @@ pub(crate) fn workflow_task_name_attribute(name: &DisplayName) -> KeyValue {
     string_key_value(CICD_PIPELINE_TASK_NAME_KEY, name.as_str())
 }
 
-/// Returns the workflow job or step run-identifier attribute.
-pub(crate) fn workflow_task_run_id_attribute(value: impl Into<String>) -> KeyValue {
-    string_key_value(CICD_PIPELINE_TASK_RUN_ID_KEY, value)
-}
-
 /// Returns the workflow conclusion attribute.
 pub(crate) fn workflow_conclusion_attribute(conclusion: WorkflowConclusion) -> KeyValue {
     string_key_value(GITHUB_WORKFLOW_CONCLUSION_KEY, conclusion.as_str())
@@ -762,11 +757,10 @@ mod tests {
         workflow_name_attribute, workflow_pipeline_result_attribute,
         workflow_pipeline_run_id_attribute, workflow_pipeline_task_run_result_attribute,
         workflow_run_attempt_attribute, workflow_run_id_attribute, workflow_task_name_attribute,
-        workflow_task_run_id_attribute, CommitSha, ConfigOperation, DatabaseOperation, HttpMethod,
-        HttpResult, Operation, OperationFailureReason, OperationOutcome, QueueEntity, TimingSource,
-        WorkflowConclusion, WorkflowJobId, WorkflowRunAttempt, WorkflowRunId,
-        CICD_PIPELINE_NAME_KEY, CICD_PIPELINE_RESULT_KEY, CICD_PIPELINE_RUN_ID_KEY,
-        CICD_PIPELINE_TASK_NAME_KEY, CICD_PIPELINE_TASK_RUN_ID_KEY,
+        CommitSha, ConfigOperation, DatabaseOperation, HttpMethod, HttpResult, Operation,
+        OperationFailureReason, OperationOutcome, QueueEntity, TimingSource, WorkflowConclusion,
+        WorkflowJobId, WorkflowRunAttempt, WorkflowRunId, CICD_PIPELINE_NAME_KEY,
+        CICD_PIPELINE_RESULT_KEY, CICD_PIPELINE_RUN_ID_KEY, CICD_PIPELINE_TASK_NAME_KEY,
         CICD_PIPELINE_TASK_RUN_RESULT_KEY, COMMIT_SHA_KEY, CONFIG_OPERATION_KEY,
         DB_OPERATION_NAME_KEY, DB_SYSTEM_NAME_KEY, DELIVERY_ID_KEY, FAILURE_REASON_KEY,
         GITHUB_WORKFLOW_CONCLUSION_KEY, GITHUB_WORKFLOW_JOB_ID_KEY,
@@ -1225,10 +1219,6 @@ mod tests {
         let job_id_kv = workflow_job_id_attribute(job_id);
         assert_eq!(job_id_kv.key.as_str(), GITHUB_WORKFLOW_JOB_ID_KEY);
         assert_eq!(job_id_kv.value.as_str().as_ref(), "41");
-
-        let task_run_id_kv = workflow_task_run_id_attribute(format!("{}:3", job_id.get()));
-        assert_eq!(task_run_id_kv.key.as_str(), CICD_PIPELINE_TASK_RUN_ID_KEY);
-        assert_eq!(task_run_id_kv.value.as_str().as_ref(), "41:3");
 
         let conclusion_kv = workflow_conclusion_attribute(WorkflowConclusion::Cancelled);
         assert_eq!(conclusion_kv.key.as_str(), GITHUB_WORKFLOW_CONCLUSION_KEY);

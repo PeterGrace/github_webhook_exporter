@@ -14,11 +14,17 @@ use crate::{
 use super::trace::CommitSha;
 
 const MAX_DISPLAY_NAME_LENGTH: usize = 128;
+const MAX_PULL_REQUEST_COUNT: usize = 20;
 
 /// A malformed workflow telemetry value.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[error("workflow telemetry value must be positive")]
 pub(crate) struct WorkflowValueError;
+
+/// A malformed workflow timing interval.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("workflow timing interval is invalid")]
+pub(crate) struct WorkflowTimingError;
 
 macro_rules! positive_i64_newtype {
     ($name:ident, $doc:literal) => {
@@ -114,6 +120,199 @@ impl DisplayName {
     /// Returns the sanitized display name.
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl HistoricalTiming {
+    /// Creates a reported historical interval when the bounds are ordered.
+    ///
+    /// # Parameters
+    ///
+    /// * `start` - The reported start time.
+    /// * `end` - The reported end time.
+    ///
+    /// # Returns
+    ///
+    /// A reported historical interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkflowTimingError`] when `start` is after `end`.
+    pub(crate) fn reported(
+        start: SystemTime,
+        end: SystemTime,
+    ) -> Result<Self, WorkflowTimingError> {
+        if start <= end {
+            Ok(Self {
+                start,
+                end,
+                source: TimingSource::Reported,
+            })
+        } else {
+            Err(WorkflowTimingError)
+        }
+    }
+
+    /// Creates a fallback historical interval anchored to a single instant.
+    pub(crate) fn fallback(instant: SystemTime) -> Self {
+        Self {
+            start: instant,
+            end: instant,
+            source: TimingSource::Fallback,
+        }
+    }
+
+    /// Creates a reported child interval bounded by its parent interval.
+    ///
+    /// # Parameters
+    ///
+    /// * `start` - The reported child start time.
+    /// * `end` - The reported child end time.
+    /// * `parent` - The selected parent interval.
+    ///
+    /// # Returns
+    ///
+    /// A reported child interval that remains inside `parent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkflowTimingError`] when the child interval is not ordered or falls outside the
+    /// parent interval.
+    pub(crate) fn reported_within_parent(
+        start: SystemTime,
+        end: SystemTime,
+        parent: &Self,
+    ) -> Result<Self, WorkflowTimingError> {
+        if start <= end && start >= parent.start && end <= parent.end {
+            Ok(Self {
+                start,
+                end,
+                source: TimingSource::Reported,
+            })
+        } else {
+            Err(WorkflowTimingError)
+        }
+    }
+
+    /// Returns the historical start time.
+    pub(crate) fn start(&self) -> SystemTime {
+        self.start
+    }
+
+    /// Returns the historical end time.
+    pub(crate) fn end(&self) -> SystemTime {
+        self.end
+    }
+
+    /// Returns the timing source.
+    pub(crate) fn source(&self) -> TimingSource {
+        self.source
+    }
+}
+
+impl WorkflowJobTrace {
+    /// Creates a bounded workflow job trace from validated parts.
+    ///
+    /// # Parameters
+    ///
+    /// * `parts` - The already validated workflow job components.
+    pub(crate) fn new(parts: WorkflowJobTraceParts) -> Self {
+        Self {
+            repository_name: parts.repository_name,
+            delivery_id: parts.delivery_id,
+            workflow_name: parts.workflow_name,
+            run_id: parts.run_id,
+            run_attempt: parts.run_attempt,
+            job_id: parts.job_id,
+            job_name: parts.job_name,
+            conclusion: parts.conclusion,
+            head_sha: parts.head_sha,
+            pull_requests: parts.pull_requests,
+            timing: parts.timing,
+            steps: parts.steps,
+        }
+    }
+
+    /// Returns the canonical repository name.
+    pub(crate) fn repository_name(&self) -> &CanonicalRepositoryName {
+        &self.repository_name
+    }
+
+    /// Returns the delivery identifier.
+    pub(crate) fn delivery_id(&self) -> DeliveryId {
+        self.delivery_id
+    }
+
+    /// Returns the optional sanitized workflow name.
+    pub(crate) fn workflow_name(&self) -> Option<&DisplayName> {
+        self.workflow_name.as_ref()
+    }
+
+    /// Returns the workflow run identifier.
+    pub(crate) fn run_id(&self) -> WorkflowRunId {
+        self.run_id
+    }
+
+    /// Returns the workflow run attempt.
+    pub(crate) fn run_attempt(&self) -> WorkflowRunAttempt {
+        self.run_attempt
+    }
+
+    /// Returns the workflow job identifier.
+    pub(crate) fn job_id(&self) -> WorkflowJobId {
+        self.job_id
+    }
+
+    /// Returns the optional sanitized job name.
+    pub(crate) fn job_name(&self) -> Option<&DisplayName> {
+        self.job_name.as_ref()
+    }
+
+    /// Returns the bounded job conclusion.
+    pub(crate) fn conclusion(&self) -> WorkflowConclusion {
+        self.conclusion
+    }
+
+    /// Returns the optional validated commit SHA.
+    pub(crate) fn head_sha(&self) -> Option<&CommitSha> {
+        self.head_sha.as_ref()
+    }
+
+    /// Returns the bounded pull-request collection.
+    pub(crate) fn pull_requests(&self) -> &[PullRequestNumber] {
+        self.pull_requests.as_slice()
+    }
+
+    /// Returns the selected historical interval.
+    pub(crate) fn timing(&self) -> &HistoricalTiming {
+        &self.timing
+    }
+
+    /// Returns the validated workflow steps.
+    pub(crate) fn steps(&self) -> &[WorkflowStepTrace] {
+        &self.steps
+    }
+}
+
+impl WorkflowStepTrace {
+    /// Returns the validated step number.
+    pub(crate) fn number(&self) -> i64 {
+        self.number
+    }
+
+    /// Returns the optional sanitized step name.
+    pub(crate) fn name(&self) -> Option<&DisplayName> {
+        self.name.as_ref()
+    }
+
+    /// Returns the bounded step conclusion.
+    pub(crate) fn conclusion(&self) -> WorkflowConclusion {
+        self.conclusion
+    }
+
+    /// Returns the selected historical interval.
+    pub(crate) fn timing(&self) -> &HistoricalTiming {
+        &self.timing
     }
 }
 
@@ -226,15 +425,49 @@ impl TimingSource {
 /// A bounded historical interval and the source that selected it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HistoricalTiming {
-    pub(crate) start: SystemTime,
-    pub(crate) end: SystemTime,
-    pub(crate) source: TimingSource,
+    start: SystemTime,
+    end: SystemTime,
+    source: TimingSource,
 }
 
-/// An owned workflow-job trace accepted by the telemetry emitter.
-#[allow(dead_code)]
+/// A bounded collection of workflow pull-request numbers.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct WorkflowJobTrace {
+pub(crate) struct WorkflowPullRequests(Vec<PullRequestNumber>);
+
+impl WorkflowPullRequests {
+    /// Creates a bounded pull-request collection while preserving input order.
+    ///
+    /// Only the first 20 validated pull-request numbers are retained.
+    pub(crate) fn new<I>(values: I) -> Self
+    where
+        I: IntoIterator<Item = PullRequestNumber>,
+    {
+        let mut pull_requests = Vec::with_capacity(MAX_PULL_REQUEST_COUNT);
+        for number in values.into_iter().take(MAX_PULL_REQUEST_COUNT) {
+            pull_requests.push(number);
+        }
+        Self(pull_requests)
+    }
+
+    /// Returns the retained pull-request numbers.
+    pub(crate) fn as_slice(&self) -> &[PullRequestNumber] {
+        &self.0
+    }
+
+    /// Returns the number of retained pull-request numbers.
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns whether no pull-request numbers were retained.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// The validated parts needed to construct a workflow job trace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkflowJobTraceParts {
     pub(crate) repository_name: CanonicalRepositoryName,
     pub(crate) delivery_id: DeliveryId,
     pub(crate) workflow_name: Option<DisplayName>,
@@ -244,18 +477,36 @@ pub(crate) struct WorkflowJobTrace {
     pub(crate) job_name: Option<DisplayName>,
     pub(crate) conclusion: WorkflowConclusion,
     pub(crate) head_sha: Option<CommitSha>,
-    pub(crate) pull_requests: Vec<PullRequestNumber>,
+    pub(crate) pull_requests: WorkflowPullRequests,
     pub(crate) timing: HistoricalTiming,
     pub(crate) steps: Vec<WorkflowStepTrace>,
+}
+
+/// An owned workflow-job trace accepted by the telemetry emitter.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkflowJobTrace {
+    repository_name: CanonicalRepositoryName,
+    delivery_id: DeliveryId,
+    workflow_name: Option<DisplayName>,
+    run_id: WorkflowRunId,
+    run_attempt: WorkflowRunAttempt,
+    job_id: WorkflowJobId,
+    job_name: Option<DisplayName>,
+    conclusion: WorkflowConclusion,
+    head_sha: Option<CommitSha>,
+    pull_requests: WorkflowPullRequests,
+    timing: HistoricalTiming,
+    steps: Vec<WorkflowStepTrace>,
 }
 
 /// An owned workflow-step trace accepted by the telemetry emitter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WorkflowStepTrace {
-    pub(crate) number: i64,
-    pub(crate) name: Option<DisplayName>,
-    pub(crate) conclusion: WorkflowConclusion,
-    pub(crate) timing: HistoricalTiming,
+    number: i64,
+    name: Option<DisplayName>,
+    conclusion: WorkflowConclusion,
+    timing: HistoricalTiming,
 }
 
 impl WorkflowStepTrace {
@@ -302,8 +553,10 @@ mod tests {
 
     use super::{
         DisplayName, HistoricalTiming, TimingSource, WorkflowConclusion, WorkflowJobId,
-        WorkflowRunAttempt, WorkflowRunId, WorkflowStepTrace,
+        WorkflowJobTrace, WorkflowJobTraceParts, WorkflowPullRequests, WorkflowRunAttempt,
+        WorkflowRunId, WorkflowStepTrace,
     };
+    use crate::domain::merge_queue::PullRequestNumber;
 
     #[test]
     fn positive_workflow_identifiers_reject_zero_and_negative_values() {
@@ -430,12 +683,129 @@ mod tests {
     }
 
     #[test]
+    fn historical_timing_constructors_enforce_order_and_parent_bounds() {
+        let parent_start = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let parent_end = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+        let parent = HistoricalTiming::reported(parent_start, parent_end)
+            .expect("ordered reported interval is valid");
+
+        assert_eq!(parent.start(), parent_start);
+        assert_eq!(parent.end(), parent_end);
+        assert_eq!(parent.source(), TimingSource::Reported);
+
+        let fallback = HistoricalTiming::fallback(parent_end);
+        assert_eq!(fallback.start(), parent_end);
+        assert_eq!(fallback.end(), parent_end);
+        assert_eq!(fallback.source(), TimingSource::Fallback);
+
+        let child = HistoricalTiming::reported_within_parent(
+            parent_start + Duration::from_secs(1),
+            parent_end - Duration::from_secs(1),
+            &parent,
+        )
+        .expect("child interval fits inside parent");
+        assert_eq!(child.source(), TimingSource::Reported);
+
+        assert!(HistoricalTiming::reported(parent_end, parent_start).is_err());
+        assert!(HistoricalTiming::reported_within_parent(
+            parent_start - Duration::from_secs(1),
+            parent_end,
+            &parent,
+        )
+        .is_err());
+        assert!(HistoricalTiming::reported_within_parent(
+            parent_start,
+            parent_end + Duration::from_secs(1),
+            &parent,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pull_request_collections_keep_input_order_and_cap_at_twenty() {
+        let pull_requests = WorkflowPullRequests::new((1..=25).map(|number| {
+            PullRequestNumber::new(number).expect("pull request number is positive")
+        }));
+
+        assert_eq!(pull_requests.len(), 20);
+        assert!(!pull_requests.is_empty());
+        assert_eq!(
+            pull_requests
+                .as_slice()
+                .iter()
+                .map(|number| number.get())
+                .collect::<Vec<_>>(),
+            (1..=20).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn workflow_job_trace_exposes_bounded_accessors() {
+        let repository_name = crate::security::CanonicalRepositoryName::new("Owner/Repository")
+            .expect("repository name is valid");
+        let delivery_id =
+            crate::domain::delivery::DeliveryId::parse("550e8400-e29b-41d4-a716-446655440000")
+                .expect("delivery id is valid");
+        let workflow_name = DisplayName::sanitize("Build\nWorkflow");
+        let job_name = DisplayName::sanitize("Linux\tJob");
+        let run_id = WorkflowRunId::new(31).expect("run id is valid");
+        let run_attempt = WorkflowRunAttempt::new(2).expect("run attempt is valid");
+        let job_id = WorkflowJobId::new(41).expect("job id is valid");
+        let head_sha = super::CommitSha::parse("0123456789abcdef0123456789abcdef01234567")
+            .expect("commit sha is valid");
+        let timing = HistoricalTiming::reported(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+        )
+        .expect("job interval is valid");
+        let step_timing = HistoricalTiming::reported_within_parent(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(12),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(18),
+            &timing,
+        )
+        .expect("step interval fits inside job interval");
+        let step = WorkflowStepTrace::new(1, None, WorkflowConclusion::Success, step_timing)
+            .expect("step number is positive");
+        let pull_requests = WorkflowPullRequests::new(vec![
+            PullRequestNumber::new(7).expect("pull request number is positive")
+        ]);
+        let job = WorkflowJobTrace::new(WorkflowJobTraceParts {
+            repository_name: repository_name.clone(),
+            delivery_id,
+            workflow_name: workflow_name.clone(),
+            run_id,
+            run_attempt,
+            job_id,
+            job_name: job_name.clone(),
+            conclusion: WorkflowConclusion::Success,
+            head_sha: Some(head_sha.clone()),
+            pull_requests,
+            timing: timing.clone(),
+            steps: vec![step.clone()],
+        });
+
+        assert_eq!(job.repository_name(), &repository_name);
+        assert_eq!(job.delivery_id(), delivery_id);
+        assert_eq!(job.workflow_name(), workflow_name.as_ref());
+        assert_eq!(job.run_id(), run_id);
+        assert_eq!(job.run_attempt(), run_attempt);
+        assert_eq!(job.job_id(), job_id);
+        assert_eq!(job.job_name(), job_name.as_ref());
+        assert_eq!(job.conclusion(), WorkflowConclusion::Success);
+        assert_eq!(job.head_sha(), Some(&head_sha));
+        assert_eq!(job.pull_requests().len(), 1);
+        assert_eq!(job.timing(), &timing);
+        assert_eq!(job.steps(), &[step]);
+        assert_eq!(job.pull_requests()[0].get(), 7);
+    }
+
+    #[test]
     fn workflow_step_trace_rejects_non_positive_numbers() {
-        let timing = HistoricalTiming {
-            start: SystemTime::UNIX_EPOCH,
-            end: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-            source: TimingSource::Reported,
-        };
+        let timing = HistoricalTiming::reported(
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        )
+        .expect("ordered interval is valid");
 
         assert!(
             WorkflowStepTrace::new(1, None, WorkflowConclusion::Success, timing.clone()).is_ok()
