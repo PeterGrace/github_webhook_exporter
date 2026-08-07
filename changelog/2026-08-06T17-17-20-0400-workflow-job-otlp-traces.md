@@ -42,9 +42,8 @@ Task 7 reran the full gate sequence from a clean state and all checks passed:
   `api::workflow_job::tests::malformed_or_missing_job_timestamps_select_fallback`, and
   `api::workflow_job::tests::pre_epoch_receipt_times_project_with_checked_fallback`.
 - Statuses and conclusion matrix:
-  `telemetry::workflow::tests::workflow_conclusions_map_to_status_and_strings`,
-  `telemetry::otlp_test::workflow_conclusions_export_bounded_results_and_statuses`, and
-  `api::workflow_job::tests::reversed_job_timestamps_fall_back_at_valid_completion`.
+  `telemetry::workflow::tests::workflow_conclusions_map_to_status_and_strings` and
+  `telemetry::otlp_test::workflow_conclusions_export_bounded_results_and_statuses`.
 - Unsupported or malformed input:
   `api::workflow_job::tests::malformed_or_non_array_steps_reject_projection`,
   `api::workflow_job::tests::unsupported_large_fields_have_no_representation_in_the_output_model`, and
