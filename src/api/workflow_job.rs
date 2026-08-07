@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::{
     fmt,
     time::{Duration, SystemTime},
@@ -26,11 +28,29 @@ use crate::{
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct StepCount(usize);
 
+#[cfg(test)]
+thread_local! {
+    static STEP_COUNT_DESERIALIZE_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn increment_step_count_deserialize_calls() {
+    STEP_COUNT_DESERIALIZE_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
+#[cfg(test)]
+fn step_count_deserialize_calls() -> usize {
+    STEP_COUNT_DESERIALIZE_CALLS.with(Cell::get)
+}
+
 impl<'de> Deserialize<'de> for StepCount {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
+        #[cfg(test)]
+        increment_step_count_deserialize_calls();
+
         struct StepCountVisitor;
 
         impl<'de> Visitor<'de> for StepCountVisitor {
@@ -79,6 +99,9 @@ struct WorkflowJobEnvelope {
 
 #[derive(Deserialize)]
 struct WorkflowJobProjection {
+    id: i64,
+    run_id: i64,
+    run_attempt: i64,
     workflow_name: Option<Value>,
     name: Option<Value>,
     conclusion: Option<Value>,
@@ -173,6 +196,12 @@ pub(super) fn inspect_completed_job(body: &[u8]) -> Option<WorkflowJobAdmission>
     })
 }
 
+const _: fn(&[u8]) -> Option<WorkflowJobAdmission> = inspect_completed_job;
+const _: fn(&WorkflowJobAdmission) -> WorkflowRunId = WorkflowJobAdmission::run_id;
+const _: fn(&WorkflowJobAdmission) -> WorkflowRunAttempt = WorkflowJobAdmission::run_attempt;
+const _: fn(&WorkflowJobAdmission) -> WorkflowJobId = WorkflowJobAdmission::job_id;
+const _: fn(&WorkflowJobAdmission) -> usize = WorkflowJobAdmission::step_count;
+
 /// Projects one authenticated completed workflow-job payload into the bounded workflow model.
 ///
 /// # Parameters
@@ -193,9 +222,11 @@ pub(crate) fn project_completed_job(
     received_at: OffsetDateTime,
 ) -> Option<WorkflowJobTrace> {
     let received_at = offset_datetime_to_system_time(received_at)?;
-    let admission = inspect_completed_job(body)?;
     let envelope: WorkflowJobEnvelope = serde_json::from_slice(body).ok()?;
     let WorkflowJobProjection {
+        id,
+        run_id,
+        run_attempt,
         workflow_name,
         name,
         conclusion,
@@ -204,18 +235,17 @@ pub(crate) fn project_completed_job(
         completed_at,
         pull_requests,
         steps,
-        ..
     } = envelope.workflow_job;
 
-    let run_id = admission.run_id();
-    let run_attempt = admission.run_attempt();
-    let job_id = admission.job_id();
+    let run_id = WorkflowRunId::new(run_id).ok()?;
+    let run_attempt = WorkflowRunAttempt::new(run_attempt).ok()?;
+    let job_id = WorkflowJobId::new(id).ok()?;
     let timing = select_job_timing(
         parse_timestamp(started_at.as_ref()),
         parse_timestamp(completed_at.as_ref()),
         received_at,
     );
-    let mut projected_steps = Vec::with_capacity(admission.step_count());
+    let mut projected_steps = Vec::with_capacity(steps.len());
     for step in steps {
         let step_timing = select_step_timing(
             parse_timestamp(step.started_at.as_ref()),
@@ -331,7 +361,7 @@ mod tests {
 
     use super::{
         inspect_completed_job, offset_datetime_to_system_time, project_completed_job,
-        WorkflowJobAdmission,
+        step_count_deserialize_calls, WorkflowJobAdmission,
     };
     use crate::{
         domain::delivery::DeliveryId,
@@ -450,6 +480,28 @@ mod tests {
 
         assert_eq!(admission.step_count(), 2_048);
         assert!(!render_admission(&admission).contains(secret));
+    }
+
+    #[test]
+    fn detailed_projection_does_not_run_admission_deserialization() {
+        let admission_deserialize_calls_before = step_count_deserialize_calls();
+
+        let trace = project_fixture(json!({
+            "workflow_job": {
+                "id": 41,
+                "run_id": 31,
+                "run_attempt": 2,
+                "completed_at": "2026-08-06T10:05:00Z",
+                "steps": [{"number": 1}]
+            }
+        }))
+        .expect("valid completed job projects");
+
+        assert_eq!(trace.steps().len(), 1);
+        assert_eq!(
+            step_count_deserialize_calls(),
+            admission_deserialize_calls_before
+        );
     }
 
     #[test]
