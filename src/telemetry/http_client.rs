@@ -91,6 +91,7 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::TcpListener,
+        sync::Mutex,
         thread,
         time::Duration,
     };
@@ -104,6 +105,21 @@ mod tests {
             http_client::{classify_reqwest_error, ObservingHttpClient},
         },
     };
+
+    #[derive(Debug)]
+    struct ErrorClient(Mutex<Option<HttpError>>);
+
+    #[async_trait::async_trait]
+    impl HttpClient for ErrorClient {
+        async fn send_bytes(&self, _request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
+            Err(self
+                .0
+                .lock()
+                .expect("error-client lock is available")
+                .take()
+                .expect("one error is configured"))
+        }
+    }
 
     #[derive(Debug)]
     struct StaticResponseClient;
@@ -168,6 +184,51 @@ mod tests {
             classify_reqwest_error(&transport),
             TelemetryExportFailureReason::Transport
         );
+    }
+
+    #[tokio::test]
+    async fn send_bytes_records_each_structured_reqwest_failure() {
+        let failures = tokio::task::spawn_blocking(|| {
+            [
+                (
+                    request_error(
+                        Some(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"),
+                        Duration::from_secs(1),
+                    ),
+                    "http_response",
+                ),
+                (
+                    request_error(Some(b""), Duration::from_millis(10)),
+                    "timeout",
+                ),
+                (request_error(None, Duration::from_secs(1)), "transport"),
+            ]
+        })
+        .await
+        .expect("failure fixtures are created");
+
+        for (error, reason) in failures {
+            let metrics = Metrics::new();
+            let client = ObservingHttpClient::new(
+                ErrorClient(Mutex::new(Some(Box::new(error)))),
+                TelemetrySignal::Log,
+                DiagnosticsObserver::new(metrics.clone()),
+            );
+            let request = Request::builder()
+                .uri("http://collector.invalid/v1/logs")
+                .body(Bytes::new())
+                .expect("request is valid");
+
+            assert!(client.send_bytes(request).await.is_err());
+            let sample = format!(
+                "github_telemetry_export_failures_total{{signal=\"log\",reason=\"{reason}\"}} 1"
+            );
+            let exposition = metrics.encode().expect("metrics encode");
+            assert!(
+                exposition.contains(&sample),
+                "missing {sample:?} in:\n{exposition}"
+            );
+        }
     }
 
     #[tokio::test]

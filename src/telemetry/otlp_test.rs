@@ -678,11 +678,12 @@ impl WebhookTraceFixture {
             timeout_millis,
         );
         let output = CapturedOutput::default();
+        let metrics = Metrics::new();
         let (runtime, subscriber) = build_runtime(
             "github_webhook_exporter=info",
             &config,
             output.clone(),
-            Metrics::new(),
+            metrics.clone(),
         )
         .expect("telemetry runtime initializes");
         let span_lifecycles = CapturedSpanLifecycles::default();
@@ -728,6 +729,7 @@ impl WebhookTraceFixture {
                 2_097_152,
                 workflow_job_max_steps,
             )
+            .with_metrics(metrics)
             .with_workflow_trace_emitter(runtime.workflow_trace_emitter()),
         );
         Self {
@@ -3924,6 +3926,67 @@ async fn duplicate_over_limit_workflow_job_records_one_rejection() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collector_outage_is_counted_without_affecting_webhook_or_readiness() {
+    let mut fixture = WebhookTraceFixture::new().await;
+    fixture.receiver.stop().await;
+
+    let ready_before = fixture
+        .request(Method::GET, "/health/ready", None, None, Body::empty())
+        .await;
+    assert_eq!(ready_before.status(), StatusCode::OK);
+    let body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 991,
+            "run_id": 992,
+            "run_attempt": 1,
+            "conclusion": "success",
+            "started_at": "2026-08-07T12:00:00Z",
+            "completed_at": "2026-08-07T12:01:00Z",
+            "steps": []
+        }),
+    );
+    let response = fixture
+        .webhook(
+            &body,
+            "workflow_job",
+            "550e8400-e29b-41d4-a716-446655440799",
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    tracing::dispatcher::with_default(&fixture.dispatch, || {
+        tracing::info!(target: "github_webhook_exporter", "outage-test-log");
+    });
+    tokio::task::block_in_place(|| fixture.runtime.force_flush().expect("providers flush"));
+
+    let ready_after = fixture
+        .request(Method::GET, "/health/ready", None, None, Body::empty())
+        .await;
+    assert_eq!(ready_after.status(), StatusCode::OK);
+    tokio::task::block_in_place(|| {
+        fixture
+            .runtime
+            .force_flush()
+            .expect("readiness trace flushes")
+    });
+    let expected_failures = [
+        ("trace", fixture.runtime.failed_trace_exports()),
+        ("log", fixture.runtime.failed_log_exports()),
+    ];
+    let exposition = fixture.metrics_text().await;
+    for (signal, failures) in expected_failures {
+        assert!(failures > 0, "{signal} export must fail during outage");
+        assert_metric_line(
+            &exposition,
+            &format!(
+                "github_telemetry_export_failures_total{{signal=\"{signal}\",reason=\"transport\"}} {failures}"
+            ),
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocked_collector_does_not_change_completed_workflow_response() {
     const EXPORTER_TIMEOUT_MILLIS: u64 = 10_000;
     const WEBHOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -5143,11 +5206,12 @@ async fn blocked_exporters_preserve_exact_bounds_and_export_otlp_protobuf() {
             .expect("test receiver serves requests");
     });
     let config = telemetry_config(&format!("http://{address}"));
+    let metrics = Metrics::new();
     let (runtime, subscriber) = build_runtime(
         "github_webhook_exporter=info",
         &config,
         io::sink,
-        Metrics::new(),
+        metrics.clone(),
     )
     .expect("telemetry runtime initializes");
     let dispatch = Dispatch::new(subscriber);
@@ -5162,6 +5226,13 @@ async fn blocked_exporters_preserve_exact_bounds_and_export_otlp_protobuf() {
     assert_eq!(runtime.pending_log_records(), QUEUE_CAPACITY);
     assert_eq!(runtime.dropped_trace_records(), expected_drops);
     assert_eq!(runtime.dropped_log_records(), expected_drops);
+    let exposition = metrics.encode().expect("metrics encode");
+    for signal in ["trace", "log"] {
+        let sample = format!(
+            "github_telemetry_dropped_records_total{{signal=\"{signal}\",reason=\"queue_full\"}} {expected_drops}"
+        );
+        assert_metric_line(&exposition, &sample);
+    }
     state
         .release_exports
         .send(true)
@@ -5190,6 +5261,10 @@ async fn blocked_exporters_preserve_exact_bounds_and_export_otlp_protobuf() {
     assert!(keys.contains(&"k8s.pod.name"));
     assert!(keys.contains(&"k8s.namespace.name"));
     assert!(!keys.contains(&"forbidden"));
+    assert!(
+        !format!("{:?}", captures.logs).contains("telemetry pipeline diagnostic"),
+        "direct diagnostics must not recursively enter OTLP logs"
+    );
 
     receiver.abort();
 }

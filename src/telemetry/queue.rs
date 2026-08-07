@@ -365,25 +365,35 @@ pub(super) fn log_processor<E: LogExporter + 'static>(
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{atomic::AtomicU64, Arc, Barrier},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc, Barrier,
+        },
         thread,
+        time::Duration,
     };
 
     use opentelemetry_sdk::error::OTelSdkError;
 
     use crate::{
-        metrics::{Metrics, TelemetrySignal},
+        metrics::{Metrics, TelemetryExportFailureReason, TelemetrySignal},
         telemetry::diagnostics::DiagnosticsObserver,
     };
 
     use super::{observe_export, AdmissionBoundary, AdmissionOutcome};
 
-    fn boundary(capacity: usize) -> AdmissionBoundary {
-        AdmissionBoundary::new(
+    fn boundary_with_metrics(capacity: usize) -> (AdmissionBoundary, Metrics) {
+        let metrics = Metrics::new();
+        let boundary = AdmissionBoundary::new(
             capacity,
             TelemetrySignal::Trace,
-            DiagnosticsObserver::new(Metrics::new()),
-        )
+            DiagnosticsObserver::new(metrics.clone()),
+        );
+        (boundary, metrics)
+    }
+
+    fn boundary(capacity: usize) -> AdmissionBoundary {
+        boundary_with_metrics(capacity).0
     }
 
     #[test]
@@ -451,16 +461,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_failures_are_counted_by_the_application_hook() {
-        let boundary = boundary(1);
+    async fn sdk_export_failures_increment_each_bounded_metric_once() {
+        let (boundary, metrics) = boundary_with_metrics(1);
+        let classified_failures = AtomicU64::new(0);
+        for error in [
+            OTelSdkError::InternalFailure("private failure".to_owned()),
+            OTelSdkError::Timeout(Duration::from_secs(1)),
+            OTelSdkError::AlreadyShutdown,
+        ] {
+            let result =
+                observe_export(&boundary, &classified_failures, async { Err(error) }).await;
+            assert!(result.is_err());
+        }
 
-        let result = observe_export(&boundary, &AtomicU64::new(0), async {
-            Err(OTelSdkError::InternalFailure("private failure".to_owned()))
+        assert_eq!(boundary.failed_exports(), 3);
+        let exposition = metrics.encode().expect("metrics encode");
+        for sample in [
+            "github_telemetry_export_failures_total{signal=\"trace\",reason=\"internal\"} 1",
+            "github_telemetry_export_failures_total{signal=\"trace\",reason=\"timeout\"} 1",
+            "github_telemetry_export_failures_total{signal=\"trace\",reason=\"shutdown\"} 1",
+        ] {
+            assert!(
+                exposition.contains(sample),
+                "missing {sample:?} in:\n{exposition}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_classified_export_failure_is_not_counted_as_internal() {
+        let (boundary, metrics) = boundary_with_metrics(1);
+        let classified_failures = AtomicU64::new(0);
+        let result = observe_export(&boundary, &classified_failures, async {
+            boundary.observer.export_failure(
+                TelemetrySignal::Trace,
+                TelemetryExportFailureReason::Transport,
+            );
+            classified_failures.fetch_add(1, Ordering::Relaxed);
+            Err(OTelSdkError::InternalFailure(
+                "redacted HTTP failure".to_owned(),
+            ))
         })
         .await;
 
         assert!(result.is_err());
         assert_eq!(boundary.failed_exports(), 1);
+        let exposition = metrics.encode().expect("metrics encode");
+        assert!(exposition.contains(
+            "github_telemetry_export_failures_total{signal=\"trace\",reason=\"transport\"} 1"
+        ));
+        assert!(exposition.contains(
+            "github_telemetry_export_failures_total{signal=\"trace\",reason=\"internal\"} 0"
+        ));
     }
 
     #[test]
