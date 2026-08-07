@@ -448,6 +448,107 @@ impl EncodeLabelValue for WorkflowTraceRejectionReason {
     }
 }
 
+/// An OTLP signal with an application-owned bounded pipeline.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum TelemetrySignal {
+    /// OpenTelemetry traces.
+    Trace,
+    /// OpenTelemetry logs.
+    Log,
+}
+
+impl TelemetrySignal {
+    pub(crate) const ALL: [Self; 2] = [Self::Trace, Self::Log];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Log => "log",
+        }
+    }
+}
+
+impl EncodeLabelValue for TelemetrySignal {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> fmt::Result {
+        encoder.write_str(self.as_str())
+    }
+}
+
+/// A normalized OTLP export failure category.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum TelemetryExportFailureReason {
+    /// The collector transport could not complete a request.
+    Transport,
+    /// The export exceeded its configured timeout.
+    Timeout,
+    /// The collector returned a non-success HTTP response.
+    HttpResponse,
+    /// OTLP request or response encoding was invalid.
+    Encoding,
+    /// Export failed during or after pipeline shutdown.
+    Shutdown,
+    /// An application or SDK invariant failed internally.
+    Internal,
+    /// A future failure category outside the fixed vocabulary.
+    Other,
+}
+
+impl TelemetryExportFailureReason {
+    pub(crate) const ALL: [Self; 7] = [
+        Self::Transport,
+        Self::Timeout,
+        Self::HttpResponse,
+        Self::Encoding,
+        Self::Shutdown,
+        Self::Internal,
+        Self::Other,
+    ];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transport => "transport",
+            Self::Timeout => "timeout",
+            Self::HttpResponse => "http_response",
+            Self::Encoding => "encoding",
+            Self::Shutdown => "shutdown",
+            Self::Internal => "internal",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl EncodeLabelValue for TelemetryExportFailureReason {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> fmt::Result {
+        encoder.write_str(self.as_str())
+    }
+}
+
+/// A normalized reason for rejecting a telemetry record.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum TelemetryDropReason {
+    /// The application-owned queue was at capacity.
+    QueueFull,
+    /// The application-owned pipeline no longer accepts records.
+    PipelineClosed,
+}
+
+impl TelemetryDropReason {
+    pub(crate) const ALL: [Self; 2] = [Self::QueueFull, Self::PipelineClosed];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::QueueFull => "queue_full",
+            Self::PipelineClosed => "pipeline_closed",
+        }
+    }
+}
+
+impl EncodeLabelValue for TelemetryDropReason {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> fmt::Result {
+        encoder.write_str(self.as_str())
+    }
+}
+
 impl QueueTransitionFailureReason {
     fn as_str(self) -> &'static str {
         match self {
@@ -543,6 +644,18 @@ struct WorkflowTraceRejectionLabels {
     reason: WorkflowTraceRejectionReason,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct TelemetryExportFailureLabels {
+    signal: TelemetrySignal,
+    reason: TelemetryExportFailureReason,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct TelemetryDropLabels {
+    signal: TelemetrySignal,
+    reason: TelemetryDropReason,
+}
+
 type CounterFamily<L> = Family<L, Counter>;
 type HistogramFamily<L> = Family<L, Histogram, fn() -> Histogram>;
 type RepositoryGauge = Gauge<u64, AtomicU64>;
@@ -572,6 +685,8 @@ struct MetricsInner {
     merge_queue_transition_failures: CounterFamily<QueueTransitionFailureLabels>,
     workflow_job_steps: Histogram,
     workflow_trace_rejections: CounterFamily<WorkflowTraceRejectionLabels>,
+    telemetry_export_failures: CounterFamily<TelemetryExportFailureLabels>,
+    telemetry_dropped_records: CounterFamily<TelemetryDropLabels>,
 }
 
 impl Metrics {
@@ -593,6 +708,8 @@ impl Metrics {
         let merge_queue_transition_failures = CounterFamily::default();
         let workflow_job_steps = Histogram::new(WORKFLOW_JOB_STEP_BUCKETS);
         let workflow_trace_rejections = CounterFamily::default();
+        let telemetry_export_failures = CounterFamily::default();
+        let telemetry_dropped_records = CounterFamily::default();
         let mut registry = Registry::with_prefix("github");
 
         // `prometheus-client` omits a labelled family until it owns at least one metric. Seed only
@@ -662,6 +779,16 @@ impl Metrics {
         let _ = workflow_trace_rejections.get_or_create(&WorkflowTraceRejectionLabels {
             reason: WorkflowTraceRejectionReason::TooManySteps,
         });
+        for signal in TelemetrySignal::ALL {
+            for reason in TelemetryExportFailureReason::ALL {
+                let _ = telemetry_export_failures
+                    .get_or_create(&TelemetryExportFailureLabels { signal, reason });
+            }
+            for reason in TelemetryDropReason::ALL {
+                let _ = telemetry_dropped_records
+                    .get_or_create(&TelemetryDropLabels { signal, reason });
+            }
+        }
 
         registry.register(
             "webhook_requests",
@@ -728,6 +855,16 @@ impl Metrics {
             "Completed workflow-job traces rejected by bounded reason",
             workflow_trace_rejections.clone(),
         );
+        registry.register(
+            "telemetry_export_failures",
+            "OTLP export failures by bounded signal and reason",
+            telemetry_export_failures.clone(),
+        );
+        registry.register(
+            "telemetry_dropped_records",
+            "Telemetry records dropped by bounded signal and reason",
+            telemetry_dropped_records.clone(),
+        );
 
         Self {
             inner: Arc::new(MetricsInner {
@@ -745,6 +882,8 @@ impl Metrics {
                 merge_queue_transition_failures,
                 workflow_job_steps,
                 workflow_trace_rejections,
+                telemetry_export_failures,
+                telemetry_dropped_records,
             }),
         }
     }
@@ -845,6 +984,30 @@ impl Metrics {
         self.inner
             .workflow_trace_rejections
             .get_or_create(&WorkflowTraceRejectionLabels { reason })
+            .inc();
+    }
+
+    /// Increments one bounded OTLP export-failure counter.
+    pub(crate) fn record_telemetry_export_failure(
+        &self,
+        signal: TelemetrySignal,
+        reason: TelemetryExportFailureReason,
+    ) {
+        self.inner
+            .telemetry_export_failures
+            .get_or_create(&TelemetryExportFailureLabels { signal, reason })
+            .inc();
+    }
+
+    /// Increments one bounded telemetry drop counter.
+    pub(crate) fn record_telemetry_drop(
+        &self,
+        signal: TelemetrySignal,
+        reason: TelemetryDropReason,
+    ) {
+        self.inner
+            .telemetry_dropped_records
+            .get_or_create(&TelemetryDropLabels { signal, reason })
             .inc();
     }
 
@@ -990,7 +1153,8 @@ mod tests {
     use super::{
         normalize_action, normalize_event_type, normalize_merge_group_destroyed_reason, Action,
         EventType, FailureStage, MergeGroupAction, MergeGroupReason, MergeQueueCompletion,
-        MergeQueueOutcome, MergeQueueReason, Metrics, QueueTransitionFailureReason, WebhookResult,
+        MergeQueueOutcome, MergeQueueReason, Metrics, QueueTransitionFailureReason,
+        TelemetryDropReason, TelemetryExportFailureReason, TelemetrySignal, WebhookResult,
         WorkflowTraceRejectionReason,
     };
 
@@ -1110,6 +1274,29 @@ mod tests {
             assert!(
                 exposition.contains(expected_sample),
                 "missing sample {expected_sample:?} in:\n{exposition}"
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_diagnostic_families_are_complete_and_exact() {
+        let metrics = Metrics::new();
+        metrics.record_telemetry_export_failure(
+            TelemetrySignal::Trace,
+            TelemetryExportFailureReason::Timeout,
+        );
+        metrics.record_telemetry_drop(TelemetrySignal::Log, TelemetryDropReason::QueueFull);
+
+        let exposition = metrics.encode().expect("metrics encode");
+        for sample in [
+            "github_telemetry_export_failures_total{signal=\"trace\",reason=\"timeout\"} 1",
+            "github_telemetry_dropped_records_total{signal=\"log\",reason=\"queue_full\"} 1",
+            "github_telemetry_export_failures_total{signal=\"log\",reason=\"other\"} 0",
+            "github_telemetry_dropped_records_total{signal=\"trace\",reason=\"pipeline_closed\"} 0",
+        ] {
+            assert!(
+                exposition.contains(sample),
+                "missing {sample:?} in:\n{exposition}"
             );
         }
     }
