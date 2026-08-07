@@ -188,7 +188,7 @@ fn webhook_request_for_event(
 }
 
 async fn response_body(response: Response) -> Vec<u8> {
-    to_bytes(response.into_body(), 16 * 1_024)
+    to_bytes(response.into_body(), 64 * 1_024)
         .await
         .expect("response body is readable")
         .to_vec()

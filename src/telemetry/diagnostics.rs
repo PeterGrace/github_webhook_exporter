@@ -183,8 +183,9 @@ mod tests {
         io,
         sync::{
             atomic::{AtomicU64, Ordering},
-            Arc, Mutex,
+            Arc, Barrier, Mutex,
         },
+        thread,
         time::Duration,
     };
 
@@ -259,6 +260,37 @@ mod tests {
         assert!(metrics.encode().expect("metrics encode").contains(
             "github_telemetry_export_failures_total{signal=\"trace\",reason=\"timeout\"} 4"
         ));
+    }
+
+    #[test]
+    fn concurrent_reports_emit_once_and_account_for_every_suppression() {
+        const REPORTERS: usize = 32;
+        let clock = Arc::new(TestClock::default());
+        let sink = Arc::new(CaptureSink::default());
+        let observer =
+            DiagnosticsObserver::with_dependencies(Metrics::new(), clock.clone(), sink.clone());
+        let barrier = Arc::new(Barrier::new(REPORTERS));
+        let handles: Vec<_> = (0..REPORTERS)
+            .map(|_| {
+                let observer = observer.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    observer.drop_record(TelemetrySignal::Trace, TelemetryDropReason::QueueFull);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("reporter does not panic");
+        }
+
+        assert_eq!(sink.lines().len(), 1);
+        clock.advance(Duration::from_secs(60));
+        observer.drop_record(TelemetrySignal::Trace, TelemetryDropReason::QueueFull);
+        assert_eq!(
+            sink.lines()[1],
+            "telemetry pipeline diagnostic kind=drop signal=trace reason=queue_full suppressed=31\n"
+        );
     }
 
     #[test]

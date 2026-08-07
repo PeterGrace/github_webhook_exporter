@@ -132,15 +132,19 @@ async fn observe_export(
     if let Err(error) = &result {
         boundary.failed_exports.fetch_add(1, Ordering::Relaxed);
         if classified_failures.load(Ordering::Relaxed) == classified_before {
-            let reason = match error {
-                OTelSdkError::AlreadyShutdown => TelemetryExportFailureReason::Shutdown,
-                OTelSdkError::Timeout(_) => TelemetryExportFailureReason::Timeout,
-                OTelSdkError::InternalFailure(_) => TelemetryExportFailureReason::Internal,
-            };
-            boundary.observer.export_failure(boundary.signal, reason);
+            record_sdk_failure(boundary, error);
         }
     }
     result
+}
+
+fn record_sdk_failure(boundary: &AdmissionBoundary, error: &OTelSdkError) {
+    let reason = match error {
+        OTelSdkError::AlreadyShutdown => TelemetryExportFailureReason::Shutdown,
+        OTelSdkError::Timeout(_) => TelemetryExportFailureReason::Timeout,
+        OTelSdkError::InternalFailure(_) => TelemetryExportFailureReason::Internal,
+    };
+    boundary.observer.export_failure(boundary.signal, reason);
 }
 
 #[derive(Debug)]
@@ -164,11 +168,19 @@ impl<E: SpanExporter> SpanExporter for BoundarySpanExporter<E> {
     }
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
-        self.exporter.shutdown_with_timeout(timeout)
+        let result = self.exporter.shutdown_with_timeout(timeout);
+        if let Err(error) = &result {
+            record_sdk_failure(&self.boundary, error);
+        }
+        result
     }
 
     fn force_flush(&self) -> OTelSdkResult {
-        self.exporter.force_flush()
+        let result = self.exporter.force_flush();
+        if let Err(error) = &result {
+            record_sdk_failure(&self.boundary, error);
+        }
+        result
     }
 
     fn set_resource(&mut self, resource: &Resource) {
@@ -269,7 +281,11 @@ impl<E: LogExporter> LogExporter for BoundaryLogExporter<E> {
     }
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
-        self.exporter.shutdown_with_timeout(timeout)
+        let result = self.exporter.shutdown_with_timeout(timeout);
+        if let Err(error) = &result {
+            record_sdk_failure(&self.boundary, error);
+        }
+        result
     }
 
     fn event_enabled(&self, level: Severity, target: &str, name: Option<&str>) -> bool {

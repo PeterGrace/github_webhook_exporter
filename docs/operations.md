@@ -38,12 +38,26 @@ integers:
 
 Invalid requested telemetry configuration fails startup with only the variable name. Collector
 latency or unavailability occurs on dedicated exporter threads and does not change HTTP readiness
-or request results. During this interim phase, drop and export-failure counts are internal hooks
-only: they are not yet exposed through Prometheus or direct stderr diagnostics, so collector
-failure can silently discard remote telemetry. Issue
-[#35](https://github.com/PeterGrace/github_webhook_exporter/issues/35) adds those operator-visible
-counters and diagnostics. Final graceful provider shutdown and application-wide spans are also
-delivered by later Phase 4 work.
+or request results.
+
+Pipeline failures and rejected records are exposed through these local Prometheus families:
+
+- `github_telemetry_export_failures_total{signal,reason}`
+- `github_telemetry_dropped_records_total{signal,reason}`
+
+`signal` is exactly `trace` or `log`. Export-failure `reason` is one of `transport`, `timeout`,
+`http_response`, `encoding`, `shutdown`, `internal`, or `other`. Drop `reason` is `queue_full` or
+`pipeline_closed`. All bounded series exist at zero before the first event. A malformed successful
+collector response is an `encoding` failure; collector response bodies and transport error text are
+never exposed.
+
+Each counter update may also produce a direct stderr line containing only the diagnostic kind,
+signal, reason, and numeric suppression count. This path bypasses `tracing` and OpenTelemetry logs,
+so exporter diagnostics cannot recursively enter the failing log pipeline. Output is limited to one
+line per signal/reason category per monotonic minute. Repeated events still increment Prometheus;
+the next permitted line reports how many local lines were suppressed.
+
+Final graceful provider shutdown remains later Phase 4 work.
 
 ## Exported core traces
 
@@ -150,10 +164,10 @@ repository name and `workflow_job_id`, and can use the delivery UUID to correlat
 delivery records.
 
 Historical spans use the existing bounded non-blocking trace queue. The request path does not wait
-for export or retry collector failures synchronously. Queue drops and export failures are accounted
-for by the telemetry runtime but never change the authenticated `204 No Content` response,
-readiness, generic webhook metrics, or merge-queue state. Collector endpoints and exporter error
-details are not exposed in responses or application logs.
+for export or retry collector failures synchronously. Queue drops and export failures increment the
+bounded telemetry diagnostic counters described above but never change the authenticated
+`204 No Content` response, readiness, generic webhook metrics, or merge-queue state. Collector
+endpoints and exporter error details are not exposed in responses or application logs.
 
 ## Health endpoints
 
