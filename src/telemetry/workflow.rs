@@ -1,5 +1,4 @@
 //! Bounded workflow telemetry values used to project authenticated GitHub Actions history.
-#![allow(dead_code)]
 
 use std::{fmt, time::SystemTime};
 
@@ -584,11 +583,13 @@ impl WorkflowPullRequests {
     }
 
     /// Returns the number of retained pull-request numbers.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
 
     /// Returns whether no pull-request numbers were retained.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -612,7 +613,6 @@ pub(crate) struct WorkflowJobTraceParts {
 }
 
 /// An owned workflow-job trace accepted by the telemetry emitter.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WorkflowJobTrace {
     repository_name: CanonicalRepositoryName,

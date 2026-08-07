@@ -1,5 +1,4 @@
 //! Centralized trace policy for bounded span names, statuses, and identifiers.
-#![allow(dead_code)]
 
 use std::fmt;
 

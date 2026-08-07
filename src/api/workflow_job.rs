@@ -66,7 +66,6 @@ struct WorkflowStepProjection {
 ///
 /// A bounded workflow job trace when the wrapper and required workflow-job identifiers are valid;
 /// otherwise `None`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn project_completed_job(
     body: &[u8],
     repository_name: &CanonicalRepositoryName,
