@@ -71,8 +71,9 @@ events use closed bounded vocabularies.
 
 Repository names and database identifiers, delivery identifiers, pull-request numbers, valid full
 commit SHAs, workflow identifiers, and sanitized workflow names are diagnostic trace span
-attributes only. They are excluded from structured stderr, OTLP application logs, and Prometheus
-exposition.
+attributes only, except for the bounded workflow-job rejection warning documented in
+[Completed workflow traces](#completed-workflow-traces). Outside that narrow exception, they are
+excluded from structured stderr, OTLP application logs, and Prometheus exposition.
 
 Duplicate delivery claims emit an authentication span and a process span with outcome `duplicate`,
 but no second `merge_queue.update` span or specialized outcome. Queue-state persistence failures
@@ -94,8 +95,20 @@ a duplicate, unsupported action, or malformed specialized projection emits no wo
 zero or negative step number rejects the entire specialized projection; it never produces a partial
 root-and-children trace. Admission is at most once: after a delivery claim commits, the service does
 not retry projection or emission for that delivery, including after a process interruption. Generic
-webhook responses and
-metrics retain their normal behavior.
+webhook responses and metrics retain their normal behavior.
+
+`GHE_WORKFLOW_JOB_MAX_STEPS` bounds completed workflow-job admission. It defaults to `256`, accepts
+only integer values in `1..=1024`, and has no unlimited mode. The inclusive limit applies after the
+delivery claim and after the bounded admission pass counts the reported steps in a structurally
+valid job, so a newly claimed over-limit job remains durably claimed and still returns
+authenticated `204 No Content`.
+
+Every structurally valid newly claimed completed job updates the unlabeled histogram
+`github_workflow_job_steps` once with its reported step count, regardless of later acceptance or
+rejection. The histogram buckets are `0`, `5`, `10`, `20`, `40`, `64`, `128`, `256`, `512`, and
+`1024` steps, plus Prometheus `+Inf`. Accepted jobs at or below the inclusive limit emit every
+reported step. Over-limit jobs emit no partial trace and increment
+`github_workflow_job_trace_rejections_total{reason="too_many_steps"}` once.
 
 Each accepted projection creates an independent root named `github.workflow.job`, with a new trace
 identity unrelated to the live `http.request` trace. Every projected step is a direct child named
@@ -103,12 +116,12 @@ identity unrelated to the live `http.request` trace. Every projected step is a d
 a workflow-run root, persist workflow data, correlate jobs across deliveries, or mutate merge-queue
 state for a workflow-job event.
 
-A job uses its exact RFC 3339 `started_at` and `completed_at` values only when both parse and start is
-not after completion; this is marked `timing_source=reported`. Otherwise it is instantaneous at a
+A job uses its exact RFC 3339 `started_at` and `completed_at` values only when both parse and start
+is not after completion; this is marked `timing_source=reported`. Otherwise it is instantaneous at a
 valid completion time, or at the request receipt time when completion is missing or malformed, and
 is marked `timing_source=fallback`. A step uses reported timing only when both values parse, are
-ordered, and lie inside the selected job interval. Every other step interval is instantaneous at
-the selected job end and marked as fallback.
+ordered, and lie inside the selected job interval. Every other step interval is instantaneous at the
+selected job end and marked as fallback.
 
 Conclusions are normalized to `success`, `failure`, `cancelled`, `skipped`, `timed_out`, `neutral`,
 or `other`. The CI/CD result is respectively `success`, `failure`, `cancellation`, `skip`, or
@@ -125,11 +138,16 @@ string under both `github.workflow.job.id` and the root's `cicd.pipeline.task.ru
 display names are span-only. Sanitization removes all Unicode control characters, retains at most
 the first 128 remaining Unicode scalar values, and omits an empty result.
 
-Commands, output, logs, actors or other user data, raw or derived URLs, request bodies and arbitrary
-payload fragments, secrets, signatures, authorization and other headers, unsupported actions, and
-raw unknown conclusions are not represented in workflow telemetry. They do not enter OTLP traces,
-OTLP logs, structured stderr, or Prometheus exposition. Approved identifiers and sanitized names
-enter spans only.
+Commands, output, logs, actors or other user data, raw or derived URLs, request bodies and
+arbitrary payload fragments, secrets, signatures, authorization and other headers, unsupported
+actions, and raw unknown conclusions are not represented in workflow telemetry. They do not enter
+OTLP traces, OTLP logs, structured stderr, or Prometheus exposition. Approved identifiers and
+sanitized names enter spans only, except for one parentless structured warning on a newly claimed
+`too_many_steps` rejection. That warning may contain only `repository_name`, `delivery_id`,
+`workflow_run_id`, `workflow_run_attempt`, `workflow_job_id`, `step_count`, and `step_limit`.
+Operators can query `GET /repos/{owner}/{repo}/actions/jobs/{job_id}` with the canonical
+repository name and `workflow_job_id`, and can use the delivery UUID to correlate GitHub webhook
+delivery records.
 
 Historical spans use the existing bounded non-blocking trace queue. The request path does not wait
 for export or retry collector failures synchronously. Queue drops and export failures are accounted
