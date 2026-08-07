@@ -3,7 +3,7 @@ use std::{
     ffi::OsString,
     io::{self, Write},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU16, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
 };
@@ -186,6 +186,7 @@ struct Captures {
 
 struct ReceiverState {
     captures: Mutex<Captures>,
+    response_status: AtomicU16,
     started_requests: AtomicUsize,
     request_started: Notify,
     release_exports: watch::Sender<bool>,
@@ -214,7 +215,7 @@ async fn receive_traces(
         .traces
         .push(request);
     wait_until_released(&state).await;
-    protobuf_response()
+    collector_response(&state)
 }
 
 async fn receive_logs(
@@ -231,7 +232,7 @@ async fn receive_logs(
         .logs
         .push(request);
     wait_until_released(&state).await;
-    protobuf_response()
+    collector_response(&state)
 }
 
 fn validate_headers(headers: &HeaderMap) {
@@ -261,12 +262,15 @@ async fn wait_until_released(state: &ReceiverState) {
     }
 }
 
-fn protobuf_response() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [(CONTENT_TYPE, "application/x-protobuf")],
-        Bytes::new(),
-    )
+fn collector_response(state: &ReceiverState) -> impl IntoResponse {
+    let status = StatusCode::from_u16(state.response_status.load(Ordering::Acquire))
+        .expect("configured collector status is valid");
+    let body = if status.is_success() {
+        Bytes::new()
+    } else {
+        Bytes::from_static(b"collector-secret-response-body")
+    };
+    (status, [(CONTENT_TYPE, "application/x-protobuf")], body)
 }
 
 fn telemetry_config(endpoint: &str) -> TelemetryConfig {
@@ -373,6 +377,7 @@ impl RunningReceiver {
         let (release_exports, _) = watch::channel(true);
         let state = Arc::new(ReceiverState {
             captures: Mutex::new(Captures::default()),
+            response_status: AtomicU16::new(StatusCode::OK.as_u16()),
             started_requests: AtomicUsize::new(0),
             request_started: Notify::new(),
             release_exports,
@@ -439,6 +444,12 @@ impl RunningReceiver {
 
     fn set_exports_released(&self, released: bool) {
         self.state.release_exports.send_replace(released);
+    }
+
+    fn set_response_status(&self, status: StatusCode) {
+        self.state
+            .response_status
+            .store(status.as_u16(), Ordering::Release);
     }
 
     fn started_request_count(&self) -> usize {
@@ -3987,6 +3998,70 @@ async fn collector_outage_is_counted_without_affecting_webhook_or_readiness() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collector_http_failure_is_classified_without_exposing_response_body() {
+    let fixture = WebhookTraceFixture::new().await;
+    fixture
+        .receiver
+        .set_response_status(StatusCode::SERVICE_UNAVAILABLE);
+
+    let body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 993,
+            "run_id": 994,
+            "run_attempt": 1,
+            "conclusion": "success",
+            "started_at": "2026-08-07T13:00:00Z",
+            "completed_at": "2026-08-07T13:01:00Z",
+            "steps": []
+        }),
+    );
+    let response = fixture
+        .webhook(
+            &body,
+            "workflow_job",
+            "550e8400-e29b-41d4-a716-446655440798",
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    tracing::dispatcher::with_default(&fixture.dispatch, || {
+        tracing::info!(target: "github_webhook_exporter", "http-failure-test-log");
+    });
+    let ready = fixture
+        .request(Method::GET, "/health/ready", None, None, Body::empty())
+        .await;
+    assert_eq!(ready.status(), StatusCode::OK);
+    tokio::task::block_in_place(|| fixture.runtime.force_flush().expect("providers flush"));
+
+    let expected_failures = [
+        ("trace", fixture.runtime.failed_trace_exports()),
+        ("log", fixture.runtime.failed_log_exports()),
+    ];
+    let exposition = fixture.metrics_text().await;
+    for (signal, failures) in expected_failures {
+        assert!(failures > 0, "{signal} export must receive HTTP 503");
+        assert_metric_line(
+            &exposition,
+            &format!(
+                "github_telemetry_export_failures_total{{signal=\"{signal}\",reason=\"http_response\"}} {failures}"
+            ),
+        );
+        assert_metric_line(
+            &exposition,
+            &format!(
+                "github_telemetry_export_failures_total{{signal=\"{signal}\",reason=\"encoding\"}} 0"
+            ),
+        );
+    }
+    assert!(!exposition.contains("collector-secret-response-body"));
+    assert!(!fixture
+        .output
+        .text()
+        .contains("collector-secret-response-body"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocked_collector_does_not_change_completed_workflow_response() {
     const EXPORTER_TIMEOUT_MILLIS: u64 = 10_000;
     const WEBHOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -5186,6 +5261,7 @@ async fn blocked_exporters_preserve_exact_bounds_and_export_otlp_protobuf() {
     let (release_exports, _) = watch::channel(false);
     let state = Arc::new(ReceiverState {
         captures: Mutex::new(Captures::default()),
+        response_status: AtomicU16::new(StatusCode::OK.as_u16()),
         started_requests: AtomicUsize::new(0),
         request_started: Notify::new(),
         release_exports,

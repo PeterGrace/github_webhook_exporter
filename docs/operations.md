@@ -57,6 +57,14 @@ so exporter diagnostics cannot recursively enter the failing log pipeline. Outpu
 line per signal/reason category per monotonic minute. Repeated events still increment Prometheus;
 the next permitted line reports how many local lines were suppressed.
 
+Alert on sustained increases in
+`github_telemetry_export_failures_total{reason=~"transport|timeout|http_response"}` because they
+indicate collector reachability, latency, or response failures. `encoding` and `internal` should be
+investigated as compatibility or implementation faults; unexpected `shutdown` indicates lifecycle
+misordering. A rising `github_telemetry_dropped_records_total{reason="queue_full"}` is primarily a
+capacity/tuning signal under load, while `pipeline_closed` before planned shutdown indicates
+incorrect producer lifecycle ordering.
+
 Final graceful provider shutdown remains later Phase 4 work.
 
 ## Exported core traces

@@ -127,6 +127,7 @@ async fn observe_export(
     classified_failures: &AtomicU64,
     export: impl Future<Output = OTelSdkResult>,
 ) -> OTelSdkResult {
+    // A sequence change means the HTTP layer classified at least one attempt in this export future.
     let classified_before = classified_failures.load(Ordering::Relaxed);
     let result = export.await;
     if let Err(error) = &result {
