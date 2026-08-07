@@ -59,7 +59,7 @@ use tracing::{
     Dispatch, Instrument, Subscriber,
 };
 
-use crate::config::TelemetryConfig;
+use crate::{config::TelemetryConfig, metrics::Metrics};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use super::{build_runtime, trace, TelemetryState};
@@ -471,9 +471,13 @@ impl RepositoryTraceFixture {
         let receiver = RunningReceiver::start_released().await;
         let config = telemetry_config_with_queue_capacity(&receiver.endpoint(), 128);
         let output = CapturedOutput::default();
-        let (runtime, subscriber) =
-            build_runtime("github_webhook_exporter=info", &config, output.clone())
-                .expect("telemetry runtime initializes");
+        let (runtime, subscriber) = build_runtime(
+            "github_webhook_exporter=info",
+            &config,
+            output.clone(),
+            Metrics::new(),
+        )
+        .expect("telemetry runtime initializes");
         let dispatch = Dispatch::new(subscriber);
         let directory = tempfile::tempdir().expect("temporary directory is created");
         let pool = open_database(&directory.path().join("repository-trace.db"))
@@ -674,9 +678,13 @@ impl WebhookTraceFixture {
             timeout_millis,
         );
         let output = CapturedOutput::default();
-        let (runtime, subscriber) =
-            build_runtime("github_webhook_exporter=info", &config, output.clone())
-                .expect("telemetry runtime initializes");
+        let (runtime, subscriber) = build_runtime(
+            "github_webhook_exporter=info",
+            &config,
+            output.clone(),
+            Metrics::new(),
+        )
+        .expect("telemetry runtime initializes");
         let span_lifecycles = CapturedSpanLifecycles::default();
         let dispatch = Dispatch::new(subscriber.with(span_lifecycles.clone()));
         let directory = tempfile::tempdir().expect("temporary directory is created");
@@ -1696,9 +1704,13 @@ mod sqlite {
                 &receiver.endpoint(),
                 SQLITE_TRACE_QUEUE_CAPACITY,
             );
-            let (runtime, subscriber) =
-                build_runtime("github_webhook_exporter=info", &config, io::sink)
-                    .expect("telemetry runtime initializes");
+            let (runtime, subscriber) = build_runtime(
+                "github_webhook_exporter=info",
+                &config,
+                io::sink,
+                Metrics::new(),
+            )
+            .expect("telemetry runtime initializes");
             let dispatch = Dispatch::new(subscriber);
             let directory = tempfile::tempdir().expect("temporary directory is created");
             let database_path = directory.path().join("sqlite-trace.db");
@@ -4813,9 +4825,13 @@ mod retention {
                 &receiver.endpoint(),
                 RETENTION_TRACE_QUEUE_CAPACITY,
             );
-            let (runtime, subscriber) =
-                build_runtime("github_webhook_exporter=info", &config, writer)
-                    .expect("telemetry runtime initializes");
+            let (runtime, subscriber) = build_runtime(
+                "github_webhook_exporter=info",
+                &config,
+                writer,
+                Metrics::new(),
+            )
+            .expect("telemetry runtime initializes");
             let dispatch = Dispatch::new(subscriber);
             let directory = tempfile::tempdir().expect("temporary directory is created");
             let database_path = directory.path().join("retention-trace.db");
@@ -5127,8 +5143,13 @@ async fn blocked_exporters_preserve_exact_bounds_and_export_otlp_protobuf() {
             .expect("test receiver serves requests");
     });
     let config = telemetry_config(&format!("http://{address}"));
-    let (runtime, subscriber) = build_runtime("github_webhook_exporter=info", &config, io::sink)
-        .expect("telemetry runtime initializes");
+    let (runtime, subscriber) = build_runtime(
+        "github_webhook_exporter=info",
+        &config,
+        io::sink,
+        Metrics::new(),
+    )
+    .expect("telemetry runtime initializes");
     let dispatch = Dispatch::new(subscriber);
 
     emit_records(&dispatch, 0..1);

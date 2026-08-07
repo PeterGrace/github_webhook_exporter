@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::{future::Future, sync::Arc, time::Duration};
 
 use opentelemetry::{logs::Severity, Context, InstrumentationScope};
@@ -15,31 +15,55 @@ use opentelemetry_sdk::{
     Resource,
 };
 
+use crate::metrics::{TelemetryDropReason, TelemetrySignal};
+use crate::telemetry::diagnostics::DiagnosticsObserver;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AdmissionOutcome {
+    Admitted,
+    QueueFull,
+    PipelineClosed,
+}
+
 #[derive(Debug)]
 pub(super) struct AdmissionBoundary {
     capacity: usize,
     pending: AtomicUsize,
     dropped: AtomicU64,
     failed_exports: AtomicU64,
+    closed: AtomicBool,
+    signal: TelemetrySignal,
+    observer: DiagnosticsObserver,
 }
 
 impl AdmissionBoundary {
-    pub(super) fn new(capacity: usize) -> Self {
+    pub(super) fn new(
+        capacity: usize,
+        signal: TelemetrySignal,
+        observer: DiagnosticsObserver,
+    ) -> Self {
         debug_assert!(capacity > 0);
         Self {
             capacity,
             pending: AtomicUsize::new(0),
             dropped: AtomicU64::new(0),
             failed_exports: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            signal,
+            observer,
         }
     }
 
-    pub(super) fn try_admit(&self) -> bool {
+    pub(super) fn try_admit(&self) -> AdmissionOutcome {
+        if self.closed.load(Ordering::Acquire) {
+            self.record_drop(TelemetryDropReason::PipelineClosed);
+            return AdmissionOutcome::PipelineClosed;
+        }
         let mut pending = self.pending.load(Ordering::Acquire);
         loop {
             if pending >= self.capacity {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-                return false;
+                self.record_drop(TelemetryDropReason::QueueFull);
+                return AdmissionOutcome::QueueFull;
             }
             match self.pending.compare_exchange_weak(
                 pending,
@@ -47,10 +71,26 @@ impl AdmissionBoundary {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    if self.closed.load(Ordering::Acquire) {
+                        self.release(1);
+                        self.record_drop(TelemetryDropReason::PipelineClosed);
+                        return AdmissionOutcome::PipelineClosed;
+                    }
+                    return AdmissionOutcome::Admitted;
+                }
                 Err(observed) => pending = observed,
             }
         }
+    }
+
+    fn record_drop(&self, reason: TelemetryDropReason) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        self.observer.drop_record(self.signal, reason);
+    }
+
+    pub(super) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
     }
 
     pub(super) fn release(&self, count: usize) {
@@ -133,7 +173,7 @@ impl SpanProcessor for BoundarySpanProcessor {
     }
 
     fn on_end(&self, span: SpanData) {
-        if self.boundary.try_admit() {
+        if self.boundary.try_admit() == AdmissionOutcome::Admitted {
             self.processor.on_end(span);
         }
     }
@@ -143,6 +183,7 @@ impl SpanProcessor for BoundarySpanProcessor {
     }
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.boundary.close();
         self.processor.shutdown_with_timeout(timeout)
     }
 
@@ -162,8 +203,13 @@ pub(super) fn span_processor<E: SpanExporter + 'static>(
     exporter: E,
     capacity: usize,
     batch_size: usize,
+    observer: DiagnosticsObserver,
 ) -> (BoundarySpanProcessor, Arc<AdmissionBoundary>) {
-    let boundary = Arc::new(AdmissionBoundary::new(capacity));
+    let boundary = Arc::new(AdmissionBoundary::new(
+        capacity,
+        TelemetrySignal::Trace,
+        observer,
+    ));
     let exporter = BoundarySpanExporter {
         exporter,
         boundary: Arc::clone(&boundary),
@@ -221,7 +267,7 @@ pub(super) struct BoundaryLogProcessor {
 
 impl LogProcessor for BoundaryLogProcessor {
     fn emit(&self, record: &mut SdkLogRecord, scope: &InstrumentationScope) {
-        if self.boundary.try_admit() {
+        if self.boundary.try_admit() == AdmissionOutcome::Admitted {
             self.processor.emit(record, scope);
         }
     }
@@ -231,6 +277,7 @@ impl LogProcessor for BoundaryLogProcessor {
     }
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.boundary.close();
         self.processor.shutdown_with_timeout(timeout)
     }
 
@@ -248,8 +295,13 @@ pub(super) fn log_processor<E: LogExporter + 'static>(
     exporter: E,
     capacity: usize,
     batch_size: usize,
+    observer: DiagnosticsObserver,
 ) -> (BoundaryLogProcessor, Arc<AdmissionBoundary>) {
-    let boundary = Arc::new(AdmissionBoundary::new(capacity));
+    let boundary = Arc::new(AdmissionBoundary::new(
+        capacity,
+        TelemetrySignal::Log,
+        observer,
+    ));
     let exporter = BoundaryLogExporter {
         exporter,
         boundary: Arc::clone(&boundary),
@@ -279,25 +331,53 @@ mod tests {
 
     use opentelemetry_sdk::error::OTelSdkError;
 
-    use super::{observe_export, AdmissionBoundary};
+    use crate::{
+        metrics::{Metrics, TelemetrySignal},
+        telemetry::diagnostics::DiagnosticsObserver,
+    };
+
+    use super::{observe_export, AdmissionBoundary, AdmissionOutcome};
+
+    fn boundary(capacity: usize) -> AdmissionBoundary {
+        AdmissionBoundary::new(
+            capacity,
+            TelemetrySignal::Trace,
+            DiagnosticsObserver::new(Metrics::new()),
+        )
+    }
+
+    #[test]
+    fn closed_admission_is_counted_as_pipeline_closed() {
+        let metrics = Metrics::new();
+        let observer = DiagnosticsObserver::new(metrics.clone());
+        let boundary = AdmissionBoundary::new(2, TelemetrySignal::Trace, observer);
+
+        boundary.close();
+
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::PipelineClosed);
+        assert_eq!(boundary.dropped(), 1);
+        assert!(metrics.encode().expect("metrics encode").contains(
+            "github_telemetry_dropped_records_total{signal=\"trace\",reason=\"pipeline_closed\"} 1"
+        ));
+    }
 
     #[test]
     fn admission_capacity_is_exact_and_released_batches_restore_space() {
-        let boundary = AdmissionBoundary::new(3);
+        let boundary = boundary(3);
 
-        assert!(boundary.try_admit());
-        assert!(boundary.try_admit());
-        assert!(boundary.try_admit());
-        assert!(!boundary.try_admit());
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::Admitted);
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::Admitted);
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::Admitted);
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::QueueFull);
         assert_eq!(boundary.pending(), 3);
         assert_eq!(boundary.dropped(), 1);
 
         boundary.release(2);
 
         assert_eq!(boundary.pending(), 1);
-        assert!(boundary.try_admit());
-        assert!(boundary.try_admit());
-        assert!(!boundary.try_admit());
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::Admitted);
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::Admitted);
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::QueueFull);
         assert_eq!(boundary.pending(), 3);
         assert_eq!(boundary.dropped(), 2);
     }
@@ -306,7 +386,7 @@ mod tests {
     fn concurrent_admission_never_exceeds_capacity() {
         const CAPACITY: usize = 8;
         const CONTENDERS: usize = 64;
-        let boundary = Arc::new(AdmissionBoundary::new(CAPACITY));
+        let boundary = Arc::new(boundary(CAPACITY));
         let barrier = Arc::new(Barrier::new(CONTENDERS));
         let handles: Vec<_> = (0..CONTENDERS)
             .map(|_| {
@@ -322,7 +402,7 @@ mod tests {
         let admitted = handles
             .into_iter()
             .map(|handle| handle.join().expect("admission thread does not panic"))
-            .filter(|admitted| *admitted)
+            .filter(|outcome| *outcome == AdmissionOutcome::Admitted)
             .count();
 
         assert_eq!(admitted, CAPACITY);
@@ -332,7 +412,7 @@ mod tests {
 
     #[tokio::test]
     async fn export_failures_are_counted_by_the_application_hook() {
-        let boundary = AdmissionBoundary::new(1);
+        let boundary = boundary(1);
 
         let result = observe_export(&boundary, async {
             Err(OTelSdkError::InternalFailure("private failure".to_owned()))
@@ -345,13 +425,13 @@ mod tests {
 
     #[test]
     fn releasing_more_than_pending_saturates_at_zero() {
-        let boundary = AdmissionBoundary::new(2);
-        assert!(boundary.try_admit());
+        let boundary = boundary(2);
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::Admitted);
 
         boundary.release(2);
 
         assert_eq!(boundary.pending(), 0);
-        assert!(boundary.try_admit());
-        assert!(boundary.try_admit());
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::Admitted);
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::Admitted);
     }
 }

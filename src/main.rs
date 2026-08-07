@@ -31,7 +31,7 @@ async fn main() -> ExitCode {
 async fn run() -> Result<()> {
     let config = RuntimeConfig::from_env().context("failed to load runtime configuration")?;
     let metrics = Metrics::new();
-    let telemetry_runtime = telemetry::init(config.rust_log(), config.telemetry())
+    let telemetry_runtime = telemetry::init(config.rust_log(), config.telemetry(), metrics.clone())
         .context("failed to initialize telemetry")?;
 
     let pool = storage::open_database(config.database_path())

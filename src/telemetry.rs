@@ -1,5 +1,6 @@
 use std::{io, sync::Arc};
 
+mod diagnostics;
 #[cfg(test)]
 mod otlp_test;
 mod queue;
@@ -28,7 +29,11 @@ use tracing_subscriber::{
     EnvFilter, Registry,
 };
 
-use crate::config::{ExporterSettings, TelemetryConfig};
+use crate::{
+    config::{ExporterSettings, TelemetryConfig},
+    metrics::Metrics,
+};
+use diagnostics::DiagnosticsObserver;
 use queue::AdmissionBoundary;
 
 const INSTRUMENTATION_SCOPE: &str = "github_webhook_exporter";
@@ -152,8 +157,12 @@ pub enum TelemetryError {
 ///
 /// Returns [`TelemetryError`] when the tracing filter or an exporter is invalid, or when another
 /// global subscriber has already been installed. Errors contain no endpoint or header values.
-pub fn init(rust_log: &str, config: &TelemetryConfig) -> Result<TelemetryRuntime, TelemetryError> {
-    let (runtime, subscriber) = build_runtime(rust_log, config, io::stderr)?;
+pub fn init(
+    rust_log: &str,
+    config: &TelemetryConfig,
+    metrics: Metrics,
+) -> Result<TelemetryRuntime, TelemetryError> {
+    let (runtime, subscriber) = build_runtime(rust_log, config, io::stderr, metrics)?;
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|_| TelemetryError::AlreadyInitialized)?;
     Ok(runtime)
@@ -176,16 +185,18 @@ fn build_runtime<W>(
     rust_log: &str,
     config: &TelemetryConfig,
     writer: W,
+    metrics: Metrics,
 ) -> Result<(TelemetryRuntime, impl Subscriber + Send + Sync), TelemetryError>
 where
     W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
 {
     let filter = EnvFilter::try_new(rust_log).map_err(|_| TelemetryError::InvalidFilter)?;
     let resource = telemetry_resource(config);
+    let observer = DiagnosticsObserver::new(metrics);
     let (tracer_provider, trace_tracer, workflow_trace_emitter, trace_queue) = config
         .trace_exporter
         .as_ref()
-        .map(|settings| build_trace_provider(settings, config, &resource))
+        .map(|settings| build_trace_provider(settings, config, &resource, observer.clone()))
         .transpose()?
         .map_or(
             (None, None, WorkflowTraceEmitter::disabled(), None),
@@ -201,7 +212,7 @@ where
     let (logger_provider, log_queue) = config
         .log_exporter
         .as_ref()
-        .map(|settings| build_log_provider(settings, config, &resource))
+        .map(|settings| build_log_provider(settings, config, &resource, observer.clone()))
         .transpose()?
         .map_or((None, None), |(provider, queue)| {
             (Some(provider), Some(queue))
@@ -251,6 +262,7 @@ fn build_trace_provider(
     settings: &ExporterSettings,
     config: &TelemetryConfig,
     resource: &Resource,
+    observer: DiagnosticsObserver,
 ) -> Result<(SdkTracerProvider, SdkTracer, Arc<AdmissionBoundary>), TelemetryError> {
     let exporter = OtlpSpanExporter::builder()
         .with_http()
@@ -259,8 +271,12 @@ fn build_trace_provider(
         .with_headers(settings.headers())
         .build()
         .map_err(|_| TelemetryError::TraceExporter)?;
-    let (processor, queue) =
-        queue::span_processor(exporter, config.queue_capacity(), config.batch_size());
+    let (processor, queue) = queue::span_processor(
+        exporter,
+        config.queue_capacity(),
+        config.batch_size(),
+        observer,
+    );
     let provider = SdkTracerProvider::builder()
         .with_resource(resource.clone())
         .with_span_processor(processor)
@@ -273,6 +289,7 @@ fn build_log_provider(
     settings: &ExporterSettings,
     config: &TelemetryConfig,
     resource: &Resource,
+    observer: DiagnosticsObserver,
 ) -> Result<(SdkLoggerProvider, Arc<AdmissionBoundary>), TelemetryError> {
     let exporter = OtlpLogExporter::builder()
         .with_http()
@@ -281,8 +298,12 @@ fn build_log_provider(
         .with_headers(settings.headers())
         .build()
         .map_err(|_| TelemetryError::LogExporter)?;
-    let (processor, queue) =
-        queue::log_processor(exporter, config.queue_capacity(), config.batch_size());
+    let (processor, queue) = queue::log_processor(
+        exporter,
+        config.queue_capacity(),
+        config.batch_size(),
+        observer,
+    );
     let provider = SdkLoggerProvider::builder()
         .with_resource(resource.clone())
         .with_log_processor(processor)
@@ -344,7 +365,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use crate::config::TelemetryConfig;
+    use crate::{config::TelemetryConfig, metrics::Metrics};
 
     use super::{build_runtime, build_subscriber, is_application_target, TelemetryState};
 
@@ -409,9 +430,13 @@ mod tests {
     fn disabled_runtime_preserves_structured_stderr() {
         let output = SharedWriter::default();
         let config = telemetry_config(&[]);
-        let (runtime, subscriber) =
-            build_runtime("github_webhook_exporter=info", &config, output.clone())
-                .expect("disabled runtime builds");
+        let (runtime, subscriber) = build_runtime(
+            "github_webhook_exporter=info",
+            &config,
+            output.clone(),
+            Metrics::new(),
+        )
+        .expect("disabled runtime builds");
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(target: "github_webhook_exporter", "local-disabled-event");
@@ -430,9 +455,13 @@ mod tests {
             ("GHE_OTEL_QUEUE_CAPACITY", "4"),
             ("GHE_OTEL_BATCH_SIZE", "1"),
         ]);
-        let (runtime, subscriber) =
-            build_runtime("github_webhook_exporter=info", &config, output.clone())
-                .expect("enabled runtime builds");
+        let (runtime, subscriber) = build_runtime(
+            "github_webhook_exporter=info",
+            &config,
+            output.clone(),
+            Metrics::new(),
+        )
+        .expect("enabled runtime builds");
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(target: "github_webhook_exporter", "local-enabled-event");
