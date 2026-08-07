@@ -91,6 +91,30 @@ const PRIVACY_RETENTION_DELIVERY: &str = "71000000-0000-4000-8000-000000000006";
 const PRIVACY_QUEUE_FAILURE_DELIVERY: &str = "71000000-0000-4000-8000-000000000007";
 const PRIVACY_RETENTION_PR_NUMBER: i64 = PRIVACY_PR_NUMBER + 1;
 const PRIVACY_QUEUE_FAILURE_PR_NUMBER: i64 = PRIVACY_PR_NUMBER + 2;
+const WORKFLOW_PRIVACY_DELIVERY: &str = "71000000-0000-4000-8000-000000000008";
+const WORKFLOW_PRIVACY_RUN_ID: i64 = 8_123_456_789_013;
+const WORKFLOW_PRIVACY_RUN_ATTEMPT: i64 = 8_123_456_789_014;
+const WORKFLOW_PRIVACY_JOB_ID: i64 = 8_123_456_789_015;
+const WORKFLOW_PRIVACY_PR_NUMBERS: &[i64] = &[812_345_671, 812_345_672];
+const WORKFLOW_PRIVACY_STEP_NUMBER: i64 = 73;
+const WORKFLOW_PRIVACY_SHA: &str = "fedcba9876543210fedcba9876543210fedcba98";
+const WORKFLOW_RAW_NAME: &str = "task6-workflow\nname-sentinel";
+const WORKFLOW_SANITIZED_NAME: &str = "task6-workflowname-sentinel";
+const WORKFLOW_RAW_JOB_NAME: &str = "task6-job\tname-sentinel";
+const WORKFLOW_SANITIZED_JOB_NAME: &str = "task6-jobname-sentinel";
+const WORKFLOW_RAW_STEP_NAME: &str = "task6-step\rname-sentinel";
+const WORKFLOW_SANITIZED_STEP_NAME: &str = "task6-stepname-sentinel";
+const WORKFLOW_FORBIDDEN_COMMAND: &str = "task6-forbidden-command-sentinel";
+const WORKFLOW_FORBIDDEN_OUTPUT: &str = "task6-forbidden-output-sentinel";
+const WORKFLOW_FORBIDDEN_LOG: &str = "task6-forbidden-log-sentinel";
+const WORKFLOW_FORBIDDEN_ACTOR: &str = "task6-forbidden-actor-sentinel";
+const WORKFLOW_FORBIDDEN_URL: &str = "https://task6-forbidden-url.invalid/private";
+const WORKFLOW_FORBIDDEN_SECRET: &str = "task6-forbidden-secret-sentinel";
+const WORKFLOW_FORBIDDEN_SIGNATURE: &str =
+    "sha256=6666666666666666666666666666666666666666666666666666666666666666";
+const WORKFLOW_FORBIDDEN_HEADER: &str = "x-task6-private=forbidden-header-sentinel";
+const WORKFLOW_FORBIDDEN_FRAGMENT: &str = "task6-forbidden-raw-payload-fragment-sentinel";
+const WORKFLOW_UNKNOWN_CONCLUSION: &str = "task6-forbidden-unknown-conclusion-sentinel";
 
 const RESOURCE_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "service.name",
@@ -132,12 +156,19 @@ const SPAN_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "db.operation.name",
 ];
 const SPAN_EVENT_ALLOWLIST: &[(&str, &[&str])] = &[("operation.failure", &["ghe.failure.reason"])];
-const SPAN_ONLY_IDENTIFIER_ATTRIBUTE_KEYS: &[&str] = &[
+const SPAN_ONLY_ATTRIBUTE_KEYS: &[&str] = &[
+    "cicd.pipeline.name",
+    "cicd.pipeline.run.id",
+    "cicd.pipeline.task.name",
+    "cicd.pipeline.task.run.id",
     "github.repository.name",
     "github.repository.id",
     "github.delivery.id",
     "github.pull_request.number",
     "github.commit.sha",
+    "github.workflow.run.id",
+    "github.workflow.run.attempt",
+    "github.workflow.job.id",
 ];
 
 #[derive(Default)]
@@ -747,6 +778,29 @@ impl WebhookTraceFixture {
         CapturedSpans::from_requests(traces, logs)
     }
 
+    fn finish_without_force_flush(self) -> String {
+        let Self {
+            _otlp_guard,
+            receiver,
+            runtime,
+            dispatch,
+            output,
+            span_lifecycles: _,
+            router,
+            pool,
+            _directory,
+        } = self;
+        drop(router);
+        drop(pool);
+        drop(dispatch);
+        drop(_directory);
+        let stderr = output.text();
+        drop(runtime);
+        drop(receiver);
+        drop(_otlp_guard);
+        stderr
+    }
+
     fn finish(self) -> (CapturedSpans, String) {
         // Destructuring permits the request-serving resources to drop before the providers flush,
         // so completed failure-path spans cannot remain owned by the in-process router or pool.
@@ -879,9 +933,19 @@ impl CapturedSpans {
             .flat_map(|record| record.attributes.iter())
     }
 
+    fn has_trace_attribute_key(&self, key: &str) -> bool {
+        self.trace_attributes()
+            .any(|attribute| attribute.key == key)
+    }
+
     fn has_trace_i64_attribute(&self, key: &str, value: i64) -> bool {
         self.trace_attributes()
             .any(|attribute| i64_key_value(attribute, key) == Some(value))
+    }
+
+    fn has_trace_i64_array_attribute(&self, key: &str, values: &[i64]) -> bool {
+        self.trace_attributes()
+            .any(|attribute| i64_array_key_value(attribute, key) == Some(values.to_vec()))
     }
 
     fn has_log_i64_attribute(&self, key: &str, value: i64) -> bool {
@@ -894,9 +958,17 @@ impl CapturedSpans {
             .any(|attribute| i64_key_value(attribute, &attribute.key) == Some(value))
     }
 
-    fn has_log_i64_value(&self, value: i64) -> bool {
+    fn has_log_i64_array_attribute(&self, key: &str, values: &[i64]) -> bool {
         self.log_attributes()
-            .any(|attribute| i64_key_value(attribute, &attribute.key) == Some(value))
+            .any(|attribute| i64_array_key_value(attribute, key) == Some(values.to_vec()))
+    }
+
+    fn has_log_i64_value(&self, value: i64) -> bool {
+        self.log_attributes().any(|attribute| {
+            i64_key_value(attribute, &attribute.key) == Some(value)
+                || i64_array_key_value(attribute, &attribute.key)
+                    .is_some_and(|values| values.contains(&value))
+        })
     }
 
     fn has_trace_string_attribute(&self, key: &str, value: &str) -> bool {
@@ -1190,39 +1262,43 @@ fn i64_attribute(span: &Span, key: &str) -> Option<i64> {
 }
 
 fn i64_array_attribute(span: &Span, key: &str) -> Option<Vec<i64>> {
-    span.attributes.iter().find_map(|attribute| {
-        if attribute.key != key {
-            return None;
-        }
-        let values = attribute
-            .value
-            .as_ref()
-            .and_then(|value| match value.value.as_ref() {
-                Some(AttributeValue::ArrayValue(values)) => Some(&values.values),
-                Some(AttributeValue::StringValue(_))
-                | Some(AttributeValue::IntValue(_))
-                | Some(AttributeValue::DoubleValue(_))
-                | Some(AttributeValue::BoolValue(_))
-                | Some(AttributeValue::KvlistValue(_))
-                | Some(AttributeValue::BytesValue(_))
-                | Some(AttributeValue::StringValueStrindex(_))
-                | None => None,
-            })?;
-        values
-            .iter()
-            .map(|value| match value.value.as_ref() {
-                Some(AttributeValue::IntValue(value)) => Some(*value),
-                Some(AttributeValue::StringValue(_))
-                | Some(AttributeValue::DoubleValue(_))
-                | Some(AttributeValue::BoolValue(_))
-                | Some(AttributeValue::ArrayValue(_))
-                | Some(AttributeValue::KvlistValue(_))
-                | Some(AttributeValue::BytesValue(_))
-                | Some(AttributeValue::StringValueStrindex(_))
-                | None => None,
-            })
-            .collect()
-    })
+    span.attributes
+        .iter()
+        .find_map(|attribute| i64_array_key_value(attribute, key))
+}
+
+fn i64_array_key_value(attribute: &KeyValue, key: &str) -> Option<Vec<i64>> {
+    if attribute.key != key {
+        return None;
+    }
+    let values = attribute
+        .value
+        .as_ref()
+        .and_then(|value| match value.value.as_ref() {
+            Some(AttributeValue::ArrayValue(values)) => Some(&values.values),
+            Some(AttributeValue::StringValue(_))
+            | Some(AttributeValue::IntValue(_))
+            | Some(AttributeValue::DoubleValue(_))
+            | Some(AttributeValue::BoolValue(_))
+            | Some(AttributeValue::KvlistValue(_))
+            | Some(AttributeValue::BytesValue(_))
+            | Some(AttributeValue::StringValueStrindex(_))
+            | None => None,
+        })?;
+    values
+        .iter()
+        .map(|value| match value.value.as_ref() {
+            Some(AttributeValue::IntValue(value)) => Some(*value),
+            Some(AttributeValue::StringValue(_))
+            | Some(AttributeValue::DoubleValue(_))
+            | Some(AttributeValue::BoolValue(_))
+            | Some(AttributeValue::ArrayValue(_))
+            | Some(AttributeValue::KvlistValue(_))
+            | Some(AttributeValue::BytesValue(_))
+            | Some(AttributeValue::StringValueStrindex(_))
+            | None => None,
+        })
+        .collect()
 }
 
 fn i64_key_value(attribute: &KeyValue, key: &str) -> Option<i64> {
@@ -2222,6 +2298,227 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent() {
+    let required_workflow_span_only_keys = [
+        "cicd.pipeline.name",
+        "cicd.pipeline.run.id",
+        "cicd.pipeline.task.name",
+        "cicd.pipeline.task.run.id",
+        "github.workflow.run.id",
+        "github.workflow.run.attempt",
+        "github.workflow.job.id",
+    ];
+    for key in required_workflow_span_only_keys {
+        assert!(
+            SPAN_ONLY_ATTRIBUTE_KEYS.contains(&key),
+            "workflow span-only attribute key {key:?} is centralized"
+        );
+    }
+
+    let fixture = WebhookTraceFixture::new().await;
+    let body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": WORKFLOW_PRIVACY_JOB_ID,
+            "run_id": WORKFLOW_PRIVACY_RUN_ID,
+            "run_attempt": WORKFLOW_PRIVACY_RUN_ATTEMPT,
+            "workflow_name": WORKFLOW_RAW_NAME,
+            "name": WORKFLOW_RAW_JOB_NAME,
+            "conclusion": WORKFLOW_UNKNOWN_CONCLUSION,
+            "head_sha": WORKFLOW_PRIVACY_SHA,
+            "started_at": "2026-08-06T13:00:00.123456789Z",
+            "completed_at": "2026-08-06T13:05:00.987654321Z",
+            "pull_requests": WORKFLOW_PRIVACY_PR_NUMBERS
+                .iter()
+                .map(|number| serde_json::json!({"number": number}))
+                .collect::<Vec<_>>(),
+            "command": WORKFLOW_FORBIDDEN_COMMAND,
+            "output": WORKFLOW_FORBIDDEN_OUTPUT,
+            "logs": WORKFLOW_FORBIDDEN_LOG,
+            "actor": {"login": WORKFLOW_FORBIDDEN_ACTOR},
+            "url": WORKFLOW_FORBIDDEN_URL,
+            "secret": WORKFLOW_FORBIDDEN_SECRET,
+            "signature": WORKFLOW_FORBIDDEN_SIGNATURE,
+            "headers": {"x-task6-private": WORKFLOW_FORBIDDEN_HEADER},
+            "raw_payload_fragment": WORKFLOW_FORBIDDEN_FRAGMENT,
+            "steps": [{
+                "number": WORKFLOW_PRIVACY_STEP_NUMBER,
+                "name": WORKFLOW_RAW_STEP_NAME,
+                "conclusion": WORKFLOW_UNKNOWN_CONCLUSION,
+                "started_at": "2026-08-06T13:01:00.111111111Z",
+                "completed_at": "2026-08-06T13:02:00.222222222Z",
+                "command": WORKFLOW_FORBIDDEN_COMMAND,
+                "output": WORKFLOW_FORBIDDEN_OUTPUT,
+                "logs": WORKFLOW_FORBIDDEN_LOG,
+                "actor": WORKFLOW_FORBIDDEN_ACTOR,
+                "url": WORKFLOW_FORBIDDEN_URL
+            }]
+        }),
+    );
+
+    let response = fixture
+        .webhook(
+            &body,
+            "workflow_job",
+            WORKFLOW_PRIVACY_DELIVERY,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(to_bytes(response.into_body(), 1)
+        .await
+        .expect("workflow response body is readable")
+        .is_empty());
+
+    let exposition = fixture.metrics_text().await;
+    let captured = fixture.force_flush();
+    let stderr = fixture.output.text();
+    let job = captured.workflow_job_for_delivery(WORKFLOW_PRIVACY_DELIVERY);
+    let task_run_id = format!("{WORKFLOW_PRIVACY_JOB_ID}:{WORKFLOW_PRIVACY_STEP_NUMBER}");
+    let step = captured.workflow_step_for_task_run_id(job, &task_run_id);
+
+    assert!(job.parent_span_id.is_empty());
+    assert_attribute(job, "github.repository.name", WEBHOOK_REPOSITORY);
+    assert_attribute(job, "github.delivery.id", WORKFLOW_PRIVACY_DELIVERY);
+    assert_attribute(job, "github.commit.sha", WORKFLOW_PRIVACY_SHA);
+    assert_attribute(job, "cicd.pipeline.name", WORKFLOW_SANITIZED_NAME);
+    assert_attribute(job, "cicd.pipeline.task.name", WORKFLOW_SANITIZED_JOB_NAME);
+    assert_attribute(
+        job,
+        "cicd.pipeline.run.id",
+        &WORKFLOW_PRIVACY_RUN_ID.to_string(),
+    );
+    assert_attribute(
+        job,
+        "github.workflow.run.id",
+        &WORKFLOW_PRIVACY_RUN_ID.to_string(),
+    );
+    assert_attribute(
+        job,
+        "github.workflow.run.attempt",
+        &WORKFLOW_PRIVACY_RUN_ATTEMPT.to_string(),
+    );
+    assert_attribute(
+        job,
+        "github.workflow.job.id",
+        &WORKFLOW_PRIVACY_JOB_ID.to_string(),
+    );
+    assert_i64_array_attribute(
+        job,
+        "github.pull_request.number",
+        WORKFLOW_PRIVACY_PR_NUMBERS,
+    );
+    assert_attribute(job, "github.workflow.conclusion", "other");
+    assert_eq!(string_attribute(job, "cicd.pipeline.result"), None);
+    assert_historical_interval(
+        job,
+        rfc3339_unix_nanos("2026-08-06T13:00:00.123456789Z"),
+        rfc3339_unix_nanos("2026-08-06T13:05:00.987654321Z"),
+        "reported",
+    );
+    assert_attribute(
+        step,
+        "cicd.pipeline.task.name",
+        WORKFLOW_SANITIZED_STEP_NAME,
+    );
+    assert_attribute(step, "cicd.pipeline.task.run.id", &task_run_id);
+    assert_attribute(step, "github.workflow.conclusion", "other");
+    assert_eq!(
+        string_attribute(step, "cicd.pipeline.task.run.result"),
+        None
+    );
+    assert_historical_interval(
+        step,
+        rfc3339_unix_nanos("2026-08-06T13:01:00.111111111Z"),
+        rfc3339_unix_nanos("2026-08-06T13:02:00.222222222Z"),
+        "reported",
+    );
+
+    captured.assert_approved_attribute_keys();
+    for key in SPAN_ONLY_ATTRIBUTE_KEYS {
+        assert!(
+            captured.has_trace_attribute_key(key),
+            "span-only attribute key {key:?} is present in traces"
+        );
+        assert!(
+            !captured.has_log_attribute_key(key),
+            "OTLP logs must not contain span-only attribute key {key:?}"
+        );
+    }
+    assert!(captured
+        .has_trace_i64_array_attribute("github.pull_request.number", WORKFLOW_PRIVACY_PR_NUMBERS,));
+    assert!(!captured
+        .has_log_i64_array_attribute("github.pull_request.number", WORKFLOW_PRIVACY_PR_NUMBERS,));
+    for pull_request_number in WORKFLOW_PRIVACY_PR_NUMBERS {
+        assert!(!captured.has_log_i64_value(*pull_request_number));
+        let value = pull_request_number.to_string();
+        assert!(!stderr.contains(&value));
+        assert!(!exposition.contains(&value));
+    }
+
+    let run_id = WORKFLOW_PRIVACY_RUN_ID.to_string();
+    let run_attempt = WORKFLOW_PRIVACY_RUN_ATTEMPT.to_string();
+    let job_id = WORKFLOW_PRIVACY_JOB_ID.to_string();
+    for approved_span_only_value in [
+        WEBHOOK_REPOSITORY,
+        WORKFLOW_PRIVACY_DELIVERY,
+        WORKFLOW_PRIVACY_SHA,
+        WORKFLOW_SANITIZED_NAME,
+        WORKFLOW_SANITIZED_JOB_NAME,
+        WORKFLOW_SANITIZED_STEP_NAME,
+        run_id.as_str(),
+        run_attempt.as_str(),
+        job_id.as_str(),
+        task_run_id.as_str(),
+    ] {
+        captured.assert_logs_absent(approved_span_only_value);
+        assert!(
+            !stderr.contains(approved_span_only_value),
+            "stderr must not contain span-only value {approved_span_only_value:?}"
+        );
+        assert!(
+            !exposition.contains(approved_span_only_value),
+            "Prometheus must not contain span-only value {approved_span_only_value:?}"
+        );
+    }
+
+    for forbidden in [
+        WORKFLOW_RAW_NAME,
+        WORKFLOW_RAW_JOB_NAME,
+        WORKFLOW_RAW_STEP_NAME,
+        WORKFLOW_FORBIDDEN_COMMAND,
+        WORKFLOW_FORBIDDEN_OUTPUT,
+        WORKFLOW_FORBIDDEN_LOG,
+        WORKFLOW_FORBIDDEN_ACTOR,
+        WORKFLOW_FORBIDDEN_URL,
+        WORKFLOW_FORBIDDEN_SECRET,
+        WORKFLOW_FORBIDDEN_SIGNATURE,
+        WORKFLOW_FORBIDDEN_HEADER,
+        WORKFLOW_FORBIDDEN_FRAGMENT,
+        WORKFLOW_UNKNOWN_CONCLUSION,
+    ] {
+        captured.assert_absent(forbidden);
+        captured.assert_logs_absent(forbidden);
+        assert!(
+            !stderr.contains(forbidden),
+            "stderr must not contain forbidden workflow value {forbidden:?}"
+        );
+        assert!(
+            !exposition.contains(forbidden),
+            "Prometheus must not contain forbidden workflow value {forbidden:?}"
+        );
+    }
+    for expected in [
+        "github_webhook_requests_total{result=\"accepted\"} 1",
+        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 1",
+        "github_webhook_request_body_bytes_count 1",
+        "github_webhook_duplicates_total 0",
+    ] {
+        assert_metric_line(&exposition, expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_conclusions_export_bounded_results_and_statuses() {
     let fixture = WebhookTraceFixture::new().await;
     let cases = [
@@ -2796,6 +3093,118 @@ async fn duplicate_workflow_delivery_emits_one_historical_trace() {
         "github_webhook_duplicates_total 1",
     ] {
         assert_metric_line(&exposition, expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_collector_does_not_change_completed_workflow_response() {
+    let fixture = WebhookTraceFixture::new().await;
+    let ready_before = fixture
+        .request(Method::GET, "/health/ready", None, None, Body::empty())
+        .await;
+    assert_eq!(ready_before.status(), StatusCode::OK);
+    fixture.flush();
+    assert_eq!(fixture.runtime.failed_trace_exports(), 0);
+    assert_eq!(fixture.runtime.failed_log_exports(), 0);
+
+    let collector_endpoint = fixture.receiver.endpoint();
+    let collector_address = fixture.receiver.address.to_string();
+    fixture.receiver.task.abort();
+    tokio::task::yield_now().await;
+
+    let body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 901,
+            "run_id": 902,
+            "run_attempt": 1,
+            "workflow_name": "Unavailable collector workflow",
+            "name": "Unavailable collector job",
+            "conclusion": "success",
+            "started_at": "2026-08-06T14:00:00Z",
+            "completed_at": "2026-08-06T14:05:00Z",
+            "steps": [{
+                "number": 1,
+                "name": "Unavailable collector step",
+                "conclusion": "success",
+                "started_at": "2026-08-06T14:01:00Z",
+                "completed_at": "2026-08-06T14:02:00Z"
+            }]
+        }),
+    );
+    let request_started = std::time::Instant::now();
+    let response = fixture
+        .webhook(
+            &body,
+            "workflow_job",
+            "550e8400-e29b-41d4-a716-446655440700",
+            WEBHOOK_SECRET,
+        )
+        .await;
+    let request_elapsed = request_started.elapsed();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(to_bytes(response.into_body(), 1)
+        .await
+        .expect("workflow response body is readable")
+        .is_empty());
+    assert!(
+        request_elapsed < std::time::Duration::from_secs(1),
+        "request path must not wait for the configured two-second exporter timeout: {request_elapsed:?}"
+    );
+
+    let ready_after = fixture
+        .request(Method::GET, "/health/ready", None, None, Body::empty())
+        .await;
+    assert_eq!(ready_after.status(), StatusCode::OK);
+    let exposition = fixture.metrics_text().await;
+    for expected in [
+        "github_webhook_requests_total{result=\"accepted\"} 1",
+        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 1",
+        "github_webhook_request_body_bytes_count 1",
+        "github_webhook_duplicates_total 0",
+    ] {
+        assert_metric_line(&exposition, expected);
+    }
+    let merge_queue_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_queue_attempts")
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("merge-queue state is countable");
+    assert_eq!(merge_queue_rows, 0);
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while fixture.runtime.failed_trace_exports() == 0
+            || fixture.runtime.failed_log_exports() == 0
+            || fixture.runtime.pending_trace_records() != 0
+            || fixture.runtime.pending_log_records() != 0
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("unavailable collector failures are counted asynchronously");
+    assert!(fixture.runtime.failed_trace_exports() > 0);
+    assert!(fixture.runtime.failed_log_exports() > 0);
+    assert_eq!(fixture.runtime.dropped_trace_records(), 0);
+    assert_eq!(fixture.runtime.dropped_log_records(), 0);
+
+    let stderr = fixture.finish_without_force_flush();
+    let stderr_lowercase = stderr.to_ascii_lowercase();
+    for detail in [collector_endpoint.as_str(), collector_address.as_str()] {
+        assert!(
+            !stderr.contains(detail),
+            "stderr must not expose collector detail {detail:?}"
+        );
+    }
+    for error_detail in [
+        "connection refused",
+        "error sending request",
+        "failed to export",
+    ] {
+        assert!(
+            !stderr_lowercase.contains(error_detail),
+            "stderr must not expose exporter error detail {error_detail:?}"
+        );
     }
 }
 
@@ -3448,7 +3857,7 @@ async fn integrated_core_trace_privacy() {
     ));
 
     captured.assert_approved_attribute_keys();
-    for key in SPAN_ONLY_IDENTIFIER_ATTRIBUTE_KEYS {
+    for key in SPAN_ONLY_ATTRIBUTE_KEYS {
         assert!(
             !captured.has_log_attribute_key(key),
             "OTLP logs must not contain span-only identifier key {key:?}"

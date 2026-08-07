@@ -69,12 +69,10 @@ attributes. HTTP methods, response classes, repository operations, webhook event
 database operations, merge-group reasons, queue outcomes/reasons, terminal outcomes, and failure
 events use closed bounded vocabularies.
 
-Repository names and database identifiers, delivery identifiers, pull-request numbers, and valid
-full commit SHAs are diagnostic trace span attributes only. They are excluded from structured
-stderr, OTLP application logs, and Prometheus exposition. Workflow run, run-attempt, and job
-identifiers remain deferred to issue
-[#10](https://github.com/PeterGrace/github_webhook_exporter/issues/10), which shares the same
-span-only identifier boundary.
+Repository names and database identifiers, delivery identifiers, pull-request numbers, valid full
+commit SHAs, workflow identifiers, and sanitized workflow names are diagnostic trace span
+attributes only. They are excluded from structured stderr, OTLP application logs, and Prometheus
+exposition.
 
 Duplicate delivery claims emit an authentication span and a process span with outcome `duplicate`,
 but no second `merge_queue.update` span or specialized outcome. Queue-state persistence failures
@@ -87,6 +85,54 @@ reason `dequeued` records normalized group reason `dequeued`; a pull-request deq
 Trace attributes and events never include request bodies or payload fragments, repository secrets,
 webhook signatures, authorization or OTLP headers, actors, raw URLs, commands, raw actions or
 reasons, SQL statements, database paths, or internal error text.
+
+### Completed workflow traces
+
+Only an authenticated `workflow_job` webhook whose normalized action is `completed` can emit a
+historical workflow trace. Admission occurs only after the durable delivery claim returns `New`, so
+a duplicate, unsupported action, or malformed specialized projection emits no workflow spans.
+Admission is at most once: after a delivery claim commits, the service does not retry projection or
+emission for that delivery, including after a process interruption. Generic webhook responses and
+metrics retain their normal behavior.
+
+Each accepted projection creates an independent root named `github.workflow.job`, with a new trace
+identity unrelated to the live `http.request` trace. Every projected step is a direct child named
+`github.workflow.step`; payload-provided names never become span names. The service does not create
+a workflow-run root, persist workflow data, correlate jobs across deliveries, or mutate merge-queue
+state for a workflow-job event.
+
+A job uses its exact RFC 3339 `started_at` and `completed_at` values only when both parse and start is
+not after completion; this is marked `timing_source=reported`. Otherwise it is instantaneous at a
+valid completion time, or at the request receipt time when completion is missing or malformed, and
+is marked `timing_source=fallback`. A step uses reported timing only when both values parse, are
+ordered, and lie inside the selected job interval. Every other step interval is instantaneous at
+the selected job end and marked as fallback.
+
+Conclusions are normalized to `success`, `failure`, `cancelled`, `skipped`, `timed_out`, `neutral`,
+or `other`. The CI/CD result is respectively `success`, `failure`, `cancellation`, `skip`, or
+`timeout` where that semantic value exists; it is omitted for `neutral` and `other`. `success` sets
+OpenTelemetry status OK, `failure` and `timed_out` set error status with a fixed description, and
+all other conclusions leave status unset. Raw unknown conclusions are discarded.
+
+The workflow root may contain only these validated span-only identifiers: canonical repository
+name, delivery UUID, workflow run ID, positive run attempt, workflow job ID, valid full head SHA,
+and at most the first 20 positive pull-request numbers. The run ID is exported under both
+`cicd.pipeline.run.id` and `github.workflow.run.id`; each step's
+`cicd.pipeline.task.run.id` is derived as `<job-id>:<positive-step-number>`. Workflow, job, and step
+display names are span-only. Sanitization removes all Unicode control characters, retains at most
+the first 128 remaining Unicode scalar values, and omits an empty result.
+
+Commands, output, logs, actors or other user data, raw or derived URLs, request bodies and arbitrary
+payload fragments, secrets, signatures, authorization and other headers, unsupported actions, and
+raw unknown conclusions are not represented in workflow telemetry. They do not enter OTLP traces,
+OTLP logs, structured stderr, or Prometheus exposition. Approved identifiers and sanitized names
+enter spans only.
+
+Historical spans use the existing bounded non-blocking trace queue. The request path does not wait
+for export or retry collector failures synchronously. Queue drops and export failures are accounted
+for by the telemetry runtime but never change the authenticated `204 No Content` response,
+readiness, generic webhook metrics, or merge-queue state. Collector endpoints and exporter error
+details are not exposed in responses or application logs.
 
 ## Health endpoints
 
