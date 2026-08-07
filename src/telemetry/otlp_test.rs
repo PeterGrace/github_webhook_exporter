@@ -19,9 +19,11 @@ use axum::{
 use hmac::{Hmac, Mac};
 use opentelemetry_proto::tonic::{
     collector::{logs::v1::ExportLogsServiceRequest, trace::v1::ExportTraceServiceRequest},
-    common::v1::{any_value::Value as AttributeValue, AnyValue, KeyValue},
+    common::v1::{
+        any_value::Value as AttributeValue, AnyValue, ArrayValue, KeyValue, KeyValueList,
+    },
     logs::v1::LogRecord,
-    trace::v1::Span,
+    trace::v1::{status::StatusCode as OtlpStatusCode, Span},
 };
 use prost::Message;
 use serde_json::Value;
@@ -34,6 +36,7 @@ use tracing_subscriber::layer::{Context as SubscriberContext, Layer, SubscriberE
 
 use crate::{
     app::{build_router, AppState},
+    config::DEFAULT_WORKFLOW_JOB_MAX_STEPS,
     domain::{
         delivery::DeliveryId,
         merge_queue::{PullRequestNumber, QueueCompletion, QueueTimestamp},
@@ -57,7 +60,7 @@ use tracing::{
 };
 
 use crate::config::TelemetryConfig;
-use time::{Duration, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use super::{build_runtime, trace, TelemetryState};
 
@@ -67,6 +70,7 @@ const ADMIN_TOKEN: &str = "independent-admin-token";
 const MASTER_KEY_BYTES: &[u8; 32] = b"MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM";
 const WEBHOOK_SECRET: &str = "webhook-trace-secret-must-not-appear";
 const WEBHOOK_REPOSITORY: &str = "owner/webhook-private-repository";
+const ACTIONABLE_REPOSITORY: &str = "owner/repository";
 const WEBHOOK_SHA_40: &str = "0123456789ABCDEF0123456789abcdef01234567";
 const WEBHOOK_SHA_64: &str = "ABCDEF0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789";
 const SECRET: &str = "forbidden-webhook-secret";
@@ -91,6 +95,33 @@ const PRIVACY_RETENTION_DELIVERY: &str = "71000000-0000-4000-8000-000000000006";
 const PRIVACY_QUEUE_FAILURE_DELIVERY: &str = "71000000-0000-4000-8000-000000000007";
 const PRIVACY_RETENTION_PR_NUMBER: i64 = PRIVACY_PR_NUMBER + 1;
 const PRIVACY_QUEUE_FAILURE_PR_NUMBER: i64 = PRIVACY_PR_NUMBER + 2;
+const WORKFLOW_PRIVACY_DELIVERY: &str = "71000000-0000-4000-8000-000000000008";
+const WORKFLOW_PRIVACY_RUN_ID: i64 = 8_123_456_789_013;
+const WORKFLOW_PRIVACY_RUN_ATTEMPT: i64 = 8_123_456_789_014;
+const WORKFLOW_PRIVACY_JOB_ID: i64 = 8_123_456_789_015;
+const WORKFLOW_PRIVACY_PR_NUMBERS: &[i64] = &[812_345_671, 812_345_672];
+const WORKFLOW_PRIVACY_STEP_NUMBER: i64 = 73;
+const WORKFLOW_PRIVACY_SHA: &str = "fedcba9876543210fedcba9876543210fedcba98";
+const WORKFLOW_RAW_NAME: &str = "task6-workflow\nname-sentinel";
+const WORKFLOW_ESCAPED_RAW_NAME: &str = "task6-workflow\\nname-sentinel";
+const WORKFLOW_SANITIZED_NAME: &str = "task6-workflowname-sentinel";
+const WORKFLOW_RAW_JOB_NAME: &str = "task6-job\tname-sentinel";
+const WORKFLOW_ESCAPED_RAW_JOB_NAME: &str = "task6-job\\tname-sentinel";
+const WORKFLOW_SANITIZED_JOB_NAME: &str = "task6-jobname-sentinel";
+const WORKFLOW_RAW_STEP_NAME: &str = "task6-step\rname-sentinel";
+const WORKFLOW_ESCAPED_RAW_STEP_NAME: &str = "task6-step\\rname-sentinel";
+const WORKFLOW_SANITIZED_STEP_NAME: &str = "task6-stepname-sentinel";
+const WORKFLOW_FORBIDDEN_COMMAND: &str = "task6-forbidden-command-sentinel";
+const WORKFLOW_FORBIDDEN_OUTPUT: &str = "task6-forbidden-output-sentinel";
+const WORKFLOW_FORBIDDEN_LOG: &str = "task6-forbidden-log-sentinel";
+const WORKFLOW_FORBIDDEN_ACTOR: &str = "task6-forbidden-actor-sentinel";
+const WORKFLOW_FORBIDDEN_URL: &str = "https://task6-forbidden-url.invalid/private";
+const WORKFLOW_FORBIDDEN_SECRET: &str = "task6-forbidden-secret-sentinel";
+const WORKFLOW_FORBIDDEN_SIGNATURE: &str =
+    "sha256=6666666666666666666666666666666666666666666666666666666666666666";
+const WORKFLOW_FORBIDDEN_HEADER: &str = "x-task6-private=forbidden-header-sentinel";
+const WORKFLOW_FORBIDDEN_FRAGMENT: &str = "task6-forbidden-raw-payload-fragment-sentinel";
+const WORKFLOW_UNKNOWN_CONCLUSION: &str = "task6-forbidden-unknown-conclusion-sentinel";
 
 const RESOURCE_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "service.name",
@@ -117,16 +148,34 @@ const SPAN_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "github.delivery.id",
     "github.pull_request.number",
     "github.commit.sha",
+    "cicd.pipeline.name",
+    "cicd.pipeline.run.id",
+    "cicd.pipeline.task.name",
+    "cicd.pipeline.task.run.id",
+    "cicd.pipeline.result",
+    "cicd.pipeline.task.run.result",
+    "github.workflow.conclusion",
+    "github.workflow.run.id",
+    "github.workflow.run.attempt",
+    "github.workflow.job.id",
+    "timing_source",
     "db.system.name",
     "db.operation.name",
 ];
 const SPAN_EVENT_ALLOWLIST: &[(&str, &[&str])] = &[("operation.failure", &["ghe.failure.reason"])];
-const SPAN_ONLY_IDENTIFIER_ATTRIBUTE_KEYS: &[&str] = &[
+const SPAN_ONLY_ATTRIBUTE_KEYS: &[&str] = &[
+    "cicd.pipeline.name",
+    "cicd.pipeline.run.id",
+    "cicd.pipeline.task.name",
+    "cicd.pipeline.task.run.id",
     "github.repository.name",
     "github.repository.id",
     "github.delivery.id",
     "github.pull_request.number",
     "github.commit.sha",
+    "github.workflow.run.id",
+    "github.workflow.run.attempt",
+    "github.workflow.job.id",
 ];
 
 #[derive(Default)]
@@ -225,11 +274,20 @@ fn telemetry_config(endpoint: &str) -> TelemetryConfig {
 }
 
 fn telemetry_config_with_queue_capacity(endpoint: &str, queue_capacity: usize) -> TelemetryConfig {
+    telemetry_config_with_queue_capacity_and_timeout(endpoint, queue_capacity, 2_000)
+}
+
+fn telemetry_config_with_queue_capacity_and_timeout(
+    endpoint: &str,
+    queue_capacity: usize,
+    timeout_millis: u64,
+) -> TelemetryConfig {
     let queue_capacity = queue_capacity.to_string();
+    let timeout_millis = timeout_millis.to_string();
     let values = HashMap::from([
         ("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint),
         ("OTEL_EXPORTER_OTLP_HEADERS", "x-test-token=private-value"),
-        ("OTEL_EXPORTER_OTLP_TIMEOUT", "2000"),
+        ("OTEL_EXPORTER_OTLP_TIMEOUT", timeout_millis.as_str()),
         ("OTEL_SERVICE_NAME", "github-webhook-exporter-test"),
         (
             "OTEL_RESOURCE_ATTRIBUTES",
@@ -298,8 +356,8 @@ fn resource_keys(request: &ExportTraceServiceRequest) -> Vec<&str> {
         .collect()
 }
 
-async fn wait_for_blocked_signals(state: &ReceiverState) {
-    while state.started_requests.load(Ordering::Acquire) < 2 {
+async fn wait_for_started_requests(state: &ReceiverState, target: usize) {
+    while state.started_requests.load(Ordering::Acquire) < target {
         state.request_started.notified().await;
     }
 }
@@ -307,7 +365,7 @@ async fn wait_for_blocked_signals(state: &ReceiverState) {
 struct RunningReceiver {
     state: SharedReceiverState,
     address: std::net::SocketAddr,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RunningReceiver {
@@ -337,7 +395,19 @@ impl RunningReceiver {
         Self {
             state,
             address,
-            task,
+            task: Some(task),
+        }
+    }
+
+    async fn stop(&mut self) {
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        task.abort();
+        match task.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => panic!("test receiver shutdown failed: {error}"),
         }
     }
 
@@ -366,11 +436,21 @@ impl RunningReceiver {
             .lock()
             .expect("capture lock is available") = Captures::default();
     }
+
+    fn set_exports_released(&self, released: bool) {
+        self.state.release_exports.send_replace(released);
+    }
+
+    fn started_request_count(&self) -> usize {
+        self.state.started_requests.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for RunningReceiver {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -564,9 +644,35 @@ struct WebhookTraceFixture {
 
 impl WebhookTraceFixture {
     async fn new() -> Self {
+        Self::new_with_exporter_timeout_and_step_limit(2_000, DEFAULT_WORKFLOW_JOB_MAX_STEPS, false)
+            .await
+    }
+
+    async fn new_with_workflow_job_max_steps(workflow_job_max_steps: usize) -> Self {
+        Self::new_with_exporter_timeout_and_step_limit(2_000, workflow_job_max_steps, true).await
+    }
+
+    async fn new_with_exporter_timeout(timeout_millis: u64) -> Self {
+        Self::new_with_exporter_timeout_and_step_limit(
+            timeout_millis,
+            DEFAULT_WORKFLOW_JOB_MAX_STEPS,
+            false,
+        )
+        .await
+    }
+
+    async fn new_with_exporter_timeout_and_step_limit(
+        timeout_millis: u64,
+        workflow_job_max_steps: usize,
+        include_actionable_repository: bool,
+    ) -> Self {
         let otlp_guard = otlp_test_lock().lock_owned().await;
         let receiver = RunningReceiver::start_released().await;
-        let config = telemetry_config_with_queue_capacity(&receiver.endpoint(), 128);
+        let config = telemetry_config_with_queue_capacity_and_timeout(
+            &receiver.endpoint(),
+            128,
+            timeout_millis,
+        );
         let output = CapturedOutput::default();
         let (runtime, subscriber) =
             build_runtime("github_webhook_exporter=info", &config, output.clone())
@@ -591,14 +697,31 @@ impl WebhookTraceFixture {
             .with_subscriber(dispatch.clone())
             .await
             .expect("test repository is created");
+        if include_actionable_repository {
+            store
+                .create(
+                    CanonicalRepositoryName::new(ACTIONABLE_REPOSITORY)
+                        .expect("test repository name is valid"),
+                    RepositorySecret::new(WEBHOOK_SECRET.to_owned())
+                        .expect("test webhook secret is valid"),
+                    true,
+                )
+                .with_subscriber(dispatch.clone())
+                .await
+                .expect("test repository is created");
+        }
         tokio::task::block_in_place(|| runtime.force_flush().expect("setup telemetry flushes"));
         receiver.clear_captured_requests();
         let admin_token = AdminToken::new(ADMIN_TOKEN.to_owned()).expect("test token is valid");
-        let router = build_router(AppState::new(
-            store,
-            AdminAuthenticator::new(&admin_token),
-            2_097_152,
-        ));
+        let router = build_router(
+            AppState::new(
+                store,
+                AdminAuthenticator::new(&admin_token),
+                2_097_152,
+                workflow_job_max_steps,
+            )
+            .with_workflow_trace_emitter(runtime.workflow_trace_emitter()),
+        );
         Self {
             _otlp_guard: otlp_guard,
             receiver,
@@ -659,18 +782,44 @@ impl WebhookTraceFixture {
         delivery_id: &str,
         secret: &str,
     ) -> axum::response::Response {
+        self.webhook_with_authorization(body, event_type, delivery_id, secret, None)
+            .await
+    }
+
+    async fn webhook_with_authorization(
+        &self,
+        body: &[u8],
+        event_type: &str,
+        delivery_id: &str,
+        secret: &str,
+        authorization: Option<&str>,
+    ) -> axum::response::Response {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC key is valid");
         mac.update(body);
         let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method(Method::POST)
             .uri("/webhooks/github")
             .header(CONTENT_TYPE, "application/json")
             .header("X-GitHub-Event", event_type)
             .header("X-GitHub-Delivery", delivery_id)
-            .header("X-Hub-Signature-256", signature)
+            .header("X-Hub-Signature-256", signature);
+        if let Some(value) = authorization {
+            request = request.header(header::AUTHORIZATION, value);
+        }
+        let request = request
             .body(Body::from(body.to_vec()))
             .expect("webhook request is valid");
+        if let Some(expected) = authorization {
+            assert_eq!(
+                request
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected),
+                "webhook Authorization header contains the sentinel before submission"
+            );
+        }
         self.router
             .clone()
             .oneshot(request)
@@ -737,6 +886,30 @@ impl WebhookTraceFixture {
         CapturedSpans::from_requests(traces, logs)
     }
 
+    async fn finish_without_force_flush(self) -> String {
+        let Self {
+            _otlp_guard,
+            mut receiver,
+            runtime,
+            dispatch,
+            output,
+            span_lifecycles: _,
+            router,
+            pool,
+            _directory,
+        } = self;
+        drop(router);
+        drop(pool);
+        drop(dispatch);
+        drop(_directory);
+        drop(runtime);
+        receiver.stop().await;
+        drop(receiver);
+        let stderr = output.text();
+        drop(_otlp_guard);
+        stderr
+    }
+
     fn finish(self) -> (CapturedSpans, String) {
         // Destructuring permits the request-serving resources to drop before the providers flush,
         // so completed failure-path spans cannot remain owned by the in-process router or pool.
@@ -779,6 +952,7 @@ fn router_for_pool(pool: SqlitePool) -> Router {
         RepositoryStore::new(pool, cipher),
         AdminAuthenticator::new(&admin_token),
         2_097_152,
+        DEFAULT_WORKFLOW_JOB_MAX_STEPS,
     ))
 }
 
@@ -786,6 +960,7 @@ fn router_for_pool(pool: SqlitePool) -> Router {
 struct CapturedSpans {
     spans: Vec<Span>,
     log_records: Vec<LogRecord>,
+    log_resource_attributes: Vec<KeyValue>,
     resource_attribute_keys: BTreeSet<String>,
     serialized: Vec<u8>,
     serialized_logs: Vec<u8>,
@@ -807,6 +982,12 @@ impl CapturedSpans {
             .flat_map(|request| &request.resource_logs)
             .flat_map(|resource| &resource.scope_logs)
             .flat_map(|scope| scope.log_records.iter().cloned())
+            .collect();
+        let log_resource_attributes = log_requests
+            .iter()
+            .flat_map(|request| &request.resource_logs)
+            .filter_map(|resource_logs| resource_logs.resource.as_ref())
+            .flat_map(|resource| resource.attributes.iter().cloned())
             .collect();
         let resource_attribute_keys = requests
             .iter()
@@ -833,6 +1014,7 @@ impl CapturedSpans {
         Self {
             spans,
             log_records,
+            log_resource_attributes,
             resource_attribute_keys,
             serialized,
             serialized_logs,
@@ -842,12 +1024,14 @@ impl CapturedSpans {
     fn from_parsed_records(
         spans: Vec<Span>,
         log_records: Vec<LogRecord>,
+        log_resource_attributes: Vec<KeyValue>,
         serialized: Vec<u8>,
         serialized_logs: Vec<u8>,
     ) -> Self {
         Self {
             spans,
             log_records,
+            log_resource_attributes,
             resource_attribute_keys: BTreeSet::new(),
             serialized,
             serialized_logs,
@@ -867,6 +1051,12 @@ impl CapturedSpans {
         self.log_records
             .iter()
             .flat_map(|record| record.attributes.iter())
+            .chain(self.log_resource_attributes.iter())
+    }
+
+    fn has_trace_attribute_key(&self, key: &str) -> bool {
+        self.trace_attributes()
+            .any(|attribute| attribute.key == key)
     }
 
     fn has_trace_i64_attribute(&self, key: &str, value: i64) -> bool {
@@ -874,9 +1064,19 @@ impl CapturedSpans {
             .any(|attribute| i64_key_value(attribute, key) == Some(value))
     }
 
+    fn has_trace_i64_array_attribute(&self, key: &str, values: &[i64]) -> bool {
+        self.trace_attributes()
+            .any(|attribute| i64_array_key_value(attribute, key) == Some(values.to_vec()))
+    }
+
     fn has_log_i64_attribute(&self, key: &str, value: i64) -> bool {
         self.log_attributes()
             .any(|attribute| i64_key_value(attribute, key) == Some(value))
+    }
+
+    fn has_log_string_attribute(&self, key: &str, value: &str) -> bool {
+        self.log_attributes()
+            .any(|attribute| string_key_value(attribute, key) == Some(value))
     }
 
     fn has_trace_i64_value(&self, value: i64) -> bool {
@@ -884,9 +1084,20 @@ impl CapturedSpans {
             .any(|attribute| i64_key_value(attribute, &attribute.key) == Some(value))
     }
 
+    fn has_log_i64_array_attribute(&self, key: &str, values: &[i64]) -> bool {
+        self.log_attributes()
+            .any(|attribute| i64_array_key_value(attribute, key) == Some(values.to_vec()))
+    }
+
     fn has_log_i64_value(&self, value: i64) -> bool {
         self.log_attributes()
-            .any(|attribute| i64_key_value(attribute, &attribute.key) == Some(value))
+            .filter_map(|attribute| attribute.value.as_ref())
+            .chain(
+                self.log_records
+                    .iter()
+                    .filter_map(|record| record.body.as_ref()),
+            )
+            .any(|candidate| any_value_contains_i64(candidate, value))
     }
 
     fn has_trace_string_attribute(&self, key: &str, value: &str) -> bool {
@@ -906,6 +1117,19 @@ impl CapturedSpans {
                 .and_then(string_any_value)
                 .is_some_and(|body| body.contains(expected))
         })
+    }
+
+    fn workflow_rejection_log(&self) -> &LogRecord {
+        let matches = self
+            .log_records
+            .iter()
+            .filter(|record| {
+                record.body.as_ref().and_then(string_any_value)
+                    == Some("completed workflow-job trace rejected")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "workflow rejection warning count");
+        matches[0]
     }
 
     fn http_request(&self, method: &str, route: &str, status_code: i64) -> &Span {
@@ -961,6 +1185,39 @@ impl CapturedSpans {
                     .collect();
                 panic!("webhook request span for delivery is exported: {summary:?}")
             })
+    }
+
+    fn workflow_job_for_delivery(&self, delivery_id: &str) -> &Span {
+        let matches = self
+            .spans
+            .iter()
+            .filter(|span| {
+                span.name == "github.workflow.job"
+                    && string_attribute(span, "github.delivery.id") == Some(delivery_id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
+            1,
+            "workflow job span count for {delivery_id}"
+        );
+        matches[0]
+    }
+
+    fn workflow_step_for_task_run_id<'spans>(
+        &'spans self,
+        job: &'spans Span,
+        task_run_id: &str,
+    ) -> &'spans Span {
+        let matches = self
+            .children(job)
+            .filter(|span| {
+                span.name == "github.workflow.step"
+                    && string_attribute(span, "cicd.pipeline.task.run.id") == Some(task_run_id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "workflow step count for {task_run_id}");
+        matches[0]
     }
 
     fn one_named(&self, name: &str) -> &Span {
@@ -1140,10 +1397,75 @@ fn string_any_value(value: &AnyValue) -> Option<&str> {
     }
 }
 
+fn any_value_contains_i64(value: &AnyValue, expected: i64) -> bool {
+    match value.value.as_ref() {
+        Some(AttributeValue::StringValue(value)) => value.parse() == Ok(expected),
+        Some(AttributeValue::IntValue(value)) => *value == expected,
+        Some(AttributeValue::DoubleValue(value)) => {
+            let expected_as_f64 = expected as f64;
+            expected_as_f64 as i64 == expected && *value == expected_as_f64
+        }
+        Some(AttributeValue::ArrayValue(values)) => values
+            .values
+            .iter()
+            .any(|value| any_value_contains_i64(value, expected)),
+        Some(AttributeValue::KvlistValue(values)) => values.values.iter().any(|attribute| {
+            attribute
+                .value
+                .as_ref()
+                .is_some_and(|value| any_value_contains_i64(value, expected))
+        }),
+        Some(AttributeValue::BoolValue(_))
+        | Some(AttributeValue::BytesValue(_))
+        | Some(AttributeValue::StringValueStrindex(_))
+        | None => false,
+    }
+}
+
 fn i64_attribute(span: &Span, key: &str) -> Option<i64> {
     span.attributes
         .iter()
         .find_map(|attribute| i64_key_value(attribute, key))
+}
+
+fn i64_array_attribute(span: &Span, key: &str) -> Option<Vec<i64>> {
+    span.attributes
+        .iter()
+        .find_map(|attribute| i64_array_key_value(attribute, key))
+}
+
+fn i64_array_key_value(attribute: &KeyValue, key: &str) -> Option<Vec<i64>> {
+    if attribute.key != key {
+        return None;
+    }
+    let values = attribute
+        .value
+        .as_ref()
+        .and_then(|value| match value.value.as_ref() {
+            Some(AttributeValue::ArrayValue(values)) => Some(&values.values),
+            Some(AttributeValue::StringValue(_))
+            | Some(AttributeValue::IntValue(_))
+            | Some(AttributeValue::DoubleValue(_))
+            | Some(AttributeValue::BoolValue(_))
+            | Some(AttributeValue::KvlistValue(_))
+            | Some(AttributeValue::BytesValue(_))
+            | Some(AttributeValue::StringValueStrindex(_))
+            | None => None,
+        })?;
+    values
+        .iter()
+        .map(|value| match value.value.as_ref() {
+            Some(AttributeValue::IntValue(value)) => Some(*value),
+            Some(AttributeValue::StringValue(_))
+            | Some(AttributeValue::DoubleValue(_))
+            | Some(AttributeValue::BoolValue(_))
+            | Some(AttributeValue::ArrayValue(_))
+            | Some(AttributeValue::KvlistValue(_))
+            | Some(AttributeValue::BytesValue(_))
+            | Some(AttributeValue::StringValueStrindex(_))
+            | None => None,
+        })
+        .collect()
 }
 
 fn i64_key_value(attribute: &KeyValue, key: &str) -> Option<i64> {
@@ -1183,12 +1505,107 @@ fn assert_i64_attribute(span: &Span, key: &str, value: i64) {
     assert_eq!(i64_attribute(span, key), Some(value));
 }
 
+fn assert_i64_array_attribute(span: &Span, key: &str, value: &[i64]) {
+    assert_eq!(i64_array_attribute(span, key), Some(value.to_vec()));
+}
+
+fn rfc3339_unix_nanos(value: &str) -> u64 {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .expect("timestamp is RFC3339")
+        .unix_timestamp_nanos() as u64
+}
+
+fn workflow_job_body(action: Option<&str>, workflow_job: Value) -> Vec<u8> {
+    workflow_job_body_for_repository(action, workflow_job, WEBHOOK_REPOSITORY)
+}
+
+fn workflow_job_body_for_repository(
+    action: Option<&str>,
+    workflow_job: Value,
+    repository_name: &str,
+) -> Vec<u8> {
+    let mut payload = serde_json::Map::with_capacity(3);
+    if let Some(action) = action {
+        payload.insert("action".to_owned(), Value::String(action.to_owned()));
+    }
+    payload.insert("workflow_job".to_owned(), workflow_job);
+    payload.insert(
+        "repository".to_owned(),
+        serde_json::json!({"full_name": repository_name}),
+    );
+    serde_json::to_vec(&Value::Object(payload)).expect("workflow-job payload serializes")
+}
+
+fn assert_otlp_status(span: &Span, code: OtlpStatusCode, description: &str) {
+    let status = span.status.as_ref().expect("span status is exported");
+    assert_eq!(status.code, code as i32, "status code for {}", span.name);
+    assert_eq!(
+        status.message, description,
+        "status description for {}",
+        span.name
+    );
+}
+
+fn assert_historical_interval(span: &Span, start: u64, end: u64, source: &str) {
+    assert_eq!(
+        span.start_time_unix_nano, start,
+        "start time for {}",
+        span.name
+    );
+    assert_eq!(span.end_time_unix_nano, end, "end time for {}", span.name);
+    assert_attribute(span, "timing_source", source);
+    for timestamp in [start, end] {
+        assert!(
+            OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp)).is_ok(),
+            "{} timestamp is a valid Unix nanosecond value",
+            span.name
+        );
+    }
+}
+
+fn current_unix_nanos() -> u64 {
+    u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos())
+        .expect("current test time is after the Unix epoch")
+}
+
+fn assert_metric_line(exposition: &str, expected: &str) {
+    assert!(
+        exposition.lines().any(|line| line == expected),
+        "missing metric line {expected:?}"
+    );
+}
+
+fn metric_u64(exposition: &str, series: &str) -> u64 {
+    let prefix = format!("{series} ");
+    exposition
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("missing metric series {series:?}"))
+        .parse()
+        .unwrap_or_else(|_| panic!("metric series {series:?} is an integer"))
+}
+
+fn metric_u64_or_zero(exposition: &str, series: &str) -> u64 {
+    let prefix = format!("{series} ");
+    exposition
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(|value| {
+            value
+                .parse()
+                .unwrap_or_else(|_| panic!("metric series {series:?} is an integer"))
+        })
+        .unwrap_or(0)
+}
+
 #[test]
 fn parsed_numeric_privacy_checks_detect_varint_attributes() {
     const TRACE_KEY: &str = "github.repository.id";
     const LOG_KEY: &str = "github.pull_request.number";
     const TRACE_VALUE: i64 = 987_000_001;
     const LOG_VALUE: i64 = 976_543_211;
+    const LOG_BODY_VALUE: i64 = 8_123_456_789_013;
+    const LOG_RESOURCE_VALUE: i64 = 8_123_456_789_014;
 
     let trace_span = Span {
         attributes: vec![KeyValue {
@@ -1208,7 +1625,29 @@ fn parsed_numeric_privacy_checks_detect_varint_attributes() {
             }),
             key_strindex: 0,
         }],
+        body: Some(AnyValue {
+            value: Some(AttributeValue::ArrayValue(ArrayValue {
+                values: vec![AnyValue {
+                    value: Some(AttributeValue::KvlistValue(KeyValueList {
+                        values: vec![KeyValue {
+                            key: "nested".to_owned(),
+                            value: Some(AnyValue {
+                                value: Some(AttributeValue::IntValue(LOG_BODY_VALUE)),
+                            }),
+                            key_strindex: 0,
+                        }],
+                    })),
+                }],
+            })),
+        }),
         ..LogRecord::default()
+    };
+    let log_resource_attribute = KeyValue {
+        key: "resource.numeric".to_owned(),
+        value: Some(AnyValue {
+            value: Some(AttributeValue::IntValue(LOG_RESOURCE_VALUE)),
+        }),
+        key_strindex: 0,
     };
     let serialized_trace = trace_span.encode_to_vec();
     let serialized_log = log_record.encode_to_vec();
@@ -1218,11 +1657,14 @@ fn parsed_numeric_privacy_checks_detect_varint_attributes() {
     let captured = CapturedSpans::from_parsed_records(
         vec![trace_span],
         vec![log_record],
+        vec![log_resource_attribute],
         serialized_trace,
         serialized_log,
     );
     assert!(captured.has_trace_i64_attribute(TRACE_KEY, TRACE_VALUE));
     assert!(captured.has_log_i64_attribute(LOG_KEY, LOG_VALUE));
+    assert!(captured.has_log_i64_value(LOG_BODY_VALUE));
+    assert!(captured.has_log_i64_value(LOG_RESOURCE_VALUE));
     assert!(captured.has_log_attribute_key(LOG_KEY));
 }
 
@@ -1929,6 +2371,1666 @@ async fn webhook_successes_emit_bounded_hierarchy_and_span_only_identifiers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_job_completed_exports_one_independent_historical_trace() {
+    let fixture = WebhookTraceFixture::new().await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440207";
+    let job_started_at = "2026-08-06T10:00:00.123456789Z";
+    let first_step_started_at = "2026-08-06T10:00:01.000000001Z";
+    let first_step_completed_at = "2026-08-06T10:00:02.000000002Z";
+    let second_step_started_at = "2026-08-06T10:00:03.000000003Z";
+    let second_step_completed_at = "2026-08-06T10:00:04.000000004Z";
+    let job_completed_at = "2026-08-06T10:05:00.987654321Z";
+    let pull_requests = (1..=25)
+        .map(|number| serde_json::json!({"number": number}))
+        .collect::<Vec<_>>();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "action": "completed",
+        "workflow_job": {
+            "id": 41,
+            "run_id": 31,
+            "run_attempt": 2,
+            "workflow_name": "Build\nWorkflow",
+            "name": "Linux\tJob",
+            "conclusion": "success",
+            "head_sha": WEBHOOK_SHA_40,
+            "started_at": job_started_at,
+            "completed_at": job_completed_at,
+            "pull_requests": pull_requests,
+            "steps": [
+                {
+                    "number": 2,
+                    "name": "Run\tTests",
+                    "conclusion": "success",
+                    "started_at": first_step_started_at,
+                    "completed_at": first_step_completed_at
+                },
+                {
+                    "number": 1,
+                    "name": "Check\nout",
+                    "conclusion": "success",
+                    "started_at": second_step_started_at,
+                    "completed_at": second_step_completed_at
+                }
+            ]
+        },
+        "repository": {
+            "full_name": WEBHOOK_REPOSITORY
+        }
+    }))
+    .expect("workflow-job payload serializes");
+
+    let response = fixture
+        .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    let captured = fixture.force_flush();
+    let request = captured.webhook_request_for_delivery(delivery_id);
+    let job = captured.one_named("github.workflow.job");
+    assert!(job.parent_span_id.is_empty());
+    assert_eq!(captured.child_count(job, "github.workflow.step"), 2);
+    assert_ne!(job.trace_id, request.trace_id);
+    assert_attribute(job, "github.repository.name", WEBHOOK_REPOSITORY);
+    assert_attribute(job, "github.delivery.id", delivery_id);
+    assert_attribute(
+        job,
+        "github.commit.sha",
+        &WEBHOOK_SHA_40.to_ascii_lowercase(),
+    );
+    assert_attribute(job, "cicd.pipeline.name", "BuildWorkflow");
+    assert_attribute(job, "cicd.pipeline.task.name", "LinuxJob");
+    assert_attribute(job, "cicd.pipeline.task.run.id", "41");
+    assert_attribute(job, "cicd.pipeline.run.id", "31");
+    assert_attribute(job, "github.workflow.run.id", "31");
+    assert_attribute(job, "github.workflow.run.attempt", "2");
+    assert_attribute(job, "github.workflow.job.id", "41");
+    assert_attribute(job, "github.workflow.conclusion", "success");
+    assert_attribute(job, "cicd.pipeline.result", "success");
+    assert_attribute(job, "timing_source", "reported");
+    assert_i64_array_attribute(
+        job,
+        "github.pull_request.number",
+        &(1..=20).collect::<Vec<_>>(),
+    );
+    assert_eq!(job.start_time_unix_nano, rfc3339_unix_nanos(job_started_at));
+    assert_eq!(job.end_time_unix_nano, rfc3339_unix_nanos(job_completed_at));
+
+    let steps = captured
+        .children(job)
+        .filter(|span| span.name == "github.workflow.step")
+        .collect::<Vec<_>>();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].parent_span_id, job.span_id);
+    assert_eq!(steps[1].parent_span_id, job.span_id);
+    assert_eq!(steps[0].trace_id, job.trace_id);
+    assert_eq!(steps[1].trace_id, job.trace_id);
+    assert_eq!(
+        steps
+            .iter()
+            .map(|span| string_attribute(span, "cicd.pipeline.task.run.id"))
+            .collect::<Vec<_>>(),
+        vec![Some("41:2"), Some("41:1")]
+    );
+    assert_attribute(steps[0], "cicd.pipeline.task.name", "RunTests");
+    assert_attribute(steps[0], "github.workflow.conclusion", "success");
+    assert_attribute(steps[0], "cicd.pipeline.task.run.result", "success");
+    assert_attribute(steps[0], "timing_source", "reported");
+    assert_eq!(
+        steps[0].start_time_unix_nano,
+        rfc3339_unix_nanos(first_step_started_at)
+    );
+    assert_eq!(
+        steps[0].end_time_unix_nano,
+        rfc3339_unix_nanos(first_step_completed_at)
+    );
+    assert_attribute(steps[1], "cicd.pipeline.task.name", "Checkout");
+    assert_attribute(steps[1], "github.workflow.conclusion", "success");
+    assert_attribute(steps[1], "cicd.pipeline.task.run.result", "success");
+    assert_attribute(steps[1], "timing_source", "reported");
+    assert_eq!(
+        steps[1].start_time_unix_nano,
+        rfc3339_unix_nanos(second_step_started_at)
+    );
+    assert_eq!(
+        steps[1].end_time_unix_nano,
+        rfc3339_unix_nanos(second_step_completed_at)
+    );
+
+    captured.assert_approved_attribute_keys();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_job_at_configured_step_limit_exports_complete_trace() {
+    let fixture = WebhookTraceFixture::new_with_workflow_job_max_steps(2).await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440800";
+    let body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 9900,
+            "run_id": 8800,
+            "run_attempt": 1,
+            "conclusion": "success",
+            "steps": [
+                {"number": 1, "conclusion": "success"},
+                {"number": 2, "conclusion": "success"}
+            ]
+        }),
+    );
+
+    let response = fixture
+        .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    let exposition = fixture.metrics_text().await;
+    let captured = fixture.force_flush();
+    let job = captured.workflow_job_for_delivery(delivery_id);
+    assert_eq!(captured.child_count(job, "github.workflow.step"), 2);
+    assert_metric_line(&exposition, "github_workflow_job_steps_count 1");
+    assert_metric_line(&exposition, "github_workflow_job_steps_sum 2.0");
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 0",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_job_over_step_limit_emits_actionable_rejection_without_trace() {
+    const REPOSITORY_NAME: &str = "owner/repository";
+    const WORKFLOW_RUN_ID: i64 = 8801;
+    const WORKFLOW_RUN_ATTEMPT: i64 = 2;
+    const WORKFLOW_JOB_ID: i64 = 9901;
+    const DELIVERY_ID: &str = "550e8400-e29b-41d4-a716-446655440801";
+    const FORBIDDEN_WORKFLOW_NAME: &str = "rejection-workflow-name-sentinel";
+    const FORBIDDEN_JOB_NAME: &str = "rejection-job-name-sentinel";
+    const FORBIDDEN_STEP_NAME: &str = "rejection-step-name-sentinel";
+    const FORBIDDEN_SHA: &str = "rejection-sha-sentinel";
+    const FORBIDDEN_PR: &str = "rejection-pr-sentinel";
+    const FORBIDDEN_ACTOR: &str = "rejection-actor-sentinel";
+    const FORBIDDEN_COMMAND: &str = "secret-command";
+    const FORBIDDEN_OUTPUT: &str = "secret-output";
+    const FORBIDDEN_LOGS: &str = "secret-logs";
+    const FORBIDDEN_RAW_URL: &str = "https://rejection-raw-url.invalid/private";
+    const FORBIDDEN_DERIVED_URL: &str = "https://rejection-derived-url.invalid/private";
+    const FORBIDDEN_PAYLOAD_FRAGMENT: &str = "rejection-payload-fragment-sentinel";
+    const FORBIDDEN_SIGNATURE: &str = "rejection-signature-sentinel";
+    const FORBIDDEN_AUTHORIZATION: &str = "rejection-authorization-sentinel";
+    const FORBIDDEN_REPOSITORY_SECRET: &str = "rejection-repository-secret-sentinel";
+    const FORBIDDEN_COLLECTOR_DETAILS: &str = "rejection-collector-details-sentinel";
+
+    let fixture = WebhookTraceFixture::new_with_workflow_job_max_steps(2).await;
+    let body = workflow_job_body_for_repository(
+        Some("completed"),
+        serde_json::json!({
+            "id": WORKFLOW_JOB_ID,
+            "run_id": WORKFLOW_RUN_ID,
+            "run_attempt": WORKFLOW_RUN_ATTEMPT,
+            "conclusion": "success",
+            "workflow_name": FORBIDDEN_WORKFLOW_NAME,
+            "name": FORBIDDEN_JOB_NAME,
+            "head_sha": FORBIDDEN_SHA,
+            "pull_requests": [{"number": 123, "sentinel": FORBIDDEN_PR}],
+            "actor": {"login": FORBIDDEN_ACTOR},
+            "commands": [FORBIDDEN_COMMAND],
+            "output": FORBIDDEN_OUTPUT,
+            "logs": FORBIDDEN_LOGS,
+            "url": FORBIDDEN_RAW_URL,
+            "html_url": FORBIDDEN_DERIVED_URL,
+            "raw_payload_fragment": FORBIDDEN_PAYLOAD_FRAGMENT,
+            "signature": FORBIDDEN_SIGNATURE,
+            "authorization": FORBIDDEN_AUTHORIZATION,
+            "repository_secret": FORBIDDEN_REPOSITORY_SECRET,
+            "collector_details": FORBIDDEN_COLLECTOR_DETAILS,
+            "steps": [
+                {"number": 1, "name": FORBIDDEN_STEP_NAME, "conclusion": "success"},
+                {"number": 2, "conclusion": "success"},
+                {"number": 3, "conclusion": "success"}
+            ]
+        }),
+        REPOSITORY_NAME,
+    );
+
+    let serialized_body = String::from_utf8(body.clone()).expect("webhook body is UTF-8");
+    assert!(
+        serialized_body.contains(FORBIDDEN_LOGS),
+        "serialized webhook body contains the logs sentinel before submission"
+    );
+    let authorization_header = format!("Bearer {FORBIDDEN_AUTHORIZATION}");
+    let response = fixture
+        .webhook_with_authorization(
+            &body,
+            "workflow_job",
+            DELIVERY_ID,
+            WEBHOOK_SECRET,
+            Some(&authorization_header),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    let claim_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries WHERE delivery_id = ?")
+            .bind(DELIVERY_ID)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("durable delivery claim is countable");
+    assert_eq!(claim_count, 1);
+
+    let exposition = fixture.metrics_text().await;
+    let captured = fixture.force_flush();
+    let stderr = fixture.output.text();
+    assert_eq!(
+        captured
+            .spans
+            .iter()
+            .filter(|span| {
+                (span.name == "github.workflow.job" || span.name == "github.workflow.step")
+                    && string_attribute(span, "github.delivery.id") == Some(DELIVERY_ID)
+            })
+            .count(),
+        0,
+        "over-limit delivery emits no historical workflow spans"
+    );
+    assert_metric_line(&exposition, "github_workflow_job_steps_count 1");
+    assert_metric_line(&exposition, "github_workflow_job_steps_sum 3.0");
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 1",
+    );
+
+    for approved in [
+        "reason",
+        "too_many_steps",
+        "repository_name",
+        REPOSITORY_NAME,
+        "workflow_run_id",
+        "workflow_run_attempt",
+        "workflow_job_id",
+        "delivery_id",
+        DELIVERY_ID,
+        "step_count",
+        "step_limit",
+        "8801",
+        "2",
+        "9901",
+        "3",
+    ] {
+        assert!(
+            stderr.contains(approved),
+            "stderr contains approved field or value {approved:?}"
+        );
+    }
+    assert!(stderr.contains("completed workflow-job trace rejected"));
+    let rejection_log = captured.workflow_rejection_log();
+    assert!(
+        rejection_log.trace_id.is_empty() || rejection_log.trace_id.iter().all(|byte| *byte == 0),
+        "rejection warning trace ID must be absent or zero: {:?}",
+        rejection_log.trace_id
+    );
+    assert!(
+        rejection_log.span_id.is_empty() || rejection_log.span_id.iter().all(|byte| *byte == 0),
+        "rejection warning span ID must be absent or zero: {:?}",
+        rejection_log.span_id
+    );
+    let mut rejection_attribute_keys = rejection_log
+        .attributes
+        .iter()
+        .map(|attribute| attribute.key.as_str())
+        .collect::<Vec<_>>();
+    rejection_attribute_keys.sort_unstable();
+    assert_eq!(
+        rejection_attribute_keys,
+        vec![
+            "delivery_id",
+            "reason",
+            "repository_name",
+            "step_count",
+            "step_limit",
+            "workflow_job_id",
+            "workflow_run_attempt",
+            "workflow_run_id",
+        ],
+        "rejection warning custom OTLP attributes"
+    );
+    assert!(captured.has_log_body("completed workflow-job trace rejected"));
+    assert!(captured.has_log_string_attribute("reason", "too_many_steps"));
+    assert!(captured.has_log_string_attribute("repository_name", REPOSITORY_NAME));
+    assert!(captured.has_log_string_attribute("delivery_id", DELIVERY_ID));
+    for (key, value) in [
+        ("workflow_run_id", WORKFLOW_RUN_ID),
+        ("workflow_run_attempt", WORKFLOW_RUN_ATTEMPT),
+        ("workflow_job_id", WORKFLOW_JOB_ID),
+        ("step_count", 3),
+        ("step_limit", 2),
+    ] {
+        assert!(
+            captured.has_log_i64_attribute(key, value),
+            "OTLP logs contain approved field {key:?}"
+        );
+    }
+
+    for forbidden in [
+        FORBIDDEN_WORKFLOW_NAME,
+        FORBIDDEN_JOB_NAME,
+        FORBIDDEN_STEP_NAME,
+        FORBIDDEN_SHA,
+        FORBIDDEN_PR,
+        FORBIDDEN_ACTOR,
+        FORBIDDEN_COMMAND,
+        FORBIDDEN_OUTPUT,
+        FORBIDDEN_LOGS,
+        FORBIDDEN_RAW_URL,
+        FORBIDDEN_DERIVED_URL,
+        FORBIDDEN_PAYLOAD_FRAGMENT,
+        FORBIDDEN_SIGNATURE,
+        FORBIDDEN_AUTHORIZATION,
+        FORBIDDEN_REPOSITORY_SECRET,
+        FORBIDDEN_COLLECTOR_DETAILS,
+    ] {
+        captured.assert_absent(forbidden);
+        captured.assert_logs_absent(forbidden);
+        assert!(!stderr.contains(forbidden));
+        assert!(!exposition.contains(forbidden));
+    }
+    for identifier in [REPOSITORY_NAME, DELIVERY_ID] {
+        assert!(!exposition.contains(identifier));
+    }
+    for identifier in [WORKFLOW_RUN_ID, WORKFLOW_JOB_ID] {
+        let identifier_text = identifier.to_string();
+        assert!(
+            !exposition.lines().any(|line| {
+                if line.starts_with('#') {
+                    return false;
+                }
+
+                let Some((metric_series, _sample_value)) = line.rsplit_once(' ') else {
+                    return false;
+                };
+                metric_series.contains(&identifier_text)
+            }),
+            "Prometheus metric series and labels must not contain workflow identifier {identifier}"
+        );
+
+        let identifier_value = identifier as f64;
+        assert!(
+            !exposition.lines().any(|line| {
+                !line.starts_with('#')
+                    && line
+                        .rsplit_once(' ')
+                        .and_then(|(_, value)| value.parse::<f64>().ok())
+                        .is_some_and(|value| value == identifier_value)
+            }),
+            "Prometheus sample values must not contain workflow identifier {identifier}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unauthorized_and_non_completed_over_limit_jobs_skip_specialized_processing() {
+    let fixture = WebhookTraceFixture::new_with_workflow_job_max_steps(2).await;
+    let unauthorized_delivery = "550e8400-e29b-41d4-a716-446655440803";
+    let non_completed_delivery = "550e8400-e29b-41d4-a716-446655440804";
+    let over_limit_steps = serde_json::json!([
+        {"number": 1},
+        {"number": 2},
+        {"number": 3}
+    ]);
+    let unauthorized_body = workflow_job_body_for_repository(
+        Some("completed"),
+        serde_json::json!({
+            "id": 9903,
+            "run_id": 8803,
+            "run_attempt": 1,
+            "steps": over_limit_steps.clone()
+        }),
+        ACTIONABLE_REPOSITORY,
+    );
+    let non_completed_body = workflow_job_body_for_repository(
+        Some("in_progress"),
+        serde_json::json!({
+            "id": 9904,
+            "run_id": 8804,
+            "run_attempt": 1,
+            "steps": over_limit_steps
+        }),
+        ACTIONABLE_REPOSITORY,
+    );
+
+    let unauthorized_response = fixture
+        .webhook_with_signature(
+            &unauthorized_body,
+            "workflow_job",
+            unauthorized_delivery,
+            "sha256=0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .await;
+    assert_eq!(unauthorized_response.status(), StatusCode::UNAUTHORIZED);
+
+    let non_completed_response = fixture
+        .webhook(
+            &non_completed_body,
+            "workflow_job",
+            non_completed_delivery,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(non_completed_response.status(), StatusCode::NO_CONTENT);
+
+    for (delivery_id, expected_claim_count) in [
+        (unauthorized_delivery, 0_i64),
+        (non_completed_delivery, 1_i64),
+    ] {
+        let claim_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries WHERE delivery_id = ?")
+                .bind(delivery_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("delivery claim is countable");
+        assert_eq!(claim_count, expected_claim_count, "claim for {delivery_id}");
+    }
+
+    let exposition = fixture.metrics_text().await;
+    assert_metric_line(
+        &exposition,
+        "github_webhook_requests_total{result=\"unauthorized\"} 1",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_webhook_requests_total{result=\"accepted\"} 1",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_webhook_events_total{event_type=\"workflow_job\",action=\"in_progress\"} 1",
+    );
+    assert_metric_line(&exposition, "github_workflow_job_steps_count 0");
+    assert_metric_line(&exposition, "github_workflow_job_steps_sum 0.0");
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 0",
+    );
+
+    let captured = fixture.force_flush();
+    let stderr = fixture.output.text();
+    for delivery_id in [unauthorized_delivery, non_completed_delivery] {
+        assert_eq!(
+            captured
+                .spans
+                .iter()
+                .filter(|span| {
+                    (span.name == "github.workflow.job" || span.name == "github.workflow.step")
+                        && string_attribute(span, "github.delivery.id") == Some(delivery_id)
+                })
+                .count(),
+            0,
+            "non-admitted delivery {delivery_id} emits no historical workflow spans"
+        );
+    }
+    assert!(!stderr.contains("completed workflow-job trace rejected"));
+    captured.assert_logs_absent("completed workflow-job trace rejected");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_workflow_admission_after_authentication_has_no_specialized_effects() {
+    let fixture = WebhookTraceFixture::new_with_workflow_job_max_steps(2).await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440805";
+    let body = workflow_job_body_for_repository(
+        Some("completed"),
+        serde_json::Value::Null,
+        ACTIONABLE_REPOSITORY,
+    );
+
+    let response = fixture
+        .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let claim_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries WHERE delivery_id = ?")
+            .bind(delivery_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("delivery claim is countable");
+    assert_eq!(claim_count, 1);
+
+    let exposition = fixture.metrics_text().await;
+    assert_metric_line(
+        &exposition,
+        "github_webhook_requests_total{result=\"accepted\"} 1",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 1",
+    );
+    assert_metric_line(&exposition, "github_workflow_job_steps_count 0");
+    assert_metric_line(&exposition, "github_workflow_job_steps_sum 0.0");
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 0",
+    );
+
+    let captured = fixture.force_flush();
+    let stderr = fixture.output.text();
+    assert_eq!(
+        captured
+            .spans
+            .iter()
+            .filter(|span| {
+                (span.name == "github.workflow.job" || span.name == "github.workflow.step")
+                    && string_attribute(span, "github.delivery.id") == Some(delivery_id)
+            })
+            .count(),
+        0,
+        "malformed admission emits no historical workflow spans"
+    );
+    assert!(!stderr.contains("completed workflow-job trace rejected"));
+    captured.assert_logs_absent("completed workflow-job trace rejected");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_detailed_workflow_projection_observes_admission_once_without_rejection() {
+    let fixture = WebhookTraceFixture::new_with_workflow_job_max_steps(2).await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440806";
+    let body = workflow_job_body_for_repository(
+        Some("completed"),
+        serde_json::json!({
+            "id": 9906,
+            "run_id": 8806,
+            "run_attempt": 1,
+            "steps": [{"name": "missing required number"}]
+        }),
+        ACTIONABLE_REPOSITORY,
+    );
+
+    let response = fixture
+        .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let claim_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries WHERE delivery_id = ?")
+            .bind(delivery_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("delivery claim is countable");
+    assert_eq!(claim_count, 1);
+
+    let exposition = fixture.metrics_text().await;
+    assert_metric_line(
+        &exposition,
+        "github_webhook_requests_total{result=\"accepted\"} 1",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 1",
+    );
+    assert_metric_line(&exposition, "github_workflow_job_steps_count 1");
+    assert_metric_line(&exposition, "github_workflow_job_steps_sum 1.0");
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 0",
+    );
+
+    let captured = fixture.force_flush();
+    let stderr = fixture.output.text();
+    assert_eq!(
+        captured
+            .spans
+            .iter()
+            .filter(|span| {
+                (span.name == "github.workflow.job" || span.name == "github.workflow.step")
+                    && string_attribute(span, "github.delivery.id") == Some(delivery_id)
+            })
+            .count(),
+        0,
+        "detailed projection failure emits no historical workflow spans"
+    );
+    assert!(!stderr.contains("completed workflow-job trace rejected"));
+    captured.assert_logs_absent("completed workflow-job trace rejected");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent() {
+    let required_workflow_span_only_keys = [
+        "cicd.pipeline.name",
+        "cicd.pipeline.run.id",
+        "cicd.pipeline.task.name",
+        "cicd.pipeline.task.run.id",
+        "github.workflow.run.id",
+        "github.workflow.run.attempt",
+        "github.workflow.job.id",
+    ];
+    for key in required_workflow_span_only_keys {
+        assert!(
+            SPAN_ONLY_ATTRIBUTE_KEYS.contains(&key),
+            "workflow span-only attribute key {key:?} is centralized"
+        );
+    }
+
+    let fixture = WebhookTraceFixture::new().await;
+    let body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": WORKFLOW_PRIVACY_JOB_ID,
+            "run_id": WORKFLOW_PRIVACY_RUN_ID,
+            "run_attempt": WORKFLOW_PRIVACY_RUN_ATTEMPT,
+            "workflow_name": WORKFLOW_RAW_NAME,
+            "name": WORKFLOW_RAW_JOB_NAME,
+            "conclusion": WORKFLOW_UNKNOWN_CONCLUSION,
+            "head_sha": WORKFLOW_PRIVACY_SHA,
+            "started_at": "2026-08-06T13:00:00.123456789Z",
+            "completed_at": "2026-08-06T13:05:00.987654321Z",
+            "pull_requests": WORKFLOW_PRIVACY_PR_NUMBERS
+                .iter()
+                .map(|number| serde_json::json!({"number": number}))
+                .collect::<Vec<_>>(),
+            "command": WORKFLOW_FORBIDDEN_COMMAND,
+            "output": WORKFLOW_FORBIDDEN_OUTPUT,
+            "logs": WORKFLOW_FORBIDDEN_LOG,
+            "actor": {"login": WORKFLOW_FORBIDDEN_ACTOR},
+            "url": WORKFLOW_FORBIDDEN_URL,
+            "secret": WORKFLOW_FORBIDDEN_SECRET,
+            "signature": WORKFLOW_FORBIDDEN_SIGNATURE,
+            "headers": {"x-task6-private": WORKFLOW_FORBIDDEN_HEADER},
+            "raw_payload_fragment": WORKFLOW_FORBIDDEN_FRAGMENT,
+            "steps": [{
+                "number": WORKFLOW_PRIVACY_STEP_NUMBER,
+                "name": WORKFLOW_RAW_STEP_NAME,
+                "conclusion": WORKFLOW_UNKNOWN_CONCLUSION,
+                "started_at": "2026-08-06T13:01:00.111111111Z",
+                "completed_at": "2026-08-06T13:02:00.222222222Z",
+                "command": WORKFLOW_FORBIDDEN_COMMAND,
+                "output": WORKFLOW_FORBIDDEN_OUTPUT,
+                "logs": WORKFLOW_FORBIDDEN_LOG,
+                "actor": WORKFLOW_FORBIDDEN_ACTOR,
+                "url": WORKFLOW_FORBIDDEN_URL
+            }]
+        }),
+    );
+
+    let response = fixture
+        .webhook(
+            &body,
+            "workflow_job",
+            WORKFLOW_PRIVACY_DELIVERY,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(to_bytes(response.into_body(), 1)
+        .await
+        .expect("workflow response body is readable")
+        .is_empty());
+
+    let exposition = fixture.metrics_text().await;
+    let captured = fixture.force_flush();
+    let stderr = fixture.output.text();
+    let job = captured.workflow_job_for_delivery(WORKFLOW_PRIVACY_DELIVERY);
+    let task_run_id = format!("{WORKFLOW_PRIVACY_JOB_ID}:{WORKFLOW_PRIVACY_STEP_NUMBER}");
+    let step = captured.workflow_step_for_task_run_id(job, &task_run_id);
+
+    assert!(job.parent_span_id.is_empty());
+    assert_attribute(job, "github.repository.name", WEBHOOK_REPOSITORY);
+    assert_attribute(job, "github.delivery.id", WORKFLOW_PRIVACY_DELIVERY);
+    assert_attribute(job, "github.commit.sha", WORKFLOW_PRIVACY_SHA);
+    assert_attribute(job, "cicd.pipeline.name", WORKFLOW_SANITIZED_NAME);
+    assert_attribute(job, "cicd.pipeline.task.name", WORKFLOW_SANITIZED_JOB_NAME);
+    assert_attribute(
+        job,
+        "cicd.pipeline.run.id",
+        &WORKFLOW_PRIVACY_RUN_ID.to_string(),
+    );
+    assert_attribute(
+        job,
+        "github.workflow.run.id",
+        &WORKFLOW_PRIVACY_RUN_ID.to_string(),
+    );
+    assert_attribute(
+        job,
+        "github.workflow.run.attempt",
+        &WORKFLOW_PRIVACY_RUN_ATTEMPT.to_string(),
+    );
+    assert_attribute(
+        job,
+        "github.workflow.job.id",
+        &WORKFLOW_PRIVACY_JOB_ID.to_string(),
+    );
+    assert_attribute(
+        job,
+        "cicd.pipeline.task.run.id",
+        &WORKFLOW_PRIVACY_JOB_ID.to_string(),
+    );
+    assert_i64_array_attribute(
+        job,
+        "github.pull_request.number",
+        WORKFLOW_PRIVACY_PR_NUMBERS,
+    );
+    assert_attribute(job, "github.workflow.conclusion", "other");
+    assert_eq!(string_attribute(job, "cicd.pipeline.result"), None);
+    assert_historical_interval(
+        job,
+        rfc3339_unix_nanos("2026-08-06T13:00:00.123456789Z"),
+        rfc3339_unix_nanos("2026-08-06T13:05:00.987654321Z"),
+        "reported",
+    );
+    assert_attribute(
+        step,
+        "cicd.pipeline.task.name",
+        WORKFLOW_SANITIZED_STEP_NAME,
+    );
+    assert_attribute(step, "cicd.pipeline.task.run.id", &task_run_id);
+    assert_attribute(step, "github.workflow.conclusion", "other");
+    assert_eq!(
+        string_attribute(step, "cicd.pipeline.task.run.result"),
+        None
+    );
+    assert_historical_interval(
+        step,
+        rfc3339_unix_nanos("2026-08-06T13:01:00.111111111Z"),
+        rfc3339_unix_nanos("2026-08-06T13:02:00.222222222Z"),
+        "reported",
+    );
+
+    captured.assert_approved_attribute_keys();
+    for key in SPAN_ONLY_ATTRIBUTE_KEYS {
+        assert!(
+            captured.has_trace_attribute_key(key),
+            "span-only attribute key {key:?} is present in traces"
+        );
+        assert!(
+            !captured.has_log_attribute_key(key),
+            "OTLP logs must not contain span-only attribute key {key:?}"
+        );
+    }
+    assert!(captured
+        .has_trace_i64_array_attribute("github.pull_request.number", WORKFLOW_PRIVACY_PR_NUMBERS,));
+    assert!(!captured
+        .has_log_i64_array_attribute("github.pull_request.number", WORKFLOW_PRIVACY_PR_NUMBERS,));
+    for numeric_identifier in [
+        WORKFLOW_PRIVACY_RUN_ID,
+        WORKFLOW_PRIVACY_RUN_ATTEMPT,
+        WORKFLOW_PRIVACY_JOB_ID,
+        WORKFLOW_PRIVACY_PR_NUMBERS[0],
+        WORKFLOW_PRIVACY_PR_NUMBERS[1],
+    ] {
+        assert!(
+            !captured.has_log_i64_value(numeric_identifier),
+            "OTLP log bodies, attributes, and resources must not contain numeric workflow identifier {numeric_identifier}"
+        );
+        let value = numeric_identifier.to_string();
+        assert!(!stderr.contains(&value));
+        assert!(!exposition.contains(&value));
+    }
+
+    let run_id = WORKFLOW_PRIVACY_RUN_ID.to_string();
+    let run_attempt = WORKFLOW_PRIVACY_RUN_ATTEMPT.to_string();
+    let job_id = WORKFLOW_PRIVACY_JOB_ID.to_string();
+    for approved_span_only_value in [
+        WEBHOOK_REPOSITORY,
+        WORKFLOW_PRIVACY_DELIVERY,
+        WORKFLOW_PRIVACY_SHA,
+        WORKFLOW_SANITIZED_NAME,
+        WORKFLOW_SANITIZED_JOB_NAME,
+        WORKFLOW_SANITIZED_STEP_NAME,
+        run_id.as_str(),
+        run_attempt.as_str(),
+        job_id.as_str(),
+        task_run_id.as_str(),
+    ] {
+        captured.assert_logs_absent(approved_span_only_value);
+        assert!(
+            !stderr.contains(approved_span_only_value),
+            "stderr must not contain span-only value {approved_span_only_value:?}"
+        );
+        assert!(
+            !exposition.contains(approved_span_only_value),
+            "Prometheus must not contain span-only value {approved_span_only_value:?}"
+        );
+    }
+
+    for forbidden in [
+        WORKFLOW_RAW_NAME,
+        WORKFLOW_ESCAPED_RAW_NAME,
+        WORKFLOW_RAW_JOB_NAME,
+        WORKFLOW_ESCAPED_RAW_JOB_NAME,
+        WORKFLOW_RAW_STEP_NAME,
+        WORKFLOW_ESCAPED_RAW_STEP_NAME,
+        WORKFLOW_FORBIDDEN_COMMAND,
+        WORKFLOW_FORBIDDEN_OUTPUT,
+        WORKFLOW_FORBIDDEN_LOG,
+        WORKFLOW_FORBIDDEN_ACTOR,
+        WORKFLOW_FORBIDDEN_URL,
+        WORKFLOW_FORBIDDEN_SECRET,
+        WORKFLOW_FORBIDDEN_SIGNATURE,
+        WORKFLOW_FORBIDDEN_HEADER,
+        WORKFLOW_FORBIDDEN_FRAGMENT,
+        WORKFLOW_UNKNOWN_CONCLUSION,
+    ] {
+        captured.assert_absent(forbidden);
+        captured.assert_logs_absent(forbidden);
+        assert!(
+            !stderr.contains(forbidden),
+            "stderr must not contain forbidden workflow value {forbidden:?}"
+        );
+        assert!(
+            !exposition.contains(forbidden),
+            "Prometheus must not contain forbidden workflow value {forbidden:?}"
+        );
+    }
+    for expected in [
+        "github_webhook_requests_total{result=\"accepted\"} 1",
+        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 1",
+        "github_webhook_request_body_bytes_count 1",
+        "github_webhook_duplicates_total 0",
+    ] {
+        assert_metric_line(&exposition, expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_conclusions_export_bounded_results_and_statuses() {
+    let fixture = WebhookTraceFixture::new().await;
+    let cases = [
+        (
+            "success",
+            "success",
+            Some("success"),
+            OtlpStatusCode::Ok,
+            "",
+        ),
+        (
+            "failure",
+            "failure",
+            Some("failure"),
+            OtlpStatusCode::Error,
+            "workflow_failed",
+        ),
+        (
+            "cancelled",
+            "cancelled",
+            Some("cancellation"),
+            OtlpStatusCode::Unset,
+            "",
+        ),
+        (
+            "skipped",
+            "skipped",
+            Some("skip"),
+            OtlpStatusCode::Unset,
+            "",
+        ),
+        (
+            "timed_out",
+            "timed_out",
+            Some("timeout"),
+            OtlpStatusCode::Error,
+            "workflow_failed",
+        ),
+        ("neutral", "neutral", None, OtlpStatusCode::Unset, ""),
+        (
+            "fixture_private_unknown",
+            "other",
+            None,
+            OtlpStatusCode::Unset,
+            "",
+        ),
+    ];
+
+    for (index, (raw, _, _, _, _)) in cases.iter().enumerate() {
+        let body = workflow_job_body(
+            Some("completed"),
+            serde_json::json!({
+                "id": 100 + index,
+                "run_id": 200 + index,
+                "run_attempt": 1,
+                "conclusion": raw,
+                "started_at": "2026-08-06T10:00:00.000000001Z",
+                "completed_at": "2026-08-06T10:00:01.000000002Z",
+                "steps": [{
+                    "number": 1,
+                    "conclusion": raw,
+                    "started_at": "2026-08-06T10:00:00.100000003Z",
+                    "completed_at": "2026-08-06T10:00:00.900000004Z"
+                }]
+            }),
+        );
+        let delivery_id = format!("550e8400-e29b-41d4-a716-4466554403{index:02}");
+        let response = fixture
+            .webhook(&body, "workflow_job", &delivery_id, WEBHOOK_SECRET)
+            .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let captured = fixture.force_flush();
+    assert_eq!(
+        captured
+            .spans
+            .iter()
+            .filter(|span| span.name == "github.workflow.job")
+            .count(),
+        cases.len()
+    );
+    assert_eq!(
+        captured
+            .spans
+            .iter()
+            .filter(|span| span.name == "github.workflow.step")
+            .count(),
+        cases.len()
+    );
+
+    for (index, (_, normalized, semantic_result, status, description)) in cases.iter().enumerate() {
+        let delivery_id = format!("550e8400-e29b-41d4-a716-4466554403{index:02}");
+        let job = captured.workflow_job_for_delivery(&delivery_id);
+        let step = captured.child_named(job, "github.workflow.step");
+
+        assert_attribute(job, "github.workflow.conclusion", normalized);
+        assert_attribute(step, "github.workflow.conclusion", normalized);
+        // These exact presence/absence assertions exercise WorkflowConclusion::semantic_result.
+        assert_eq!(
+            string_attribute(job, "cicd.pipeline.result"),
+            *semantic_result
+        );
+        assert_eq!(
+            string_attribute(step, "cicd.pipeline.task.run.result"),
+            *semantic_result
+        );
+        // These protobuf assertions exercise WorkflowConclusion::status.
+        assert_otlp_status(job, *status, description);
+        assert_otlp_status(step, *status, description);
+    }
+    captured.assert_absent("fixture_private_unknown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_timing_uses_reported_and_bounded_fallback_intervals() {
+    let fixture = WebhookTraceFixture::new().await;
+    let reported_delivery = "550e8400-e29b-41d4-a716-446655440400";
+    let malformed_completion_delivery = "550e8400-e29b-41d4-a716-446655440401";
+    let missing_delivery = "550e8400-e29b-41d4-a716-446655440402";
+    let malformed_receipt_delivery = "550e8400-e29b-41d4-a716-446655440403";
+    let reversed_delivery = "550e8400-e29b-41d4-a716-446655440404";
+    let job_started_at = "2026-08-06T10:00:00.123456789Z";
+    let job_completed_at = "2026-08-06T10:05:00.987654321Z";
+    let step_started_at = "2026-08-06T10:01:00.111111111Z";
+    let step_completed_at = "2026-08-06T10:02:00.222222222Z";
+    let reported_body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 410,
+            "run_id": 310,
+            "run_attempt": 2,
+            "started_at": job_started_at,
+            "completed_at": job_completed_at,
+            "steps": [
+                {
+                    "number": 1,
+                    "started_at": step_started_at,
+                    "completed_at": step_completed_at
+                },
+                {
+                    "number": 2,
+                    "started_at": "not-a-timestamp",
+                    "completed_at": "also-not-a-timestamp"
+                },
+                {"number": 3},
+                {
+                    "number": 4,
+                    "started_at": "2026-08-06T10:03:00.000000004Z",
+                    "completed_at": "2026-08-06T10:02:00.000000005Z"
+                },
+                {
+                    "number": 5,
+                    "started_at": "2026-08-06T09:59:59.000000006Z",
+                    "completed_at": "2026-08-06T10:01:00.000000007Z"
+                }
+            ]
+        }),
+    );
+    let response = fixture
+        .webhook(
+            &reported_body,
+            "workflow_job",
+            reported_delivery,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let malformed_completion_at = "2026-08-06T11:05:00.333333333Z";
+    let malformed_completion_body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 411,
+            "run_id": 311,
+            "run_attempt": 1,
+            "started_at": "not-a-timestamp",
+            "completed_at": malformed_completion_at,
+            "steps": []
+        }),
+    );
+    let response = fixture
+        .webhook(
+            &malformed_completion_body,
+            "workflow_job",
+            malformed_completion_delivery,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let missing_body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 412,
+            "run_id": 312,
+            "run_attempt": 1,
+            "steps": []
+        }),
+    );
+    let missing_request_started = current_unix_nanos();
+    let response = fixture
+        .webhook(
+            &missing_body,
+            "workflow_job",
+            missing_delivery,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    let missing_request_completed = current_unix_nanos();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let malformed_receipt_body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 413,
+            "run_id": 313,
+            "run_attempt": 1,
+            "started_at": "not-a-timestamp",
+            "completed_at": {"invalid": true},
+            "steps": []
+        }),
+    );
+    let malformed_request_started = current_unix_nanos();
+    let response = fixture
+        .webhook(
+            &malformed_receipt_body,
+            "workflow_job",
+            malformed_receipt_delivery,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    let malformed_request_completed = current_unix_nanos();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let reversed_completion_at = "2026-08-06T12:04:00.444444444Z";
+    let reversed_body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 414,
+            "run_id": 314,
+            "run_attempt": 1,
+            "started_at": "2026-08-06T12:05:00.555555555Z",
+            "completed_at": reversed_completion_at,
+            "steps": []
+        }),
+    );
+    let response = fixture
+        .webhook(
+            &reversed_body,
+            "workflow_job",
+            reversed_delivery,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let captured = fixture.force_flush();
+    let reported_job = captured.workflow_job_for_delivery(reported_delivery);
+    let reported_job_end = rfc3339_unix_nanos(job_completed_at);
+    assert_historical_interval(
+        reported_job,
+        rfc3339_unix_nanos(job_started_at),
+        reported_job_end,
+        "reported",
+    );
+    let steps = captured
+        .children(reported_job)
+        .filter(|span| span.name == "github.workflow.step")
+        .collect::<Vec<_>>();
+    assert_eq!(steps.len(), 5);
+    let step_by_number = |number: i64| {
+        let task_run_id = format!("410:{number}");
+        steps
+            .iter()
+            .copied()
+            .find(|span| {
+                string_attribute(span, "cicd.pipeline.task.run.id") == Some(task_run_id.as_str())
+            })
+            .unwrap_or_else(|| panic!("workflow step {task_run_id} is exported"))
+    };
+    assert_historical_interval(
+        step_by_number(1),
+        rfc3339_unix_nanos(step_started_at),
+        rfc3339_unix_nanos(step_completed_at),
+        "reported",
+    );
+    for number in 2..=5 {
+        assert_historical_interval(
+            step_by_number(number),
+            reported_job_end,
+            reported_job_end,
+            "fallback",
+        );
+    }
+
+    let malformed_completion = captured.workflow_job_for_delivery(malformed_completion_delivery);
+    let malformed_completion_at = rfc3339_unix_nanos(malformed_completion_at);
+    assert_historical_interval(
+        malformed_completion,
+        malformed_completion_at,
+        malformed_completion_at,
+        "fallback",
+    );
+
+    let missing = captured.workflow_job_for_delivery(missing_delivery);
+    assert_eq!(missing.start_time_unix_nano, missing.end_time_unix_nano);
+    assert!(
+        (missing_request_started..=missing_request_completed)
+            .contains(&missing.start_time_unix_nano),
+        "missing timestamps fall back to the exact bounded receipt instant"
+    );
+    assert_historical_interval(
+        missing,
+        missing.start_time_unix_nano,
+        missing.end_time_unix_nano,
+        "fallback",
+    );
+
+    let malformed_receipt = captured.workflow_job_for_delivery(malformed_receipt_delivery);
+    assert_eq!(
+        malformed_receipt.start_time_unix_nano,
+        malformed_receipt.end_time_unix_nano
+    );
+    assert!(
+        (malformed_request_started..=malformed_request_completed)
+            .contains(&malformed_receipt.start_time_unix_nano),
+        "malformed timestamps fall back to the exact bounded receipt instant"
+    );
+    assert_historical_interval(
+        malformed_receipt,
+        malformed_receipt.start_time_unix_nano,
+        malformed_receipt.end_time_unix_nano,
+        "fallback",
+    );
+
+    let reversed = captured.workflow_job_for_delivery(reversed_delivery);
+    let reversed_completion_at = rfc3339_unix_nanos(reversed_completion_at);
+    assert_historical_interval(
+        reversed,
+        reversed_completion_at,
+        reversed_completion_at,
+        "fallback",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsupported_workflow_actions_and_projections_emit_no_historical_trace() {
+    let fixture = WebhookTraceFixture::new().await;
+    let requests = [
+        (
+            "550e8400-e29b-41d4-a716-446655440500",
+            Some("queued"),
+            "queued",
+            serde_json::json!({
+                "id": 501, "run_id": 601, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z", "steps": []
+            }),
+        ),
+        (
+            "550e8400-e29b-41d4-a716-446655440501",
+            Some("in_progress"),
+            "in_progress",
+            serde_json::json!({
+                "id": 502, "run_id": 602, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z", "steps": []
+            }),
+        ),
+        (
+            "550e8400-e29b-41d4-a716-446655440502",
+            None,
+            "none",
+            serde_json::json!({
+                "id": 503, "run_id": 603, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z", "steps": []
+            }),
+        ),
+        (
+            "550e8400-e29b-41d4-a716-446655440503",
+            Some("fixture_unknown_action"),
+            "other",
+            serde_json::json!({
+                "id": 504, "run_id": 604, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z", "steps": []
+            }),
+        ),
+        (
+            "550e8400-e29b-41d4-a716-446655440504",
+            Some("completed"),
+            "completed",
+            serde_json::json!({
+                "id": 0, "run_id": 605, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z", "steps": []
+            }),
+        ),
+        (
+            "550e8400-e29b-41d4-a716-446655440505",
+            Some("completed"),
+            "completed",
+            serde_json::json!({
+                "id": 506, "run_id": "malformed", "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z", "steps": []
+            }),
+        ),
+        (
+            "550e8400-e29b-41d4-a716-446655440506",
+            Some("completed"),
+            "completed",
+            serde_json::json!({
+                "id": 507, "run_id": 607,
+                "completed_at": "2026-08-06T10:05:00Z", "steps": []
+            }),
+        ),
+        (
+            "550e8400-e29b-41d4-a716-446655440507",
+            Some("completed"),
+            "completed",
+            serde_json::json!({
+                "id": 508, "run_id": 608, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z", "steps": {}
+            }),
+        ),
+        (
+            "550e8400-e29b-41d4-a716-446655440508",
+            Some("completed"),
+            "completed",
+            serde_json::json!({
+                "id": 509, "run_id": 609, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z",
+                "steps": [{"name": "missing required number"}]
+            }),
+        ),
+        (
+            "550e8400-e29b-41d4-a716-446655440509",
+            Some("completed"),
+            "completed",
+            serde_json::json!({
+                "id": 510, "run_id": 610, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z",
+                "steps": [{"number": 1}, {"number": 0}, {"number": 2}]
+            }),
+        ),
+        (
+            "550e8400-e29b-41d4-a716-446655440510",
+            Some("completed"),
+            "completed",
+            serde_json::json!({
+                "id": 511, "run_id": 611, "run_attempt": 1,
+                "completed_at": "2026-08-06T10:05:00Z",
+                "steps": [{"number": 1}, {"number": -1}, {"number": 2}]
+            }),
+        ),
+    ];
+
+    for (delivery_id, action, normalized_action, workflow_job) in &requests {
+        let delivery_id = *delivery_id;
+        let normalized_action = *normalized_action;
+        let event_series = format!(
+            "github_webhook_events_total{{event_type=\"workflow_job\",action=\"{normalized_action}\"}}"
+        );
+        let before = fixture.metrics_text().await;
+        let event_count = metric_u64_or_zero(&before, &event_series);
+        let body_count = metric_u64(&before, "github_webhook_request_body_bytes_count");
+        let accepted_count = metric_u64(
+            &before,
+            "github_webhook_requests_total{result=\"accepted\"}",
+        );
+
+        let body = workflow_job_body(*action, workflow_job.clone());
+        let response = fixture
+            .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
+            .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let claim_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries WHERE delivery_id = ?")
+                .bind(delivery_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("delivery claim is countable");
+        assert_eq!(claim_count, 1, "durable claim for {delivery_id}");
+
+        let after = fixture.metrics_text().await;
+        assert_eq!(
+            metric_u64(&after, &event_series),
+            event_count + 1,
+            "generic event metric delta for {delivery_id}"
+        );
+        assert_eq!(
+            metric_u64(&after, "github_webhook_request_body_bytes_count"),
+            body_count + 1,
+            "generic body metric delta for {delivery_id}"
+        );
+        assert_eq!(
+            metric_u64(&after, "github_webhook_requests_total{result=\"accepted\"}",),
+            accepted_count + 1,
+            "accepted request metric delta for {delivery_id}"
+        );
+
+        let captured = fixture.force_flush();
+        assert_eq!(
+            captured
+                .spans
+                .iter()
+                .filter(|span| {
+                    span.name == "github.workflow.job" || span.name == "github.workflow.step"
+                })
+                .count(),
+            0,
+            "request {delivery_id} emits no historical workflow span"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_workflow_delivery_emits_one_historical_trace() {
+    let fixture = WebhookTraceFixture::new().await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440600";
+    let first_step_started_at = "2026-08-06T10:01:00.000000003Z";
+    let first_step_completed_at = "2026-08-06T10:02:00.000000004Z";
+    let second_step_started_at = "2026-08-06T10:03:00.000000005Z";
+    let second_step_completed_at = "2026-08-06T10:04:00.000000006Z";
+    let body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 701,
+            "run_id": 801,
+            "run_attempt": 1,
+            "conclusion": "success",
+            "started_at": "2026-08-06T10:00:00.000000001Z",
+            "completed_at": "2026-08-06T10:05:00.000000002Z",
+            "steps": [
+                {
+                    "number": 1,
+                    "conclusion": "success",
+                    "started_at": first_step_started_at,
+                    "completed_at": first_step_completed_at
+                },
+                {
+                    "number": 2,
+                    "conclusion": "failure",
+                    "started_at": second_step_started_at,
+                    "completed_at": second_step_completed_at
+                }
+            ]
+        }),
+    );
+
+    for _ in 0..2 {
+        let response = fixture
+            .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
+            .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let claim_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries WHERE delivery_id = ?")
+            .bind(delivery_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("durable delivery claim is countable");
+    assert_eq!(claim_count, 1);
+    let exposition = fixture.metrics_text().await;
+    let captured = fixture.force_flush();
+
+    let job = captured.workflow_job_for_delivery(delivery_id);
+    assert_eq!(captured.child_count(job, "github.workflow.step"), 2);
+    let first_step = captured.workflow_step_for_task_run_id(job, "701:1");
+    let second_step = captured.workflow_step_for_task_run_id(job, "701:2");
+    assert_attribute(first_step, "github.workflow.conclusion", "success");
+    assert_attribute(first_step, "cicd.pipeline.task.run.result", "success");
+    assert_otlp_status(first_step, OtlpStatusCode::Ok, "");
+    assert_historical_interval(
+        first_step,
+        rfc3339_unix_nanos(first_step_started_at),
+        rfc3339_unix_nanos(first_step_completed_at),
+        "reported",
+    );
+    assert_attribute(second_step, "github.workflow.conclusion", "failure");
+    assert_attribute(second_step, "cicd.pipeline.task.run.result", "failure");
+    assert_otlp_status(second_step, OtlpStatusCode::Error, "workflow_failed");
+    assert_historical_interval(
+        second_step,
+        rfc3339_unix_nanos(second_step_started_at),
+        rfc3339_unix_nanos(second_step_completed_at),
+        "reported",
+    );
+    for expected in [
+        "github_webhook_requests_total{result=\"accepted\"} 2",
+        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 1",
+        "github_webhook_request_body_bytes_count 1",
+        "github_webhook_duplicates_total 1",
+    ] {
+        assert_metric_line(&exposition, expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_over_limit_workflow_job_records_one_rejection() {
+    let fixture = WebhookTraceFixture::new_with_workflow_job_max_steps(2).await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440802";
+    let body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 9902,
+            "run_id": 8802,
+            "run_attempt": 1,
+            "conclusion": "success",
+            "steps": [
+                {"number": 1, "conclusion": "success"},
+                {"number": 2, "conclusion": "success"},
+                {"number": 3, "conclusion": "success"}
+            ]
+        }),
+    );
+
+    for _ in 0..2 {
+        let response = fixture
+            .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
+            .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let claim_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM processed_deliveries WHERE delivery_id = ?")
+            .bind(delivery_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("durable delivery claim is countable");
+    assert_eq!(claim_count, 1);
+
+    let exposition = fixture.metrics_text().await;
+    let captured = fixture.force_flush();
+    let stderr = fixture.output.text();
+    assert_metric_line(
+        &exposition,
+        "github_webhook_requests_total{result=\"accepted\"} 2",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 1",
+    );
+    assert_metric_line(&exposition, "github_webhook_duplicates_total 1");
+    assert_metric_line(&exposition, "github_workflow_job_steps_count 1");
+    assert_metric_line(&exposition, "github_workflow_job_steps_sum 3.0");
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 1",
+    );
+    assert_eq!(
+        captured
+            .spans
+            .iter()
+            .filter(|span| span.name == "github.workflow.job" || span.name == "github.workflow.step")
+            .count(),
+        0,
+        "over-limit duplicate delivery emits no historical workflow spans"
+    );
+    assert_eq!(
+        stderr
+            .matches("completed workflow-job trace rejected")
+            .count(),
+        1,
+        "duplicate delivery emits one completed workflow-job rejection warning"
+    );
+    assert_eq!(
+        captured
+            .log_records
+            .iter()
+            .filter(|record| {
+                record
+                    .body
+                    .as_ref()
+                    .and_then(string_any_value)
+                    .is_some_and(|body| body.contains("completed workflow-job trace rejected"))
+            })
+            .count(),
+        1,
+        "duplicate delivery exports one completed workflow-job rejection warning"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_collector_does_not_change_completed_workflow_response() {
+    const EXPORTER_TIMEOUT_MILLIS: u64 = 10_000;
+    const WEBHOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let fixture = WebhookTraceFixture::new_with_exporter_timeout(EXPORTER_TIMEOUT_MILLIS).await;
+    let ready_before = fixture
+        .request(Method::GET, "/health/ready", None, None, Body::empty())
+        .await;
+    assert_eq!(ready_before.status(), StatusCode::OK);
+    fixture.flush();
+    fixture.receiver.clear_captured_requests();
+    assert_eq!(fixture.runtime.failed_trace_exports(), 0);
+    assert_eq!(fixture.runtime.failed_log_exports(), 0);
+
+    let collector_endpoint = fixture.receiver.endpoint();
+    let collector_address = fixture.receiver.address.to_string();
+    let started_requests = fixture.receiver.started_request_count();
+    fixture.receiver.set_exports_released(false);
+
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440700";
+    let body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 901,
+            "run_id": 902,
+            "run_attempt": 1,
+            "workflow_name": "Blocked collector workflow",
+            "name": "Blocked collector job",
+            "conclusion": "success",
+            "started_at": "2026-08-06T14:00:00Z",
+            "completed_at": "2026-08-06T14:05:00Z",
+            "steps": [{
+                "number": 1,
+                "name": "Blocked collector step",
+                "conclusion": "success",
+                "started_at": "2026-08-06T14:01:00Z",
+                "completed_at": "2026-08-06T14:02:00Z"
+            }]
+        }),
+    );
+    let response = tokio::time::timeout(
+        WEBHOOK_TIMEOUT,
+        fixture.webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET),
+    )
+    .await
+    .expect("webhook must not wait for the blocked ten-second exporter");
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(to_bytes(response.into_body(), 1)
+        .await
+        .expect("workflow response body is readable")
+        .is_empty());
+
+    tokio::time::timeout(
+        WEBHOOK_TIMEOUT,
+        wait_for_started_requests(&fixture.receiver.state, started_requests + 2),
+    )
+    .await
+    .expect("trace and log exports reach the blocked collector");
+    let (blocked_traces, blocked_logs) = fixture.receiver.captured_requests();
+    assert!(!blocked_traces.is_empty(), "a trace export is blocked");
+    assert!(!blocked_logs.is_empty(), "a log export is blocked");
+
+    let ready_after = fixture
+        .request(Method::GET, "/health/ready", None, None, Body::empty())
+        .await;
+    assert_eq!(ready_after.status(), StatusCode::OK);
+    let exposition = fixture.metrics_text().await;
+    for expected in [
+        "github_webhook_requests_total{result=\"accepted\"} 1",
+        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 1",
+        "github_webhook_request_body_bytes_count 1",
+        "github_webhook_duplicates_total 0",
+    ] {
+        assert_metric_line(&exposition, expected);
+    }
+    let merge_queue_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_queue_attempts")
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("merge-queue state is countable");
+    assert_eq!(merge_queue_rows, 0);
+    assert_eq!(fixture.runtime.state(), TelemetryState::Enabled);
+    assert_eq!(fixture.runtime.failed_trace_exports(), 0);
+    assert_eq!(fixture.runtime.failed_log_exports(), 0);
+    assert_eq!(fixture.runtime.dropped_trace_records(), 0);
+    assert_eq!(fixture.runtime.dropped_log_records(), 0);
+
+    fixture.receiver.set_exports_released(true);
+    let captured = fixture.force_flush();
+    let job = captured.workflow_job_for_delivery(delivery_id);
+    assert_attribute(job, "cicd.pipeline.task.run.id", "901");
+    assert_eq!(fixture.runtime.pending_trace_records(), 0);
+    assert_eq!(fixture.runtime.pending_log_records(), 0);
+    assert_eq!(fixture.runtime.failed_trace_exports(), 0);
+    assert_eq!(fixture.runtime.failed_log_exports(), 0);
+    assert_eq!(fixture.runtime.dropped_trace_records(), 0);
+    assert_eq!(fixture.runtime.dropped_log_records(), 0);
+
+    let stderr = fixture.finish_without_force_flush().await;
+    let stderr_lowercase = stderr.to_ascii_lowercase();
+    for detail in [collector_endpoint.as_str(), collector_address.as_str()] {
+        assert!(
+            !stderr.contains(detail),
+            "stderr must not expose collector detail {detail:?}"
+        );
+    }
+    for error_detail in [
+        "connection refused",
+        "error sending request",
+        "failed to export",
+    ] {
+        assert!(
+            !stderr_lowercase.contains(error_detail),
+            "stderr must not expose exporter error detail {error_detail:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn webhook_failures_mark_authentication_and_processing_without_raw_error_data() {
     let fixture = WebhookTraceFixture::new().await;
     let unauthorized_delivery = "550e8400-e29b-41d4-a716-446655440211";
@@ -2577,7 +4679,7 @@ async fn integrated_core_trace_privacy() {
     ));
 
     captured.assert_approved_attribute_keys();
-    for key in SPAN_ONLY_IDENTIFIER_ATTRIBUTE_KEYS {
+    for key in SPAN_ONLY_ATTRIBUTE_KEYS {
         assert!(
             !captured.has_log_attribute_key(key),
             "OTLP logs must not contain span-only identifier key {key:?}"
@@ -3030,7 +5132,7 @@ async fn blocked_exporters_preserve_exact_bounds_and_export_otlp_protobuf() {
     let dispatch = Dispatch::new(subscriber);
 
     emit_records(&dispatch, 0..1);
-    wait_for_blocked_signals(&state).await;
+    wait_for_started_requests(&state, 2).await;
     emit_records(&dispatch, 1..SATURATION_RECORDS + 1);
 
     let expected_drops = (SATURATION_RECORDS - QUEUE_CAPACITY) as u64;

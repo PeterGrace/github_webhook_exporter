@@ -20,7 +20,10 @@ use crate::{
     retention::{run_retention, RetentionConfig},
     security::AdminAuthenticator,
     storage::{DeliveryStore, MergeQueueStore, RepositoryStore},
-    telemetry::trace::{self, Operation},
+    telemetry::{
+        trace::{self, Operation},
+        WorkflowTraceEmitter,
+    },
 };
 
 /// Immutable dependencies shared by all HTTP request handlers.
@@ -32,7 +35,9 @@ pub struct AppState {
     delivery_store: DeliveryStore,
     merge_queue_store: MergeQueueStore,
     metrics: Metrics,
+    workflow_trace_emitter: WorkflowTraceEmitter,
     webhook_body_limit_bytes: usize,
+    workflow_job_max_steps: usize,
 }
 
 impl AppState {
@@ -41,6 +46,7 @@ impl AppState {
         repository_store: RepositoryStore,
         admin_authenticator: AdminAuthenticator,
         webhook_body_limit_bytes: usize,
+        workflow_job_max_steps: usize,
     ) -> Self {
         let database_pool = repository_store.pool().clone();
         let delivery_store = DeliveryStore::new(database_pool.clone());
@@ -52,8 +58,19 @@ impl AppState {
             delivery_store,
             merge_queue_store,
             metrics: Metrics::new(),
+            workflow_trace_emitter: WorkflowTraceEmitter::disabled(),
             webhook_body_limit_bytes,
+            workflow_job_max_steps,
         }
+    }
+
+    /// Returns application state updated with the configured workflow trace emitter.
+    pub fn with_workflow_trace_emitter(
+        mut self,
+        workflow_trace_emitter: WorkflowTraceEmitter,
+    ) -> Self {
+        self.workflow_trace_emitter = workflow_trace_emitter;
+        self
     }
 
     /// Initializes the configured-repository gauge from durable storage.
@@ -95,6 +112,16 @@ impl AppState {
     /// Returns the shared bounded metrics component.
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
+    }
+
+    /// Returns the configured explicit-time historical workflow trace emitter.
+    pub fn workflow_trace_emitter(&self) -> &WorkflowTraceEmitter {
+        &self.workflow_trace_emitter
+    }
+
+    /// Returns the maximum reported steps accepted for one completed workflow-job trace.
+    pub fn workflow_job_max_steps(&self) -> usize {
+        self.workflow_job_max_steps
     }
 }
 
@@ -300,6 +327,7 @@ mod tests {
             RepositoryStore::new(pool, cipher),
             AdminAuthenticator::new(&token),
             2_097_152,
+            256,
         )
     }
 
@@ -318,6 +346,13 @@ mod tests {
             .expect("router serves request");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn application_state_exposes_workflow_job_step_limit() {
+        let state = app_state().await;
+
+        assert_eq!(state.workflow_job_max_steps(), 256);
     }
 
     #[tokio::test]
@@ -355,6 +390,8 @@ mod tests {
             "github_merge_queue_pr_outcomes_total",
             "github_merge_queue_attempt_duration_seconds",
             "github_merge_queue_transition_failures_total",
+            "github_workflow_job_steps",
+            "github_workflow_job_trace_rejections_total",
         ] {
             assert!(
                 exposition.contains(metric_name),

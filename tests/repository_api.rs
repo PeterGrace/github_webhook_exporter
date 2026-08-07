@@ -10,6 +10,7 @@ use axum::{
 };
 use github_webhook_exporter::{
     app::{build_router, AppState},
+    config::DEFAULT_WORKFLOW_JOB_MAX_STEPS,
     security::{AdminAuthenticator, AdminToken, MasterKey, RepositorySecretCipher},
     storage::{open_database, RepositoryStore},
 };
@@ -36,6 +37,7 @@ fn router_for_pool(pool: SqlitePool) -> Router {
         RepositoryStore::new(pool, cipher),
         AdminAuthenticator::new(&admin_token),
         2_097_152,
+        DEFAULT_WORKFLOW_JOB_MAX_STEPS,
     ))
 }
 
@@ -732,7 +734,12 @@ async fn repository_configuration_gauge_initializes_from_durable_count() {
             .expect("repository fixture is created");
     }
     let admin_token = AdminToken::new(ADMIN_TOKEN.to_owned()).expect("test token is valid");
-    let state = AppState::new(store, AdminAuthenticator::new(&admin_token), 2_097_152);
+    let state = AppState::new(
+        store,
+        AdminAuthenticator::new(&admin_token),
+        2_097_152,
+        DEFAULT_WORKFLOW_JOB_MAX_STEPS,
+    );
 
     state
         .initialize_repository_metrics()

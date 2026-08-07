@@ -23,6 +23,9 @@ const DEFAULT_RUST_LOG: &str = "info";
 const DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_WEBHOOK_BODY_LIMIT_BYTES: u64 = 2_097_152;
 const MAX_WEBHOOK_BODY_LIMIT_BYTES: u64 = 2_097_152;
+/// Default maximum number of workflow-job steps reported per completed trace.
+pub const DEFAULT_WORKFLOW_JOB_MAX_STEPS: usize = 256;
+const MAX_WORKFLOW_JOB_MAX_STEPS: usize = 1_024;
 const DEFAULT_DELIVERY_RETENTION_DAYS: u64 = 7;
 const DEFAULT_MERGE_QUEUE_RETENTION_DAYS: u64 = 90;
 const DEFAULT_DELIVERY_PRUNE_INTERVAL_SECONDS: u64 = 3_600;
@@ -138,6 +141,7 @@ pub struct RuntimeConfig {
     bind_address: SocketAddr,
     shutdown_timeout: Duration,
     webhook_body_limit_bytes: usize,
+    workflow_job_max_steps: usize,
     delivery_retention: Duration,
     merge_queue_retention: Duration,
     delivery_prune_interval: Duration,
@@ -184,6 +188,11 @@ impl RuntimeConfig {
     /// Returns the maximum accepted GitHub webhook request-body size in bytes.
     pub fn webhook_body_limit_bytes(&self) -> usize {
         self.webhook_body_limit_bytes
+    }
+
+    /// Returns the maximum reported steps accepted for one completed workflow-job trace.
+    pub fn workflow_job_max_steps(&self) -> usize {
+        self.workflow_job_max_steps
     }
 
     /// Returns how long processed webhook delivery identifiers are retained.
@@ -282,6 +291,17 @@ impl RuntimeConfig {
             usize::try_from(webhook_body_limit_bytes).map_err(|_| ConfigError::Invalid {
                 variable: "GHE_WEBHOOK_BODY_LIMIT_BYTES",
             })?;
+        let workflow_job_max_steps = optional_positive_usize(
+            &mut lookup,
+            "GHE_WORKFLOW_JOB_MAX_STEPS",
+            DEFAULT_WORKFLOW_JOB_MAX_STEPS,
+        )?;
+        if workflow_job_max_steps > MAX_WORKFLOW_JOB_MAX_STEPS {
+            return Err(ConfigError::Invalid {
+                variable: "GHE_WORKFLOW_JOB_MAX_STEPS",
+            });
+        }
+
         let delivery_retention_days = optional_positive_u64(
             &mut lookup,
             "GHE_DELIVERY_RETENTION_DAYS",
@@ -323,6 +343,7 @@ impl RuntimeConfig {
             bind_address,
             shutdown_timeout: Duration::from_secs(shutdown_timeout_seconds),
             webhook_body_limit_bytes,
+            workflow_job_max_steps,
             delivery_retention: Duration::from_secs(delivery_retention_seconds),
             merge_queue_retention: Duration::from_secs(merge_queue_retention_seconds),
             delivery_prune_interval: Duration::from_secs(delivery_prune_interval_seconds),
@@ -422,6 +443,7 @@ impl fmt::Debug for RuntimeConfig {
             .field("bind_address", &self.bind_address)
             .field("shutdown_timeout", &self.shutdown_timeout)
             .field("webhook_body_limit_bytes", &self.webhook_body_limit_bytes)
+            .field("workflow_job_max_steps", &self.workflow_job_max_steps)
             .field("delivery_retention", &self.delivery_retention)
             .field("merge_queue_retention", &self.merge_queue_retention)
             .field("delivery_prune_interval", &self.delivery_prune_interval)
@@ -657,7 +679,18 @@ mod tests {
             Duration::from_secs(90 * 86_400)
         );
         assert_eq!(config.delivery_prune_interval(), Duration::from_secs(3_600));
+        assert_eq!(config.workflow_job_max_steps(), 256);
         assert_eq!(config.rust_log(), "info");
+    }
+
+    #[test]
+    fn valid_minimum_workflow_job_max_steps_is_accepted() {
+        let mut variables = required_variables();
+        variables.insert("GHE_WORKFLOW_JOB_MAX_STEPS".to_owned(), OsString::from("1"));
+
+        let config = RuntimeConfig::from_map(variables).expect("minimum step limit is valid");
+
+        assert_eq!(config.workflow_job_max_steps(), 1);
     }
 
     #[test]
@@ -688,6 +721,10 @@ mod tests {
             OsString::from("120"),
         );
         variables.insert(
+            "GHE_WORKFLOW_JOB_MAX_STEPS".to_owned(),
+            OsString::from("1024"),
+        );
+        variables.insert(
             "RUST_LOG".to_owned(),
             OsString::from("github_webhook_exporter=debug"),
         );
@@ -709,6 +746,7 @@ mod tests {
             Duration::from_secs(180 * 86_400)
         );
         assert_eq!(config.delivery_prune_interval(), Duration::from_secs(120));
+        assert_eq!(config.workflow_job_max_steps(), 1_024);
         assert_eq!(config.rust_log(), "github_webhook_exporter=debug");
     }
 
@@ -745,6 +783,10 @@ mod tests {
             ("GHE_MERGE_QUEUE_RETENTION_DAYS", "18446744073709551615"),
             ("GHE_DELIVERY_PRUNE_INTERVAL_SECONDS", "0"),
             ("GHE_DELIVERY_PRUNE_INTERVAL_SECONDS", "not-a-number"),
+            ("GHE_WORKFLOW_JOB_MAX_STEPS", "0"),
+            ("GHE_WORKFLOW_JOB_MAX_STEPS", "not-a-number"),
+            ("GHE_WORKFLOW_JOB_MAX_STEPS", "1025"),
+            ("GHE_WORKFLOW_JOB_MAX_STEPS", "18446744073709551616"),
             ("RUST_LOG", "[invalid"),
         ];
 
@@ -784,6 +826,31 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "environment variable GHE_MERGE_QUEUE_RETENTION_DAYS has an invalid value"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_job_max_steps_rejects_non_unicode_without_disclosure() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut variables = required_variables();
+        variables.insert(
+            "GHE_WORKFLOW_JOB_MAX_STEPS".to_owned(),
+            OsString::from_vec(vec![0xff]),
+        );
+
+        let error = RuntimeConfig::from_map(variables).expect_err("value must be rejected");
+
+        assert_eq!(
+            error,
+            ConfigError::Invalid {
+                variable: "GHE_WORKFLOW_JOB_MAX_STEPS",
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "environment variable GHE_WORKFLOW_JOB_MAX_STEPS has an invalid value"
         );
     }
 
