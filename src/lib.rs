@@ -22,5 +22,5 @@ pub mod retention;
 pub mod security;
 /// SQLite startup, migrations, probes, and durable repository, delivery, and queue persistence.
 pub mod storage;
-/// Independent structured stderr logging and optional bounded OTLP trace/log export.
+/// Independent structured stderr logging and optional bounded OTLP trace/log export and shutdown.
 pub mod telemetry;

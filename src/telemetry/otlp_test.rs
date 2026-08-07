@@ -62,7 +62,7 @@ use tracing::{
 use crate::{config::TelemetryConfig, metrics::Metrics};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
-use super::{build_runtime, trace, TelemetryState};
+use super::{build_runtime, trace, TelemetryShutdownOutcome, TelemetryState};
 
 const QUEUE_CAPACITY: usize = 4;
 const SATURATION_RECORDS: usize = 10;
@@ -929,6 +929,42 @@ impl WebhookTraceFixture {
         let stderr = output.text();
         drop(_otlp_guard);
         stderr
+    }
+
+    fn shutdown(self) -> (CapturedSpans, String, TelemetryShutdownOutcome) {
+        let Self {
+            _otlp_guard,
+            receiver,
+            mut runtime,
+            dispatch,
+            output,
+            span_lifecycles: _,
+            router,
+            pool,
+            _directory,
+        } = self;
+        drop(router);
+        drop(pool);
+        drop(dispatch);
+        drop(_directory);
+        let outcome = runtime.shutdown(std::time::Duration::from_secs(2));
+        assert_eq!(
+            runtime.pending_trace_records(),
+            0,
+            "completed shutdown releases every accepted trace slot"
+        );
+        assert_eq!(
+            runtime.pending_log_records(),
+            0,
+            "completed shutdown releases every accepted log slot"
+        );
+        let (traces, logs) = receiver.captured_requests();
+        let captured = CapturedSpans::from_requests(traces, logs);
+        let stderr = output.text();
+        drop(runtime);
+        drop(receiver);
+        drop(_otlp_guard);
+        (captured, stderr, outcome)
     }
 
     fn finish(self) -> (CapturedSpans, String) {
@@ -2393,6 +2429,53 @@ async fn webhook_successes_emit_bounded_hierarchy_and_span_only_identifiers() {
         assert!(!output.contains(forbidden));
         assert!(!exposition.contains(forbidden));
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_exports_accepted_core_workflow_and_log_records() {
+    let fixture = WebhookTraceFixture::new().await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440299";
+    let body = serde_json::to_vec(&serde_json::json!({
+        "action": "completed",
+        "workflow_job": {
+            "id": 901,
+            "run_id": 902,
+            "run_attempt": 1,
+            "conclusion": "success",
+            "head_sha": WEBHOOK_SHA_40,
+            "started_at": "2026-08-07T12:00:00Z",
+            "completed_at": "2026-08-07T12:01:00Z",
+            "steps": [{
+                "number": 1,
+                "name": "shutdown step",
+                "conclusion": "success",
+                "started_at": "2026-08-07T12:00:10Z",
+                "completed_at": "2026-08-07T12:00:20Z"
+            }]
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("workflow-job payload serializes");
+    let response = fixture
+        .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+    tracing::dispatcher::with_default(&fixture.dispatch, || {
+        tracing::info!(target: "github_webhook_exporter", "shutdown export sentinel");
+    });
+
+    let (captured, stderr, outcome) = fixture.shutdown();
+
+    assert_eq!(outcome, TelemetryShutdownOutcome::Completed);
+    assert!(captured
+        .webhook_request_for_delivery(delivery_id)
+        .parent_span_id
+        .is_empty());
+    let job = captured.one_named("github.workflow.job");
+    assert_eq!(captured.child_count(job, "github.workflow.step"), 1);
+    assert!(captured.has_log_body("shutdown export sentinel"));
+    assert!(stderr.contains("shutdown export sentinel"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4646,7 +4729,8 @@ async fn integrated_core_trace_privacy() {
     assert_eq!(retained_attempt, 0);
 
     let exposition = fixture.metrics_text().await;
-    let (captured, stderr) = fixture.finish();
+    let (captured, stderr, shutdown_outcome) = fixture.shutdown();
+    assert_eq!(shutdown_outcome, TelemetryShutdownOutcome::Completed);
 
     let create_request = captured.http_request("POST", "/api/v1/repositories", 201);
     let repository_write = captured.child_named(create_request, "config.repository.write");

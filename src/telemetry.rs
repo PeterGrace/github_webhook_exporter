@@ -1,4 +1,9 @@
-use std::{io, sync::Arc, thread, time::Duration};
+use std::{
+    io,
+    sync::{mpsc, Arc},
+    thread,
+    time::{Duration, Instant},
+};
 
 mod diagnostics;
 mod http_client;
@@ -58,6 +63,36 @@ pub struct TelemetryRuntime {
     workflow_trace_emitter: WorkflowTraceEmitter,
     trace_queue: Option<Arc<AdmissionBoundary>>,
     log_queue: Option<Arc<AdmissionBoundary>>,
+    diagnostics: DiagnosticsObserver,
+    shutdown_outcome: Option<TelemetryShutdownOutcome>,
+}
+
+/// The bounded result of shutting down all enabled remote telemetry providers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TelemetryShutdownOutcome {
+    /// Every enabled provider shut down before the shared deadline.
+    Completed,
+    /// At least one provider returned a redacted shutdown failure.
+    Failed,
+    /// At least one provider remained unfinished at the shared deadline.
+    TimedOut,
+}
+
+struct ShutdownTask {
+    signal: crate::metrics::TelemetrySignal,
+    operation: Box<dyn FnOnce(Duration) -> bool + Send + 'static>,
+}
+
+impl ShutdownTask {
+    fn new(
+        signal: crate::metrics::TelemetrySignal,
+        operation: impl FnOnce(Duration) -> bool + Send + 'static,
+    ) -> Self {
+        Self {
+            signal,
+            operation: Box::new(operation),
+        }
+    }
 }
 
 impl TelemetryRuntime {
@@ -128,6 +163,142 @@ impl TelemetryRuntime {
             return Err(TelemetryError::Flush);
         }
         Ok(())
+    }
+
+    /// Stops admission and shuts down both enabled providers within one shared deadline.
+    ///
+    /// The operation is idempotent: later calls return the first terminal outcome without
+    /// invoking either provider again. Trace and log shutdown start concurrently, and `timeout`
+    /// bounds their combined wait rather than granting a serial deadline to each signal.
+    /// Provider failures are reduced to bounded diagnostics and never expose SDK error text.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum combined duration to wait for all enabled providers.
+    ///
+    /// # Returns
+    ///
+    /// A bounded outcome indicating completion, failure, or expiration of the shared deadline.
+    pub fn shutdown(&mut self, timeout: Duration) -> TelemetryShutdownOutcome {
+        if let Some(outcome) = self.shutdown_outcome {
+            return outcome;
+        }
+        if let Some(queue) = &self.trace_queue {
+            queue.close();
+        }
+        if let Some(queue) = &self.log_queue {
+            queue.close();
+        }
+
+        let mut tasks = Vec::with_capacity(2);
+        if let Some(provider) = self.tracer_provider.take() {
+            tasks.push(ShutdownTask::new(
+                crate::metrics::TelemetrySignal::Trace,
+                move |remaining| provider.shutdown_with_timeout(remaining).is_ok(),
+            ));
+        }
+        if let Some(provider) = self.logger_provider.take() {
+            tasks.push(ShutdownTask::new(
+                crate::metrics::TelemetrySignal::Log,
+                move |remaining| provider.shutdown_with_timeout(remaining).is_ok(),
+            ));
+        }
+
+        let outcome = run_shutdown_tasks(tasks, timeout, &self.diagnostics);
+        if let Some(queue) = &self.trace_queue {
+            queue.drop_pending();
+        }
+        if let Some(queue) = &self.log_queue {
+            queue.drop_pending();
+        }
+        self.shutdown_outcome = Some(outcome);
+        outcome
+    }
+}
+
+fn run_shutdown_tasks(
+    tasks: Vec<ShutdownTask>,
+    timeout: Duration,
+    diagnostics: &DiagnosticsObserver,
+) -> TelemetryShutdownOutcome {
+    use crate::metrics::{TelemetryExportFailureReason, TelemetrySignal};
+
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    let (sender, receiver) = mpsc::channel();
+    let mut pending = [false; 2];
+    let mut remaining_tasks = 0_usize;
+    let mut failed = false;
+
+    for task in tasks {
+        let signal = task.signal;
+        let slot = match signal {
+            TelemetrySignal::Trace => 0,
+            TelemetrySignal::Log => 1,
+        };
+        let sender = sender.clone();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let spawn_result = thread::Builder::new()
+            .name(format!("otel-{}-shutdown", signal.as_str()))
+            .spawn(move || {
+                let succeeded = (task.operation)(remaining);
+                let _ignored = sender.send((signal, succeeded));
+            });
+        match spawn_result {
+            Ok(_handle) => {
+                pending[slot] = true;
+                remaining_tasks += 1;
+            }
+            Err(_) => {
+                failed = true;
+                diagnostics.export_failure(signal, TelemetryExportFailureReason::Shutdown);
+            }
+        }
+    }
+    drop(sender);
+
+    while remaining_tasks > 0 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok((signal, succeeded)) => {
+                let slot = match signal {
+                    TelemetrySignal::Trace => 0,
+                    TelemetrySignal::Log => 1,
+                };
+                if pending[slot] {
+                    pending[slot] = false;
+                    remaining_tasks -= 1;
+                }
+                if !succeeded {
+                    failed = true;
+                    diagnostics.export_failure(signal, TelemetryExportFailureReason::Shutdown);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    let mut timed_out = false;
+    for (signal, unfinished) in [TelemetrySignal::Trace, TelemetrySignal::Log]
+        .into_iter()
+        .zip(pending)
+    {
+        if unfinished {
+            timed_out = true;
+            diagnostics.export_failure(signal, TelemetryExportFailureReason::Timeout);
+        }
+    }
+
+    if timed_out {
+        TelemetryShutdownOutcome::TimedOut
+    } else if failed {
+        TelemetryShutdownOutcome::Failed
+    } else {
+        TelemetryShutdownOutcome::Completed
     }
 }
 
@@ -255,6 +426,8 @@ where
             workflow_trace_emitter,
             trace_queue,
             log_queue,
+            diagnostics: observer,
+            shutdown_outcome: None,
         },
         subscriber,
     ))
@@ -398,12 +571,23 @@ mod tests {
         collections::HashMap,
         ffi::OsString,
         io::{self, Write},
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Barrier, Mutex,
+        },
+        time::{Duration, Instant},
     };
 
-    use crate::{config::TelemetryConfig, metrics::Metrics};
+    use crate::{
+        config::TelemetryConfig,
+        metrics::{Metrics, TelemetrySignal},
+        telemetry::diagnostics::DiagnosticsObserver,
+    };
 
-    use super::{build_runtime, build_subscriber, is_application_target, TelemetryState};
+    use super::{
+        build_runtime, build_subscriber, is_application_target, run_shutdown_tasks, ShutdownTask,
+        TelemetryShutdownOutcome, TelemetryState,
+    };
 
     #[derive(Clone, Default)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
@@ -519,5 +703,97 @@ mod tests {
         assert!(!is_application_target("opentelemetry_sdk"));
         assert!(!is_application_target("opentelemetry_otlp"));
         assert!(!is_application_target("unrelated_dependency"));
+    }
+
+    #[test]
+    fn shutdown_starts_both_signals_before_waiting_for_either() {
+        let barrier = Arc::new(Barrier::new(2));
+        let trace_barrier = Arc::clone(&barrier);
+        let log_barrier = Arc::clone(&barrier);
+        let tasks = vec![
+            ShutdownTask::new(TelemetrySignal::Trace, move |_| {
+                trace_barrier.wait();
+                true
+            }),
+            ShutdownTask::new(TelemetrySignal::Log, move |_| {
+                log_barrier.wait();
+                true
+            }),
+        ];
+
+        let outcome = run_shutdown_tasks(
+            tasks,
+            Duration::from_secs(1),
+            &DiagnosticsObserver::new(Metrics::new()),
+        );
+
+        assert_eq!(outcome, TelemetryShutdownOutcome::Completed);
+    }
+
+    #[test]
+    fn shutdown_uses_one_deadline_when_one_signal_hangs() {
+        let log_completed = Arc::new(AtomicBool::new(false));
+        let completed = Arc::clone(&log_completed);
+        let tasks = vec![
+            ShutdownTask::new(TelemetrySignal::Trace, |_| {
+                std::thread::sleep(Duration::from_secs(2));
+                true
+            }),
+            ShutdownTask::new(TelemetrySignal::Log, move |_| {
+                completed.store(true, Ordering::Release);
+                true
+            }),
+        ];
+        let metrics = Metrics::new();
+        let started = Instant::now();
+
+        let outcome = run_shutdown_tasks(
+            tasks,
+            Duration::from_millis(50),
+            &DiagnosticsObserver::new(metrics.clone()),
+        );
+
+        assert_eq!(outcome, TelemetryShutdownOutcome::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(log_completed.load(Ordering::Acquire));
+        assert!(metrics.encode().expect("metrics encode").contains(
+            "github_telemetry_export_failures_total{signal=\"trace\",reason=\"timeout\"} 1"
+        ));
+    }
+
+    #[test]
+    fn shutdown_failure_is_normalized_once() {
+        let metrics = Metrics::new();
+        let tasks = vec![ShutdownTask::new(TelemetrySignal::Log, |_| false)];
+
+        let outcome = run_shutdown_tasks(
+            tasks,
+            Duration::from_secs(1),
+            &DiagnosticsObserver::new(metrics.clone()),
+        );
+
+        assert_eq!(outcome, TelemetryShutdownOutcome::Failed);
+        assert!(metrics.encode().expect("metrics encode").contains(
+            "github_telemetry_export_failures_total{signal=\"log\",reason=\"shutdown\"} 1"
+        ));
+    }
+
+    #[test]
+    fn disabled_runtime_shutdown_is_idempotent() {
+        let output = SharedWriter::default();
+        let config = telemetry_config(&[]);
+        let (mut runtime, _subscriber) = build_runtime(
+            "github_webhook_exporter=info",
+            &config,
+            output,
+            Metrics::new(),
+        )
+        .expect("disabled runtime builds");
+
+        let first = runtime.shutdown(Duration::from_secs(1));
+        let second = runtime.shutdown(Duration::from_secs(1));
+
+        assert_eq!(first, TelemetryShutdownOutcome::Completed);
+        assert_eq!(second, first);
     }
 }

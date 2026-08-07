@@ -999,16 +999,17 @@ impl Metrics {
             .inc();
     }
 
-    /// Increments one bounded telemetry drop counter.
-    pub(crate) fn record_telemetry_drop(
+    /// Adds an exact batch to one bounded telemetry drop counter.
+    pub(crate) fn record_telemetry_drops(
         &self,
         signal: TelemetrySignal,
         reason: TelemetryDropReason,
+        count: u64,
     ) {
         self.inner
             .telemetry_dropped_records
             .get_or_create(&TelemetryDropLabels { signal, reason })
-            .inc();
+            .inc_by(count);
     }
 
     /// Replaces the configured-repository gauge with the supplied durable record count.
@@ -1285,7 +1286,7 @@ mod tests {
             TelemetrySignal::Trace,
             TelemetryExportFailureReason::Timeout,
         );
-        metrics.record_telemetry_drop(TelemetrySignal::Log, TelemetryDropReason::QueueFull);
+        metrics.record_telemetry_drops(TelemetrySignal::Log, TelemetryDropReason::QueueFull, 1);
 
         let exposition = metrics.encode().expect("metrics encode");
         for sample in [

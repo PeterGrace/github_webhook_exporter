@@ -2,7 +2,7 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::Path,
-    process::{Command, Stdio},
+    process::{Child, Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -21,7 +21,14 @@ fn configured_command(database_path: &Path, bind_address: SocketAddr) -> Command
         .env("GHE_MASTER_KEY", STANDARD.encode([7_u8; 32]))
         .env("GHE_ADMIN_TOKEN", "startup-admin-token-secret")
         .env("GHE_BIND_ADDRESS", bind_address.to_string())
-        .env("GHE_SHUTDOWN_TIMEOUT_SECONDS", "2");
+        .env("GHE_SHUTDOWN_TIMEOUT_SECONDS", "2")
+        .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:0")
+        .env("OTEL_EXPORTER_OTLP_TIMEOUT", "50")
+        .env(
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "authorization=startup-otlp-header-secret",
+        )
+        .env("GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS", "1");
     command
 }
 
@@ -60,7 +67,9 @@ fn database_startup_failure_is_fatal_and_redacted() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     assert!(stderr.contains("failed to initialize SQLite storage"));
+    assert!(stderr.contains("telemetry provider shutdown"));
     assert!(!stderr.contains("startup-admin-token-secret"));
+    assert!(!stderr.contains("startup-otlp-header-secret"));
     assert!(!stderr.contains(&STANDARD.encode([7_u8; 32])));
     assert!(!stderr.contains(database_path.to_string_lossy().as_ref()));
 }
@@ -120,6 +129,31 @@ async fn startup_metrics_are_initialized_before_readiness_is_served() {
 }
 
 #[cfg(unix)]
+fn wait_with_deadline(mut child: Child, timeout: Duration) -> Output {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait().expect("child process status is readable") {
+            Some(_status) => {
+                return child
+                    .wait_with_output()
+                    .expect("completed exporter output is readable");
+            }
+            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            None => {
+                child.kill().expect("stalled exporter is killed");
+                let output = child
+                    .wait_with_output()
+                    .expect("stalled exporter output is readable");
+                panic!(
+                    "exporter exceeded the combined shutdown deadline: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 fn assert_graceful_signal(signal: &str, expected_signal: &str) {
     let directory = tempfile::tempdir().expect("temporary directory is created");
     let bind_address = unused_loopback_address();
@@ -152,17 +186,22 @@ fn assert_graceful_signal(signal: &str, expected_signal: &str) {
         .status()
         .expect("kill command runs");
     assert!(signal_status.success());
-    let output = child
-        .wait_with_output()
-        .expect("exporter exits after the shutdown signal");
+    let output = wait_with_deadline(child, Duration::from_secs(5));
 
     assert!(output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     assert!(stderr.contains(expected_signal));
     assert!(stderr.contains("HTTP server stopped"));
+    assert!(stderr.contains("telemetry provider shutdown"));
+    for signal in ["trace", "log"] {
+        assert!(stderr.contains(&format!(
+            "telemetry pipeline diagnostic kind=failure signal={signal} reason="
+        )));
+    }
     for captured in [&health_response, &stderr] {
         for forbidden in [
             "startup-admin-token-secret",
+            "startup-otlp-header-secret",
             STANDARD.encode([7_u8; 32]).as_str(),
             "Authorization",
             "webhook_secret",

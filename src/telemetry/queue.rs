@@ -1,5 +1,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use opentelemetry::{logs::Severity, Context, InstrumentationScope};
 use opentelemetry_sdk::{
@@ -32,6 +36,7 @@ pub(super) struct AdmissionBoundary {
     dropped: AtomicU64,
     failed_exports: AtomicU64,
     closed: AtomicBool,
+    export_finalized: Mutex<bool>,
     signal: TelemetrySignal,
     observer: DiagnosticsObserver,
 }
@@ -49,6 +54,7 @@ impl AdmissionBoundary {
             dropped: AtomicU64::new(0),
             failed_exports: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            export_finalized: Mutex::new(false),
             signal,
             observer,
         }
@@ -109,6 +115,35 @@ impl AdmissionBoundary {
         }
     }
 
+    pub(super) fn begin_export(&self, count: usize) -> bool {
+        let finalized = self
+            .export_finalized
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *finalized {
+            return false;
+        }
+        self.release(count);
+        true
+    }
+
+    pub(super) fn drop_pending(&self) {
+        let mut finalized = self
+            .export_finalized
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *finalized = true;
+        let count = self.pending.swap(0, Ordering::AcqRel);
+        drop(finalized);
+        if count == 0 {
+            return;
+        }
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        self.dropped.fetch_add(count, Ordering::Relaxed);
+        self.observer
+            .drop_records(self.signal, TelemetryDropReason::PipelineClosed, count);
+    }
+
     pub(super) fn pending(&self) -> usize {
         self.pending.load(Ordering::Acquire)
     }
@@ -160,20 +195,23 @@ impl<E: SpanExporter> SpanExporter for BoundarySpanExporter<E> {
         &self,
         batch: Vec<SpanData>,
     ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
-        self.boundary.release(batch.len());
-        observe_export(
-            &self.boundary,
-            &self.classified_failures,
-            self.exporter.export(batch),
-        )
+        let should_export = self.boundary.begin_export(batch.len());
+        async move {
+            if !should_export {
+                return Ok(());
+            }
+            observe_export(
+                &self.boundary,
+                &self.classified_failures,
+                self.exporter.export(batch),
+            )
+            .await
+        }
     }
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
-        let result = self.exporter.shutdown_with_timeout(timeout);
-        if let Err(error) = &result {
-            record_sdk_failure(&self.boundary, error);
-        }
-        result
+        // Runtime-level shutdown owns one normalized diagnostic for this provider result.
+        self.exporter.shutdown_with_timeout(timeout)
     }
 
     fn force_flush(&self) -> OTelSdkResult {
@@ -225,8 +263,9 @@ impl SpanProcessor for BoundarySpanProcessor {
 /// Admission increments `pending` before the SDK's non-blocking send, and `pending` is released
 /// only after the SDK receiver has removed a batch. Consequently SDK queue occupancy is never
 /// greater than `pending`: when both limits are `capacity`, this boundary rejects first and the SDK
-/// queue cannot overflow. Provider shutdown must stop producers before disconnecting the SDK queue;
-/// that lifecycle ordering is implemented by the dedicated Phase 4 shutdown work.
+/// queue cannot overflow. Runtime shutdown closes this boundary before disconnecting the SDK
+/// queue, so accepted records are either released by export or remain bounded until the provider's
+/// shared shutdown deadline expires.
 pub(super) fn span_processor<E: SpanExporter + 'static>(
     exporter: E,
     capacity: usize,
@@ -273,20 +312,23 @@ impl<E: LogExporter> LogExporter for BoundaryLogExporter<E> {
         batch: LogBatch<'_>,
     ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
         // OpenTelemetry 0.32 exposes no public O(1) `LogBatch::len`; its iterator is exact.
-        self.boundary.release(batch.iter().count());
-        observe_export(
-            &self.boundary,
-            &self.classified_failures,
-            self.exporter.export(batch),
-        )
+        let should_export = self.boundary.begin_export(batch.iter().count());
+        async move {
+            if !should_export {
+                return Ok(());
+            }
+            observe_export(
+                &self.boundary,
+                &self.classified_failures,
+                self.exporter.export(batch),
+            )
+            .await
+        }
     }
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
-        let result = self.exporter.shutdown_with_timeout(timeout);
-        if let Err(error) = &result {
-            record_sdk_failure(&self.boundary, error);
-        }
-        result
+        // Runtime-level shutdown owns one normalized diagnostic for this provider result.
+        self.exporter.shutdown_with_timeout(timeout)
     }
 
     fn event_enabled(&self, level: Severity, target: &str, name: Option<&str>) -> bool {
@@ -406,6 +448,68 @@ mod tests {
         boundary.close();
 
         assert_eq!(boundary.try_admit(), AdmissionOutcome::PipelineClosed);
+        assert_eq!(boundary.dropped(), 1);
+        assert!(metrics.encode().expect("metrics encode").contains(
+            "github_telemetry_dropped_records_total{signal=\"trace\",reason=\"pipeline_closed\"} 1"
+        ));
+    }
+
+    #[test]
+    fn timeout_finalization_prevents_late_export_of_counted_drops() {
+        let boundary = boundary(1);
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::Admitted);
+
+        boundary.drop_pending();
+
+        assert!(!boundary.begin_export(1));
+        assert_eq!(boundary.pending(), 0);
+        assert_eq!(boundary.dropped(), 1);
+    }
+
+    #[test]
+    fn export_claim_before_finalization_is_not_counted_as_dropped() {
+        let boundary = boundary(1);
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::Admitted);
+
+        assert!(boundary.begin_export(1));
+        boundary.drop_pending();
+
+        assert_eq!(boundary.pending(), 0);
+        assert_eq!(boundary.dropped(), 0);
+    }
+
+    #[test]
+    fn shutdown_timeout_accounts_stranded_pending_slots_as_pipeline_closed() {
+        let metrics = Metrics::new();
+        let observer = DiagnosticsObserver::new(metrics.clone());
+        let boundary = AdmissionBoundary::new(2, TelemetrySignal::Trace, observer);
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::Admitted);
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::Admitted);
+        boundary.close();
+
+        boundary.drop_pending();
+        boundary.release(2);
+
+        assert_eq!(boundary.pending(), 0);
+        assert_eq!(boundary.dropped(), 2);
+        assert!(metrics.encode().expect("metrics encode").contains(
+            "github_telemetry_dropped_records_total{signal=\"trace\",reason=\"pipeline_closed\"} 2"
+        ));
+    }
+
+    #[test]
+    fn shutdown_releases_accepted_records_without_leaking_pending_slots() {
+        let metrics = Metrics::new();
+        let observer = DiagnosticsObserver::new(metrics.clone());
+        let boundary = AdmissionBoundary::new(2, TelemetrySignal::Trace, observer);
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::Admitted);
+
+        boundary.close();
+        boundary.release(1);
+
+        assert_eq!(boundary.pending(), 0);
+        assert_eq!(boundary.try_admit(), AdmissionOutcome::PipelineClosed);
+        assert_eq!(boundary.pending(), 0);
         assert_eq!(boundary.dropped(), 1);
         assert!(metrics.encode().expect("metrics encode").contains(
             "github_telemetry_dropped_records_total{signal=\"trace\",reason=\"pipeline_closed\"} 1"

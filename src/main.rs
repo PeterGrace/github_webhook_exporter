@@ -31,9 +31,29 @@ async fn main() -> ExitCode {
 async fn run() -> Result<()> {
     let config = RuntimeConfig::from_env().context("failed to load runtime configuration")?;
     let metrics = Metrics::new();
-    let telemetry_runtime = telemetry::init(config.rust_log(), config.telemetry(), metrics.clone())
-        .context("failed to initialize telemetry")?;
+    let telemetry_shutdown_timeout = config.telemetry().shutdown_timeout();
+    let mut telemetry_runtime =
+        telemetry::init(config.rust_log(), config.telemetry(), metrics.clone())
+            .context("failed to initialize telemetry")?;
+    let workflow_trace_emitter = telemetry_runtime.workflow_trace_emitter();
 
+    let service_result = run_service(&config, metrics, workflow_trace_emitter).await;
+    info!(
+        telemetry_shutdown_timeout_seconds = telemetry_shutdown_timeout.as_secs(),
+        "telemetry provider shutdown starting"
+    );
+    let _shutdown_task =
+        tokio::task::spawn_blocking(move || telemetry_runtime.shutdown(telemetry_shutdown_timeout))
+            .await;
+
+    service_result
+}
+
+async fn run_service(
+    config: &RuntimeConfig,
+    metrics: Metrics,
+    workflow_trace_emitter: telemetry::WorkflowTraceEmitter,
+) -> Result<()> {
     let pool = storage::open_database(config.database_path())
         .await
         .context("failed to initialize SQLite storage")?;
@@ -46,7 +66,7 @@ async fn run() -> Result<()> {
         config.workflow_job_max_steps(),
     )
     .with_metrics(metrics)
-    .with_workflow_trace_emitter(telemetry_runtime.workflow_trace_emitter());
+    .with_workflow_trace_emitter(workflow_trace_emitter);
     state
         .initialize_repository_metrics()
         .await
