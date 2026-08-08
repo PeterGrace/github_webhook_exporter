@@ -17,6 +17,10 @@ helm-lint:
 helm-test:
     scripts/helm-chart-test.sh "{{helm-chart}}"
 
+# Verify the rendered chart is accepted by a disposable Kind cluster.
+helm-kind-acceptance:
+    scripts/helm-kind-acceptance.sh "{{helm-chart}}"
+
 # Build the supported linux/amd64 production image.
 image-build:
     docker build --platform linux/amd64 --tag "{{container-image}}" .
