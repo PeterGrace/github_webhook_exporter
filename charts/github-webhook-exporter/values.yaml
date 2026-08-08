@@ -60,3 +60,54 @@ probes:
 terminationGracePeriodSeconds: 40
 podDisruptionBudget:
   enabled: false
+webhookIngress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  tls: []
+metrics:
+  service:
+    enabled: false
+    port: 8080
+    annotations: {}
+  serviceMonitor:
+    enabled: false
+    labels: {}
+    interval: 30s
+    scrapeTimeout: 10s
+administration:
+  service:
+    enabled: false
+    port: 8080
+    annotations: {}
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    host: ""
+    tls: []
+networkPolicy:
+  enabled: false
+  ingress:
+    ingressController:
+      enabled: false
+      namespaceSelector: {}
+      podSelector: {}
+    prometheus:
+      enabled: false
+      namespaceSelector: {}
+      podSelector: {}
+    management:
+      enabled: false
+      namespaceSelector: {}
+      podSelector: {}
+  egress:
+    dns:
+      enabled: false
+      namespaceSelector: {}
+      podSelector: {}
+    otlp:
+      enabled: false
+      peers: []
+      ports: []

@@ -1,9 +1,10 @@
 # GitHub Webhook Exporter Helm Chart
 
 This chart installs the core GitHub webhook exporter workload as one Kubernetes StatefulSet with a
-persistent SQLite volume. It renders one ClusterIP Service, one ConfigMap, one PVC template, and an
-optional PodDisruptionBudget. It does not render a Secret, Ingress, NetworkPolicy, ServiceMonitor,
-or backup and restore resources.
+persistent SQLite volume. It renders one ClusterIP Service, one ConfigMap, one PVC template, and
+optional exposure, NetworkPolicy, ServiceMonitor, and PodDisruptionBudget resources. It does not
+render a Secret or backup and restore resources. Every exposure and network-boundary resource is
+disabled by default.
 
 ## Prerequisites
 
@@ -122,6 +123,30 @@ ConfigMap.
 | `probes.readiness.failureThreshold` | `3` | Readiness failure threshold; range `1..=10`. |
 | `terminationGracePeriodSeconds` | `40` | Pod grace; range `1..=600` seconds and strict sum applies. |
 | `podDisruptionBudget.enabled` | `false` | Render the fixed `minAvailable: 0` PDB. |
+| `webhookIngress.enabled` | `false` | Render the fixed-path webhook Ingress. |
+| `webhookIngress.className` | `""` | Optional webhook ingress class. |
+| `webhookIngress.annotations` | `{}` | Non-secret webhook Ingress annotations. |
+| `webhookIngress.host` | `""` | Optional webhook hostname; empty renders a hostless rule. |
+| `webhookIngress.tls` | `[]` | TLS Secret metadata and hosts managed by the platform. |
+| `metrics.service.enabled` | `false` | Render the dedicated metrics Service. |
+| `metrics.service.port` | `8080` | Dedicated metrics Service port. |
+| `metrics.service.annotations` | `{}` | Non-secret metrics Service annotations. |
+| `metrics.serviceMonitor.enabled` | `false` | Render a ServiceMonitor; requires the metrics Service. |
+| `metrics.serviceMonitor.labels` | `{}` | Labels used by the installed Prometheus Operator selector. |
+| `metrics.serviceMonitor.interval` | `30s` | Prometheus scrape interval. |
+| `metrics.serviceMonitor.scrapeTimeout` | `10s` | Prometheus scrape timeout. |
+| `administration.service.enabled` | `false` | Render the dedicated administrative Service. |
+| `administration.service.port` | `8080` | Administrative Service port. |
+| `administration.service.annotations` | `{}` | Non-secret administrative Service annotations. |
+| `administration.ingress.enabled` | `false` | Render repository administration; requires its Service. |
+| `administration.ingress.className` | `""` | Management-only ingress class. |
+| `administration.ingress.annotations` | `{}` | Non-secret administrative Ingress annotations. |
+| `administration.ingress.host` | `""` | Optional administrative hostname. |
+| `administration.ingress.tls` | `[]` | Administrative TLS Secret metadata and hosts. |
+| `networkPolicy.enabled` | `false` | Default deny ingress and egress for exporter pods. |
+| `networkPolicy.ingress.*` | disabled | Selector-bounded controller, Prometheus, and management rules. |
+| `networkPolicy.egress.dns` | disabled | Selector-bounded TCP/UDP port 53 rule. |
+| `networkPolicy.egress.otlp` | disabled | Explicit selector/CIDR peers and TCP collector ports. |
 
 The schema intentionally exposes no generic `extraEnv` map. Typed, non-secret application,
 retention, and telemetry values are projected through the generated ConfigMap. The fixed database
@@ -168,7 +193,8 @@ logging without creating a remote provider.
 The pod runs as non-root UID/GID 65532, uses the runtime-default seccomp profile, and disables the
 default ServiceAccount token mount. The container forbids privilege escalation, drops every Linux
 capability, and uses a read-only root filesystem. These controls do not replace storage-provider
-permission setup or network access controls; this chart does not supply Ingress or NetworkPolicy.
+permission setup or network access controls. Optional Ingress and NetworkPolicy resources remain
+disabled until an operator configures platform-specific selectors and routing metadata.
 
 Non-secret typed configuration enters the pod from the generated ConfigMap. Required credentials
 and optional OTLP headers enter only through references to the configured existing Secret. The
@@ -201,6 +227,139 @@ any ConfigMap-backed value during `helm upgrade` changes that annotation and tri
 Recreate-equivalent operator procedure is deferred to #48; until that procedure is available, do
 not claim that chart-driven upgrades prevent overlapping attachment or SQLite writers on providers
 where overlap is possible.
+
+## Exposure and network boundaries
+
+The exporter has one HTTP listener. The core, metrics, and administrative Services all select the
+same pod and target its named `http` port. Separate Services improve discovery and routing intent,
+but they do not isolate application paths.
+
+NetworkPolicy cannot distinguish HTTP paths on the shared listener. It permits or rejects traffic
+by pod peer, IP block, protocol, and port; it cannot tell `/webhooks/github`, `/metrics`, and
+`/api/v1/repositories` apart. Enforce path boundaries with the chart's fixed Ingress routes, a
+platform authorization proxy, or equivalent external L7 policy. Do not claim that a dedicated
+Service alone prevents access to another path.
+
+TLS termination and certificate provisioning remain ingress-platform responsibilities. Likewise,
+the chart does not install an ingress controller, Prometheus Operator, authorization proxy, DNS
+implementation, or OTLP collector. Metadata maps must contain only non-secret values. The chart
+never copies `existingSecret` data or OTLP header values into Services, Ingresses, ServiceMonitors,
+or NetworkPolicies.
+
+## Webhook ingress example
+
+The webhook Ingress always uses `Exact` path `/webhooks/github`; neither path nor backend is
+configurable. Supply only platform routing and TLS metadata:
+
+```yaml
+webhookIngress:
+  enabled: true
+  className: public
+  host: hooks.example.test
+  annotations:
+    ingress.example.test/request-body-limit: "2Mi"
+  tls:
+    - secretName: webhook-tls
+      hosts:
+        - hooks.example.test
+```
+
+Route GitHub to `https://hooks.example.test/webhooks/github`. The chart does not create
+`webhook-tls` or issue its certificate.
+
+## Prometheus scraping example
+
+Enable the dedicated Service alone for a platform scraper, or enable the ServiceMonitor when the
+Prometheus Operator CRD is already installed:
+
+```yaml
+metrics:
+  service:
+    enabled: true
+    port: 8080
+    annotations: {}
+  serviceMonitor:
+    enabled: true
+    labels:
+      prometheus: platform
+    interval: 30s
+    scrapeTimeout: 10s
+```
+
+The ServiceMonitor selects only the dedicated metrics Service and requests fixed path `/metrics`.
+The Service still forwards to the shared listener, so NetworkPolicy must bound the Prometheus peer.
+
+## Management access example
+
+Use a designated management ingress class and hostname. The administrative Ingress always routes
+prefix `/api/v1/repositories` to the dedicated administrative Service:
+
+```yaml
+administration:
+  service:
+    enabled: true
+    port: 8080
+    annotations: {}
+  ingress:
+    enabled: true
+    className: management
+    host: exporter-admin.example.test
+    annotations: {}
+    tls:
+      - secretName: exporter-admin-tls
+        hosts:
+          - exporter-admin.example.test
+```
+
+This route does not replace bearer-token authentication. Restrict the management ingress controller
+with the policy selector below or enforce the route through an authorization proxy.
+
+## DNS and OTLP egress example
+
+Enabling NetworkPolicy with no allowances creates default-deny ingress and egress. Every enabled
+inbound or DNS rule requires both namespace and pod selectors. The following permits a designated
+ingress controller, cluster DNS, and one in-cluster collector; omitted Prometheus and management
+rules remain denied:
+
+```yaml
+networkPolicy:
+  enabled: true
+  ingress:
+    ingressController:
+      enabled: true
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-system
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-controller
+  egress:
+    dns:
+      enabled: true
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    otlp:
+      enabled: true
+      peers:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - 4318
+```
+
+DNS labels vary by distribution; inspect the cluster's DNS pods before enabling the rule. For an
+external collector, use an `ipBlock.cidr` peer instead of selectors. NetworkPolicy cannot allow a
+DNS hostname, so externally resolved collector addresses must have stable operator-managed CIDRs.
+The OTLP rule changes only network reachability; collector availability remains independent of
+liveness and readiness.
 
 ## Validation
 

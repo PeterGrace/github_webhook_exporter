@@ -2,5 +2,17 @@ Service DNS: {{ include "github-webhook-exporter.fullname" . }}.{{ .Release.Name
 Liveness path: /health/live
 Readiness path: /health/ready
 Existing Secret: {{ .Values.existingSecret.name }}
+{{- if .Values.webhookIngress.enabled }}
+Webhook Ingress path: /webhooks/github (Exact)
+{{- end }}
+{{- if .Values.metrics.service.enabled }}
+Metrics Service: {{ include "github-webhook-exporter.fullname" . }}-metrics
+{{- end }}
+{{- if .Values.administration.ingress.enabled }}
+Administrative Ingress path: /api/v1/repositories (Prefix)
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+NetworkPolicy: enabled; review every configured peer selector before deployment.
+{{- end }}
 
 This StatefulSet stores SQLite state, so one replica is mandatory.
