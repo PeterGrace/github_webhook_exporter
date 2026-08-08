@@ -1,0 +1,6 @@
+Service DNS: {{ include "github-webhook-exporter.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+Liveness path: /health/live
+Readiness path: /health/ready
+Existing Secret: {{ .Values.existingSecret.name }}
+
+This StatefulSet stores SQLite state, so one replica is mandatory.

@@ -8,7 +8,7 @@ if [[ -z "${CHART_DIRECTORY}" ]]; then
     exit 2
 fi
 
-for command in helm mktemp rm yq; do
+for command in awk find grep helm mktemp rm yq; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         printf 'required command not found: %s\n' "${command}" >&2
         exit 2
@@ -43,6 +43,31 @@ assert_yq() {
     yq --exit-status "${expression}" "${file}" >/dev/null || fail "${description}"
 }
 
+assert_no_sensitive_content() {
+    local file="$1"
+    if grep -Eq \
+        'changeme|replace-me|example-token|example-master-key|authorization=|kind: Secret' \
+        "${file}"; then
+        fail "rendered fixture ${file##*/} contains credentials, placeholders, or a Secret"
+    fi
+}
+
+assert_contains() {
+    local expected="$1"
+    local file="$2"
+    local description="$3"
+    grep -Fq -- "${expected}" "${file}" || fail "${description}"
+}
+
+assert_not_contains() {
+    local forbidden="$1"
+    local file="$2"
+    local description="$3"
+    if grep -Eq "${forbidden}" "${file}"; then
+        fail "${description}"
+    fi
+}
+
 helm lint "${CHART_DIRECTORY}"
 helm template github-webhook-exporter "${CHART_DIRECTORY}" \
     >"${TEMPORARY_DIRECTORY}/default.yaml"
@@ -65,6 +90,10 @@ assert_yq \
     '[.[] | select(.kind == "Secret")] | length == 0' \
     "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
     'defaults must not render a Secret'
+assert_yq \
+    '[.[] | select(.kind == "PodDisruptionBudget")] | length == 0' \
+    "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
+    'defaults must not render a PodDisruptionBudget'
 
 yq '.[] | select(.kind == "StatefulSet")' \
     "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
@@ -335,6 +364,64 @@ assert_yq \
     "${TEMPORARY_DIRECTORY}/override-statefulset.yaml" \
     'every Secret override must reference the configured existing Secret'
 
+helm install exporter "${CHART_DIRECTORY}" \
+    --dry-run=client \
+    --namespace observability \
+    >"${TEMPORARY_DIRECTORY}/dry-run-install.txt"
+awk 'found { print } /^NOTES:$/ { found = 1 }' \
+    "${TEMPORARY_DIRECTORY}/dry-run-install.txt" >"${TEMPORARY_DIRECTORY}/notes.txt"
+assert_contains \
+    'exporter-github-webhook-exporter.observability.svc.cluster.local' \
+    "${TEMPORARY_DIRECTORY}/notes.txt" \
+    'notes must print the release Service DNS name'
+assert_contains \
+    '/health/live' \
+    "${TEMPORARY_DIRECTORY}/notes.txt" \
+    'notes must print the liveness path'
+assert_contains \
+    '/health/ready' \
+    "${TEMPORARY_DIRECTORY}/notes.txt" \
+    'notes must print the readiness path'
+assert_contains \
+    'Existing Secret: github-webhook-exporter' \
+    "${TEMPORARY_DIRECTORY}/notes.txt" \
+    'notes must print the existing Secret name'
+assert_contains \
+    'one replica is mandatory' \
+    "${TEMPORARY_DIRECTORY}/notes.txt" \
+    'notes must remind operators that one replica is mandatory'
+assert_not_contains \
+    'master-key|admin-token|OTEL_EXPORTER_OTLP(_[A-Z]+)?_HEADERS' \
+    "${TEMPORARY_DIRECTORY}/notes.txt" \
+    'notes must not print Secret key names or OTLP header variables'
+assert_no_sensitive_content "${TEMPORARY_DIRECTORY}/dry-run-install.txt"
+assert_no_sensitive_content "${TEMPORARY_DIRECTORY}/notes.txt"
+
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --set podDisruptionBudget.enabled=true \
+    >"${TEMPORARY_DIRECTORY}/pdb-enabled.yaml"
+yq eval-all '[.] | flatten | map(select(. != null))' \
+    "${TEMPORARY_DIRECTORY}/pdb-enabled.yaml" \
+    >"${TEMPORARY_DIRECTORY}/pdb-enabled-manifests.yaml"
+assert_yq \
+    '([.[] | select(.kind == "PodDisruptionBudget")] | length) == 1 and
+     ([.[] | select(.kind == "PodDisruptionBudget")][0].apiVersion) == "policy/v1" and
+     ([.[] | select(.kind == "PodDisruptionBudget")][0].spec.minAvailable) == 0 and
+     (([.[] | select(.kind == "PodDisruptionBudget")][0].spec.minAvailable | type) ==
+      "!!int") and
+     (([.[] | select(.kind == "PodDisruptionBudget")][0].spec | has("maxUnavailable")) | not) and
+     (([.[] | select(.kind == "PodDisruptionBudget")][0].metadata.labels | to_json) ==
+      ([.[] | select(.kind == "StatefulSet")][0].metadata.labels | to_json)) and
+     (([.[] | select(.kind == "PodDisruptionBudget")][0].spec.selector.matchLabels |
+       to_json) ==
+      ([.[] | select(.kind == "StatefulSet")][0].spec.selector.matchLabels | to_json))' \
+    "${TEMPORARY_DIRECTORY}/pdb-enabled-manifests.yaml" \
+    'enabled PodDisruptionBudget must use fixed singleton-safe semantics and workload selectors'
+
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --set terminationGracePeriodSeconds=36 \
+    >"${TEMPORARY_DIRECTORY}/valid-grace-boundary.yaml"
+
 helm template github-webhook-exporter "${CHART_DIRECTORY}" \
     --set-string persistence.storageClass= \
     >"${TEMPORARY_DIRECTORY}/empty-storage-class.yaml"
@@ -361,12 +448,49 @@ expect_failure \
     helm template github-webhook-exporter "${CHART_DIRECTORY}" \
         --set persistence.accessModes[0]=ReadWriteMany
 expect_failure \
-    'insufficient terminationGracePeriodSeconds' \
+    'terminationGracePeriodSeconds equal to shutdown timeout sum' \
     helm template github-webhook-exporter "${CHART_DIRECTORY}" \
         --set terminationGracePeriodSeconds=35
+expect_failure \
+    'terminationGracePeriodSeconds below shutdown timeout sum' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set terminationGracePeriodSeconds=34
+expect_failure \
+    'telemetry batch size greater than queue capacity' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set telemetry.batchSize=2049
+expect_failure \
+    'empty existing Secret name' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" --set existingSecret.name=
+expect_failure \
+    'empty master key name' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set existingSecret.keys.masterKey=
+expect_failure \
+    'empty admin token key name' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set existingSecret.keys.adminToken=
+for probe in liveness readiness; do
+    for probe_value in initialDelaySeconds periodSeconds timeoutSeconds failureThreshold; do
+        expect_failure \
+            "zero probes.${probe}.${probe_value}" \
+            helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+                --set "probes.${probe}.${probe_value}=0"
+    done
+done
+expect_failure \
+    'service port below Kubernetes range' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" --set service.port=0
+expect_failure \
+    'service port above Kubernetes range' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" --set service.port=65536
 expect_failure \
     'empty resources.requests.cpu' \
     helm template github-webhook-exporter "${CHART_DIRECTORY}" --set resources.requests.cpu=
 expect_failure \
     'empty resources.limits.memory' \
     helm template github-webhook-exporter "${CHART_DIRECTORY}" --set resources.limits.memory=
+
+while IFS= read -r rendered_fixture; do
+    assert_no_sensitive_content "${rendered_fixture}"
+done < <(find "${TEMPORARY_DIRECTORY}" -type f -name '*.yaml' -print)
