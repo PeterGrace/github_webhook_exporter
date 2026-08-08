@@ -35,7 +35,7 @@ spec:
       containers:
         - name: {{ include "github-webhook-exporter.name" . }}
           image: {{ printf "%s:%s" .Values.image.repository $imageTag | quote }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ .Values.image.pullPolicy | quote }}
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false

@@ -5,7 +5,7 @@ metadata:
   labels:
     {{- include "github-webhook-exporter.labels" . | nindent 4 }}
 spec:
-  type: {{ .Values.service.type }}
+  type: {{ .Values.service.type | quote }}
   selector:
     {{- include "github-webhook-exporter.selectorLabels" . | nindent 4 }}
   ports:
