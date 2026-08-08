@@ -14,6 +14,52 @@ leave the final in-process value stale, but the next startup reconciles it from 
 process exits nonzero on any startup failure and cannot report false readiness. Local errors
 identify the failed stage without including configured credentials or the database path.
 
+## Production container image
+
+The supported production image uses a digest-pinned Rust builder and a distroless Debian runtime.
+This iteration supports `linux/amd64` only. It runs the application directly as PID 1 under the
+fixed non-root identity `65532:65532`, exposes only TCP port 8080, and contains no shell or Rust
+build tooling.
+
+Build the default `github-webhook-exporter:dev` tag locally:
+
+```bash
+just image-build
+```
+
+Set `CONTAINER_IMAGE` when a release or registry-specific tag is required. The same value selects
+the image exercised by the smoke verification:
+
+```bash
+CONTAINER_IMAGE=registry.example/github-webhook-exporter:0.1.0 just image-build
+CONTAINER_IMAGE=registry.example/github-webhook-exporter:0.1.0 just image-smoke
+```
+
+The image working and data directory is `/var/lib/github-webhook-exporter`. Mount persistent
+storage at that path and set `GHE_DATABASE_PATH` to a file within it, such as
+`/var/lib/github-webhook-exporter/github-webhook-exporter.db`. An empty Docker volume inherits the
+directory's ownership from the image. Other volume providers must make the mount writable by UID
+and GID 65532.
+
+Every container requires these environment variables:
+
+| Variable | Contract |
+| --- | --- |
+| `GHE_DATABASE_PATH` | Writable SQLite file path, normally below the mounted data directory. |
+| `GHE_MASTER_KEY` | Base64 encoding of exactly 32 random bytes, supplied from a secret store. |
+| `GHE_ADMIN_TOKEN` | Non-empty administrator bearer token, supplied from a secret store. |
+
+Do not place secret values in image arguments, labels, Dockerfiles, or committed manifests. The
+optional `GHE_*`, `OTEL_*`, and `RUST_LOG` variables retain the contracts documented in the
+sections below and in startup validation.
+
+The image deliberately defines no Docker health check. Kubernetes and other orchestrators should
+use `GET /health/live` and `GET /health/ready` as described below. Because the binary is the direct
+entrypoint, SIGTERM reaches the application's graceful lifecycle without a shell intermediary. Set
+the orchestrator termination grace period greater than the sum of
+`GHE_SHUTDOWN_TIMEOUT_SECONDS` and `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` so both application work and
+telemetry providers receive their full shutdown boundaries.
+
 ## Remote telemetry
 
 Structured stderr logging is always active. Remote trace and log export is optional and starts only
