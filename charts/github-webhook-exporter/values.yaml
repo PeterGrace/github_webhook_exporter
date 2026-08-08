@@ -1,0 +1,63 @@
+replicaCount: 1
+image:
+  repository: ghcr.io/petergrace/github-webhook-exporter
+  tag: ""
+  pullPolicy: IfNotPresent
+existingSecret:
+  name: github-webhook-exporter
+  keys:
+    masterKey: master-key
+    adminToken: admin-token
+    otlpHeaders: ""
+    otlpTracesHeaders: ""
+    otlpLogsHeaders: ""
+service:
+  type: ClusterIP
+  port: 8080
+application:
+  bindAddress: "[::]:8080"
+  shutdownTimeoutSeconds: 30
+  webhookBodyLimitBytes: 2097152
+  workflowJobMaxSteps: 256
+  rustLog: info
+retention:
+  deliveryDays: 7
+  mergeQueueDays: 90
+  pruneIntervalSeconds: 3600
+telemetry:
+  endpoint: ""
+  tracesEndpoint: ""
+  logsEndpoint: ""
+  timeoutMilliseconds: 10000
+  tracesTimeoutMilliseconds: null
+  logsTimeoutMilliseconds: null
+  serviceName: github-webhook-exporter
+  queueCapacity: 2048
+  batchSize: 512
+  shutdownTimeoutSeconds: 5
+persistence:
+  storageClass: null
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+probes:
+  liveness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+terminationGracePeriodSeconds: 40
+podDisruptionBudget:
+  enabled: false
