@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "github-webhook-exporter.fullname" . }}
+  labels:
+    {{- include "github-webhook-exporter.labels" . | nindent 4 }}
+data:
+  GHE_BIND_ADDRESS: {{ .Values.application.bindAddress | quote }}
+  GHE_SHUTDOWN_TIMEOUT_SECONDS: {{ .Values.application.shutdownTimeoutSeconds | int | quote }}
+  GHE_WEBHOOK_BODY_LIMIT_BYTES: {{ .Values.application.webhookBodyLimitBytes | int | quote }}
+  GHE_WORKFLOW_JOB_MAX_STEPS: {{ .Values.application.workflowJobMaxSteps | int | quote }}
+  GHE_DELIVERY_RETENTION_DAYS: {{ .Values.retention.deliveryDays | int | quote }}
+  GHE_MERGE_QUEUE_RETENTION_DAYS: {{ .Values.retention.mergeQueueDays | int | quote }}
+  GHE_DELIVERY_PRUNE_INTERVAL_SECONDS: {{ .Values.retention.pruneIntervalSeconds | int | quote }}
+  RUST_LOG: {{ .Values.application.rustLog | quote }}
+  GHE_OTEL_QUEUE_CAPACITY: {{ .Values.telemetry.queueCapacity | int | quote }}
+  GHE_OTEL_BATCH_SIZE: {{ .Values.telemetry.batchSize | int | quote }}
+  GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS: {{ .Values.telemetry.shutdownTimeoutSeconds | int | quote }}
+  OTEL_EXPORTER_OTLP_TIMEOUT: {{ .Values.telemetry.timeoutMilliseconds | int | quote }}
+  OTEL_SERVICE_NAME: {{ .Values.telemetry.serviceName | quote }}
+  {{- if .Values.telemetry.endpoint }}
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.telemetry.endpoint | quote }}
+  {{- end }}
+  {{- if .Values.telemetry.tracesEndpoint }}
+  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: {{ .Values.telemetry.tracesEndpoint | quote }}
+  {{- end }}
+  {{- if .Values.telemetry.logsEndpoint }}
+  OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: {{ .Values.telemetry.logsEndpoint | quote }}
+  {{- end }}
+  {{- with .Values.telemetry.tracesTimeoutMilliseconds }}
+  OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: {{ . | int | quote }}
+  {{- end }}
+  {{- with .Values.telemetry.logsTimeoutMilliseconds }}
+  OTEL_EXPORTER_OTLP_LOGS_TIMEOUT: {{ . | int | quote }}
+  {{- end }}

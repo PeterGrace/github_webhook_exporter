@@ -46,13 +46,306 @@ assert_yq() {
 helm lint "${CHART_DIRECTORY}"
 helm template github-webhook-exporter "${CHART_DIRECTORY}" \
     >"${TEMPORARY_DIRECTORY}/default.yaml"
-yq eval-all '[.] | flatten | {
-    "statefulSetCount": map(select(.kind == "StatefulSet")) | length
-}' "${TEMPORARY_DIRECTORY}/default.yaml" >"${TEMPORARY_DIRECTORY}/manifest-counts.yaml"
+yq eval-all '[.] | flatten | map(select(. != null))' \
+    "${TEMPORARY_DIRECTORY}/default.yaml" >"${TEMPORARY_DIRECTORY}/default-manifests.yaml"
+
 assert_yq \
-    '.statefulSetCount == 1' \
-    "${TEMPORARY_DIRECTORY}/manifest-counts.yaml" \
+    '[.[] | select(.kind == "StatefulSet")] | length == 1' \
+    "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
     'defaults must render exactly one StatefulSet'
+assert_yq \
+    '[.[] | select(.kind == "Service")] | length == 1' \
+    "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
+    'defaults must render exactly one Service'
+assert_yq \
+    '[.[] | select(.kind == "ConfigMap")] | length == 1' \
+    "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
+    'defaults must render exactly one ConfigMap'
+assert_yq \
+    '[.[] | select(.kind == "Secret")] | length == 0' \
+    "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
+    'defaults must not render a Secret'
+
+yq '.[] | select(.kind == "StatefulSet")' \
+    "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
+    >"${TEMPORARY_DIRECTORY}/default-statefulset.yaml"
+yq '.[] | select(.kind == "Service")' \
+    "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
+    >"${TEMPORARY_DIRECTORY}/default-service.yaml"
+yq '.[] | select(.kind == "ConfigMap")' \
+    "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
+    >"${TEMPORARY_DIRECTORY}/default-configmap.yaml"
+
+assert_yq \
+    '.spec.replicas == 1 and .spec.updateStrategy.type == "RollingUpdate" and
+     .spec.podManagementPolicy == "OrderedReady"' \
+    "${TEMPORARY_DIRECTORY}/default-statefulset.yaml" \
+    'StatefulSet must use singleton ordered rolling-update semantics'
+assert_yq \
+    '(.metadata.labels | length) == 5 and
+     .metadata.labels."helm.sh/chart" == "github-webhook-exporter-0.1.0" and
+     .metadata.labels."app.kubernetes.io/name" == "github-webhook-exporter" and
+     .metadata.labels."app.kubernetes.io/instance" == "github-webhook-exporter" and
+     .metadata.labels."app.kubernetes.io/version" == "0.1.0" and
+     .metadata.labels."app.kubernetes.io/managed-by" == "Helm"' \
+    "${TEMPORARY_DIRECTORY}/default-statefulset.yaml" \
+    'resources must receive all standard common labels'
+assert_yq \
+    '.spec.type == "ClusterIP" and .spec.ports[0].name == "http" and
+     .spec.ports[0].port == 8080 and .spec.ports[0].protocol == "TCP" and
+     .spec.ports[0].targetPort == "http" and (.spec.ports | length) == 1' \
+    "${TEMPORARY_DIRECTORY}/default-service.yaml" \
+    'Service must expose the named HTTP port through ClusterIP'
+assert_yq \
+    '([.[] | select(.kind == "Service")][0].spec.selector | length) == 2 and
+     ([.[] | select(.kind == "StatefulSet")][0].spec.selector.matchLabels | length) == 2 and
+     ([.[] | select(.kind == "StatefulSet")][0].spec.template.metadata.labels |
+       length) == 2 and
+     ([.[] | select(.kind == "Service")][0].spec.selector | to_json) ==
+     ([.[] | select(.kind == "StatefulSet")][0].spec.selector.matchLabels | to_json) and
+     ([.[] | select(.kind == "Service")][0].spec.selector | to_json) ==
+     ([.[] | select(.kind == "StatefulSet")][0].spec.template.metadata.labels | to_json)' \
+    "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
+    'Service and StatefulSet must share stable pod selector labels'
+assert_yq \
+    '.spec.template.spec.containers[0].image ==
+     "ghcr.io/petergrace/github-webhook-exporter:0.1.0" and
+     .spec.template.spec.containers[0].ports[0].name == "http" and
+     .spec.template.spec.containers[0].ports[0].containerPort == 8080 and
+     .spec.template.spec.containers[0].ports[0].protocol == "TCP" and
+     (.spec.template.spec.containers[0].ports | length) == 1' \
+    "${TEMPORARY_DIRECTORY}/default-statefulset.yaml" \
+    'StatefulSet must use the appVersion image and expose port 8080'
+assert_yq \
+    '.spec.template.spec.containers[0].volumeMounts[0].name == "data" and
+     .spec.template.spec.containers[0].volumeMounts[0].mountPath ==
+     "/var/lib/github-webhook-exporter" and
+     (.spec.template.spec.containers[0].volumeMounts | length) == 1 and
+     ([.spec.template.spec.containers[0].env[] |
+       select(.name == "GHE_DATABASE_PATH")][0].value) ==
+     "/var/lib/github-webhook-exporter/github-webhook-exporter.db"' \
+    "${TEMPORARY_DIRECTORY}/default-statefulset.yaml" \
+    'StatefulSet must mount and use the durable SQLite data path'
+assert_yq \
+    '(.data | length) == 13 and .data.GHE_BIND_ADDRESS == "[::]:8080" and
+     .data.GHE_SHUTDOWN_TIMEOUT_SECONDS == "30" and
+     .data.GHE_WEBHOOK_BODY_LIMIT_BYTES == "2097152" and
+     .data.GHE_WORKFLOW_JOB_MAX_STEPS == "256" and
+     .data.GHE_DELIVERY_RETENTION_DAYS == "7" and
+     .data.GHE_MERGE_QUEUE_RETENTION_DAYS == "90" and
+     .data.GHE_DELIVERY_PRUNE_INTERVAL_SECONDS == "3600" and
+     .data.RUST_LOG == "info" and .data.GHE_OTEL_QUEUE_CAPACITY == "2048" and
+     .data.GHE_OTEL_BATCH_SIZE == "512" and
+     .data.GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS == "5" and
+     .data.OTEL_EXPORTER_OTLP_TIMEOUT == "10000" and
+     .data.OTEL_SERVICE_NAME == "github-webhook-exporter"' \
+    "${TEMPORARY_DIRECTORY}/default-configmap.yaml" \
+    'ConfigMap must contain only default non-secret configuration'
+assert_yq \
+    '.spec.template.spec.automountServiceAccountToken == false and
+     .spec.template.spec.securityContext.runAsNonRoot == true and
+     .spec.template.spec.securityContext.runAsUser == 65532 and
+     .spec.template.spec.securityContext.runAsGroup == 65532 and
+     .spec.template.spec.securityContext.fsGroup == 65532 and
+     .spec.template.spec.securityContext.fsGroupChangePolicy == "OnRootMismatch" and
+     .spec.template.spec.securityContext.seccompProfile.type == "RuntimeDefault" and
+     .spec.template.spec.containers[0].securityContext.runAsNonRoot == true and
+     .spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation == false and
+     .spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem == true and
+     .spec.template.spec.containers[0].securityContext.capabilities.drop[0] == "ALL" and
+     (.spec.template.spec.containers[0].securityContext.capabilities.drop | length) == 1' \
+    "${TEMPORARY_DIRECTORY}/default-statefulset.yaml" \
+    'StatefulSet must apply the required pod and container security contexts'
+assert_yq \
+    '.spec.template.spec.containers[0].livenessProbe.httpGet.path == "/health/live" and
+     .spec.template.spec.containers[0].livenessProbe.httpGet.port == "http" and
+     .spec.template.spec.containers[0].livenessProbe.httpGet.scheme == "HTTP" and
+     .spec.template.spec.containers[0].readinessProbe.httpGet.path == "/health/ready" and
+     .spec.template.spec.containers[0].readinessProbe.httpGet.port == "http" and
+     .spec.template.spec.containers[0].readinessProbe.httpGet.scheme == "HTTP" and
+     (.spec.template.spec.containers[0] | has("lifecycle") | not)' \
+    "${TEMPORARY_DIRECTORY}/default-statefulset.yaml" \
+    'StatefulSet must use exact HTTP probes and no lifecycle hook'
+assert_yq \
+    '.spec.volumeClaimTemplates[0].spec.accessModes[0] == "ReadWriteOnce" and
+     (.spec.volumeClaimTemplates[0].spec.accessModes | length) == 1 and
+     .spec.volumeClaimTemplates[0].spec.resources.requests.storage == "1Gi" and
+     (.spec.volumeClaimTemplates[0].spec | has("storageClassName") | not)' \
+    "${TEMPORARY_DIRECTORY}/default-statefulset.yaml" \
+    'default PVC must use ReadWriteOnce, 1Gi, and the cluster storage class'
+# The literal Downward API substitution syntax must reach yq without shell expansion.
+# shellcheck disable=SC2016
+assert_yq \
+    '.spec.template.spec.containers[0].envFrom[0].configMapRef.name ==
+     "github-webhook-exporter" and
+     (.spec.template.spec.containers[0].envFrom | length) == 1 and
+     ([.spec.template.spec.containers[0].env[] |
+       select(.name == "GHE_MASTER_KEY")][0].valueFrom.secretKeyRef.name) ==
+     "github-webhook-exporter" and
+     ([.spec.template.spec.containers[0].env[] |
+       select(.name == "GHE_MASTER_KEY")][0].valueFrom.secretKeyRef.key) == "master-key" and
+     ([.spec.template.spec.containers[0].env[] |
+       select(.name == "GHE_MASTER_KEY")][0].valueFrom.secretKeyRef.optional) == false and
+     ([.spec.template.spec.containers[0].env[] |
+       select(.name == "GHE_ADMIN_TOKEN")][0].valueFrom.secretKeyRef.name) ==
+     "github-webhook-exporter" and
+     ([.spec.template.spec.containers[0].env[] |
+       select(.name == "GHE_ADMIN_TOKEN")][0].valueFrom.secretKeyRef.key) == "admin-token" and
+     ([.spec.template.spec.containers[0].env[] |
+       select(.name == "GHE_ADMIN_TOKEN")][0].valueFrom.secretKeyRef.optional) == false and
+     ([.spec.template.spec.containers[0].env[] |
+       select(.name == "POD_NAME")][0].valueFrom.fieldRef.fieldPath) == "metadata.name" and
+     ([.spec.template.spec.containers[0].env[] |
+       select(.name == "POD_NAMESPACE")][0].valueFrom.fieldRef.fieldPath) ==
+     "metadata.namespace" and
+     ([.spec.template.spec.containers[0].env[] |
+       select(.name == "OTEL_RESOURCE_ATTRIBUTES")][0].value) ==
+     "k8s.pod.name=$(POD_NAME),k8s.namespace.name=$(POD_NAMESPACE)" and
+     ([.spec.template.spec.containers[0].env[] |
+       select(.name == "OTEL_EXPORTER_OTLP_HEADERS" or
+              .name == "OTEL_EXPORTER_OTLP_TRACES_HEADERS" or
+              .name == "OTEL_EXPORTER_OTLP_LOGS_HEADERS")] | length) == 0' \
+    "${TEMPORARY_DIRECTORY}/default-statefulset.yaml" \
+    'StatefulSet must project default ConfigMap, Secret, and downward API environment'
+
+cat >"${TEMPORARY_DIRECTORY}/override-values.yaml" <<'EOF'
+image:
+  tag: "2.3.4"
+existingSecret:
+  name: exporter-credentials
+  keys:
+    masterKey: encryption-key
+    adminToken: bearer-token
+    otlpHeaders: collector-headers
+    otlpTracesHeaders: trace-headers
+    otlpLogsHeaders: log-headers
+telemetry:
+  endpoint: https://collector.example.test:4318
+  tracesEndpoint: https://traces.example.test/v1/traces
+  logsEndpoint: https://logs.example.test/v1/logs
+  tracesTimeoutMilliseconds: 2001
+  logsTimeoutMilliseconds: 2002
+persistence:
+  storageClass: fast-ssd
+  size: 2Gi
+resources:
+  requests:
+    cpu: 125m
+    memory: 96Mi
+  limits:
+    cpu: 750m
+    memory: 384Mi
+probes:
+  liveness:
+    initialDelaySeconds: 11
+    periodSeconds: 12
+    timeoutSeconds: 3
+    failureThreshold: 4
+  readiness:
+    initialDelaySeconds: 6
+    periodSeconds: 7
+    timeoutSeconds: 4
+    failureThreshold: 5
+EOF
+
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --values "${TEMPORARY_DIRECTORY}/override-values.yaml" \
+    >"${TEMPORARY_DIRECTORY}/override.yaml"
+yq eval-all '[.] | flatten | map(select(. != null))' \
+    "${TEMPORARY_DIRECTORY}/override.yaml" >"${TEMPORARY_DIRECTORY}/override-manifests.yaml"
+yq '.[] | select(.kind == "StatefulSet")' \
+    "${TEMPORARY_DIRECTORY}/override-manifests.yaml" \
+    >"${TEMPORARY_DIRECTORY}/override-statefulset.yaml"
+yq '.[] | select(.kind == "ConfigMap")' \
+    "${TEMPORARY_DIRECTORY}/override-manifests.yaml" \
+    >"${TEMPORARY_DIRECTORY}/override-configmap.yaml"
+
+assert_yq \
+    '([.[] | select(.kind == "StatefulSet")] | length) == 1 and
+     ([.[] | select(.kind == "Service")] | length) == 1 and
+     ([.[] | select(.kind == "ConfigMap")] | length) == 1 and
+     ([.[] | select(.kind == "Secret")] | length) == 0' \
+    "${TEMPORARY_DIRECTORY}/override-manifests.yaml" \
+    'overrides must retain one workload, Service, ConfigMap, and no Secret'
+assert_yq \
+    '.spec.template.spec.containers[0].image ==
+     "ghcr.io/petergrace/github-webhook-exporter:2.3.4" and
+     .spec.volumeClaimTemplates[0].spec.storageClassName == "fast-ssd" and
+     .spec.volumeClaimTemplates[0].spec.resources.requests.storage == "2Gi"' \
+    "${TEMPORARY_DIRECTORY}/override-statefulset.yaml" \
+    'image and persistence overrides must be present'
+assert_yq \
+    '.data.OTEL_EXPORTER_OTLP_ENDPOINT == "https://collector.example.test:4318" and
+     .data.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT ==
+     "https://traces.example.test/v1/traces" and
+     .data.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT == "https://logs.example.test/v1/logs" and
+     .data.OTEL_EXPORTER_OTLP_TRACES_TIMEOUT == "2001" and
+     .data.OTEL_EXPORTER_OTLP_LOGS_TIMEOUT == "2002" and
+     ([.data | keys | .[] | select(test("HEADERS"))] | length) == 0' \
+    "${TEMPORARY_DIRECTORY}/override-configmap.yaml" \
+    'OTLP endpoint and signal timeout overrides must be present'
+assert_yq \
+    '.spec.template.spec.containers[0].resources.requests.cpu == "125m" and
+     .spec.template.spec.containers[0].resources.requests.memory == "96Mi" and
+     .spec.template.spec.containers[0].resources.limits.cpu == "750m" and
+     .spec.template.spec.containers[0].resources.limits.memory == "384Mi" and
+     .spec.template.spec.containers[0].livenessProbe.initialDelaySeconds == 11 and
+     .spec.template.spec.containers[0].livenessProbe.periodSeconds == 12 and
+     .spec.template.spec.containers[0].livenessProbe.timeoutSeconds == 3 and
+     .spec.template.spec.containers[0].livenessProbe.failureThreshold == 4 and
+     .spec.template.spec.containers[0].readinessProbe.initialDelaySeconds == 6 and
+     .spec.template.spec.containers[0].readinessProbe.periodSeconds == 7 and
+     .spec.template.spec.containers[0].readinessProbe.timeoutSeconds == 4 and
+     .spec.template.spec.containers[0].readinessProbe.failureThreshold == 5' \
+    "${TEMPORARY_DIRECTORY}/override-statefulset.yaml" \
+    'resource and probe overrides must be present'
+assert_yq \
+    '[([.spec.template.spec.containers[0].env[] |
+        select(.name == "GHE_MASTER_KEY")][0].valueFrom.secretKeyRef.name) ==
+      "exporter-credentials",
+      ([.spec.template.spec.containers[0].env[] |
+        select(.name == "GHE_MASTER_KEY")][0].valueFrom.secretKeyRef.key) ==
+      "encryption-key",
+      ([.spec.template.spec.containers[0].env[] |
+        select(.name == "GHE_ADMIN_TOKEN")][0].valueFrom.secretKeyRef.name) ==
+      "exporter-credentials",
+      ([.spec.template.spec.containers[0].env[] |
+        select(.name == "GHE_ADMIN_TOKEN")][0].valueFrom.secretKeyRef.key) == "bearer-token",
+      ([.spec.template.spec.containers[0].env[] |
+        select(.name == "OTEL_EXPORTER_OTLP_HEADERS")][0].valueFrom.secretKeyRef.name) ==
+      "exporter-credentials",
+      ([.spec.template.spec.containers[0].env[] |
+        select(.name == "OTEL_EXPORTER_OTLP_HEADERS")][0].valueFrom.secretKeyRef.key) ==
+      "collector-headers",
+      ([.spec.template.spec.containers[0].env[] |
+        select(.name == "OTEL_EXPORTER_OTLP_TRACES_HEADERS")][0].valueFrom.secretKeyRef.name) ==
+      "exporter-credentials",
+      ([.spec.template.spec.containers[0].env[] |
+        select(.name == "OTEL_EXPORTER_OTLP_TRACES_HEADERS")][0].valueFrom.secretKeyRef.key) ==
+      "trace-headers",
+      ([.spec.template.spec.containers[0].env[] |
+        select(.name == "OTEL_EXPORTER_OTLP_LOGS_HEADERS")][0].valueFrom.secretKeyRef.name) ==
+      "exporter-credentials",
+      ([.spec.template.spec.containers[0].env[] |
+        select(.name == "OTEL_EXPORTER_OTLP_LOGS_HEADERS")][0].valueFrom.secretKeyRef.key) ==
+      "log-headers",
+      ([.spec.template.spec.containers[0].env[] |
+        select(.valueFrom.secretKeyRef.name == "exporter-credentials") |
+        .valueFrom.secretKeyRef.optional] | all_c(. == false))] | all' \
+    "${TEMPORARY_DIRECTORY}/override-statefulset.yaml" \
+    'every Secret override must reference the configured existing Secret'
+
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --set-string persistence.storageClass= \
+    >"${TEMPORARY_DIRECTORY}/empty-storage-class.yaml"
+yq eval-all '[.] | flatten | map(select(.kind == "StatefulSet"))[0]' \
+    "${TEMPORARY_DIRECTORY}/empty-storage-class.yaml" \
+    >"${TEMPORARY_DIRECTORY}/empty-storage-class-statefulset.yaml"
+assert_yq \
+    '.spec.volumeClaimTemplates[0].spec |
+     (has("storageClassName") and .storageClassName == "")' \
+    "${TEMPORARY_DIRECTORY}/empty-storage-class-statefulset.yaml" \
+    'explicit empty storage class must render storageClassName as an empty string'
 
 expect_failure \
     'replicaCount=0' \
