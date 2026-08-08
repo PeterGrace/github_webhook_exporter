@@ -1,0 +1,13 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "github-webhook-exporter.fullname" . }}
+  labels:
+    {{- include "github-webhook-exporter.labels" . | nindent 4 }}
+spec:
+  minAvailable: 0
+  selector:
+    matchLabels:
+      {{- include "github-webhook-exporter.selectorLabels" . | nindent 6 }}
+{{- end }}

@@ -60,6 +60,32 @@ the orchestrator termination grace period greater than the sum of
 `GHE_SHUTDOWN_TIMEOUT_SECONDS` and `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` so both application work and
 telemetry providers receive their full shutdown boundaries.
 
+## Helm deployment
+
+The supported singleton Helm package is documented in the
+[chart README](../charts/github-webhook-exporter/README.md). It installs exactly one StatefulSet
+replica with a `ReadWriteOnce` PVC for SQLite, a ClusterIP Service, and fixed non-root UID/GID and
+`fsGroup` 65532 security settings. Storage providers that ignore `fsGroup` must provision a mount
+writable by that identity.
+
+The chart maps typed non-secret values through a ConfigMap and references one operator-created
+Secret for `GHE_MASTER_KEY`, `GHE_ADMIN_TOKEN`, and any configured OTLP header keys. It never
+creates a Secret. `service.port` authoritatively configures the Service, container, named probes,
+and IPv6 wildcard listener. Liveness remains process-only, readiness checks SQLite, and collector
+availability affects neither probe.
+
+An empty `image.tag` selects the chart `appVersion`; the default repository is
+`ghcr.io/petergrace/github-webhook-exporter`. Issue #50 supplies the required GHCR publication.
+Until that release exists, operators may override `image.repository` and `image.tag` with an image
+the cluster can pull.
+
+The pod termination grace period must be strictly greater than the sum of the application and
+telemetry shutdown timeouts. The chart adds no `preStop` delay. A deterministic ConfigMap checksum
+in the pod template causes ConfigMap-backed value changes to trigger the StatefulSet's
+`RollingUpdate`, ensuring replacement pods read updated environment values. This rollout does not
+by itself guarantee Recreate-equivalent handoff or prevent writer overlap on every storage
+provider; see the chart README for this lifecycle limitation.
+
 ## Remote telemetry
 
 Structured stderr logging is always active. Remote trace and log export is optional and starts only
@@ -72,11 +98,13 @@ configured.
 The OTLP/HTTP protobuf exporters honor generic and signal-specific endpoint, header, and timeout
 variables. `OTEL_EXPORTER_OTLP_TIMEOUT` and its signal-specific variants are milliseconds. Header
 values are percent-decoded, validated, and redacted from errors and debug output. An explicitly
-empty signal-specific header variable clears inherited generic headers. For example:
+empty signal-specific header variable clears inherited generic headers. Read an encoded header list
+from the operator's shell environment rather than placing it in a script:
 
 ```bash
+: "${OTEL_EXPORTER_OTLP_HEADERS:?set OTEL_EXPORTER_OTLP_HEADERS in the operator shell}"
+export OTEL_EXPORTER_OTLP_HEADERS
 OTEL_EXPORTER_OTLP_ENDPOINT=https://collector.example.test:4318 \
-OTEL_EXPORTER_OTLP_HEADERS='authorization=Bearer%20redacted-token' \
 OTEL_EXPORTER_OTLP_TIMEOUT=10000 \
 github_webhook_exporter
 ```

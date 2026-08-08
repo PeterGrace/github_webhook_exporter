@@ -1,0 +1,353 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "quantity": {
+      "type": "string",
+      "pattern": "^[0-9]+(?:\\.[0-9]+)?(?:[EPTGM]i?|Ki|k|[eE][+-]?[0-9]+|m)?$"
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "replicaCount",
+    "image",
+    "existingSecret",
+    "service",
+    "application",
+    "retention",
+    "telemetry",
+    "persistence",
+    "resources",
+    "probes",
+    "terminationGracePeriodSeconds",
+    "podDisruptionBudget"
+  ],
+  "properties": {
+    "replicaCount": {
+      "type": "integer",
+      "const": 1
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag", "pullPolicy"],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": "string"
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["IfNotPresent", "Always", "Never"]
+        }
+      }
+    },
+    "existingSecret": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "keys"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "keys": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "masterKey",
+            "adminToken",
+            "otlpHeaders",
+            "otlpTracesHeaders",
+            "otlpLogsHeaders"
+          ],
+          "properties": {
+            "masterKey": {
+              "type": "string",
+              "minLength": 1
+            },
+            "adminToken": {
+              "type": "string",
+              "minLength": 1
+            },
+            "otlpHeaders": {
+              "type": "string"
+            },
+            "otlpTracesHeaders": {
+              "type": "string"
+            },
+            "otlpLogsHeaders": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "port"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["ClusterIP"]
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      }
+    },
+    "application": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "shutdownTimeoutSeconds",
+        "webhookBodyLimitBytes",
+        "workflowJobMaxSteps",
+        "rustLog"
+      ],
+      "properties": {
+        "shutdownTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300
+        },
+        "webhookBodyLimitBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2097152
+        },
+        "workflowJobMaxSteps": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "rustLog": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deliveryDays", "mergeQueueDays", "pruneIntervalSeconds"],
+      "properties": {
+        "deliveryDays": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mergeQueueDays": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pruneIntervalSeconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "endpoint",
+        "tracesEndpoint",
+        "logsEndpoint",
+        "timeoutMilliseconds",
+        "tracesTimeoutMilliseconds",
+        "logsTimeoutMilliseconds",
+        "serviceName",
+        "queueCapacity",
+        "batchSize",
+        "shutdownTimeoutSeconds"
+      ],
+      "properties": {
+        "endpoint": {
+          "type": "string"
+        },
+        "tracesEndpoint": {
+          "type": "string"
+        },
+        "logsEndpoint": {
+          "type": "string"
+        },
+        "timeoutMilliseconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "tracesTimeoutMilliseconds": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "logsTimeoutMilliseconds": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "serviceName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "queueCapacity": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "batchSize": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "shutdownTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120
+        }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["storageClass", "accessModes", "size"],
+      "properties": {
+        "storageClass": {
+          "type": ["string", "null"]
+        },
+        "accessModes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "enum": ["ReadWriteOnce"]
+          }
+        },
+        "size": {
+          "$ref": "#/definitions/quantity"
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu", "memory"],
+          "properties": {
+            "cpu": {
+              "$ref": "#/definitions/quantity"
+            },
+            "memory": {
+              "$ref": "#/definitions/quantity"
+            }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu", "memory"],
+          "properties": {
+            "cpu": {
+              "$ref": "#/definitions/quantity"
+            },
+            "memory": {
+              "$ref": "#/definitions/quantity"
+            }
+          }
+        }
+      }
+    },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["liveness", "readiness"],
+      "properties": {
+        "liveness": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "initialDelaySeconds",
+            "periodSeconds",
+            "timeoutSeconds",
+            "failureThreshold"
+          ],
+          "properties": {
+            "initialDelaySeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 300
+            },
+            "periodSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 300
+            },
+            "timeoutSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60
+            },
+            "failureThreshold": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10
+            }
+          }
+        },
+        "readiness": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "initialDelaySeconds",
+            "periodSeconds",
+            "timeoutSeconds",
+            "failureThreshold"
+          ],
+          "properties": {
+            "initialDelaySeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 300
+            },
+            "periodSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 300
+            },
+            "timeoutSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60
+            },
+            "failureThreshold": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10
+            }
+          }
+        }
+      }
+    },
+    "terminationGracePeriodSeconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 600
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
