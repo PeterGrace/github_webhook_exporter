@@ -71,6 +71,16 @@
         }
       ]
     },
+    "ingressHost": {
+      "type": "string",
+      "maxLength": 253,
+      "anyOf": [
+        {"const": ""},
+        {
+          "pattern": "^(?:\\*\\.)?(?:[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$"
+        }
+      ]
+    },
     "tls": {
       "type": "array",
       "items": {
@@ -443,7 +453,7 @@
         "enabled": {"type": "boolean"},
         "className": {"type": "string"},
         "annotations": {"$ref": "#/definitions/stringMap"},
-        "host": {"type": "string"},
+        "host": {"$ref": "#/definitions/ingressHost"},
         "tls": {"$ref": "#/definitions/tls"}
       }
     },
@@ -498,7 +508,7 @@
             "enabled": {"type": "boolean"},
             "className": {"type": "string"},
             "annotations": {"$ref": "#/definitions/stringMap"},
-            "host": {"type": "string"},
+            "host": {"$ref": "#/definitions/ingressHost"},
             "tls": {"$ref": "#/definitions/tls"}
           }
         }

@@ -23,6 +23,7 @@ spec:
           podSelector:
             {{- toYaml $rule.podSelector | nindent 12 }}
       ports:
+        # Every purpose-specific Service targets this shared container listener.
         - protocol: TCP
           port: {{ $.Values.service.port }}
     {{- end }}

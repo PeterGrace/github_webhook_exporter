@@ -678,6 +678,26 @@ assert_yq \
     'webhook Ingress must expose only the exact GitHub webhook path'
 
 helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --set webhookIngress.enabled=true \
+    >"${TEMPORARY_DIRECTORY}/hostless-webhook-ingress.yaml"
+assert_yq \
+    'select(.kind == "Ingress").spec.rules[0] |
+     ((has("host") | not) and .http.paths[0].path == "/webhooks/github" and
+      .http.paths[0].pathType == "Exact")' \
+    "${TEMPORARY_DIRECTORY}/hostless-webhook-ingress.yaml" \
+    'hostless webhook Ingress must retain its fixed exact path'
+expect_success \
+    'wildcard webhook hostname' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set webhookIngress.enabled=true \
+        --set-string 'webhookIngress.host=*.example.test'
+expect_failure \
+    'malformed webhook hostname' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set webhookIngress.enabled=true \
+        --set-string webhookIngress.host=Bad_host
+
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
     --set metrics.service.enabled=true \
     >"${TEMPORARY_DIRECTORY}/metrics-service.yaml"
 yq eval-all '[.] | flatten | map(select(. != null))' \
@@ -736,6 +756,22 @@ assert_yq \
        .backend.service.name) == "github-webhook-exporter-administration"' \
     "${TEMPORARY_DIRECTORY}/administration-manifests.yaml" \
     'administrative Ingress must route only the repository API prefix'
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --set administration.service.enabled=true \
+    --set administration.ingress.enabled=true \
+    >"${TEMPORARY_DIRECTORY}/hostless-administration-ingress.yaml"
+assert_yq \
+    'select(.kind == "Ingress").spec.rules[0] |
+     ((has("host") | not) and .http.paths[0].path == "/api/v1/repositories" and
+      .http.paths[0].pathType == "Prefix")' \
+    "${TEMPORARY_DIRECTORY}/hostless-administration-ingress.yaml" \
+    'hostless administrative Ingress must retain its fixed prefix'
+expect_failure \
+    'malformed administrative hostname' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set administration.service.enabled=true \
+        --set administration.ingress.enabled=true \
+        --set-string administration.ingress.host=Bad_host
 expect_failure_contains \
     'administrative Ingress without administrative Service' \
     'administration.ingress.enabled requires administration.service.enabled' \
