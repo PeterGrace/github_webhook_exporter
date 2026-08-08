@@ -166,17 +166,27 @@ RUNTIME_OWNERS="$(
         --platform linux/amd64 \
         --user 0:0 \
         --volume "${DATA_VOLUME}:${DATA_DIRECTORY}:ro" \
-        --entrypoint /bin/stat \
+        --entrypoint /bin/sh \
         "${AUDIT_IMAGE}" \
-        -c '%u:%g' \
+        -c '
+            set -e
+            /bin/stat -c "%u:%g" "$1" "$2"
+            for sidecar in "$2-wal" "$2-shm"; do
+                [ ! -e "$sidecar" ] || /bin/stat -c "%u:%g" "$sidecar"
+            done
+        ' ownership-audit \
         "${DATA_DIRECTORY}" \
-        "${DATA_DIRECTORY}/github-webhook-exporter.db" \
-        "${DATA_DIRECTORY}/github-webhook-exporter.db-wal" \
-        "${DATA_DIRECTORY}/github-webhook-exporter.db-shm"
+        "${DATA_DIRECTORY}/github-webhook-exporter.db"
 )"
 readonly RUNTIME_OWNERS
-readonly EXPECTED_RUNTIME_OWNERS=$'65532:65532\n65532:65532\n65532:65532\n65532:65532'
-assert_equal "${EXPECTED_RUNTIME_OWNERS}" "${RUNTIME_OWNERS}" "SQLite runtime ownership"
+declare -a runtime_owner_values
+mapfile -t runtime_owner_values <<<"${RUNTIME_OWNERS}"
+if (( ${#runtime_owner_values[@]} < 2 )); then
+    fail "SQLite runtime ownership audit omitted a required path"
+fi
+for runtime_owner in "${runtime_owner_values[@]}"; do
+    assert_equal "65532:65532" "${runtime_owner}" "SQLite runtime ownership"
+done
 stop_gracefully "${PRIMARY_CONTAINER}"
 
 docker run --detach \
