@@ -159,9 +159,12 @@ helm uninstall "${RELEASE_NAME}" \
     --kube-context "${KUBE_CONTEXT}"
 RELEASE_MAY_EXIST=false
 
-if helm status "${RELEASE_NAME}" \
+remaining_releases="$(helm list \
     --namespace "${NAMESPACE}" \
     --kubeconfig "${KUBECONFIG_PATH}" \
-    --kube-context "${KUBE_CONTEXT}" >/dev/null 2>&1; then
-    fail "Helm release remains present after uninstall"
+    --kube-context "${KUBE_CONTEXT}" \
+    --filter "^${RELEASE_NAME}$" \
+    --short)"
+if [[ -n "${remaining_releases}" ]]; then
+    fail "Helm release remains present after uninstall: ${remaining_releases}"
 fi
