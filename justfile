@@ -13,9 +13,10 @@ test:
 helm-lint:
     helm lint "{{helm-chart}}"
 
-# Exercise Helm chart schema and rendering contracts.
+# Exercise Helm chart schema, rendering, and Secret argument contracts.
 helm-test:
     scripts/helm-chart-test.sh "{{helm-chart}}"
+    scripts/helm-kind-secret-argv-test.sh scripts/helm-kind-acceptance.sh "{{helm-chart}}"
 
 # Verify the rendered chart is accepted by a disposable Kind cluster.
 helm-kind-acceptance:

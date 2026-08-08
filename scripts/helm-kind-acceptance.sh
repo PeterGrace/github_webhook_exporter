@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
 readonly RELEASE_NAME="github-webhook-exporter"
 readonly NAMESPACE="github-webhook-exporter-test"
@@ -91,24 +92,28 @@ kind create cluster \
 kubectl --kubeconfig "${KUBECONFIG_PATH}" --context "${KUBE_CONTEXT}" \
     create namespace "${NAMESPACE}"
 
+readonly MASTER_KEY_FILE="${TEMPORARY_DIRECTORY}/master-key"
+readonly ADMIN_TOKEN_FILE="${TEMPORARY_DIRECTORY}/admin-token"
 master_key="$(head -c 32 /dev/urandom | base64)"
 admin_token="$(head -c 32 /dev/urandom | base64)"
-kubectl --kubeconfig "${KUBECONFIG_PATH}" --context "${KUBE_CONTEXT}" \
-    --namespace "${NAMESPACE}" create secret generic "${RESOURCE_NAME}" \
-    --from-literal="master-key=${master_key}" \
-    --from-literal="admin-token=${admin_token}"
+printf '%s' "${master_key}" >"${MASTER_KEY_FILE}"
+printf '%s' "${admin_token}" >"${ADMIN_TOKEN_FILE}"
 master_key=''
 admin_token=''
+kubectl --kubeconfig "${KUBECONFIG_PATH}" --context "${KUBE_CONTEXT}" \
+    --namespace "${NAMESPACE}" create secret generic "${RESOURCE_NAME}" \
+    --from-file="master-key=${MASTER_KEY_FILE}" \
+    --from-file="admin-token=${ADMIN_TOKEN_FILE}"
+rm -f "${MASTER_KEY_FILE}" "${ADMIN_TOKEN_FILE}"
 
 RELEASE_MAY_EXIST=true
 helm install "${RELEASE_NAME}" "${CHART_DIRECTORY}" \
     --namespace "${NAMESPACE}" \
     --kubeconfig "${KUBECONFIG_PATH}" \
-    --kube-context "${KUBE_CONTEXT}" \
-    --wait=false
+    --kube-context "${KUBE_CONTEXT}"
 
 # kubectl currently reports StatefulSet pausing as unsupported. Invoking it immediately still
-# guards future Kubernetes clients that add support; --wait=false keeps image pulls out of scope.
+# guards future Kubernetes clients that add support; Helm's default install does not wait for pods.
 pause_error=''
 if ! pause_error="$(kubectl --kubeconfig "${KUBECONFIG_PATH}" \
     --context "${KUBE_CONTEXT}" --namespace "${NAMESPACE}" \

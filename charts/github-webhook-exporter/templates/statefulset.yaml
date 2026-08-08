@@ -16,6 +16,8 @@ spec:
       {{- include "github-webhook-exporter.selectorLabels" . | nindent 6 }}
   template:
     metadata:
+      annotations:
+        checksum/config: {{ include "github-webhook-exporter.configChecksum" . | quote }}
       labels:
         {{- include "github-webhook-exporter.selectorLabels" . | nindent 8 }}
     spec:

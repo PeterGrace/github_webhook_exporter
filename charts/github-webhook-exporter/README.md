@@ -32,9 +32,23 @@ manifest.
 : "${GHE_ADMIN_TOKEN:?set GHE_ADMIN_TOKEN in the operator shell}"
 
 kubectl create namespace github-webhook-exporter
-kubectl --namespace github-webhook-exporter create secret generic github-webhook-exporter \
-  --from-literal="master-key=${GHE_MASTER_KEY}" \
-  --from-literal="admin-token=${GHE_ADMIN_TOKEN}"
+(
+  set -Eeuo pipefail
+  umask 077
+  secret_directory="$(mktemp -d)"
+  cleanup_secret_files() {
+    rm -rf -- "${secret_directory}"
+  }
+  trap cleanup_secret_files EXIT
+  trap 'exit 1' HUP INT TERM
+
+  printf '%s' "${GHE_MASTER_KEY}" >"${secret_directory}/master-key"
+  printf '%s' "${GHE_ADMIN_TOKEN}" >"${secret_directory}/admin-token"
+  unset GHE_MASTER_KEY GHE_ADMIN_TOKEN
+  kubectl --namespace github-webhook-exporter create secret generic github-webhook-exporter \
+    --from-file="master-key=${secret_directory}/master-key" \
+    --from-file="admin-token=${secret_directory}/admin-token"
+)
 
 helm upgrade --install github-webhook-exporter charts/github-webhook-exporter \
   --namespace github-webhook-exporter
@@ -73,9 +87,8 @@ ConfigMap.
 | `existingSecret.keys.otlpTracesHeaders` | `""` | Optional key projected as trace OTLP headers; empty omits it. |
 | `existingSecret.keys.otlpLogsHeaders` | `""` | Optional key projected as log OTLP headers; empty omits it. |
 | `service.type` | `ClusterIP` | Fixed supported Service type. |
-| `service.port` | `8080` | Service and container HTTP port. |
-| `application.bindAddress` | `[::]:8080` | Application listen address. |
-| `application.shutdownTimeoutSeconds` | `30` | HTTP and retention drain deadline in seconds. |
+| `service.port` | `8080` | Service, container, probe, and `[::]` application listener port. |
+| `application.shutdownTimeoutSeconds` | `30` | Drain deadline; range `1..=300` seconds. |
 | `application.webhookBodyLimitBytes` | `2097152` | Maximum webhook request body size. |
 | `application.workflowJobMaxSteps` | `256` | Maximum admitted steps in a completed workflow job. |
 | `application.rustLog` | `info` | Rust logging filter. |
@@ -91,7 +104,7 @@ ConfigMap.
 | `telemetry.serviceName` | `github-webhook-exporter` | OpenTelemetry service name. |
 | `telemetry.queueCapacity` | `2048` | Bounded queue capacity per enabled signal. |
 | `telemetry.batchSize` | `512` | Maximum export batch; cannot exceed queue capacity. |
-| `telemetry.shutdownTimeoutSeconds` | `5` | Shared trace-and-log shutdown deadline in seconds. |
+| `telemetry.shutdownTimeoutSeconds` | `5` | Telemetry deadline; range `1..=120` seconds. |
 | `persistence.storageClass` | `null` | Storage class selection; see [Storage](#storage). |
 | `persistence.accessModes` | `[ReadWriteOnce]` | Fixed one-element PVC access-mode list. |
 | `persistence.size` | `1Gi` | Requested PVC storage at installation. |
@@ -99,21 +112,22 @@ ConfigMap.
 | `resources.requests.memory` | `64Mi` | Container memory request. |
 | `resources.limits.cpu` | `500m` | Container CPU limit. |
 | `resources.limits.memory` | `256Mi` | Container memory limit. |
-| `probes.liveness.initialDelaySeconds` | `5` | Liveness initial delay. |
-| `probes.liveness.periodSeconds` | `10` | Liveness period. |
-| `probes.liveness.timeoutSeconds` | `2` | Liveness request timeout. |
-| `probes.liveness.failureThreshold` | `3` | Liveness consecutive-failure threshold. |
-| `probes.readiness.initialDelaySeconds` | `2` | Readiness initial delay. |
-| `probes.readiness.periodSeconds` | `5` | Readiness period. |
-| `probes.readiness.timeoutSeconds` | `2` | Readiness request timeout. |
-| `probes.readiness.failureThreshold` | `3` | Readiness consecutive-failure threshold. |
-| `terminationGracePeriodSeconds` | `40` | Pod grace period; must satisfy the strict shutdown sum. |
+| `probes.liveness.initialDelaySeconds` | `5` | Liveness initial delay; range `1..=300`. |
+| `probes.liveness.periodSeconds` | `10` | Liveness period; range `1..=300`. |
+| `probes.liveness.timeoutSeconds` | `2` | Liveness request timeout; range `1..=60`. |
+| `probes.liveness.failureThreshold` | `3` | Liveness failure threshold; range `1..=10`. |
+| `probes.readiness.initialDelaySeconds` | `2` | Readiness initial delay; range `1..=300`. |
+| `probes.readiness.periodSeconds` | `5` | Readiness period; range `1..=300`. |
+| `probes.readiness.timeoutSeconds` | `2` | Readiness request timeout; range `1..=60`. |
+| `probes.readiness.failureThreshold` | `3` | Readiness failure threshold; range `1..=10`. |
+| `terminationGracePeriodSeconds` | `40` | Pod grace; range `1..=600` seconds and strict sum applies. |
 | `podDisruptionBudget.enabled` | `false` | Render the fixed `minAvailable: 0` PDB. |
 
 The schema intentionally exposes no generic `extraEnv` map. Typed, non-secret application,
 retention, and telemetry values are projected through the generated ConfigMap. The fixed database
 path, downward-API pod metadata, and existing-Secret references are rendered directly in the
-StatefulSet.
+StatefulSet. `service.port` is the single HTTP port setting: the Service, container, named probes,
+and IPv6 wildcard application listener all derive from it.
 
 ## Storage
 
@@ -170,19 +184,23 @@ terminationGracePeriodSeconds
   > application.shutdownTimeoutSeconds + telemetry.shutdownTimeoutSeconds
 ```
 
-The defaults are `40 > 30 + 5`. This leaves a positive Kubernetes process-exit margin after the
-application drain and telemetry shutdown boundaries. The pod defines no `preStop` delay; SIGTERM
-starts application shutdown directly. The validation checks configuration arithmetic, not runtime
+The defaults are `40 > 30 + 5`. The maximum values also permit a valid combination because
+`600 > 300 + 120`. This leaves a positive Kubernetes process-exit margin after the application
+drain and telemetry shutdown boundaries. The pod defines no `preStop` delay; SIGTERM starts
+application shutdown directly. The validation checks configuration arithmetic, not runtime
 lifecycle behavior.
 
 The optional PodDisruptionBudget is disabled by default. When enabled, it has fixed
 `minAvailable: 0` semantics. It cannot keep a singleton available, does not prevent voluntary
 disruption, and provides no protection from involuntary failures.
 
-The StatefulSet uses `RollingUpdate`. That strategy and `ReadWriteOnce` do not guarantee safe volume
-handoff on every storage provider. The Recreate-equivalent operator procedure is deferred to #48;
-until that procedure is available, do not claim that chart-driven upgrades prevent overlapping
-attachment or SQLite writers on providers where overlap is possible.
+The StatefulSet pod template contains a deterministic checksum of the rendered ConfigMap. Changing
+any ConfigMap-backed value during `helm upgrade` changes that annotation and triggers the configured
+`RollingUpdate`, so the replacement pod reads the new environment values. The strategy and
+`ReadWriteOnce` do not guarantee safe volume handoff on every storage provider. The
+Recreate-equivalent operator procedure is deferred to #48; until that procedure is available, do
+not claim that chart-driven upgrades prevent overlapping attachment or SQLite writers on providers
+where overlap is possible.
 
 ## Validation
 

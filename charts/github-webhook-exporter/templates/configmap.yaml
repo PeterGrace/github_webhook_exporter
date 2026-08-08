@@ -5,7 +5,7 @@ metadata:
   labels:
     {{- include "github-webhook-exporter.labels" . | nindent 4 }}
 data:
-  GHE_BIND_ADDRESS: {{ .Values.application.bindAddress | quote }}
+  GHE_BIND_ADDRESS: {{ printf "[::]:%d" (int .Values.service.port) | quote }}
   GHE_SHUTDOWN_TIMEOUT_SECONDS: {{ .Values.application.shutdownTimeoutSeconds | int | quote }}
   GHE_WEBHOOK_BODY_LIMIT_BYTES: {{ .Values.application.webhookBodyLimitBytes | int | quote }}
   GHE_WORKFLOW_JOB_MAX_STEPS: {{ .Values.application.workflowJobMaxSteps | int | quote }}

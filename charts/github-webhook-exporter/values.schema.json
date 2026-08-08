@@ -1,5 +1,11 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "quantity": {
+      "type": "string",
+      "pattern": "^[0-9]+(?:\\.[0-9]+)?(?:[EPTGM]i?|Ki|k|[eE][+-]?[0-9]+|m)?$"
+    }
+  },
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -100,20 +106,16 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "bindAddress",
         "shutdownTimeoutSeconds",
         "webhookBodyLimitBytes",
         "workflowJobMaxSteps",
         "rustLog"
       ],
       "properties": {
-        "bindAddress": {
-          "type": "string",
-          "minLength": 1
-        },
         "shutdownTimeoutSeconds": {
           "type": "integer",
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 300
         },
         "webhookBodyLimitBytes": {
           "type": "integer",
@@ -201,7 +203,8 @@
         },
         "shutdownTimeoutSeconds": {
           "type": "integer",
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 120
         }
       }
     },
@@ -223,8 +226,7 @@
           }
         },
         "size": {
-          "type": "string",
-          "pattern": "^[0-9]+(?:\\.[0-9]+)?(?:[EPTGMK]i?|[eE][+-]?[0-9]+|m)?$"
+          "$ref": "#/definitions/quantity"
         }
       }
     },
@@ -239,12 +241,10 @@
           "required": ["cpu", "memory"],
           "properties": {
             "cpu": {
-              "type": "string",
-              "pattern": "^[0-9]+(?:\\.[0-9]+)?(?:[EPTGMK]i?|[eE][+-]?[0-9]+|m)?$"
+              "$ref": "#/definitions/quantity"
             },
             "memory": {
-              "type": "string",
-              "pattern": "^[0-9]+(?:\\.[0-9]+)?(?:[EPTGMK]i?|[eE][+-]?[0-9]+|m)?$"
+              "$ref": "#/definitions/quantity"
             }
           }
         },
@@ -254,12 +254,10 @@
           "required": ["cpu", "memory"],
           "properties": {
             "cpu": {
-              "type": "string",
-              "pattern": "^[0-9]+(?:\\.[0-9]+)?(?:[EPTGMK]i?|[eE][+-]?[0-9]+|m)?$"
+              "$ref": "#/definitions/quantity"
             },
             "memory": {
-              "type": "string",
-              "pattern": "^[0-9]+(?:\\.[0-9]+)?(?:[EPTGMK]i?|[eE][+-]?[0-9]+|m)?$"
+              "$ref": "#/definitions/quantity"
             }
           }
         }
@@ -282,19 +280,23 @@
           "properties": {
             "initialDelaySeconds": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 1,
+              "maximum": 300
             },
             "periodSeconds": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 1,
+              "maximum": 300
             },
             "timeoutSeconds": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 1,
+              "maximum": 60
             },
             "failureThreshold": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 1,
+              "maximum": 10
             }
           }
         },
@@ -310,19 +312,23 @@
           "properties": {
             "initialDelaySeconds": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 1,
+              "maximum": 300
             },
             "periodSeconds": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 1,
+              "maximum": 300
             },
             "timeoutSeconds": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 1,
+              "maximum": 60
             },
             "failureThreshold": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 1,
+              "maximum": 10
             }
           }
         }
@@ -330,7 +336,8 @@
     },
     "terminationGracePeriodSeconds": {
       "type": "integer",
-      "minimum": 1
+      "minimum": 1,
+      "maximum": 600
     },
     "podDisruptionBudget": {
       "type": "object",

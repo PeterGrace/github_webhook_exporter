@@ -70,8 +70,9 @@ writable by that identity.
 
 The chart maps typed non-secret values through a ConfigMap and references one operator-created
 Secret for `GHE_MASTER_KEY`, `GHE_ADMIN_TOKEN`, and any configured OTLP header keys. It never
-creates a Secret. Liveness remains process-only, readiness checks SQLite, and collector availability
-affects neither probe.
+creates a Secret. `service.port` authoritatively configures the Service, container, named probes,
+and IPv6 wildcard listener. Liveness remains process-only, readiness checks SQLite, and collector
+availability affects neither probe.
 
 An empty `image.tag` selects the chart `appVersion`; the default repository is
 `ghcr.io/petergrace/github-webhook-exporter`. Issue #50 supplies the required GHCR publication.
@@ -79,9 +80,11 @@ Until that release exists, operators may override `image.repository` and `image.
 the cluster can pull.
 
 The pod termination grace period must be strictly greater than the sum of the application and
-telemetry shutdown timeouts. The chart adds no `preStop` delay. Its StatefulSet uses
-`RollingUpdate`, but the chart does not by itself guarantee Recreate-equivalent handoff or prevent
-writer overlap on every storage provider; see the chart README for this lifecycle limitation.
+telemetry shutdown timeouts. The chart adds no `preStop` delay. A deterministic ConfigMap checksum
+in the pod template causes ConfigMap-backed value changes to trigger the StatefulSet's
+`RollingUpdate`, ensuring replacement pods read updated environment values. This rollout does not
+by itself guarantee Recreate-equivalent handoff or prevent writer overlap on every storage
+provider; see the chart README for this lifecycle limitation.
 
 ## Remote telemetry
 

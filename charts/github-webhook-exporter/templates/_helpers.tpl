@@ -31,6 +31,11 @@ app.kubernetes.io/name: {{ include "github-webhook-exporter.name" . | quote }}
 app.kubernetes.io/instance: {{ .Release.Name | trunc 63 | trimSuffix "-" | quote }}
 {{- end -}}
 
+{{/* Return a deterministic checksum of the rendered non-secret ConfigMap. */}}
+{{- define "github-webhook-exporter.configChecksum" -}}
+{{- include (print $.Template.BasePath "/configmap.yaml") . | sha256sum -}}
+{{- end -}}
+
 {{/* Validate singleton, storage, telemetry, and shutdown invariants. */}}
 {{- define "github-webhook-exporter.validate" -}}
 {{- if ne (int .Values.replicaCount) 1 -}}

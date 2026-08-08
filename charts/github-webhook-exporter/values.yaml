@@ -15,7 +15,6 @@ service:
   type: ClusterIP
   port: 8080
 application:
-  bindAddress: "[::]:8080"
   shutdownTimeoutSeconds: 30
   webhookBodyLimitBytes: 2097152
   workflowJobMaxSteps: 256

@@ -8,7 +8,7 @@ if [[ -z "${CHART_DIRECTORY}" ]]; then
     exit 2
 fi
 
-for command in awk find grep helm mktemp rm yq; do
+for command in awk cat find grep helm mktemp rm yq; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         printf 'required command not found: %s\n' "${command}" >&2
         exit 2
@@ -33,6 +33,26 @@ expect_failure() {
     shift
     if "$@" >"${TEMPORARY_DIRECTORY}/unexpected-output" 2>&1; then
         fail "${description} unexpectedly succeeded"
+    fi
+}
+
+expect_failure_contains() {
+    local description="$1"
+    local expected_diagnostic="$2"
+    shift 2
+    if "$@" >"${TEMPORARY_DIRECTORY}/unexpected-output" 2>&1; then
+        fail "${description} unexpectedly succeeded"
+    fi
+    if ! grep -Fq -- "${expected_diagnostic}" "${TEMPORARY_DIRECTORY}/unexpected-output"; then
+        fail "${description} did not emit the expected diagnostic: ${expected_diagnostic}"
+    fi
+}
+
+expect_success() {
+    local description="$1"
+    shift
+    if ! "$@" >"${TEMPORARY_DIRECTORY}/unexpected-output" 2>&1; then
+        fail "${description} unexpectedly failed"
     fi
 }
 
@@ -170,6 +190,50 @@ assert_yq \
      .data.OTEL_SERVICE_NAME == "github-webhook-exporter"' \
     "${TEMPORARY_DIRECTORY}/default-configmap.yaml" \
     'ConfigMap must contain only default non-secret configuration'
+assert_yq \
+    '.spec.template.metadata.annotations."checksum/config" |
+     test("^[0-9a-f]{64}$")' \
+    "${TEMPORARY_DIRECTORY}/default-statefulset.yaml" \
+    'StatefulSet pod template must contain a SHA-256 ConfigMap checksum'
+
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    >"${TEMPORARY_DIRECTORY}/default-repeat.yaml"
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --set application.rustLog=debug \
+    >"${TEMPORARY_DIRECTORY}/configmap-change.yaml"
+default_checksum="$(yq \
+    'select(.kind == "StatefulSet").spec.template.metadata.annotations."checksum/config"' \
+    "${TEMPORARY_DIRECTORY}/default.yaml")"
+repeat_checksum="$(yq \
+    'select(.kind == "StatefulSet").spec.template.metadata.annotations."checksum/config"' \
+    "${TEMPORARY_DIRECTORY}/default-repeat.yaml")"
+changed_checksum="$(yq \
+    'select(.kind == "StatefulSet").spec.template.metadata.annotations."checksum/config"' \
+    "${TEMPORARY_DIRECTORY}/configmap-change.yaml")"
+if [[ "${default_checksum}" != "${repeat_checksum}" ]]; then
+    fail 'identical ConfigMaps must produce identical pod-template checksums'
+fi
+if [[ "${default_checksum}" == "${changed_checksum}" ]]; then
+    fail 'changing ConfigMap-backed RUST_LOG must change the pod-template checksum'
+fi
+assert_yq \
+    'select(.kind == "ConfigMap").data.RUST_LOG == "debug"' \
+    "${TEMPORARY_DIRECTORY}/configmap-change.yaml" \
+    'checksum regression fixture must change ConfigMap-backed RUST_LOG'
+
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --set service.port=9090 \
+    >"${TEMPORARY_DIRECTORY}/non-default-port.yaml"
+yq eval-all '[.] | flatten | map(select(. != null))' \
+    "${TEMPORARY_DIRECTORY}/non-default-port.yaml" \
+    >"${TEMPORARY_DIRECTORY}/non-default-port-manifests.yaml"
+assert_yq \
+    '([.[] | select(.kind == "Service")][0].spec.ports[0].port) == 9090 and
+     ([.[] | select(.kind == "StatefulSet")][0].spec.template.spec.containers[0].ports[0]
+       .containerPort) == 9090 and
+     ([.[] | select(.kind == "ConfigMap")][0].data.GHE_BIND_ADDRESS) == "[::]:9090"' \
+    "${TEMPORARY_DIRECTORY}/non-default-port-manifests.yaml" \
+    'service.port must configure the Service, container, and application listener together'
 assert_yq \
     '.spec.template.spec.automountServiceAccountToken == false and
      .spec.template.spec.securityContext.runAsNonRoot == true and
@@ -422,6 +486,65 @@ helm template github-webhook-exporter "${CHART_DIRECTORY}" \
     --set terminationGracePeriodSeconds=36 \
     >"${TEMPORARY_DIRECTORY}/valid-grace-boundary.yaml"
 
+expect_success \
+    'application shutdown maximum of 300 seconds' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set application.shutdownTimeoutSeconds=300 \
+        --set terminationGracePeriodSeconds=306
+expect_failure \
+    'application shutdown first value above 300 seconds' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set application.shutdownTimeoutSeconds=301 \
+        --set terminationGracePeriodSeconds=307
+expect_success \
+    'telemetry shutdown maximum of 120 seconds' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set telemetry.shutdownTimeoutSeconds=120 \
+        --set terminationGracePeriodSeconds=151
+expect_failure \
+    'telemetry shutdown first value above 120 seconds' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set telemetry.shutdownTimeoutSeconds=121 \
+        --set terminationGracePeriodSeconds=152
+expect_success \
+    'termination grace maximum of 600 seconds' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set terminationGracePeriodSeconds=600
+expect_success \
+    'combined shutdown maxima preserve a valid strict sum' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set application.shutdownTimeoutSeconds=300 \
+        --set telemetry.shutdownTimeoutSeconds=120 \
+        --set terminationGracePeriodSeconds=600
+expect_failure \
+    'termination grace first value above 600 seconds' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set terminationGracePeriodSeconds=601
+
+readonly -a PROBE_FIELDS=(
+    initialDelaySeconds
+    periodSeconds
+    timeoutSeconds
+    failureThreshold
+)
+readonly -a PROBE_MAXIMUMS=(300 300 60 10)
+readonly -a PROBE_FIRST_REJECTED_VALUES=(301 301 61 11)
+for probe in liveness readiness; do
+    for probe_index in "${!PROBE_FIELDS[@]}"; do
+        probe_field="${PROBE_FIELDS[${probe_index}]}"
+        probe_maximum="${PROBE_MAXIMUMS[${probe_index}]}"
+        probe_first_rejected="${PROBE_FIRST_REJECTED_VALUES[${probe_index}]}"
+        expect_success \
+            "probes.${probe}.${probe_field} accepted maximum ${probe_maximum}" \
+            helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+                --set "probes.${probe}.${probe_field}=${probe_maximum}"
+        expect_failure \
+            "probes.${probe}.${probe_field} first rejected value ${probe_first_rejected}" \
+            helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+                --set "probes.${probe}.${probe_field}=${probe_first_rejected}"
+    done
+done
+
 helm template github-webhook-exporter "${CHART_DIRECTORY}" \
     --set-string persistence.storageClass= \
     >"${TEMPORARY_DIRECTORY}/empty-storage-class.yaml"
@@ -444,19 +567,42 @@ expect_failure \
     'empty persistence.size' \
     helm template github-webhook-exporter "${CHART_DIRECTORY}" --set persistence.size=
 expect_failure \
+    'malformed non-empty persistence.size' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set-string persistence.size=1K
+expect_failure \
     'ReadWriteMany persistence access mode' \
     helm template github-webhook-exporter "${CHART_DIRECTORY}" \
         --set persistence.accessModes[0]=ReadWriteMany
-expect_failure \
+SHUTDOWN_DIAGNOSTIC='terminationGracePeriodSeconds must be greater than '
+SHUTDOWN_DIAGNOSTIC+='application.shutdownTimeoutSeconds + '
+SHUTDOWN_DIAGNOSTIC+='telemetry.shutdownTimeoutSeconds; got terminationGracePeriodSeconds='
+readonly SHUTDOWN_DIAGNOSTIC
+EQUAL_SHUTDOWN_DIAGNOSTIC="${SHUTDOWN_DIAGNOSTIC}35 "
+EQUAL_SHUTDOWN_DIAGNOSTIC+='application.shutdownTimeoutSeconds=30 '
+EQUAL_SHUTDOWN_DIAGNOSTIC+='telemetry.shutdownTimeoutSeconds=5'
+readonly EQUAL_SHUTDOWN_DIAGNOSTIC
+BELOW_SHUTDOWN_DIAGNOSTIC="${SHUTDOWN_DIAGNOSTIC}34 "
+BELOW_SHUTDOWN_DIAGNOSTIC+='application.shutdownTimeoutSeconds=30 '
+BELOW_SHUTDOWN_DIAGNOSTIC+='telemetry.shutdownTimeoutSeconds=5'
+readonly BELOW_SHUTDOWN_DIAGNOSTIC
+BATCH_DIAGNOSTIC='telemetry.batchSize must be no greater than telemetry.queueCapacity; '
+BATCH_DIAGNOSTIC+='got telemetry.batchSize=2049 telemetry.queueCapacity=2048'
+readonly BATCH_DIAGNOSTIC
+
+expect_failure_contains \
     'terminationGracePeriodSeconds equal to shutdown timeout sum' \
+    "${EQUAL_SHUTDOWN_DIAGNOSTIC}" \
     helm template github-webhook-exporter "${CHART_DIRECTORY}" \
         --set terminationGracePeriodSeconds=35
-expect_failure \
+expect_failure_contains \
     'terminationGracePeriodSeconds below shutdown timeout sum' \
+    "${BELOW_SHUTDOWN_DIAGNOSTIC}" \
     helm template github-webhook-exporter "${CHART_DIRECTORY}" \
         --set terminationGracePeriodSeconds=34
-expect_failure \
+expect_failure_contains \
     'telemetry batch size greater than queue capacity' \
+    "${BATCH_DIAGNOSTIC}" \
     helm template github-webhook-exporter "${CHART_DIRECTORY}" \
         --set telemetry.batchSize=2049
 expect_failure \
@@ -485,11 +631,25 @@ expect_failure \
     'service port above Kubernetes range' \
     helm template github-webhook-exporter "${CHART_DIRECTORY}" --set service.port=65536
 expect_failure \
+    'removed application.bindAddress value' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set-string application.bindAddress=127.0.0.1:8080
+expect_failure \
     'empty resources.requests.cpu' \
     helm template github-webhook-exporter "${CHART_DIRECTORY}" --set resources.requests.cpu=
 expect_failure \
     'empty resources.limits.memory' \
     helm template github-webhook-exporter "${CHART_DIRECTORY}" --set resources.limits.memory=
+for resource_quantity in \
+    resources.requests.cpu \
+    resources.requests.memory \
+    resources.limits.cpu \
+    resources.limits.memory; do
+    expect_failure \
+        "malformed non-empty ${resource_quantity}" \
+        helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+            --set-string "${resource_quantity}=1K"
+done
 
 while IFS= read -r rendered_fixture; do
     assert_no_sensitive_content "${rendered_fixture}"
