@@ -117,8 +117,8 @@ assert_equal "{\"8080/tcp\":{}}" \
     "single exposed application port"
 
 IMAGE_METADATA="$(
-    docker image inspect "${IMAGE}"
-    docker history --no-trunc "${IMAGE}"
+    docker image inspect "${IMAGE}" \
+        && docker history --no-trunc "${IMAGE}"
 )"
 readonly IMAGE_METADATA
 if grep --fixed-strings --quiet "${MASTER_KEY}" <<<"${IMAGE_METADATA}"; then
