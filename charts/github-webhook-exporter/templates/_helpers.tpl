@@ -72,4 +72,37 @@ app.kubernetes.io/instance: {{ .Release.Name | trunc 63 | trimSuffix "-" | quote
 {{- fail (printf
     $graceMessage $terminationGrace $applicationShutdown $telemetryShutdown) -}}
 {{- end -}}
+{{- if and .Values.metrics.serviceMonitor.enabled (not .Values.metrics.service.enabled) -}}
+{{- fail "metrics.serviceMonitor.enabled requires metrics.service.enabled" -}}
+{{- end -}}
+{{- if and .Values.administration.ingress.enabled
+    (not .Values.administration.service.enabled) -}}
+{{- fail "administration.ingress.enabled requires administration.service.enabled" -}}
+{{- end -}}
+{{- if .Values.networkPolicy.enabled -}}
+{{- range $name, $rule := .Values.networkPolicy.ingress -}}
+{{- if and $rule.enabled (or (empty $rule.namespaceSelector) (empty $rule.podSelector)) -}}
+{{- fail (printf
+    "networkPolicy.ingress.%s requires non-empty namespaceSelector and podSelector" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- $dns := .Values.networkPolicy.egress.dns -}}
+{{- if and $dns.enabled (or (empty $dns.namespaceSelector) (empty $dns.podSelector)) -}}
+{{- fail "networkPolicy.egress.dns requires non-empty namespaceSelector and podSelector" -}}
+{{- end -}}
+{{- $otlp := .Values.networkPolicy.egress.otlp -}}
+{{- if and $otlp.enabled (or (empty $otlp.peers) (empty $otlp.ports)) -}}
+{{- fail "networkPolicy.egress.otlp requires at least one peer and port" -}}
+{{- end -}}
+{{- if $otlp.enabled -}}
+{{- range $index, $peer := $otlp.peers -}}
+{{- if and (not (hasKey $peer "ipBlock"))
+    (or (empty $peer.namespaceSelector) (empty $peer.podSelector)) -}}
+{{- fail (printf
+    "networkPolicy.egress.otlp.peers[%d] requires non-empty namespaceSelector and podSelector"
+    $index) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
