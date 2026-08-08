@@ -4,25 +4,30 @@ set -Eeuo pipefail
 readonly IMAGE="${1:-}"
 readonly DATA_DIRECTORY="/var/lib/github-webhook-exporter"
 readonly BINARY="/usr/local/bin/github_webhook_exporter"
+AUDIT_IMAGE="docker.io/library/busybox:1.37.0-uclibc@"
+AUDIT_IMAGE+="sha256:39a19081c6dc060c4efa25ca5845dc867e3f476e86ba8e7ee9da97bc1c2752ca"
+readonly AUDIT_IMAGE
 
 if [[ -z "${IMAGE}" ]]; then
     printf 'usage: %s IMAGE\n' "${0##*/}" >&2
     exit 2
 fi
 
-for command in awk base64 curl date docker grep head tar timeout tr; do
+for command in base64 curl date docker grep head mktemp rm sleep tar timeout tr; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         printf 'required command not found: %s\n' "${command}" >&2
         exit 2
     fi
 done
 
-readonly RESOURCE_SUFFIX="${$}-$(date +%s)"
+RESOURCE_SUFFIX="$$-$(date +%s)"
+readonly RESOURCE_SUFFIX
 readonly AUDIT_CONTAINER="ghe-image-audit-${RESOURCE_SUFFIX}"
 readonly PRIMARY_CONTAINER="ghe-image-primary-${RESOURCE_SUFFIX}"
 readonly RESTART_CONTAINER="ghe-image-restart-${RESOURCE_SUFFIX}"
 readonly DATA_VOLUME="ghe-image-data-${RESOURCE_SUFFIX}"
-readonly TEMPORARY_DIRECTORY="$(mktemp -d)"
+TEMPORARY_DIRECTORY="$(mktemp -d)"
+readonly TEMPORARY_DIRECTORY
 
 cleanup() {
     docker rm --force \
@@ -87,8 +92,10 @@ stop_gracefully() {
     assert_equal "0" "${exit_status}" "SIGTERM must produce a successful process exit"
 }
 
-readonly MASTER_KEY="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
-readonly ADMIN_TOKEN="$(head -c 24 /dev/urandom | base64 | tr -d '\n')"
+MASTER_KEY="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+readonly MASTER_KEY
+ADMIN_TOKEN="$(head -c 24 /dev/urandom | base64 | tr -d '\n')"
+readonly ADMIN_TOKEN
 
 assert_equal "linux" \
     "$(docker image inspect --format '{{.Os}}' "${IMAGE}")" \
@@ -109,10 +116,11 @@ assert_equal "{\"8080/tcp\":{}}" \
     "$(docker image inspect --format '{{json .Config.ExposedPorts}}' "${IMAGE}")" \
     "single exposed application port"
 
-readonly IMAGE_METADATA="$(
+IMAGE_METADATA="$(
     docker image inspect "${IMAGE}"
     docker history --no-trunc "${IMAGE}"
 )"
+readonly IMAGE_METADATA
 if grep --fixed-strings --quiet "${MASTER_KEY}" <<<"${IMAGE_METADATA}"; then
     fail "generated master key appears in image metadata or history"
 fi
@@ -124,14 +132,17 @@ docker create --name "${AUDIT_CONTAINER}" "${IMAGE}" >/dev/null
 docker export --output "${TEMPORARY_DIRECTORY}/rootfs.tar" "${AUDIT_CONTAINER}"
 tar --list --file "${TEMPORARY_DIRECTORY}/rootfs.tar" \
     >"${TEMPORARY_DIRECTORY}/rootfs-files.txt"
-readonly ROOTFS_FILES="$(<"${TEMPORARY_DIRECTORY}/rootfs-files.txt")"
+ROOTFS_FILES="$(<"${TEMPORARY_DIRECTORY}/rootfs-files.txt")"
+readonly ROOTFS_FILES
 
 grep --fixed-strings --line-regexp --quiet \
     "${BINARY#/}" <<<"${ROOTFS_FILES}" || fail "application binary is absent"
 grep --fixed-strings --line-regexp --quiet \
     "${DATA_DIRECTORY#/}/" <<<"${ROOTFS_FILES}" || fail "application data directory is absent"
 
-readonly FORBIDDEN_PATH_PATTERN='(^|/)(sh|bash|dash|ash|rustc|cargo|Cargo\.toml|Cargo\.lock)$|(^|/)\.cargo/registry(/|$)|(^|/)src/.*\.rs$|(^|/)build/src(/|$)'
+FORBIDDEN_PATH_PATTERN='(^|/)(sh|bash|dash|ash|rustc|cargo|Cargo\.toml|Cargo\.lock)$|'
+FORBIDDEN_PATH_PATTERN+='(^|/)\.cargo/registry(/|$)|(^|/)src/.*\.rs$|(^|/)build/src(/|$)'
+readonly FORBIDDEN_PATH_PATTERN
 if grep --extended-regexp --quiet "${FORBIDDEN_PATH_PATTERN}" <<<"${ROOTFS_FILES}"; then
     grep --extended-regexp "${FORBIDDEN_PATH_PATTERN}" <<<"${ROOTFS_FILES}" >&2
     fail "development or shell artifacts appear in the runtime filesystem"
@@ -151,6 +162,32 @@ docker run --detach \
     "${IMAGE}" >/dev/null
 wait_until_ready "${PRIMARY_CONTAINER}"
 stop_gracefully "${PRIMARY_CONTAINER}"
+
+DATA_DIRECTORY_OWNER="$(
+    docker run --rm \
+        --platform linux/amd64 \
+        --user 0:0 \
+        --volume "${DATA_VOLUME}:${DATA_DIRECTORY}:ro" \
+        --entrypoint /bin/stat \
+        "${AUDIT_IMAGE}" \
+        -c '%u:%g' \
+        "${DATA_DIRECTORY}"
+)"
+readonly DATA_DIRECTORY_OWNER
+assert_equal "65532:65532" "${DATA_DIRECTORY_OWNER}" "mounted data directory ownership"
+
+DATABASE_OWNER="$(
+    docker run --rm \
+        --platform linux/amd64 \
+        --user 0:0 \
+        --volume "${DATA_VOLUME}:${DATA_DIRECTORY}:ro" \
+        --entrypoint /bin/stat \
+        "${AUDIT_IMAGE}" \
+        -c '%u:%g' \
+        "${DATA_DIRECTORY}/github-webhook-exporter.db"
+)"
+readonly DATABASE_OWNER
+assert_equal "65532:65532" "${DATABASE_OWNER}" "SQLite database ownership"
 
 docker run --detach \
     --name "${RESTART_CONTAINER}" \
