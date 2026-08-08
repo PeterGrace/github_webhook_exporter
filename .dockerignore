@@ -2,6 +2,7 @@
 !Cargo.toml
 !Cargo.lock
 !.cargo/
+.cargo/*
 !.cargo/config.toml
 !migrations/
 !migrations/**

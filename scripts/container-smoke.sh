@@ -156,38 +156,28 @@ docker run --detach \
     --env "GHE_DATABASE_PATH=${DATA_DIRECTORY}/github-webhook-exporter.db" \
     --env "GHE_MASTER_KEY=${MASTER_KEY}" \
     --env "GHE_ADMIN_TOKEN=${ADMIN_TOKEN}" \
-    --env GHE_BIND_ADDRESS=0.0.0.0:8080 \
     --env GHE_SHUTDOWN_TIMEOUT_SECONDS=3 \
     --env GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS=2 \
     "${IMAGE}" >/dev/null
 wait_until_ready "${PRIMARY_CONTAINER}"
+
+RUNTIME_OWNERS="$(
+    docker run --rm \
+        --platform linux/amd64 \
+        --user 0:0 \
+        --volume "${DATA_VOLUME}:${DATA_DIRECTORY}:ro" \
+        --entrypoint /bin/stat \
+        "${AUDIT_IMAGE}" \
+        -c '%u:%g' \
+        "${DATA_DIRECTORY}" \
+        "${DATA_DIRECTORY}/github-webhook-exporter.db" \
+        "${DATA_DIRECTORY}/github-webhook-exporter.db-wal" \
+        "${DATA_DIRECTORY}/github-webhook-exporter.db-shm"
+)"
+readonly RUNTIME_OWNERS
+readonly EXPECTED_RUNTIME_OWNERS=$'65532:65532\n65532:65532\n65532:65532\n65532:65532'
+assert_equal "${EXPECTED_RUNTIME_OWNERS}" "${RUNTIME_OWNERS}" "SQLite runtime ownership"
 stop_gracefully "${PRIMARY_CONTAINER}"
-
-DATA_DIRECTORY_OWNER="$(
-    docker run --rm \
-        --platform linux/amd64 \
-        --user 0:0 \
-        --volume "${DATA_VOLUME}:${DATA_DIRECTORY}:ro" \
-        --entrypoint /bin/stat \
-        "${AUDIT_IMAGE}" \
-        -c '%u:%g' \
-        "${DATA_DIRECTORY}"
-)"
-readonly DATA_DIRECTORY_OWNER
-assert_equal "65532:65532" "${DATA_DIRECTORY_OWNER}" "mounted data directory ownership"
-
-DATABASE_OWNER="$(
-    docker run --rm \
-        --platform linux/amd64 \
-        --user 0:0 \
-        --volume "${DATA_VOLUME}:${DATA_DIRECTORY}:ro" \
-        --entrypoint /bin/stat \
-        "${AUDIT_IMAGE}" \
-        -c '%u:%g' \
-        "${DATA_DIRECTORY}/github-webhook-exporter.db"
-)"
-readonly DATABASE_OWNER
-assert_equal "65532:65532" "${DATABASE_OWNER}" "SQLite database ownership"
 
 docker run --detach \
     --name "${RESTART_CONTAINER}" \
@@ -196,7 +186,6 @@ docker run --detach \
     --env "GHE_DATABASE_PATH=${DATA_DIRECTORY}/github-webhook-exporter.db" \
     --env "GHE_MASTER_KEY=${MASTER_KEY}" \
     --env "GHE_ADMIN_TOKEN=${ADMIN_TOKEN}" \
-    --env GHE_BIND_ADDRESS=0.0.0.0:8080 \
     --env GHE_SHUTDOWN_TIMEOUT_SECONDS=3 \
     --env GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS=2 \
     "${IMAGE}" >/dev/null
