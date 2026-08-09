@@ -37,6 +37,18 @@ import subprocess
 import sys
 
 workflow_path = sys.argv[1]
+
+
+def fail(message: str) -> None:
+    raise SystemExit(message)
+
+
+with open("scripts/helm-package-test.sh", encoding="utf-8") as file_handle:
+    package_test = file_handle.read()
+if 'readonly PACKAGE_NAME="github-webhook-exporter-0.1.0.tgz"' in package_test:
+    fail("Helm package validation must not hard-code the current chart version")
+
+
 result = subprocess.run(
     ["yq", "eval", "-o=json", ".", workflow_path],
     check=True,
@@ -44,10 +56,6 @@ result = subprocess.run(
     text=True,
 )
 workflow = json.loads(result.stdout)
-
-
-def fail(message: str) -> None:
-    raise SystemExit(message)
 
 
 def require_fragment(file_path: str, fragment: str) -> None:
@@ -161,7 +169,7 @@ expected_validate_steps = [
         "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
         "with": {
             "name": "helm-package",
-            "path": "dist/github-webhook-exporter-0.1.0.tgz",
+            "path": "dist/github-webhook-exporter-*.tgz",
             "if-no-files-found": "error",
             "retention-days": 30,
         },
