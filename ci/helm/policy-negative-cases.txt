@@ -1,0 +1,12 @@
+GWE001 replicas-two.yaml
+GWE002 run-as-non-root-missing.yaml
+GWE003 privileged.yaml
+GWE004 privilege-escalation.yaml
+GWE005 host-namespace.yaml
+GWE006 host-path.yaml
+GWE007 writable-root-filesystem.yaml
+GWE008 capability-additions.yaml
+GWE009 missing-drop-all.yaml
+GWE010 missing-resource-limits.yaml
+GWE011 automount-service-account-token.yaml
+GWE012 service-account-name.yaml

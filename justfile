@@ -26,6 +26,10 @@ helm-test:
 helm-kubeconform:
     scripts/helm-kubeconform.sh "{{helm-chart}}"
 
+# Validate rendered Helm manifests against the workload security policy.
+helm-policy:
+    scripts/helm-policy-test.sh "{{helm-chart}}"
+
 # Verify the rendered chart is accepted by a disposable Kind cluster.
 helm-kind-acceptance:
     scripts/helm-kind-acceptance.sh "{{helm-chart}}"
