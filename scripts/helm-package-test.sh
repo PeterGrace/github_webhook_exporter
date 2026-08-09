@@ -48,7 +48,7 @@ validate_archive_path() {
     esac
 
     case "${archive_entry}" in
-        "${archive_root}/"*|"${archive_root}")
+        "${archive_root}"/*|"${archive_root}")
             ;;
         *)
             fail "unexpected archive root entry: ${archive_entry}"
@@ -56,10 +56,65 @@ validate_archive_path() {
     esac
 
     case "${archive_entry}" in
-        *"/ci/"*|*"/scripts/"*|*"/dist/"*|*"/target/"*|*"/changelog/"*|*"/.superpowers/"*|*"/tests/"*|*negative*)
+        *"/ci/"*|*"/scripts/"*|*"/dist/"*|*"/target/"*|*"/changelog/"*|\
+        *"/.superpowers/"*|*"/tests/"*|*negative*)
             fail "archive contains a forbidden generated or negative path: ${archive_entry}"
             ;;
     esac
+}
+
+validate_archive_members() {
+    local archive_root="$1"
+    local package_path="$2"
+    local suppress_errors="${3:-0}"
+
+    while IFS=' ' read -r mode owner_group size date time archive_entry extra ||
+        [[ -n "${mode}" ]]; do
+        case "${mode}" in
+            ""|total)
+                continue
+                ;;
+        esac
+
+        local member_type="${mode:0:1}"
+        case "${member_type}" in
+            -|d)
+                ;;
+            *)
+                if (( suppress_errors )); then
+                    return 1
+                fi
+                fail "unsupported archive member type: ${member_type}"
+                ;;
+        esac
+
+        archive_entry="${archive_entry%/}"
+        validate_archive_path "${archive_root}" "${archive_entry}"
+    done < <(tar -tvzf "${package_path}")
+}
+
+run_malicious_link_archive_test() {
+    (
+        local test_directory
+        local chart_directory
+        local archive_path
+
+        test_directory="$(mktemp -d)"
+        trap 'rm -rf -- "${test_directory}"' EXIT
+
+        chart_directory="${test_directory}/chart"
+        mkdir -p "${chart_directory}"
+        printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: malicious\n' >"${chart_directory}/Chart.yaml"
+        ln -s /etc/passwd "${chart_directory}/escape-link"
+        ln "${chart_directory}/Chart.yaml" "${chart_directory}/escape-hardlink"
+
+        archive_path="${test_directory}/malicious.tgz"
+        tar -czf "${archive_path}" -C "${test_directory}" chart
+
+        if validate_archive_members "chart" "${archive_path}" 1; then
+            fail "malicious link archive unexpectedly passed validation"
+        fi
+    )
 }
 
 main() {
@@ -69,6 +124,7 @@ main() {
 
     require_command find
     require_command helm
+    require_command ln
     require_command mktemp
     require_command rm
     require_command tar
@@ -78,6 +134,8 @@ main() {
 
     rm -rf "${OUTPUT_DIRECTORY}"
     mkdir -p "${OUTPUT_DIRECTORY}"
+
+    run_malicious_link_archive_test
 
     helm package "${CHART_DIRECTORY}" --destination "${OUTPUT_DIRECTORY}" >/dev/null
 
@@ -103,12 +161,9 @@ main() {
     TEMPORARY_DIRECTORY="$(mktemp -d)"
     trap cleanup_temporary_directory EXIT
 
-    while IFS= read -r archive_entry || [[ -n "${archive_entry}" ]]; do
-        [[ -z "${archive_entry}" ]] && continue
-        validate_archive_path "${archive_root}" "${archive_entry}"
-    done < <(tar -tzf "${package_path}")
+    validate_archive_members "${archive_root}" "${package_path}"
 
-    tar -xzf "${package_path}" -C "${TEMPORARY_DIRECTORY}"
+    tar --no-same-owner --no-same-permissions -xzf "${package_path}" -C "${TEMPORARY_DIRECTORY}"
 
     local extracted_chart_directory="${TEMPORARY_DIRECTORY}/${archive_root}"
     if [[ ! -d "${extracted_chart_directory}" ]]; then

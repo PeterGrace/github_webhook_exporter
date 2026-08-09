@@ -36,7 +36,7 @@ require_command() {
 is_scannable_file() {
     local file_path="$1"
     case "${file_path}" in
-        *.yaml|*.yml|*.json|*.txt|*.tpl)
+        *.yaml|*.yml|*.json|*.txt|*.tpl|*.md)
             return 0
             ;;
         *)
@@ -62,6 +62,10 @@ scan_file() {
     local line_number=0
     local matched=0
     local inside_secret_key_ref=0
+
+    if ! grep -Iq . "${file_path}"; then
+        return 0
+    fi
     local secret_key_ref_indent=0
 
     while IFS= read -r line || [[ -n "${line}" ]]; do
@@ -102,11 +106,11 @@ scan_file() {
             category_id="SECRET005"
         elif [[ "${line}" =~ ^[[:space:]]*[Aa]uthorization[[:space:]]*[:=][[:space:]]*.+$ ]]; then
             category_id="SECRET004"
-        elif [[ "${line}" == *"webhook-secret"* ]]; then
+        elif [[ "${line}" =~ [:=][[:space:]]*\"?webhook-secret\"?([[:space:]]*,)?([[:space:]]*(#.*)?)?$ ]]; then
             category_id="SECRET003"
-        elif [[ "${line}" == *"master-key"* ]]; then
+        elif [[ "${line}" =~ [:=][[:space:]]*\"?master-key\"?([[:space:]]*,)?([[:space:]]*(#.*)?)?$ ]]; then
             category_id="SECRET002"
-        elif [[ "${line}" == *"fixture-token"* ]]; then
+        elif [[ "${line}" =~ [:=][[:space:]]*\"?fixture-token\"?([[:space:]]*,)?([[:space:]]*(#.*)?)?$ ]]; then
             category_id="SECRET001"
         fi
 
@@ -147,10 +151,10 @@ collect_files() {
                        -path '*/ci/helm/secret-negative-cases.txt' -o \
                        -path '*/ci/helm/*negative-cases.txt' \) -prune -o \
                     -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.json' -o \
-                               -name '*.txt' -o -name '*.tpl' \) -print
+                               -name '*.txt' -o -name '*.tpl' -o -name '*.md' \) -print
             else
                 find "${root_path}" -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.json' -o \
-                                                -name '*.txt' -o -name '*.tpl' \) -print
+                                                -name '*.txt' -o -name '*.tpl' -o -name '*.md' \) -print
             fi
             continue
         fi
