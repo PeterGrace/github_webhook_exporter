@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly CHART_DIRECTORY="${1:-}"
+readonly RENDERED_DIRECTORY="${1:-}"
 script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIRECTORY="${script_directory}"
-readonly RENDER_SCRIPT="${SCRIPT_DIRECTORY}/helm-render-matrix.sh"
 readonly POLICY_DIRECTORY="${SCRIPT_DIRECTORY}/../ci/helm/policy"
 readonly NEGATIVE_DIRECTORY="${SCRIPT_DIRECTORY}/../ci/helm/negative/policy"
 readonly NEGATIVE_CASES_FILE="${SCRIPT_DIRECTORY}/../ci/helm/policy-negative-cases.txt"
@@ -14,20 +13,20 @@ fail() {
     exit 1
 }
 
-if [[ -z "${CHART_DIRECTORY}" ]]; then
-    printf 'usage: %s CHART_DIRECTORY\n' "${0##*/}" >&2
+if [[ -z "${RENDERED_DIRECTORY}" ]]; then
+    printf 'usage: %s RENDERED_DIRECTORY\n' "${0##*/}" >&2
     exit 2
 fi
 
-for command in conftest grep mktemp rm sort tr; do
+for command in conftest grep sort tr; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         printf 'required command not found: %s\n' "${command}" >&2
         exit 2
     fi
 done
 
-if [[ ! -x "${RENDER_SCRIPT}" ]]; then
-    fail "missing Helm render matrix script: ${RENDER_SCRIPT}"
+if [[ ! -d "${RENDERED_DIRECTORY}" ]]; then
+    fail "missing rendered manifest directory"
 fi
 
 if [[ ! -d "${POLICY_DIRECTORY}" ]]; then
@@ -42,20 +41,7 @@ if [[ ! -f "${NEGATIVE_CASES_FILE}" ]]; then
     fail "missing negative cases contract: ${NEGATIVE_CASES_FILE}"
 fi
 
-temporary_directory="$(mktemp -d)"
-chmod 755 "${temporary_directory}"
-readonly TEMPORARY_DIRECTORY="${temporary_directory}"
-cleanup() {
-    rm -rf "${TEMPORARY_DIRECTORY}"
-}
-trap cleanup EXIT
-
-readonly RENDER_DIRECTORY="${TEMPORARY_DIRECTORY}/rendered"
-mkdir -p "${RENDER_DIRECTORY}"
-
-"${RENDER_SCRIPT}" "${CHART_DIRECTORY}" "${RENDER_DIRECTORY}" >/dev/null
-
-if ! supported_output="$({ conftest test --policy "${POLICY_DIRECTORY}" "${RENDER_DIRECTORY}"; } 2>&1)"; then
+if ! supported_output="$({ conftest test --policy "${POLICY_DIRECTORY}" "${RENDERED_DIRECTORY}"; } 2>&1)"; then
     fail "supported render matrix violated policy: ${supported_output}"
 fi
 

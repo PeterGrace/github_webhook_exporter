@@ -116,8 +116,9 @@ helm show values dist/github-webhook-exporter-0.1.0.tgz
 helm template archive dist/github-webhook-exporter-0.1.0.tgz --kube-version 1.35.0 >/dev/null
 ```
 
-If `just helm-policy` fails, inspect the rendered manifests under `dist/rendered/` and compare them
-with the bounded policy fixtures under `ci/helm/negative/policy/`. If `just helm-secrets` fails,
+If `just helm-policy` fails, run `just helm-render` first, then inspect the rendered manifests under
+`dist/rendered/` and compare them with the bounded policy fixtures under
+`ci/helm/negative/policy/`. If `just helm-secrets` fails,
 inspect the rendered manifests and ensure the chart never copies credentials into ConfigMaps,
 Services, Ingresses, ServiceMonitors, or NetworkPolicies. The chart README documents the exact
 Secret contract for runtime credentials.

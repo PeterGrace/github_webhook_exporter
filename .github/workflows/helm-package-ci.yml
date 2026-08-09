@@ -29,6 +29,9 @@ jobs:
       - name: Add CI tools to PATH
         run: echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"
 
+      - name: Verify workflow contract
+        run: just workflow-test
+
       - name: ShellCheck tracked shell scripts
         run: |
           mapfile -t shell_files < <(git ls-files -- '*.sh')

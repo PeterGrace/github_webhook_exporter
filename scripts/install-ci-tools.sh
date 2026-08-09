@@ -141,27 +141,50 @@ download_release_asset() {
     (cd "$(dirname "${output_path}")" && sha256sum --check --status "${checksum_file}")
 }
 
+install_regular_file() {
+    local source_path="$1"
+    local target_path="$2"
+    local target_name="${target_path##*/}"
+    local staged_path
+
+    if [[ -e "${target_path}" || -L "${target_path}" ]]; then
+        fail "installation target already exists: ${target_name}"
+    fi
+    staged_path="$(mktemp "${INSTALL_DIRECTORY}/.${target_name}.XXXXXX")"
+    cat -- "${source_path}" >"${staged_path}"
+    chmod 0755 "${staged_path}"
+    mv -n -- "${staged_path}" "${target_path}"
+    if [[ -e "${staged_path}" || ! -f "${target_path}" || -L "${target_path}" ]]; then
+        rm -f -- "${staged_path}"
+        fail "could not atomically install target: ${target_name}"
+    fi
+}
+
 extract_expected_member() {
     local archive_path="$1"
     local member_path="$2"
-    local output_path="$3"
+    local target_path="$3"
+    local extracted_path="${TEMPORARY_DIRECTORY}/extracted-${target_path##*/}"
 
-    local listed_member
-    listed_member="$(tar -tf "${archive_path}" | awk -v member="${member_path}" '
-        $0 == member { found = $0 }
-        END {
-            if (found != "") {
-                print found
-            }
-        }
-    ')"
+    python3 - "${archive_path}" "${member_path}" "${extracted_path}" <<'PY'
+import pathlib
+import sys
+import tarfile
 
-    if [[ -z "${listed_member}" ]]; then
-        fail "missing expected archive member: ${member_path}"
-    fi
-
-    tar -xOf "${archive_path}" "${listed_member}" > "${output_path}"
-    chmod 0755 "${output_path}"
+archive_path, member_path, output_path = sys.argv[1:]
+try:
+    with tarfile.open(archive_path, mode="r:*") as archive:
+        members = [member for member in archive.getmembers() if member.name == member_path]
+        if len(members) != 1 or not members[0].isreg():
+            raise SystemExit(1)
+        source = archive.extractfile(members[0])
+        if source is None:
+            raise SystemExit(1)
+        pathlib.Path(output_path).write_bytes(source.read())
+except (OSError, tarfile.TarError):
+    raise SystemExit(1)
+PY
+    install_regular_file "${extracted_path}" "${target_path}"
 }
 
 install_helm() {
@@ -203,8 +226,7 @@ install_yq() {
     local url="https://github.com/mikefarah/yq/releases/download/v${version}/yq_linux_amd64"
 
     download_release_asset "${url}" "${checksum}" "${binary_path}"
-    chmod 0755 "${binary_path}"
-    mv -- "${binary_path}" "${INSTALL_DIRECTORY}/yq"
+    install_regular_file "${binary_path}" "${INSTALL_DIRECTORY}/yq"
 }
 
 install_shellcheck() {
@@ -246,21 +268,35 @@ main() {
         usage
     fi
 
-    require_command awk
+    require_command cat
     require_command chmod
     require_command curl
     require_command mktemp
+    require_command mv
+    require_command python3
     require_command rm
     require_command rustup
     require_command sha256sum
-    require_command tar
     require_command uname
 
     if [[ ! -f "${TOOL_VERSIONS_FILE}" ]]; then
         fail "missing tool version file: ${TOOL_VERSIONS_FILE}"
     fi
 
+    if [[ -L "${INSTALL_DIRECTORY}" ||
+          ( -e "${INSTALL_DIRECTORY}" && ! -d "${INSTALL_DIRECTORY}" ) ]]; then
+        fail "install directory must be a regular directory"
+    fi
     mkdir -p -- "${INSTALL_DIRECTORY}"
+
+    local target_name
+    for target_name in helm kubeconform conftest yq shellcheck just; do
+        if [[ -e "${INSTALL_DIRECTORY}/${target_name}" ||
+              -L "${INSTALL_DIRECTORY}/${target_name}" ]]; then
+            fail "installation target already exists: ${target_name}"
+        fi
+    done
+
     local write_probe
     write_probe="$(mktemp "${INSTALL_DIRECTORY}/.write-probe.XXXXXX")"
     rm -f -- "${write_probe}"

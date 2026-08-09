@@ -7,8 +7,11 @@ SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIRECTORY
 readonly CASES_FILE="${SCRIPT_DIRECTORY}/../ci/helm/render-cases.txt"
 readonly VALUES_DIRECTORY="${SCRIPT_DIRECTORY}/../ci/helm/values"
+readonly OUTPUT_GUARD="${SCRIPT_DIRECTORY}/helm-output-directory.sh"
+readonly REPOSITORY_ROOT="${SCRIPT_DIRECTORY}/.."
 readonly HELM_RELEASE_NAME="github-webhook-exporter"
 readonly KUBE_VERSION="1.31.0"
+export HELM_OUTPUT_ERROR_PREFIX="Helm render matrix"
 
 declare -A SUPPORTED_CASES=(
     [default]=1
@@ -33,7 +36,7 @@ if [[ -z "${CHART_DIRECTORY}" || -z "${OUTPUT_DIRECTORY}" ]]; then
     exit 2
 fi
 
-for command in helm mkdir mktemp rm yq; do
+for command in helm mkdir mktemp mv python3 rm rmdir yq; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         printf 'required command not found: %s\n' "${command}" >&2
         exit 2
@@ -43,16 +46,21 @@ done
 if [[ ! -f "${CASES_FILE}" ]]; then
     fail "missing render matrix contract: ${CASES_FILE}"
 fi
+if [[ ! -f "${OUTPUT_GUARD}" ]]; then
+    fail "missing output-directory guard"
+fi
+# shellcheck source=helm-output-directory.sh disable=SC1091
+source "${OUTPUT_GUARD}"
+helm_output_prepare "helm-render-matrix" "${CHART_DIRECTORY}" "${OUTPUT_DIRECTORY}" \
+    "${REPOSITORY_ROOT}"
 
 TEMPORARY_DIRECTORY="$(mktemp -d)"
 readonly TEMPORARY_DIRECTORY
 cleanup() {
-    rm -rf "${TEMPORARY_DIRECTORY}"
+    rm -rf -- "${TEMPORARY_DIRECTORY}"
+    helm_output_cleanup_stage
 }
 trap cleanup EXIT
-
-rm -rf "${OUTPUT_DIRECTORY}"
-mkdir -p "${OUTPUT_DIRECTORY}"
 
 readarray -t RENDER_CASES <"${CASES_FILE}"
 declare -A SEEN_CASES=()
@@ -79,7 +87,7 @@ for case_name in "${!SUPPORTED_CASES[@]}"; do
 done
 
 for case_name in "${ORDERED_CASES[@]}"; do
-    rendered_manifest="${OUTPUT_DIRECTORY}/${case_name}.yaml"
+    rendered_manifest="${HELM_OUTPUT_STAGE}/${case_name}.yaml"
     if [[ "${case_name}" == default ]]; then
         helm template "${HELM_RELEASE_NAME}" "${CHART_DIRECTORY}" \
             --kube-version "${KUBE_VERSION}" \
@@ -108,3 +116,5 @@ for case_name in "${ORDERED_CASES[@]}"; do
 
     printf '%s\n' "${case_name}"
 done
+
+helm_output_commit

@@ -71,6 +71,7 @@ for file_path in (
         "passing static checks does not prove cluster lifecycle behavior",
     )
 
+require_fragment("docs/operations.md", "`just helm-render` first")
 
 if not isinstance(workflow, dict):
     fail("workflow did not parse as a mapping")
@@ -138,6 +139,9 @@ expected_steps = [
     },
     {
         "run": 'echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"',
+    },
+    {
+        "run": "just workflow-test",
     },
     {
         "run": "mapfile -t shell_files < <(git ls-files -- '*.sh')\nshellcheck \"${shell_files[@]}\"\n",

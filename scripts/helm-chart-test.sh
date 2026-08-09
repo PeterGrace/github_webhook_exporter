@@ -2,18 +2,29 @@
 set -Eeuo pipefail
 
 readonly CHART_DIRECTORY="${1:-}"
+readonly KUBE_VERSION="1.31.0"
 
 if [[ -z "${CHART_DIRECTORY}" ]]; then
     printf 'usage: %s CHART_DIRECTORY\n' "${0##*/}" >&2
     exit 2
 fi
 
-for command in awk cat find grep helm mktemp rm yq; do
+for command in awk cat cp find grep helm mktemp rm yq; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         printf 'required command not found: %s\n' "${command}" >&2
         exit 2
     fi
 done
+
+# Helm's built-in default Kubernetes version can move beyond the chart's declared support range.
+# Keep every chart contract render on the same supported lower boundary as the matrix renderer.
+helm() {
+    if [[ ${1:-} == template ]]; then
+        command helm "$@" --kube-version "${KUBE_VERSION}"
+    else
+        command helm "$@"
+    fi
+}
 
 TEMPORARY_DIRECTORY="$(mktemp -d)"
 readonly TEMPORARY_DIRECTORY
@@ -433,7 +444,13 @@ assert_yq \
     "${TEMPORARY_DIRECTORY}/override-statefulset.yaml" \
     'every Secret override must reference the configured existing Secret'
 
-helm install exporter "${CHART_DIRECTORY}" \
+# Helm 4.2's client-only install capability defaults to Kubernetes 1.36 and has no
+# --kube-version override. Use an isolated metadata copy only to render NOTES;
+# every manifest render above still enforces the chart's declared version range.
+NOTES_CHART_DIRECTORY="${TEMPORARY_DIRECTORY}/notes-chart"
+cp -R -- "${CHART_DIRECTORY}" "${NOTES_CHART_DIRECTORY}"
+yq --inplace 'del(.kubeVersion)' "${NOTES_CHART_DIRECTORY}/Chart.yaml"
+helm install exporter "${NOTES_CHART_DIRECTORY}" \
     --dry-run=client \
     --namespace observability \
     >"${TEMPORARY_DIRECTORY}/dry-run-install.txt"

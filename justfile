@@ -22,17 +22,17 @@ helm-test:
     scripts/helm-chart-test.sh "{{helm-chart}}"
     scripts/helm-kind-secret-argv-test.sh scripts/helm-kind-acceptance.sh "{{helm-chart}}"
 
-# Validate rendered Helm manifests against Kubernetes schemas.
-helm-kubeconform:
-    scripts/helm-kubeconform.sh "{{helm-chart}}"
+# Validate the exact shared render matrix against Kubernetes schemas.
+helm-kubeconform: helm-render
+    scripts/helm-kubeconform.sh "dist/rendered"
 
-# Validate rendered Helm manifests against the workload security policy.
-helm-policy:
-    scripts/helm-policy-test.sh "{{helm-chart}}"
+# Validate the exact shared render matrix against the workload security policy.
+helm-policy: helm-render
+    scripts/helm-policy-test.sh "dist/rendered"
 
-# Scan chart source, fixtures, and rendered output for credential leaks.
-helm-secrets:
-    scripts/helm-secret-scan.sh --test "{{helm-chart}}"
+# Scan chart source, fixtures, and the exact shared render matrix for credentials.
+helm-secrets: helm-render
+    scripts/helm-secret-scan.sh --test "{{helm-chart}}" "dist/rendered"
 
 # Package the Helm chart and revalidate the extracted archive.
 helm-package output-directory="dist":
@@ -40,6 +40,10 @@ helm-package output-directory="dist":
 
 # Run the full static Helm chart validation suite.
 helm-static: helm-lint helm-test helm-kubeconform helm-policy helm-secrets helm-package
+
+# Run focused Helm output, archive, installer, and workflow security regressions.
+helm-security-test:
+    scripts/helm-security-self-test.sh
 
 # Verify the GitHub Actions workflow contract.
 workflow-test:

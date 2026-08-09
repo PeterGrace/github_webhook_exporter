@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly CHART_DIRECTORY="${1:-}"
-script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly SCRIPT_DIRECTORY="${script_directory}"
-readonly RENDER_SCRIPT="${SCRIPT_DIRECTORY}/helm-render-matrix.sh"
+readonly RENDERED_DIRECTORY="${1:-}"
+SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIRECTORY
 readonly SCHEMA_DIRECTORY="${SCRIPT_DIRECTORY}/../ci/helm/schemas"
-readonly NEGATIVE_FIXTURE="${SCRIPT_DIRECTORY}/../ci/helm/negative/schema/unsupported-api.yaml"
+readonly UNSUPPORTED_FIXTURE="${SCRIPT_DIRECTORY}/../ci/helm/negative/schema/unsupported-api.yaml"
+readonly SERVICEMONITOR_TYPO_FIXTURE="${SCRIPT_DIRECTORY}/../ci/helm/negative/schema/servicemonitor-top-level-typo.yaml"
 readonly KUBERNETES_VERSIONS=("1.31.0" "1.35.0")
 readonly CUSTOM_SCHEMA_LOCATION="${SCHEMA_DIRECTORY}/monitoring.coreos.com/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
 
@@ -15,41 +15,35 @@ fail() {
     exit 1
 }
 
-if [[ -z "${CHART_DIRECTORY}" ]]; then
-    printf 'usage: %s CHART_DIRECTORY\n' "${0##*/}" >&2
+if [[ -z "${RENDERED_DIRECTORY}" ]]; then
+    printf 'usage: %s RENDERED_DIRECTORY\n' "${0##*/}" >&2
     exit 2
 fi
 
-for command in helm kubeconform mktemp rm grep; do
+for command in grep kubeconform; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         printf 'required command not found: %s\n' "${command}" >&2
         exit 2
     fi
 done
 
-if [[ ! -x "${RENDER_SCRIPT}" ]]; then
-    fail "missing Helm render matrix script: ${RENDER_SCRIPT}"
+if [[ ! -d "${RENDERED_DIRECTORY}" ]]; then
+    fail "missing rendered manifest directory"
 fi
-
 if [[ ! -d "${SCHEMA_DIRECTORY}" ]]; then
-    fail "missing schema directory: ${SCHEMA_DIRECTORY}"
+    fail "missing schema directory"
+fi
+if [[ ! -f "${UNSUPPORTED_FIXTURE}" || ! -f "${SERVICEMONITOR_TYPO_FIXTURE}" ]]; then
+    fail "missing negative schema fixture"
 fi
 
-if [[ ! -f "${NEGATIVE_FIXTURE}" ]]; then
-    fail "missing negative schema fixture: ${NEGATIVE_FIXTURE}"
-fi
-
-temporary_directory="$(mktemp -d)"
-readonly TEMPORARY_DIRECTORY="${temporary_directory}"
-cleanup() {
-    rm -rf "${TEMPORARY_DIRECTORY}"
-}
-trap cleanup EXIT
-
-readonly RENDER_DIRECTORY="${TEMPORARY_DIRECTORY}/rendered"
-mkdir -p "${RENDER_DIRECTORY}"
-
-"${RENDER_SCRIPT}" "${CHART_DIRECTORY}" "${RENDER_DIRECTORY}" >/dev/null
+kubeconform_arguments=(
+    -strict
+    -summary
+    -kubernetes-version 1.31.0
+    -schema-location "${SCHEMA_DIRECTORY}"
+    -schema-location "${CUSTOM_SCHEMA_LOCATION}"
+)
 
 for kubernetes_version in "${KUBERNETES_VERSIONS[@]}"; do
     printf 'Validating rendered Helm manifests against Kubernetes %s\n' "${kubernetes_version}"
@@ -60,32 +54,28 @@ for kubernetes_version in "${KUBERNETES_VERSIONS[@]}"; do
         -kubernetes-version "${kubernetes_version}" \
         -schema-location "${SCHEMA_DIRECTORY}" \
         -schema-location "${CUSTOM_SCHEMA_LOCATION}" \
-        "${RENDER_DIRECTORY}"; then
+        "${RENDERED_DIRECTORY}"; then
         fail "rendered manifests failed validation against Kubernetes ${kubernetes_version}"
     fi
 done
 
-if unsupported_output="$(kubeconform \
-    -strict \
-    -summary \
-    -output json \
-    -kubernetes-version 1.31.0 \
-    -schema-location "${SCHEMA_DIRECTORY}" \
-    -schema-location "${CUSTOM_SCHEMA_LOCATION}" \
-    "${NEGATIVE_FIXTURE}" 2>&1)"; then
+if unsupported_output="$(kubeconform "${kubeconform_arguments[@]}" -output json \
+    "${UNSUPPORTED_FIXTURE}" 2>&1)"; then
     fail 'unsupported API fixture unexpectedly validated'
 fi
-
-if ! grep -Fq 'Ingress' <<<"${unsupported_output}"; then
-    fail 'unsupported API rejection did not mention Ingress'
+if ! grep -Fq 'Ingress' <<<"${unsupported_output}" ||
+   ! grep -Fq 'extensions/v1beta1' <<<"${unsupported_output}" ||
+   ! grep -Fq 'could not find schema for Ingress' <<<"${unsupported_output}"; then
+    fail 'unsupported API rejection lost its expected diagnostic'
 fi
-
-if ! grep -Fq 'extensions/v1beta1' <<<"${unsupported_output}"; then
-    fail 'unsupported API rejection did not mention extensions/v1beta1'
-fi
-
-if ! grep -Fq 'could not find schema for Ingress' <<<"${unsupported_output}"; then
-    fail 'unsupported API rejection did not report the missing Ingress schema'
-fi
-
 printf 'Unsupported API fixture rejected as expected: extensions/v1beta1 Ingress\n'
+
+if typo_output="$(kubeconform "${kubeconform_arguments[@]}" -output json \
+    "${SERVICEMONITOR_TYPO_FIXTURE}" 2>&1)"; then
+    fail 'ServiceMonitor top-level typo unexpectedly validated'
+fi
+if ! grep -Fq 'additional properties' <<<"${typo_output}" ||
+   ! grep -Fq 'spce' <<<"${typo_output}"; then
+    fail 'ServiceMonitor typo rejection lost its strict-root diagnostic'
+fi
+printf 'ServiceMonitor top-level typo rejected as expected\n'

@@ -5,13 +5,20 @@ readonly CHART_DIRECTORY="${1:-}"
 readonly OUTPUT_DIRECTORY="${2:-}"
 SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIRECTORY
+readonly REPOSITORY_ROOT="${SCRIPT_DIRECTORY}/.."
+readonly OUTPUT_GUARD="${SCRIPT_DIRECTORY}/helm-output-directory.sh"
 readonly RENDER_SCRIPT="${SCRIPT_DIRECTORY}/helm-render-matrix.sh"
 readonly KUBECONFORM_SCRIPT="${SCRIPT_DIRECTORY}/helm-kubeconform.sh"
 readonly POLICY_SCRIPT="${SCRIPT_DIRECTORY}/helm-policy-test.sh"
 readonly SECRET_SCAN_SCRIPT="${SCRIPT_DIRECTORY}/helm-secret-scan.sh"
+readonly ARCHIVE_PREFLIGHT="${SCRIPT_DIRECTORY}/helm-archive-preflight.py"
+readonly ARCHIVE_PREFLIGHT_TEST="${SCRIPT_DIRECTORY}/helm-archive-preflight-test.py"
+readonly RENDER_COMPARE="${SCRIPT_DIRECTORY}/helm-render-compare.py"
+readonly RENDER_CASES_FILE="${SCRIPT_DIRECTORY}/../ci/helm/render-cases.txt"
 readonly PACKAGE_NAME="github-webhook-exporter-0.1.0.tgz"
 readonly KUBE_VERSION="1.31.0"
 TEMPORARY_DIRECTORY=""
+export HELM_OUTPUT_ERROR_PREFIX="Helm package test"
 
 fail() {
     printf 'Helm package test failed: %s\n' "$1" >&2
@@ -24,159 +31,90 @@ usage() {
 }
 
 require_command() {
-    local command_name="$1"
-    if ! command -v "${command_name}" >/dev/null 2>&1; then
-        printf 'required command not found: %s\n' "${command_name}" >&2
+    if ! command -v "$1" >/dev/null 2>&1; then
+        printf 'required command not found: %s\n' "$1" >&2
         exit 2
     fi
 }
 
-cleanup_temporary_directory() {
+cleanup() {
     if [[ -n "${TEMPORARY_DIRECTORY}" ]]; then
         rm -rf -- "${TEMPORARY_DIRECTORY}"
     fi
+    helm_output_cleanup_stage
 }
 
-validate_archive_path() {
-    local archive_root="$1"
-    local archive_entry="$2"
-
-    case "${archive_entry}" in
-        ""|/*|../*|*"/../"*|*"/.."|*"//"*)
-            fail "unsafe archive path: ${archive_entry}"
-            ;;
-    esac
-
-    case "${archive_entry}" in
-        "${archive_root}"/*|"${archive_root}")
-            ;;
-        *)
-            fail "unexpected archive root entry: ${archive_entry}"
-            ;;
-    esac
-
-    case "${archive_entry}" in
-        *"/ci/"*|*"/scripts/"*|*"/dist/"*|*"/target/"*|*"/changelog/"*|\
-        *"/.superpowers/"*|*"/tests/"*|*negative*)
-            fail "archive contains a forbidden generated or negative path: ${archive_entry}"
-            ;;
-    esac
-}
-
-validate_archive_members() {
-    local archive_root="$1"
-    local package_path="$2"
-    local suppress_errors="${3:-0}"
-
-    while IFS=' ' read -r mode _ _ _ _ archive_entry _ ||
-        [[ -n "${mode}" ]]; do
-        case "${mode}" in
-            ""|total)
-                continue
-                ;;
-        esac
-
-        local member_type="${mode:0:1}"
-        case "${member_type}" in
-            -|d)
-                ;;
-            *)
-                if (( suppress_errors )); then
-                    return 1
-                fi
-                fail "unsupported archive member type: ${member_type}"
-                ;;
-        esac
-
-        archive_entry="${archive_entry%/}"
-        validate_archive_path "${archive_root}" "${archive_entry}"
-    done < <(tar -tvzf "${package_path}")
-}
-
-run_malicious_link_archive_test() {
-    (
-        local test_directory
-        local chart_directory
-        local archive_path
-
-        test_directory="$(mktemp -d)"
-        trap 'rm -rf -- "${test_directory}"' EXIT
-
-        chart_directory="${test_directory}/chart"
-        mkdir -p "${chart_directory}"
-        printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: malicious\n' >"${chart_directory}/Chart.yaml"
-        ln -s /etc/passwd "${chart_directory}/escape-link"
-        ln "${chart_directory}/Chart.yaml" "${chart_directory}/escape-hardlink"
-
-        archive_path="${test_directory}/malicious.tgz"
-        tar -czf "${archive_path}" -C "${test_directory}" chart
-
-        if validate_archive_members "chart" "${archive_path}" 1; then
-            fail "malicious link archive unexpectedly passed validation"
-        fi
-    )
+validate_rendered_directory() {
+    local rendered_directory="$1"
+    "${KUBECONFORM_SCRIPT}" "${rendered_directory}" >/dev/null
+    "${POLICY_SCRIPT}" "${rendered_directory}" >/dev/null
 }
 
 main() {
     if [[ -z "${CHART_DIRECTORY}" || -z "${OUTPUT_DIRECTORY}" ]]; then
         usage
     fi
+    for command in find helm mktemp mv python3 rm rmdir sort; do
+        require_command "${command}"
+    done
+    for required_file in "${OUTPUT_GUARD}" "${ARCHIVE_PREFLIGHT}" \
+        "${ARCHIVE_PREFLIGHT_TEST}" "${RENDER_COMPARE}" "${RENDER_CASES_FILE}"; do
+        if [[ ! -f "${required_file}" ]]; then
+            fail "missing package validation component"
+        fi
+    done
 
-    require_command find
-    require_command helm
-    require_command ln
-    require_command mktemp
-    require_command rm
-    require_command tar
+    # shellcheck source=helm-output-directory.sh disable=SC1091
+    source "${OUTPUT_GUARD}"
+    helm_output_prepare "helm-package" "${CHART_DIRECTORY}" "${OUTPUT_DIRECTORY}" \
+        "${REPOSITORY_ROOT}"
+    trap cleanup EXIT
+    TEMPORARY_DIRECTORY="$(mktemp -d)"
 
-    local archive_root
-    archive_root="${CHART_DIRECTORY##*/}"
+    python3 "${ARCHIVE_PREFLIGHT_TEST}" >/dev/null
 
-    rm -rf "${OUTPUT_DIRECTORY}"
-    mkdir -p "${OUTPUT_DIRECTORY}"
+    local source_rendered_directory="${TEMPORARY_DIRECTORY}/source-rendered"
+    local archive_rendered_directory="${TEMPORARY_DIRECTORY}/archive-rendered"
+    "${RENDER_SCRIPT}" "${CHART_DIRECTORY}" "${source_rendered_directory}" >/dev/null
 
-    run_malicious_link_archive_test
-
-    helm package "${CHART_DIRECTORY}" --destination "${OUTPUT_DIRECTORY}" >/dev/null
-
+    helm package "${CHART_DIRECTORY}" --destination "${HELM_OUTPUT_STAGE}" >/dev/null
     local -a package_files=()
     mapfile -t package_files < <(
-        find "${OUTPUT_DIRECTORY}" -maxdepth 1 -type f -name '*.tgz' | sort
+        find "${HELM_OUTPUT_STAGE}" -maxdepth 1 -type f -name '*.tgz' | sort
     )
-
     if [[ ${#package_files[@]} -ne 1 ]]; then
         fail "expected exactly one packaged archive, found ${#package_files[@]}"
     fi
 
-    local package_path
-    package_path="${package_files[0]}"
+    local package_path="${package_files[0]}"
     if [[ "${package_path##*/}" != "${PACKAGE_NAME}" ]]; then
-        fail "unexpected packaged archive name: ${package_path##*/}"
+        fail "unexpected packaged archive name"
     fi
-
     helm show chart "${package_path}" >/dev/null
     helm show values "${package_path}" >/dev/null
     helm template archive "${package_path}" --kube-version "${KUBE_VERSION}" >/dev/null
 
-    TEMPORARY_DIRECTORY="$(mktemp -d)"
-    trap cleanup_temporary_directory EXIT
-
-    validate_archive_members "${archive_root}" "${package_path}"
-
-    tar --no-same-owner --no-same-permissions -xzf "${package_path}" -C "${TEMPORARY_DIRECTORY}"
-
+    local archive_root="${CHART_DIRECTORY%/}"
+    archive_root="${archive_root##*/}"
+    python3 "${ARCHIVE_PREFLIGHT}" "${package_path}" "${archive_root}" \
+        "${TEMPORARY_DIRECTORY}"
     local extracted_chart_directory="${TEMPORARY_DIRECTORY}/${archive_root}"
     if [[ ! -d "${extracted_chart_directory}" ]]; then
-        fail "missing extracted chart directory: ${extracted_chart_directory}"
+        fail "missing extracted chart directory"
     fi
 
-    local rendered_directory="${TEMPORARY_DIRECTORY}/rendered"
-    "${RENDER_SCRIPT}" "${extracted_chart_directory}" "${rendered_directory}" >/dev/null
-    "${KUBECONFORM_SCRIPT}" "${extracted_chart_directory}" >/dev/null
-    "${POLICY_SCRIPT}" "${extracted_chart_directory}" >/dev/null
-    "${SECRET_SCAN_SCRIPT}" "${extracted_chart_directory}" "${rendered_directory}" >/dev/null
+    "${RENDER_SCRIPT}" "${extracted_chart_directory}" "${archive_rendered_directory}" >/dev/null
+    python3 "${RENDER_COMPARE}" "${source_rendered_directory}" \
+        "${archive_rendered_directory}" "${RENDER_CASES_FILE}"
 
-    printf 'Validated packaged Helm chart: %s\n' "${package_path}"
+    validate_rendered_directory "${source_rendered_directory}"
+    validate_rendered_directory "${archive_rendered_directory}"
+    "${SECRET_SCAN_SCRIPT}" --test "${CHART_DIRECTORY}" "${source_rendered_directory}" >/dev/null
+    "${SECRET_SCAN_SCRIPT}" "${extracted_chart_directory}" \
+        "${archive_rendered_directory}" >/dev/null
+
+    helm_output_commit
+    printf 'Validated packaged Helm chart: %s/%s\n' "${HELM_OUTPUT_DIRECTORY}" "${PACKAGE_NAME}"
 }
 
 main "$@"
