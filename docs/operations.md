@@ -121,8 +121,8 @@ material before success.
 The cluster and private temporary files are removed after both success and failure. For interactive
 debugging only, `KEEP_KIND_CLUSTER=true` preserves them and prints the generated cluster name and
 kubeconfig path; delete that cluster and temporary directory manually as soon as investigation
-finishes. CI uses checksum-pinned Kind 0.31.0 and kubectl 1.35.0 and uploads the diagnostics for 14
-days with `if: always()`.
+finishes. CI uses checksum-pinned Kind 0.31.0 and kubectl 1.35.0, while the harness pins the Kind
+Kubernetes 1.35.0 node image by digest. CI uploads the diagnostics for 14 days with `if: always()`.
 
 For local archive inspection, use the fixed package name directly:
 

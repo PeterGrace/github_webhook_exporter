@@ -20,13 +20,14 @@ readonly RELEASE_NAME='github-webhook-exporter'
 readonly NAMESPACE='github-webhook-exporter-test'
 readonly RESOURCE_NAME='github-webhook-exporter'
 readonly POD_NAME='github-webhook-exporter-0'
+readonly KIND_NODE_IMAGE='kindest/node:v1.35.0@sha256:4613778f3cfcd10e615029370f5786704559103cf27bef934597ba562b269661'
 readonly REPOSITORY_NAME='acceptance/repository'
 readonly PULL_REQUEST_ENQUEUED="${REPOSITORY_ROOT}/ci/kind/pull-request-enqueued.json"
 readonly PULL_REQUEST_DEQUEUED="${REPOSITORY_ROOT}/ci/kind/pull-request-dequeued.json"
 readonly MERGE_GROUP_OPEN="${REPOSITORY_ROOT}/ci/kind/merge-group-checks-requested.json"
 readonly MERGE_GROUP_CLOSE="${REPOSITORY_ROOT}/ci/kind/merge-group-destroyed.json"
 
-for command_name in base64 curl cut date docker find grep head helm jq kind kubectl mktemp \
+for command_name in base64 cp curl cut date docker find grep head helm jq kind kubectl mktemp \
     python3 rm sleep tr; do
     require_command "${command_name}"
 done
@@ -439,7 +440,8 @@ chmod 600 "${MASTER_KEY_FILE}" "${ADMIN_TOKEN_FILE}" "${WEBHOOK_SECRET_FILE}" \
     "${SIGNATURE_PATTERNS_FILE}" "${FORBIDDEN_PATTERNS_FILE}"
 
 CLUSTER_CREATED=true
-kind create cluster --name "${CLUSTER_NAME}" --kubeconfig "${KUBECONFIG_PATH}" --wait 90s
+kind create cluster --name "${CLUSTER_NAME}" --kubeconfig "${KUBECONFIG_PATH}" \
+    --image "${KIND_NODE_IMAGE}" --wait 90s
 kind load docker-image "${IMAGE}" --name "${CLUSTER_NAME}"
 kube create namespace "${NAMESPACE}"
 kube --namespace "${NAMESPACE}" create secret generic "${RESOURCE_NAME}" \
@@ -495,6 +497,8 @@ if ! jq --exit-status --arg name "${REPOSITORY_NAME}" \
     fail 'repository configuration did not survive pod restart'
     exit 1
 fi
+jq '[.[] | {id, full_name, enabled, created_at, updated_at}]' \
+    "${HTTP_RESPONSE_FILE}" >"${ARTIFACT_DIRECTORY}/repository-list.json"
 send_webhook pull_request 550e8400-e29b-41d4-a716-446655440101 \
     "${PULL_REQUEST_ENQUEUED}" duplicate_after_restart
 send_webhook pull_request 550e8400-e29b-41d4-a716-446655440103 \
@@ -531,6 +535,8 @@ verify_graceful_sigterm
 verify_singleton_rollout
 request_status GET /health/live live_after_rollout 200
 request_status GET /health/ready ready_after_rollout 200
+fetch_metrics
+cp "${TEMPORARY_DIRECTORY}/metrics" "${ARTIFACT_DIRECTORY}/metrics.txt"
 
 capture_diagnostics
 scan_private_artifacts "${ARTIFACT_DIRECTORY}" \
