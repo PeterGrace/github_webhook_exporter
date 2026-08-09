@@ -26,7 +26,8 @@ readonly PULL_REQUEST_DEQUEUED="${REPOSITORY_ROOT}/ci/kind/pull-request-dequeued
 readonly MERGE_GROUP_OPEN="${REPOSITORY_ROOT}/ci/kind/merge-group-checks-requested.json"
 readonly MERGE_GROUP_CLOSE="${REPOSITORY_ROOT}/ci/kind/merge-group-destroyed.json"
 
-for command_name in base64 curl docker find grep head helm jq kind kubectl mktemp python3 rm sleep; do
+for command_name in base64 curl cut date docker find grep head helm jq kind kubectl mktemp \
+    python3 rm sleep tr; do
     require_command "${command_name}"
 done
 if [[ ! -f "${CHART_DIRECTORY}/Chart.yaml" ]]; then
@@ -51,13 +52,19 @@ readonly REPOSITORY_REQUEST_FILE="${TEMPORARY_DIRECTORY}/repository.json"
 readonly HTTP_RESPONSE_FILE="${TEMPORARY_DIRECTORY}/response"
 readonly HTTP_CONFIG_FILE="${TEMPORARY_DIRECTORY}/curl.conf"
 readonly PORT_FORWARD_LOG="${TEMPORARY_DIRECTORY}/port-forward.log"
+readonly SIGNATURE_PATTERNS_FILE="${TEMPORARY_DIRECTORY}/signatures"
+readonly FORBIDDEN_PATTERNS_FILE="${TEMPORARY_DIRECTORY}/forbidden-patterns"
 readonly STATUS_FILE="${ARTIFACT_DIRECTORY}/http-statuses.txt"
+readonly ROLLOUT_SAMPLES_FILE="${ARTIFACT_DIRECTORY}/rollout-samples.txt"
 CLUSTER_SUFFIX="$(head -c 9 /dev/urandom | base64 | tr '/+' 'ab' | tr -d '=')"
 CLUSTER_SUFFIX="${CLUSTER_SUFFIX,,}"
 readonly CLUSTER_NAME="gwe-lifecycle-${CLUSTER_SUFFIX}"
 readonly KUBE_CONTEXT="kind-${CLUSTER_NAME}"
 CLUSTER_CREATED=false
 PORT_FORWARD_PID=''
+ACTIVITY_PID=''
+LOG_PID=''
+UPGRADE_PID=''
 LOCAL_PORT=''
 
 kube() {
@@ -94,12 +101,19 @@ cleanup() {
     local original_status=$?
     local cleanup_status=0
     trap - EXIT
+    for background_pid in "${ACTIVITY_PID}" "${LOG_PID}" "${UPGRADE_PID}"; do
+        if [[ -n "${background_pid}" ]]; then
+            kill "${background_pid}" >/dev/null 2>&1 || true
+            wait "${background_pid}" >/dev/null 2>&1 || true
+        fi
+    done
     stop_port_forward
     capture_diagnostics
     if [[ -d "${ARTIFACT_DIRECTORY}" && -s "${MASTER_KEY_FILE}" && \
         -s "${ADMIN_TOKEN_FILE}" && -s "${WEBHOOK_SECRET_FILE}" ]]; then
         if ! scan_private_artifacts "${ARTIFACT_DIRECTORY}" \
-            "${MASTER_KEY_FILE}" "${ADMIN_TOKEN_FILE}" "${WEBHOOK_SECRET_FILE}"; then
+            "${MASTER_KEY_FILE}" "${ADMIN_TOKEN_FILE}" "${WEBHOOK_SECRET_FILE}" \
+            "${SIGNATURE_PATTERNS_FILE}" "${FORBIDDEN_PATTERNS_FILE}"; then
             cleanup_status=1
         fi
     fi
@@ -201,6 +215,7 @@ send_webhook() {
     local status
     local signature
     signature="$(hmac_sha256 "${WEBHOOK_SECRET_FILE}" "${payload_file}")"
+    printf '%s\n' "${signature}" >>"${SIGNATURE_PATTERNS_FILE}"
     write_curl_config POST "http://127.0.0.1:${LOCAL_PORT}/webhooks/github" \
         "${HTTP_RESPONSE_FILE}"
     {
@@ -234,13 +249,186 @@ assert_metric() {
     fi
 }
 
+verify_broken_database_readiness() {
+    kube --namespace "${NAMESPACE}" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: broken-database-readiness
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: github-webhook-exporter
+      image: ${IMAGE}
+      imagePullPolicy: Never
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      env:
+        - name: GHE_DATABASE_PATH
+          value: /proc/github-webhook-exporter.db
+        - name: GHE_MASTER_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ${RESOURCE_NAME}
+              key: master-key
+        - name: GHE_ADMIN_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: ${RESOURCE_NAME}
+              key: admin-token
+      readinessProbe:
+        httpGet:
+          path: /health/ready
+          port: 8080
+        periodSeconds: 1
+        failureThreshold: 1
+EOF
+    if kube --namespace "${NAMESPACE}" wait --for=condition=Ready \
+        pod/broken-database-readiness --timeout=15s >/dev/null 2>&1; then
+        fail 'broken database pod reported Ready'
+        return 1
+    fi
+    local ready_status
+    ready_status="$(kube --namespace "${NAMESPACE}" get pod broken-database-readiness \
+        -o json | jq -r '.status.conditions[]? | select(.type == "Ready") | .status' | head -n 1)"
+    if [[ "${ready_status}" == True ]]; then
+        fail 'broken database pod retained a successful readiness condition'
+        return 1
+    fi
+    kube --namespace "${NAMESPACE}" describe pod broken-database-readiness \
+        >"${ARTIFACT_DIRECTORY}/broken-database-pod.txt" 2>&1 || true
+    kube --namespace "${NAMESPACE}" logs broken-database-readiness \
+        >"${ARTIFACT_DIRECTORY}/broken-database-logs.txt" 2>&1 || true
+    if grep --fixed-strings --quiet '/proc/github-webhook-exporter.db' \
+        "${ARTIFACT_DIRECTORY}/broken-database-logs.txt"; then
+        fail 'broken database diagnostics disclosed the configured path'
+        return 1
+    fi
+    kube --namespace "${NAMESPACE}" delete pod broken-database-readiness \
+        --wait=true >/dev/null
+}
+
+wait_for_replacement_ready() {
+    local old_uid="$1"
+    local deadline=$((SECONDS + 30))
+    local pod_json
+    while (( SECONDS < deadline )); do
+        pod_json="$(kube --namespace "${NAMESPACE}" get pod "${POD_NAME}" \
+            -o json 2>/dev/null || true)"
+        if [[ -n "${pod_json}" ]] && \
+            [[ "$(jq -r '.metadata.uid // ""' <<<"${pod_json}")" != "${old_uid}" ]] && \
+            [[ "$(jq -r '[.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length' \
+                <<<"${pod_json}")" == 1 ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+    fail 'replacement pod did not become Ready before the lifecycle deadline'
+}
+
+verify_graceful_sigterm() {
+    local old_uid
+    local started_at
+    local elapsed
+    local pre_stop
+    pre_stop="$(kube --namespace "${NAMESPACE}" get statefulset "${RESOURCE_NAME}" \
+        -o jsonpath='{.spec.template.spec.containers[0].lifecycle.preStop}')"
+    assert_equal '' "${pre_stop}" 'absence of a preStop delay'
+    old_uid="$(kube --namespace "${NAMESPACE}" get pod "${POD_NAME}" \
+        -o jsonpath='{.metadata.uid}')"
+    kube --namespace "${NAMESPACE}" logs --follow "${POD_NAME}" \
+        >"${ARTIFACT_DIRECTORY}/sigterm-previous-logs.txt" 2>&1 &
+    LOG_PID=$!
+    (
+        while curl --silent --output /dev/null \
+            "http://127.0.0.1:${LOCAL_PORT}/metrics"; do
+            sleep 0.1
+        done
+    ) &
+    ACTIVITY_PID=$!
+    started_at=${SECONDS}
+    kube --namespace "${NAMESPACE}" delete pod "${POD_NAME}" --wait=false >/dev/null
+    wait_for_replacement_ready "${old_uid}"
+    elapsed=$((SECONDS - started_at))
+    kill "${ACTIVITY_PID}" >/dev/null 2>&1 || true
+    wait "${ACTIVITY_PID}" >/dev/null 2>&1 || true
+    ACTIVITY_PID=''
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        if ! kill -0 "${LOG_PID}" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
+    kill "${LOG_PID}" >/dev/null 2>&1 || true
+    wait "${LOG_PID}" >/dev/null 2>&1 || true
+    LOG_PID=''
+    if (( elapsed > 10 )); then
+        fail 'SIGTERM lifecycle exceeded the pod termination grace period'
+        return 1
+    fi
+    for expected_log in 'shutdown signal received' 'HTTP server stopped' \
+        'telemetry provider shutdown starting'; do
+        if ! grep --fixed-strings --quiet "${expected_log}" \
+            "${ARTIFACT_DIRECTORY}/sigterm-previous-logs.txt"; then
+            fail "graceful shutdown stage was not observed: ${expected_log}"
+            return 1
+        fi
+    done
+    start_port_forward
+}
+
+verify_singleton_rollout() {
+    local running_count
+    local maximum_running=0
+    : >"${ROLLOUT_SAMPLES_FILE}"
+    helm upgrade "${RELEASE_NAME}" "${CHART_DIRECTORY}" \
+        --namespace "${NAMESPACE}" --kubeconfig "${KUBECONFIG_PATH}" \
+        --kube-context "${KUBE_CONTEXT}" --reuse-values --wait --timeout 3m \
+        --set-string application.rustLog=debug \
+        >"${TEMPORARY_DIRECTORY}/helm-upgrade.log" 2>&1 &
+    UPGRADE_PID=$!
+    while kill -0 "${UPGRADE_PID}" >/dev/null 2>&1; do
+        running_count="$(kube --namespace "${NAMESPACE}" get pods -o json | jq \
+            '[.items[] | select(any(.spec.volumes[]?; .persistentVolumeClaim.claimName == "data-github-webhook-exporter-0")) | .status.containerStatuses[]? | select(.name == "github-webhook-exporter" and .state.running != null)] | length')"
+        printf '%s running_pvc_exporters=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            "${running_count}" >>"${ROLLOUT_SAMPLES_FILE}"
+        if (( running_count > maximum_running )); then
+            maximum_running=${running_count}
+        fi
+        sleep 0.2
+    done
+    if ! wait "${UPGRADE_PID}"; then
+        UPGRADE_PID=''
+        cat "${TEMPORARY_DIRECTORY}/helm-upgrade.log" >&2
+        fail 'Helm rollout failed'
+        return 1
+    fi
+    UPGRADE_PID=''
+    assert_equal 1 "${maximum_running}" 'maximum active exporters with the SQLite PVC'
+    wait_for_pod_ready
+    start_port_forward
+}
+
 rm -rf "${ARTIFACT_DIRECTORY}"
 mkdir -p "${ARTIFACT_DIRECTORY}"
 : >"${STATUS_FILE}"
 head -c 32 /dev/urandom | base64 | tr -d '\n' >"${MASTER_KEY_FILE}"
 head -c 24 /dev/urandom | base64 | tr -d '\n' >"${ADMIN_TOKEN_FILE}"
 head -c 24 /dev/urandom | base64 | tr -d '\n' >"${WEBHOOK_SECRET_FILE}"
-chmod 600 "${MASTER_KEY_FILE}" "${ADMIN_TOKEN_FILE}" "${WEBHOOK_SECRET_FILE}"
+printf '%s\n' 'kind-payload-private-marker' >"${FORBIDDEN_PATTERNS_FILE}"
+: >"${SIGNATURE_PATTERNS_FILE}"
+chmod 600 "${MASTER_KEY_FILE}" "${ADMIN_TOKEN_FILE}" "${WEBHOOK_SECRET_FILE}" \
+    "${SIGNATURE_PATTERNS_FILE}" "${FORBIDDEN_PATTERNS_FILE}"
 
 CLUSTER_CREATED=true
 kind create cluster --name "${CLUSTER_NAME}" --kubeconfig "${KUBECONFIG_PATH}" --wait 90s
@@ -254,10 +442,11 @@ image_repository="${IMAGE%:*}"
 image_tag="${IMAGE##*:}"
 helm install "${RELEASE_NAME}" "${CHART_DIRECTORY}" \
     --namespace "${NAMESPACE}" --kubeconfig "${KUBECONFIG_PATH}" \
-    --kube-context "${KUBE_CONTEXT}" --atomic --wait --timeout 3m \
+    --kube-context "${KUBE_CONTEXT}" --rollback-on-failure --wait --timeout 3m \
     --set-string "image.repository=${image_repository}" \
     --set-string "image.tag=${image_tag}" --set image.pullPolicy=Never \
     --set application.shutdownTimeoutSeconds=5 \
+    --set retention.pruneIntervalSeconds=1 \
     --set telemetry.shutdownTimeoutSeconds=2 \
     --set telemetry.timeoutMilliseconds=100 \
     --set-string telemetry.endpoint=http://127.0.0.1:9 \
@@ -329,7 +518,14 @@ request_status GET /health/ready ready_during_collector_outage 200
 send_webhook merge_group 550e8400-e29b-41d4-a716-446655440105 \
     "${MERGE_GROUP_OPEN}" webhook_during_collector_outage
 
+verify_broken_database_readiness
+verify_graceful_sigterm
+verify_singleton_rollout
+request_status GET /health/live live_after_rollout 200
+request_status GET /health/ready ready_after_rollout 200
+
 capture_diagnostics
 scan_private_artifacts "${ARTIFACT_DIRECTORY}" \
-    "${MASTER_KEY_FILE}" "${ADMIN_TOKEN_FILE}" "${WEBHOOK_SECRET_FILE}"
+    "${MASTER_KEY_FILE}" "${ADMIN_TOKEN_FILE}" "${WEBHOOK_SECRET_FILE}" \
+    "${SIGNATURE_PATTERNS_FILE}" "${FORBIDDEN_PATTERNS_FILE}"
 printf 'Kind lifecycle acceptance passed; diagnostics: %s\n' "${ARTIFACT_DIRECTORY}"

@@ -49,4 +49,24 @@ grep --fixed-strings --quiet 'leaked.txt' "${scan_error_file}" || {
     exit 1
 }
 
+readonly FORBIDDEN_PAYLOAD_FILE="${TEMPORARY_DIRECTORY}/forbidden-payload"
+printf '%s\n' 'forbidden-payload-fragment' >"${FORBIDDEN_PAYLOAD_FILE}"
+rm -f "${ARTIFACT_DIRECTORY}/leaked.txt"
+mkdir "${ARTIFACT_DIRECTORY}/nested"
+printf '\000forbidden-payload-fragment\000' >"${ARTIFACT_DIRECTORY}/nested/binary.dat"
+: >"${scan_error_file}"
+if scan_private_artifacts "${ARTIFACT_DIRECTORY}" \
+    "${SECRET_FILE}" "${FORBIDDEN_PAYLOAD_FILE}" 2>"${scan_error_file}"; then
+    printf 'private artifact scanner ignored a binary payload fragment\n' >&2
+    exit 1
+fi
+if grep --fixed-strings --quiet 'forbidden-payload-fragment' "${scan_error_file}"; then
+    printf 'private artifact scanner printed forbidden payload material\n' >&2
+    exit 1
+fi
+grep --fixed-strings --quiet 'nested/binary.dat' "${scan_error_file}" || {
+    printf 'private artifact scanner did not identify a nested binary artifact\n' >&2
+    exit 1
+}
+
 printf 'Kind lifecycle helper contracts passed\n'

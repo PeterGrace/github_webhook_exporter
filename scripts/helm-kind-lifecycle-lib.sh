@@ -76,7 +76,7 @@ scan_private_artifacts() {
             return 1
         fi
         while IFS= read -r -d '' artifact_file; do
-            if grep --binary-files=without-match --fixed-strings --quiet \
+            if grep --binary-files=text --fixed-strings --quiet \
                 --file="${pattern_file}" -- "${artifact_file}"; then
                 printf 'Kind lifecycle acceptance failed: private material found in artifact: %s\n' \
                     "${artifact_file#"${artifact_directory}/"}" >&2
