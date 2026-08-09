@@ -49,6 +49,10 @@ helm-security-test:
 workflow-test:
     scripts/github-actions-test.sh .github/workflows/helm-package-ci.yml
 
+# Verify deterministic Kind lifecycle helper contracts.
+helm-kind-lifecycle-unit:
+    scripts/helm-kind-lifecycle-lib-test.sh
+
 # Verify the rendered chart is accepted by a disposable Kind cluster.
 helm-kind-acceptance:
     scripts/helm-kind-acceptance.sh "{{helm-chart}}"
