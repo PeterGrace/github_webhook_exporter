@@ -28,13 +28,15 @@ CI installs immutable versions rather than using runner-provided or mutable `lat
 - Conftest `v0.69.0` for Rego policy checks.
 - yq `v4.53.3` for deterministic YAML selection and assertions.
 - ShellCheck `v0.11.0` for repository shell validation.
+- just `1.58.0` for the repository task interface.
+- Rust `1.97.1`, matching the production image builder, for project gates.
 
 GitHub Actions dependencies are pinned to full commit SHAs. Downloaded tool archives are verified
 against release checksums before installation. The workflow records each tool version before using
 it so failures show the exact validator set.
 
-The chart declares the Kubernetes versions it supports. kubeconform validates all built-in objects
-against the lower and upper supported minor versions. A repository-owned, versioned ServiceMonitor
+The chart declares Kubernetes `>=1.31.0-0 <1.36.0-0` support. kubeconform validates all built-in
+objects against Kubernetes `1.31.0` and `1.35.0`, the lower and upper supported minor versions. A repository-owned, versioned ServiceMonitor
 schema validates the optional Prometheus Operator object without installing its CRD or depending on
 mutable remote schema catalogs.
 
