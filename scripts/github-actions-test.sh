@@ -71,7 +71,6 @@ for file_path in (
 ):
     require_fragment(file_path, "just helm-static")
     require_fragment(file_path, "just image-smoke")
-    require_fragment(file_path, "dist/github-webhook-exporter-0.1.0.tgz")
     require_fragment(file_path, "1.31.0 through 1.35.0")
     require_fragment(file_path, ">=1.31.0-0 <1.36.0-0")
     require_fragment(

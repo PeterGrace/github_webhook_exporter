@@ -53,7 +53,7 @@ main() {
     if [[ -z "${CHART_DIRECTORY}" || -z "${OUTPUT_DIRECTORY}" ]]; then
         usage
     fi
-    for command in find helm mktemp mv python3 rm rmdir sort; do
+    for command in awk find helm mktemp mv python3 rm rmdir sort; do
         require_command "${command}"
     done
     for required_file in "${OUTPUT_GUARD}" "${ARCHIVE_PREFLIGHT}" \
