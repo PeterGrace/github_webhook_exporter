@@ -106,8 +106,8 @@ if not isinstance(push_section, dict):
 if push_section.get("branches") != ["main"]:
     fail("workflow branch push trigger must target main only")
 
-if push_section.get("tags") != ["v*"]:
-    fail("workflow tag push trigger must target version-like tags for strict validation")
+if push_section.get("tags") != ["v[0-9]+.[0-9]+.[0-9]+"]:
+    fail("workflow tag trigger must target stable semantic-version-shaped tags")
 
 permissions = workflow.get("permissions")
 if permissions != {"contents": "read"}:
@@ -125,8 +125,8 @@ jobs = workflow.get("jobs")
 if not isinstance(jobs, dict):
     fail("workflow must define jobs")
 
-if list(jobs) != ["validate", "publish-image"]:
-    fail("workflow must define validation followed by image publication")
+if list(jobs) != ["validate", "publish-release"]:
+    fail("workflow must define validation followed by release publication")
 
 validate_job = jobs["validate"]
 if not isinstance(validate_job, dict):
@@ -196,29 +196,54 @@ for index, expected_step in enumerate(expected_validate_steps):
     if actual_contract != expected_step:
         fail(f"workflow validation step {index + 1} does not match the expected contract")
 
-publish_job = jobs["publish-image"]
+if validate_job.get("permissions", {}).get("packages") == "write":
+    fail("workflow validation job must not grant packages: write")
+
+for index, step in enumerate(validate_steps):
+    serialized_step = json.dumps(step, sort_keys=True).lower()
+    if (
+        "login-action" in serialized_step
+        or "registry login" in serialized_step
+        or "docker push" in serialized_step
+        or "helm push" in serialized_step
+        or "release-publish.sh" in serialized_step
+        or step.get("with", {}).get("push") is True
+    ):
+        fail(f"workflow validation step {index + 1} must not authenticate or publish")
+
+publish_job = jobs["publish-release"]
 if not isinstance(publish_job, dict):
-    fail("workflow publish-image job must be a mapping")
+    fail("workflow publish-release job must be a mapping")
 
 expected_publish_job_contract = {
-    "if": "startsWith(github.ref, 'refs/tags/v')",
+    "if": "github.ref_type == 'tag'",
     "needs": "validate",
     "runs-on": "ubuntu-24.04",
     "permissions": {"contents": "read", "packages": "write"},
 }
 for key, expected_value in expected_publish_job_contract.items():
     if publish_job.get(key) != expected_value:
-        fail(f"workflow publish-image job has an invalid {key} contract")
+        fail(f"workflow publish-release job has an invalid {key} contract")
 
 publish_steps = publish_job.get("steps")
 if not isinstance(publish_steps, list):
-    fail("workflow publish-image job must define steps")
+    fail("workflow publish-release job must define steps")
 
 expected_publish_steps = [
     {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"},
     {
         "id": "version",
         "run": 'version="$(scripts/release-version.sh "$GITHUB_REF_NAME")"\necho "version=${version}" >> "$GITHUB_OUTPUT"\n',
+    },
+    {"run": 'scripts/install-ci-tools.sh "$RUNNER_TEMP/ci-tools"'},
+    {"run": 'echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"'},
+    {
+        "uses": "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+        "with": {"name": "helm-package", "path": "dist/release"},
+    },
+    {
+        "id": "chart",
+        "run": "mapfile -d '' -t chart_archives < <(\n    find dist/release -maxdepth 1 -type f -name '*.tgz' -print0\n)\nif (( ${#chart_archives[@]} != 1 )); then\n    printf 'expected exactly one downloaded chart archive, found %s\\n' \\\n        \"${#chart_archives[@]}\" >&2\n    exit 1\nfi\n\narchive=\"${chart_archives[0]}\"\nexpected_archive=\"dist/release/github-webhook-exporter-${{ steps.version.outputs.version }}.tgz\"\nif [[ \"$archive\" != \"$expected_archive\" ]]; then\n    printf 'unexpected chart archive: %s\\n' \"$archive\" >&2\n    exit 1\nfi\n\nchart_version=\"$(helm show chart \"$archive\" | yq eval '.version' -)\"\nif [[ \"$chart_version\" != \"${{ steps.version.outputs.version }}\" ]]; then\n    printf 'chart archive version does not match release version\\n' >&2\n    exit 1\nfi\n\nhelm template github-webhook-exporter \"$archive\" \\\n    --kube-version 1.35.0 >/dev/null\nprintf 'archive=%s\\n' \"$archive\" >> \"$GITHUB_OUTPUT\"\n",
     },
     {"uses": "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f"},
     {
@@ -258,16 +283,14 @@ expected_publish_steps = [
         },
     },
     {
-        "env": {
-            "RELEASE_IMAGE": "ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}"
-        },
-        "run": "if docker manifest inspect \"$RELEASE_IMAGE\" >/dev/null 2>&1; then\n    printf 'release image already exists: %s\\n' \"$RELEASE_IMAGE\" >&2\n    exit 1\nfi\n",
+        "env": {"GHCR_TOKEN": "${{ secrets.GITHUB_TOKEN }}"},
+        "run": "printf '%s' \"$GHCR_TOKEN\" | helm registry login ghcr.io \\\n    --username \"${{ github.actor }}\" --password-stdin\n",
     },
     {
         "env": {
             "RELEASE_IMAGE": "ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}"
         },
-        "run": 'docker push "$RELEASE_IMAGE"',
+        "run": "scripts/release-publish.sh \"${{ steps.version.outputs.version }}\" \\\n    \"$RELEASE_IMAGE\" \"${{ steps.chart.outputs.archive }}\"\n",
     },
 ]
 
@@ -281,4 +304,12 @@ for index, expected_step in enumerate(expected_publish_steps):
     actual_contract = {key: value for key, value in step.items() if key != "name"}
     if actual_contract != expected_step:
         fail(f"workflow publication step {index + 1} does not match the expected contract")
+
+metadata_tags = publish_steps[7].get("with", {}).get("tags", "").lower()
+if any(disallowed in metadata_tags for disallowed in ("latest", "branch", "sha")):
+    fail("workflow publication metadata must use only the normalized release tag")
+
+for index, step in enumerate(publish_steps):
+    if step.get("with", {}).get("push") is True:
+        fail(f"workflow publication step {index + 1} must not use action-level push")
 PY
