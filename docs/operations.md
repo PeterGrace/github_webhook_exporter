@@ -98,15 +98,31 @@ just helm-static
 just image-smoke
 just workflow-test
 just helm-kind-acceptance
+KIND_ARTIFACT_DIRECTORY=dist/kind-lifecycle just helm-kind-lifecycle
 ```
 
 `just helm-static` validates chart metadata, rendering, schema, policy, secret, and packaged
 archive contracts across the supported Kubernetes range 1.31.0 through 1.35.0
 (`>=1.31.0-0 <1.36.0-0`). `just image-smoke` builds and exercises the production image locally.
 `just workflow-test` checks the GitHub Actions contract, including the exact archive path
-`dist/github-webhook-exporter-0.1.0.tgz`. `just helm-kind-acceptance` is the later
-cluster-acceptance step: it confirms API acceptance for the rendered StatefulSet, Service,
-ConfigMap, and PVC, but it does not prove cluster lifecycle behavior.
+`dist/github-webhook-exporter-0.1.0.tgz`. `just helm-kind-acceptance` confirms API acceptance for the
+rendered StatefulSet, Service, ConfigMap, and PVC; it does not start the exporter.
+
+`just helm-kind-lifecycle` builds and loads the `linux/amd64` production image into a uniquely named
+disposable Kind cluster. It creates private test credentials at runtime, installs the chart, and
+proves probes, repository administration, signed webhooks, bounded metrics, SQLite persistence,
+delivery deduplication, pull-request queue completion across restart, collector-failure isolation,
+broken-storage readiness, bounded SIGTERM, and singleton PVC rollout behavior. Its default
+diagnostics directory is `dist/kind-lifecycle`; set `KIND_ARTIFACT_DIRECTORY` to isolate concurrent
+runs. The suite replaces that directory at startup and scans rendered objects, status records,
+events, descriptions, and logs for generated credentials, signatures, and forbidden payload
+material before success.
+
+The cluster and private temporary files are removed after both success and failure. For interactive
+debugging only, `KEEP_KIND_CLUSTER=true` preserves them and prints the generated cluster name and
+kubeconfig path; delete that cluster and temporary directory manually as soon as investigation
+finishes. CI uses checksum-pinned Kind 0.31.0 and kubectl 1.35.0 and uploads the diagnostics for 14
+days with `if: always()`.
 
 For local archive inspection, use the fixed package name directly:
 

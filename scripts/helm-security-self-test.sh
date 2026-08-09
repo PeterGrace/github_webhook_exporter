@@ -173,7 +173,7 @@ contents = source.read_text(encoding="utf-8")
 contents = contents.replace("run: just workflow-test", "run: echo contract-skipped", 1)
 destination.write_text(contents, encoding="utf-8")
 PY
-expect_failure "workflow step 4 must run the expected command" \
+expect_failure "workflow step 5 does not match the expected contract" \
     "workflow mutation guard" \
     "${SCRIPT_DIRECTORY}/github-actions-test.sh" "${workflow_copy}"
 printf 'Workflow order fixture passed\n'

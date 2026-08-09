@@ -111,9 +111,17 @@ cleanup() {
     capture_diagnostics
     if [[ -d "${ARTIFACT_DIRECTORY}" && -s "${MASTER_KEY_FILE}" && \
         -s "${ADMIN_TOKEN_FILE}" && -s "${WEBHOOK_SECRET_FILE}" ]]; then
+        local -a private_pattern_files=(
+            "${MASTER_KEY_FILE}"
+            "${ADMIN_TOKEN_FILE}"
+            "${WEBHOOK_SECRET_FILE}"
+            "${FORBIDDEN_PATTERNS_FILE}"
+        )
+        if [[ -s "${SIGNATURE_PATTERNS_FILE}" ]]; then
+            private_pattern_files+=("${SIGNATURE_PATTERNS_FILE}")
+        fi
         if ! scan_private_artifacts "${ARTIFACT_DIRECTORY}" \
-            "${MASTER_KEY_FILE}" "${ADMIN_TOKEN_FILE}" "${WEBHOOK_SECRET_FILE}" \
-            "${SIGNATURE_PATTERNS_FILE}" "${FORBIDDEN_PATTERNS_FILE}"; then
+            "${private_pattern_files[@]}"; then
             cleanup_status=1
         fi
     fi
