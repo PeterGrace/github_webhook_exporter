@@ -1,0 +1,33 @@
+{{- if .Values.webhookIngress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "github-webhook-exporter.fullname" . }}-webhook
+  labels:
+    {{- include "github-webhook-exporter.labels" . | nindent 4 }}
+  {{- with .Values.webhookIngress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.webhookIngress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.webhookIngress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - {{- with .Values.webhookIngress.host }}
+      host: {{ . | quote }}
+      {{- end }}
+      http:
+        paths:
+          - path: /webhooks/github
+            pathType: Exact
+            backend:
+              service:
+                name: {{ include "github-webhook-exporter.fullname" . }}
+                port:
+                  name: http
+{{- end }}

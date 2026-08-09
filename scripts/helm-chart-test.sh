@@ -114,6 +114,11 @@ assert_yq \
     '[.[] | select(.kind == "PodDisruptionBudget")] | length == 0' \
     "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
     'defaults must not render a PodDisruptionBudget'
+assert_yq \
+    '[.[] | select(.kind == "Ingress" or .kind == "ServiceMonitor" or
+                    .kind == "NetworkPolicy")] | length == 0' \
+    "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
+    'defaults must not render exposure or network-boundary resources'
 
 yq '.[] | select(.kind == "StatefulSet")' \
     "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
@@ -650,6 +655,291 @@ for resource_quantity in \
         helm template github-webhook-exporter "${CHART_DIRECTORY}" \
             --set-string "${resource_quantity}=1K"
 done
+
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --set webhookIngress.enabled=true \
+    --set webhookIngress.host=hooks.example.test \
+    >"${TEMPORARY_DIRECTORY}/webhook-ingress.yaml"
+yq eval-all '[.] | flatten | map(select(. != null))' \
+    "${TEMPORARY_DIRECTORY}/webhook-ingress.yaml" \
+    >"${TEMPORARY_DIRECTORY}/webhook-ingress-manifests.yaml"
+assert_yq \
+    '([.[] | select(.kind == "Ingress")] | length) == 1 and
+     ([.[] | select(.kind == "Ingress")][0].spec.rules[0].host) ==
+       "hooks.example.test" and
+     ([.[] | select(.kind == "Ingress")][0].spec.rules[0].http.paths | length) == 1 and
+     ([.[] | select(.kind == "Ingress")][0].spec.rules[0].http.paths[0].path) ==
+       "/webhooks/github" and
+     ([.[] | select(.kind == "Ingress")][0].spec.rules[0].http.paths[0].pathType) ==
+       "Exact" and
+     ([.[] | select(.kind == "Ingress")][0].spec.rules[0].http.paths[0]
+       .backend.service.name) == "github-webhook-exporter"' \
+    "${TEMPORARY_DIRECTORY}/webhook-ingress-manifests.yaml" \
+    'webhook Ingress must expose only the exact GitHub webhook path'
+
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --set webhookIngress.enabled=true \
+    >"${TEMPORARY_DIRECTORY}/hostless-webhook-ingress.yaml"
+assert_yq \
+    'select(.kind == "Ingress").spec.rules[0] |
+     ((has("host") | not) and .http.paths[0].path == "/webhooks/github" and
+      .http.paths[0].pathType == "Exact")' \
+    "${TEMPORARY_DIRECTORY}/hostless-webhook-ingress.yaml" \
+    'hostless webhook Ingress must retain its fixed exact path'
+expect_success \
+    'wildcard webhook hostname' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set webhookIngress.enabled=true \
+        --set-string 'webhookIngress.host=*.example.test'
+expect_failure \
+    'malformed webhook hostname' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set webhookIngress.enabled=true \
+        --set-string webhookIngress.host=Bad_host
+
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --set metrics.service.enabled=true \
+    >"${TEMPORARY_DIRECTORY}/metrics-service.yaml"
+yq eval-all '[.] | flatten | map(select(. != null))' \
+    "${TEMPORARY_DIRECTORY}/metrics-service.yaml" \
+    >"${TEMPORARY_DIRECTORY}/metrics-service-manifests.yaml"
+assert_yq \
+    '([.[] | select(.kind == "Service")] | length) == 2 and
+     ([.[] | select(.kind == "Service" and
+       .metadata.name == "github-webhook-exporter-metrics")][0].spec.ports[0].name) ==
+       "http" and
+     ([.[] | select(.kind == "ServiceMonitor")] | length) == 0' \
+    "${TEMPORARY_DIRECTORY}/metrics-service-manifests.yaml" \
+    'metrics Service must be independently enabled'
+
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --set metrics.service.enabled=true \
+    --set metrics.serviceMonitor.enabled=true \
+    >"${TEMPORARY_DIRECTORY}/service-monitor.yaml"
+yq eval-all '[.] | flatten | map(select(. != null))' \
+    "${TEMPORARY_DIRECTORY}/service-monitor.yaml" \
+    >"${TEMPORARY_DIRECTORY}/service-monitor-manifests.yaml"
+assert_yq \
+    '([.[] | select(.kind == "ServiceMonitor")] | length) == 1 and
+     ([.[] | select(.kind == "ServiceMonitor")][0].spec.endpoints | length) == 1 and
+     ([.[] | select(.kind == "ServiceMonitor")][0].spec.endpoints[0].path) ==
+       "/metrics" and
+     ([.[] | select(.kind == "ServiceMonitor")][0].spec.endpoints[0].port) == "http" and
+     ([.[] | select(.kind == "ServiceMonitor")][0].spec.selector.matchLabels
+       ."app.kubernetes.io/component") == "metrics"' \
+    "${TEMPORARY_DIRECTORY}/service-monitor-manifests.yaml" \
+    'ServiceMonitor must select and scrape only the dedicated metrics Service'
+expect_failure_contains \
+    'ServiceMonitor without metrics Service' \
+    'metrics.serviceMonitor.enabled requires metrics.service.enabled' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set metrics.serviceMonitor.enabled=true
+
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --set administration.service.enabled=true \
+    --set administration.ingress.enabled=true \
+    --set administration.ingress.host=admin.example.test \
+    >"${TEMPORARY_DIRECTORY}/administration.yaml"
+yq eval-all '[.] | flatten | map(select(. != null))' \
+    "${TEMPORARY_DIRECTORY}/administration.yaml" \
+    >"${TEMPORARY_DIRECTORY}/administration-manifests.yaml"
+assert_yq \
+    '([.[] | select(.kind == "Service" and
+       .metadata.name == "github-webhook-exporter-administration")] | length) == 1 and
+     ([.[] | select(.kind == "Ingress")] | length) == 1 and
+     ([.[] | select(.kind == "Ingress")][0].spec.rules[0].http.paths | length) == 1 and
+     ([.[] | select(.kind == "Ingress")][0].spec.rules[0].http.paths[0].path) ==
+       "/api/v1/repositories" and
+     ([.[] | select(.kind == "Ingress")][0].spec.rules[0].http.paths[0].pathType) ==
+       "Prefix" and
+     ([.[] | select(.kind == "Ingress")][0].spec.rules[0].http.paths[0]
+       .backend.service.name) == "github-webhook-exporter-administration"' \
+    "${TEMPORARY_DIRECTORY}/administration-manifests.yaml" \
+    'administrative Ingress must route only the repository API prefix'
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --set administration.service.enabled=true \
+    --set administration.ingress.enabled=true \
+    >"${TEMPORARY_DIRECTORY}/hostless-administration-ingress.yaml"
+assert_yq \
+    'select(.kind == "Ingress").spec.rules[0] |
+     ((has("host") | not) and .http.paths[0].path == "/api/v1/repositories" and
+      .http.paths[0].pathType == "Prefix")' \
+    "${TEMPORARY_DIRECTORY}/hostless-administration-ingress.yaml" \
+    'hostless administrative Ingress must retain its fixed prefix'
+expect_failure \
+    'malformed administrative hostname' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set administration.service.enabled=true \
+        --set administration.ingress.enabled=true \
+        --set-string administration.ingress.host=Bad_host
+expect_failure_contains \
+    'administrative Ingress without administrative Service' \
+    'administration.ingress.enabled requires administration.service.enabled' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set administration.ingress.enabled=true
+
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --set networkPolicy.enabled=true \
+    >"${TEMPORARY_DIRECTORY}/default-deny-policy.yaml"
+yq eval-all '[.] | flatten | map(select(. != null))' \
+    "${TEMPORARY_DIRECTORY}/default-deny-policy.yaml" \
+    >"${TEMPORARY_DIRECTORY}/default-deny-policy-manifests.yaml"
+assert_yq \
+    '([.[] | select(.kind == "NetworkPolicy")] | length) == 1 and
+     ([.[] | select(.kind == "NetworkPolicy")][0].spec.policyTypes | length) == 2 and
+     ([.[] | select(.kind == "NetworkPolicy")][0].spec.policyTypes[0]) == "Ingress" and
+     ([.[] | select(.kind == "NetworkPolicy")][0].spec.policyTypes[1]) == "Egress" and
+     ([.[] | select(.kind == "NetworkPolicy")][0].spec.ingress | length) == 0 and
+     ([.[] | select(.kind == "NetworkPolicy")][0].spec.egress | length) == 0' \
+    "${TEMPORARY_DIRECTORY}/default-deny-policy-manifests.yaml" \
+    'enabled NetworkPolicy must default deny ingress and egress'
+
+cat >"${TEMPORARY_DIRECTORY}/network-policy-values.yaml" <<'EOF'
+networkPolicy:
+  enabled: true
+  ingress:
+    ingressController:
+      enabled: true
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-system
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-controller
+    prometheus:
+      enabled: true
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: prometheus
+    management:
+      enabled: true
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: management
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: management-gateway
+  egress:
+    dns:
+      enabled: true
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    otlp:
+      enabled: true
+      peers:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+        - ipBlock:
+            cidr: 192.0.2.0/24
+      ports:
+        - 4318
+        - 4319
+EOF
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --values "${TEMPORARY_DIRECTORY}/network-policy-values.yaml" \
+    >"${TEMPORARY_DIRECTORY}/bounded-policy.yaml"
+yq 'select(.kind == "NetworkPolicy")' \
+    "${TEMPORARY_DIRECTORY}/bounded-policy.yaml" \
+    >"${TEMPORARY_DIRECTORY}/bounded-network-policy.yaml"
+assert_yq \
+    '.spec.ingress | length == 3' \
+    "${TEMPORARY_DIRECTORY}/bounded-network-policy.yaml" \
+    'policy must render exactly three configured ingress allowances'
+assert_yq \
+    '[.spec.ingress[] |
+      ((.from | length) == 1 and (.ports | length) == 1 and
+       .ports[0].port == 8080 and .ports[0].protocol == "TCP")] | all' \
+    "${TEMPORARY_DIRECTORY}/bounded-network-policy.yaml" \
+    'every ingress allowance must use one bounded peer and the application TCP port'
+assert_yq \
+    '.spec.egress | length == 2 and
+     (.spec.egress[0].ports | length) == 2 and
+     .spec.egress[0].ports[0].port == 53 and
+     .spec.egress[0].ports[0].protocol == "UDP" and
+     .spec.egress[0].ports[1].port == 53 and
+     .spec.egress[0].ports[1].protocol == "TCP" and
+     (.spec.egress[1].to | length) == 2 and
+     .spec.egress[1].to[1].ipBlock.cidr == "192.0.2.0/24" and
+     (.spec.egress[1].ports | length) == 2 and
+     .spec.egress[1].ports[0].port == 4318 and
+     .spec.egress[1].ports[0].protocol == "TCP" and
+     .spec.egress[1].ports[1].port == 4319 and
+     .spec.egress[1].ports[1].protocol == "TCP"' \
+    "${TEMPORARY_DIRECTORY}/bounded-network-policy.yaml" \
+    'egress must contain only configured DNS and OTLP destinations'
+expect_failure_contains \
+    'ingress rule without selectors' \
+    'networkPolicy.ingress.ingressController requires non-empty namespaceSelector and podSelector' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set networkPolicy.enabled=true \
+        --set networkPolicy.ingress.ingressController.enabled=true
+expect_failure_contains \
+    'DNS rule without selectors' \
+    'networkPolicy.egress.dns requires non-empty namespaceSelector and podSelector' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set networkPolicy.enabled=true \
+        --set networkPolicy.egress.dns.enabled=true
+expect_failure_contains \
+    'OTLP rule without peers and ports' \
+    'networkPolicy.egress.otlp requires at least one peer and port' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set networkPolicy.enabled=true \
+        --set networkPolicy.egress.otlp.enabled=true
+expect_failure_contains \
+    'OTLP selector peer without selectors' \
+    'networkPolicy.egress.otlp.peers[0] requires non-empty namespaceSelector and podSelector' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set networkPolicy.enabled=true \
+        --set networkPolicy.egress.otlp.enabled=true \
+        --set-json 'networkPolicy.egress.otlp.peers=[{"namespaceSelector":{},"podSelector":{}}]' \
+        --set networkPolicy.egress.otlp.ports[0]=4318
+expect_failure \
+    'invalid OTLP CIDR' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set networkPolicy.enabled=true \
+        --set networkPolicy.egress.otlp.enabled=true \
+        --set networkPolicy.egress.otlp.peers[0].ipBlock.cidr=not-a-cidr \
+        --set networkPolicy.egress.otlp.ports[0]=4318
+
+assert_contains \
+    '## Webhook ingress example' \
+    "${CHART_DIRECTORY}/README.md" \
+    'README must include a webhook ingress example'
+assert_contains \
+    '## Prometheus scraping example' \
+    "${CHART_DIRECTORY}/README.md" \
+    'README must include a Prometheus example'
+assert_contains \
+    '## Management access example' \
+    "${CHART_DIRECTORY}/README.md" \
+    'README must include a management example'
+assert_contains \
+    '## DNS and OTLP egress example' \
+    "${CHART_DIRECTORY}/README.md" \
+    'README must include DNS and OTLP examples'
+assert_contains \
+    'NetworkPolicy cannot distinguish HTTP paths on the shared listener' \
+    "${CHART_DIRECTORY}/README.md" \
+    'README must state the HTTP path limitation explicitly'
+assert_contains \
+    'authorization proxy' \
+    "${CHART_DIRECTORY}/README.md" \
+    'README must identify an authorization proxy as an L7 enforcement option'
+assert_contains \
+    'CNI-specific host-firewall' \
+    "${CHART_DIRECTORY}/README.md" \
+    'README must distinguish CNI host-firewall controls from standard NetworkPolicy'
 
 while IFS= read -r rendered_fixture; do
     assert_no_sensitive_content "${rendered_fixture}"

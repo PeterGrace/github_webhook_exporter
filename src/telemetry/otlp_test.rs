@@ -4,7 +4,7 @@ use std::{
     io::{self, Write},
     sync::{
         atomic::{AtomicU16, AtomicUsize, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
     },
 };
 
@@ -471,6 +471,7 @@ struct RepositoryTraceFixture {
     runtime: super::TelemetryRuntime,
     dispatch: Dispatch,
     output: CapturedOutput,
+    span_lifecycles: CapturedSpanLifecycles,
     router: Router,
     pool: SqlitePool,
     _directory: TempDir,
@@ -489,7 +490,8 @@ impl RepositoryTraceFixture {
             Metrics::new(),
         )
         .expect("telemetry runtime initializes");
-        let dispatch = Dispatch::new(subscriber);
+        let span_lifecycles = CapturedSpanLifecycles::default();
+        let dispatch = Dispatch::new(subscriber.with(span_lifecycles.clone()));
         let directory = tempfile::tempdir().expect("temporary directory is created");
         let pool = open_database(&directory.path().join("repository-trace.db"))
             .await
@@ -501,6 +503,7 @@ impl RepositoryTraceFixture {
             runtime,
             dispatch,
             output,
+            span_lifecycles,
             router,
             pool,
             _directory: directory,
@@ -547,9 +550,28 @@ impl RepositoryTraceFixture {
         .await
     }
 
-    fn force_flush(&self) -> CapturedSpans {
-        tokio::task::block_in_place(|| self.runtime.force_flush().expect("providers flush"));
-        let (traces, logs) = self.receiver.captured_requests();
+    fn finish(self) -> CapturedSpans {
+        let Self {
+            _otlp_guard,
+            receiver,
+            runtime,
+            dispatch,
+            output,
+            span_lifecycles,
+            router,
+            pool,
+            _directory,
+        } = self;
+        drop(router);
+        drop(pool);
+        drop(dispatch);
+        drop(output);
+        flush_after_span_closure(&runtime, &span_lifecycles);
+        let (traces, logs) = receiver.captured_requests();
+        drop(runtime);
+        drop(receiver);
+        drop(_directory);
+        drop(_otlp_guard);
         CapturedSpans::from_requests(traces, logs)
     }
 }
@@ -599,11 +621,26 @@ struct SpanLifecycleState {
 }
 
 #[derive(Clone, Default)]
-struct CapturedSpanLifecycles(Arc<Mutex<SpanLifecycleState>>);
+struct CapturedSpanLifecycles(Arc<(Mutex<SpanLifecycleState>, Condvar)>);
 
 impl CapturedSpanLifecycles {
+    fn wait_until_all_closed(&self) -> bool {
+        let (state, closed) = self.0.as_ref();
+        let state = state.lock().expect("span lifecycle lock is available");
+        if state.span_names.is_empty() {
+            return true;
+        }
+        let (state, _) = closed
+            .wait_timeout_while(state, std::time::Duration::from_millis(10), |state| {
+                !state.span_names.is_empty()
+            })
+            .expect("span lifecycle wait is available");
+        state.span_names.is_empty()
+    }
+
     fn assert_closed_before_created(&self, closed_name: &str, created_name: &str) {
-        let state = self.0.lock().expect("span lifecycle lock is available");
+        let (state, _) = self.0.as_ref();
+        let state = state.lock().expect("span lifecycle lock is available");
         let closed_index = state
             .events
             .iter()
@@ -632,17 +669,35 @@ where
         _context: SubscriberContext<'_, S>,
     ) {
         let name = attributes.metadata().name();
-        let mut state = self.0.lock().expect("span lifecycle lock is available");
+        let (state, _) = self.0.as_ref();
+        let mut state = state.lock().expect("span lifecycle lock is available");
         state.span_names.insert(id.clone(), name);
         state.events.push((name, SpanLifecycleEvent::Created));
     }
 
     fn on_close(&self, id: Id, _context: SubscriberContext<'_, S>) {
-        let mut state = self.0.lock().expect("span lifecycle lock is available");
+        let (state, closed) = self.0.as_ref();
+        let mut state = state.lock().expect("span lifecycle lock is available");
         if let Some(name) = state.span_names.remove(&id) {
             state.events.push((name, SpanLifecycleEvent::Closed));
         }
+        closed.notify_all();
     }
+}
+
+fn flush_after_span_closure(
+    runtime: &super::TelemetryRuntime,
+    span_lifecycles: &CapturedSpanLifecycles,
+) {
+    const MAX_PASSES: usize = 8;
+    for _ in 0..MAX_PASSES {
+        tokio::task::block_in_place(|| runtime.force_flush().expect("providers flush"));
+        if span_lifecycles.wait_until_all_closed() {
+            tokio::task::block_in_place(|| runtime.force_flush().expect("providers flush"));
+            return;
+        }
+    }
+    tokio::task::block_in_place(|| runtime.force_flush().expect("providers flush"));
 }
 
 struct WebhookTraceFixture {
@@ -896,7 +951,7 @@ impl WebhookTraceFixture {
     }
 
     fn flush(&self) {
-        tokio::task::block_in_place(|| self.runtime.force_flush().expect("providers flush"));
+        flush_after_span_closure(&self.runtime, &self.span_lifecycles);
     }
 
     fn force_flush(&self) -> CapturedSpans {
@@ -976,7 +1031,7 @@ impl WebhookTraceFixture {
             runtime,
             dispatch,
             output,
-            span_lifecycles: _,
+            span_lifecycles,
             router,
             pool,
             _directory,
@@ -985,7 +1040,7 @@ impl WebhookTraceFixture {
         drop(pool);
         drop(dispatch);
         drop(_directory);
-        tokio::task::block_in_place(|| runtime.force_flush().expect("providers flush"));
+        flush_after_span_closure(&runtime, &span_lifecycles);
         assert_eq!(
             runtime.dropped_trace_records(),
             0,
@@ -1737,6 +1792,7 @@ mod sqlite {
         receiver: RunningReceiver,
         runtime: super::super::TelemetryRuntime,
         dispatch: Dispatch,
+        span_lifecycles: CapturedSpanLifecycles,
         pool: SqlitePool,
         database_path: String,
         repository_store: RepositoryStore,
@@ -1760,7 +1816,8 @@ mod sqlite {
                 Metrics::new(),
             )
             .expect("telemetry runtime initializes");
-            let dispatch = Dispatch::new(subscriber);
+            let span_lifecycles = CapturedSpanLifecycles::default();
+            let dispatch = Dispatch::new(subscriber.with(span_lifecycles.clone()));
             let directory = tempfile::tempdir().expect("temporary directory is created");
             let database_path = directory.path().join("sqlite-trace.db");
             let pool = open_database(&database_path)
@@ -1777,6 +1834,7 @@ mod sqlite {
                 receiver,
                 runtime,
                 dispatch,
+                span_lifecycles,
                 pool,
                 database_path: database_path.display().to_string(),
                 repository_store,
@@ -1790,10 +1848,32 @@ mod sqlite {
             future.with_subscriber(self.dispatch.clone()).await
         }
 
-        fn force_flush(&self) -> CapturedSpans {
-            tokio::task::block_in_place(|| self.runtime.force_flush().expect("providers flush"));
-            let (traces, logs) = self.receiver.captured_requests();
-            CapturedSpans::from_requests(traces, logs)
+        fn finish(self) -> (CapturedSpans, String) {
+            let Self {
+                _otlp_guard,
+                receiver,
+                runtime,
+                dispatch,
+                span_lifecycles,
+                pool,
+                database_path,
+                repository_store,
+                delivery_store,
+                merge_queue_store,
+                _directory,
+            } = self;
+            drop(repository_store);
+            drop(delivery_store);
+            drop(merge_queue_store);
+            drop(pool);
+            drop(dispatch);
+            flush_after_span_closure(&runtime, &span_lifecycles);
+            let (traces, logs) = receiver.captured_requests();
+            drop(runtime);
+            drop(receiver);
+            drop(_directory);
+            drop(_otlp_guard);
+            (CapturedSpans::from_requests(traces, logs), database_path)
         }
     }
 
@@ -1952,7 +2032,7 @@ mod sqlite {
             .await
             .expect("repository is deleted");
 
-        let captured = fixture.force_flush();
+        let (captured, database_path) = fixture.finish();
         let expected_operations = [
             "repository.create",
             "repository.count",
@@ -1971,10 +2051,7 @@ mod sqlite {
         for operation in expected_operations {
             assert_bounded_sqlite_span(sqlite_span(&captured, operation), operation, "success");
         }
-        for forbidden in [
-            "sqlite-secret-must-not-appear",
-            fixture.database_path.as_str(),
-        ] {
+        for forbidden in ["sqlite-secret-must-not-appear", database_path.as_str()] {
             captured.assert_absent(forbidden);
         }
     }
@@ -1999,7 +2076,7 @@ mod sqlite {
             .await;
         assert!(matches!(result, Err(RepositoryStoreError::Internal(_))));
 
-        let captured = fixture.force_flush();
+        let (captured, database_path) = fixture.finish();
         let span = sqlite_span(&captured, "repository.create");
         assert_bounded_sqlite_span(span, "repository.create", "failure");
         assert_eq!(
@@ -2010,7 +2087,7 @@ mod sqlite {
             "private_table_detail_must_not_appear",
             "repository_private_trigger",
             "failure-secret-must-not-appear",
-            fixture.database_path.as_str(),
+            database_path.as_str(),
         ] {
             captured.assert_absent(forbidden);
         }
@@ -2084,7 +2161,7 @@ async fn repository_routes_emit_http_roots_and_write_children() {
     assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
     drop(deleted);
 
-    let captured = fixture.force_flush();
+    let captured = fixture.finish();
     let create_request = captured.http_request("POST", "/api/v1/repositories", 201);
     assert_attribute(create_request, "ghe.http.result", "success");
     let create_write = captured.child_named(create_request, "config.repository.write");
@@ -2163,7 +2240,7 @@ async fn repository_error_routes_emit_redacted_http_roots_without_unapproved_chi
     assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     drop(unknown);
 
-    let captured = fixture.force_flush();
+    let captured = fixture.finish();
     let malformed_request = captured.http_request("POST", "/api/v1/repositories", 400);
     assert_attribute(malformed_request, "ghe.http.result", "client_error");
     assert_eq!(
@@ -2208,7 +2285,8 @@ async fn repository_store_failure_marks_http_and_write_spans_without_error_text(
     assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
     drop(failed);
 
-    let captured = fixture.force_flush();
+    let output = fixture.output.clone();
+    let captured = fixture.finish();
     let request = captured.http_request("POST", "/api/v1/repositories", 500);
     assert_attribute(request, "ghe.http.result", "server_error");
     let write = captured.child_named(request, "config.repository.write");
@@ -2228,7 +2306,7 @@ async fn repository_store_failure_marks_http_and_write_spans_without_error_text(
     captured.assert_absent("repository-trace.db");
     captured.assert_approved_attribute_keys();
     assert!(captured.has_log_body("request failed"));
-    assert!(fixture.output.text().contains("request failed"));
+    assert!(output.text().contains("request failed"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2296,7 +2374,7 @@ async fn webhook_successes_emit_bounded_hierarchy_and_span_only_identifiers() {
         .span_lifecycles
         .assert_closed_before_created("github.webhook.authenticate", "github.webhook.process");
     let exposition = fixture.metrics_text().await;
-    let captured = fixture.force_flush();
+    let (captured, output) = fixture.finish();
 
     let merge_request = captured.webhook_request_for_delivery(merge_group_delivery);
     let merge_authenticate = captured.child_named(merge_request, "github.webhook.authenticate");
@@ -2398,7 +2476,6 @@ async fn webhook_successes_emit_bounded_hierarchy_and_span_only_identifiers() {
         None
     );
 
-    let output = fixture.output.text();
     let normalized_sha_40 = WEBHOOK_SHA_40.to_ascii_lowercase();
     let normalized_sha_64 = WEBHOOK_SHA_64.to_ascii_lowercase();
     for identifier in [
@@ -4309,7 +4386,8 @@ async fn webhook_failures_mark_authentication_and_processing_without_raw_error_d
         .await;
     assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
     drop(unavailable);
-    let captured = fixture.force_flush();
+    let output = fixture.output.clone();
+    let (captured, _) = fixture.finish();
 
     let unauthorized_request = captured.webhook_request_for_delivery(unauthorized_delivery);
     let unauthorized_authenticate =
@@ -4349,7 +4427,7 @@ async fn webhook_failures_mark_authentication_and_processing_without_raw_error_d
     ] {
         captured.assert_absent(forbidden);
         captured.assert_logs_absent(forbidden);
-        assert!(!fixture.output.text().contains(forbidden));
+        assert!(!output.text().contains(forbidden));
     }
 }
 
@@ -5026,6 +5104,7 @@ mod retention {
         receiver: RunningReceiver,
         runtime: super::super::TelemetryRuntime,
         dispatch: Dispatch,
+        span_lifecycles: CapturedSpanLifecycles,
         pool: SqlitePool,
         delivery_store: DeliveryStore,
         merge_queue_store: MergeQueueStore,
@@ -5054,7 +5133,8 @@ mod retention {
                 Metrics::new(),
             )
             .expect("telemetry runtime initializes");
-            let dispatch = Dispatch::new(subscriber);
+            let span_lifecycles = CapturedSpanLifecycles::default();
+            let dispatch = Dispatch::new(subscriber.with(span_lifecycles.clone()));
             let directory = tempfile::tempdir().expect("temporary directory is created");
             let database_path = directory.path().join("retention-trace.db");
             let pool = open_database(&database_path)
@@ -5069,6 +5149,7 @@ mod retention {
                 receiver,
                 runtime,
                 dispatch,
+                span_lifecycles,
                 pool,
                 delivery_store,
                 merge_queue_store,
@@ -5092,9 +5173,28 @@ mod retention {
             .await;
         }
 
-        fn force_flush(&self) -> CapturedSpans {
-            tokio::task::block_in_place(|| self.runtime.force_flush().expect("providers flush"));
-            let (traces, logs) = self.receiver.captured_requests();
+        fn finish(self) -> CapturedSpans {
+            let Self {
+                _otlp_guard,
+                receiver,
+                runtime,
+                dispatch,
+                span_lifecycles,
+                pool,
+                delivery_store,
+                merge_queue_store,
+                _directory,
+            } = self;
+            drop(delivery_store);
+            drop(merge_queue_store);
+            drop(pool);
+            drop(dispatch);
+            flush_after_span_closure(&runtime, &span_lifecycles);
+            let (traces, logs) = receiver.captured_requests();
+            drop(runtime);
+            drop(receiver);
+            drop(_directory);
+            drop(_otlp_guard);
             CapturedSpans::from_requests(traces, logs)
         }
     }
@@ -5254,7 +5354,7 @@ mod retention {
             .await;
         assert_eq!(delivery_count(&fixture.pool).await, 0);
         assert_eq!(queue_attempt_count(&fixture.pool).await, 0);
-        let captured = fixture.force_flush();
+        let captured = fixture.finish();
 
         let root = captured.one_named("retention.run");
         assert_root_outcome_only(root, "success");
@@ -5275,7 +5375,8 @@ mod retention {
             .run_pass(standard_config(), &shutdown_receiver)
             .await;
         assert_eq!(delivery_count(&fixture.pool).await, 0);
-        let captured = fixture.force_flush();
+        assert_eq!(queue_attempt_count(&fixture.pool).await, 1);
+        let captured = fixture.finish();
 
         let root = captured.one_named("retention.run");
         assert_root_outcome_only(root, "cancelled");
@@ -5290,7 +5391,6 @@ mod retention {
                 .count(),
             0
         );
-        assert_eq!(queue_attempt_count(&fixture.pool).await, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5300,7 +5400,7 @@ mod retention {
         fixture
             .run_pass(invalid_cutoff_config(), &shutdown_receiver)
             .await;
-        let captured = fixture.force_flush();
+        let captured = fixture.finish();
 
         let root = captured.one_named("retention.run");
         assert_root_outcome_only(root, "failure");
@@ -5322,7 +5422,7 @@ mod retention {
             .run_pass(standard_config(), &shutdown_receiver)
             .await;
         assert_eq!(queue_attempt_count(&fixture.pool).await, 0);
-        let captured = fixture.force_flush();
+        let captured = fixture.finish();
 
         let root = captured.one_named("retention.run");
         assert_root_outcome_only(root, "failure");

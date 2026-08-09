@@ -4,6 +4,98 @@
     "quantity": {
       "type": "string",
       "pattern": "^[0-9]+(?:\\.[0-9]+)?(?:[EPTGM]i?|Ki|k|[eE][+-]?[0-9]+|m)?$"
+    },
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    },
+    "labelSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "matchLabels": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {"type": "string"}
+        }
+      }
+    },
+    "networkPeerRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "namespaceSelector", "podSelector"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "namespaceSelector": {"$ref": "#/definitions/labelSelector"},
+        "podSelector": {"$ref": "#/definitions/labelSelector"}
+      }
+    },
+    "otlpPeer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "namespaceSelector": {"$ref": "#/definitions/labelSelector"},
+        "podSelector": {"$ref": "#/definitions/labelSelector"},
+        "ipBlock": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cidr"],
+          "properties": {
+            "cidr": {
+              "type": "string",
+              "anyOf": [
+                {
+                  "pattern": "^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])/(?:[0-9]|[12][0-9]|3[0-2])$"
+                },
+                {
+                  "pattern": "^[0-9A-Fa-f:]+/(?:[0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "required": ["ipBlock"],
+          "not": {
+            "anyOf": [
+              {"required": ["namespaceSelector"]},
+              {"required": ["podSelector"]}
+            ]
+          }
+        },
+        {
+          "required": ["namespaceSelector", "podSelector"],
+          "not": {"required": ["ipBlock"]}
+        }
+      ]
+    },
+    "ingressHost": {
+      "type": "string",
+      "maxLength": 253,
+      "anyOf": [
+        {"const": ""},
+        {
+          "pattern": "^(?:\\*\\.)?(?:[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$"
+        }
+      ]
+    },
+    "tls": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["secretName", "hosts"],
+        "properties": {
+          "secretName": {"type": "string", "minLength": 1},
+          "hosts": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1}
+          }
+        }
+      }
     }
   },
   "type": "object",
@@ -20,7 +112,11 @@
     "resources",
     "probes",
     "terminationGracePeriodSeconds",
-    "podDisruptionBudget"
+    "podDisruptionBudget",
+    "webhookIngress",
+    "metrics",
+    "administration",
+    "networkPolicy"
   ],
   "properties": {
     "replicaCount": {
@@ -346,6 +442,118 @@
       "properties": {
         "enabled": {
           "type": "boolean"
+        }
+      }
+    },
+    "webhookIngress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "className", "annotations", "host", "tls"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "className": {"type": "string"},
+        "annotations": {"$ref": "#/definitions/stringMap"},
+        "host": {"$ref": "#/definitions/ingressHost"},
+        "tls": {"$ref": "#/definitions/tls"}
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["service", "serviceMonitor"],
+      "properties": {
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "port", "annotations"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "annotations": {"$ref": "#/definitions/stringMap"}
+          }
+        },
+        "serviceMonitor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "labels", "interval", "scrapeTimeout"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "labels": {"$ref": "#/definitions/stringMap"},
+            "interval": {"type": "string", "pattern": "^[1-9][0-9]*(ms|s|m|h)$"},
+            "scrapeTimeout": {"type": "string", "pattern": "^[1-9][0-9]*(ms|s|m|h)$"}
+          }
+        }
+      }
+    },
+    "administration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["service", "ingress"],
+      "properties": {
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "port", "annotations"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "annotations": {"$ref": "#/definitions/stringMap"}
+          }
+        },
+        "ingress": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "className", "annotations", "host", "tls"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "className": {"type": "string"},
+            "annotations": {"$ref": "#/definitions/stringMap"},
+            "host": {"$ref": "#/definitions/ingressHost"},
+            "tls": {"$ref": "#/definitions/tls"}
+          }
+        }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "ingress", "egress"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "ingress": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ingressController", "prometheus", "management"],
+          "properties": {
+            "ingressController": {"$ref": "#/definitions/networkPeerRule"},
+            "prometheus": {"$ref": "#/definitions/networkPeerRule"},
+            "management": {"$ref": "#/definitions/networkPeerRule"}
+          }
+        },
+        "egress": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dns", "otlp"],
+          "properties": {
+            "dns": {"$ref": "#/definitions/networkPeerRule"},
+            "otlp": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["enabled", "peers", "ports"],
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "peers": {
+                  "type": "array",
+                  "items": {"$ref": "#/definitions/otlpPeer"}
+                },
+                "ports": {
+                  "type": "array",
+                  "uniqueItems": true,
+                  "items": {"type": "integer", "minimum": 1, "maximum": 65535}
+                }
+              }
+            }
+          }
         }
       }
     }
