@@ -16,9 +16,11 @@ disabled by default.
 - Access to a compatible `linux/amd64` application image.
 
 The chart defaults to `ghcr.io/petergrace/github-webhook-exporter`. When `image.tag` is empty, the
-StatefulSet uses the chart `appVersion`, currently `0.1.0`. Issue #50 supplies publication of the
-required GHCR release. Until that image exists, set `image.repository` and `image.tag` to an image
-that your cluster can pull.
+StatefulSet uses the chart `appVersion`, currently `0.1.0`. Pull requests and `main` are
+validation-only; only a stable `vMAJOR.MINOR.PATCH` repository tag publishes the matching
+`ghcr.io/petergrace/github-webhook-exporter:MAJOR.MINOR.PATCH` image. Published version tags are
+immutable, and the workflow never publishes `latest`, branch, SHA, or prerelease tags. The release
+tag without `v`, Cargo package version, chart version, and `appVersion` must match exactly.
 
 ## Install
 

@@ -70,6 +70,11 @@ for file_path in (
         file_path,
         "passing static checks does not prove cluster lifecycle behavior",
     )
+    require_fragment(file_path, "ghcr.io/petergrace/github-webhook-exporter")
+    require_fragment(file_path, "vMAJOR.MINOR.PATCH")
+    require_fragment(file_path, "validation-only")
+    require_fragment(file_path, "immutable")
+    require_fragment(file_path, "`latest`")
 
 require_fragment("docs/operations.md", "`just helm-render` first")
 
