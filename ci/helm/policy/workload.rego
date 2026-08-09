@@ -4,6 +4,12 @@ statefulset if {
     input.kind == "StatefulSet"
 }
 
+ordinary_workload_containers := [container | container := input.spec.template.spec.containers[_]]
+
+init_workload_containers := [container | container := input.spec.template.spec.initContainers[_]]
+
+workload_containers := array.concat(ordinary_workload_containers, init_workload_containers)
+
 replicas_are_one if {
     input.spec.replicas == 1
 }
@@ -21,7 +27,7 @@ run_as_non_root_violation if {
 }
 
 run_as_non_root_violation if {
-    some container in input.spec.template.spec.containers
+    some container in workload_containers
     not container_runs_as_non_root(container)
 }
 
@@ -94,6 +100,16 @@ service_account_token_automount_disabled if {
     input.spec.template.spec.automountServiceAccountToken == false
 }
 
+service_account_override_present if {
+    service_account_name := input.spec.template.spec.serviceAccountName
+    service_account_name != ""
+}
+
+service_account_override_present if {
+    service_account := input.spec.template.spec.serviceAccount
+    service_account != ""
+}
+
 deny contains msg if {
     statefulset
     not replicas_are_one
@@ -108,14 +124,14 @@ deny contains msg if {
 
 deny contains msg if {
     statefulset
-    some container in input.spec.template.spec.containers
+    some container in workload_containers
     container_privileged(container)
     msg := "GWE003: containers must not be privileged"
 }
 
 deny contains msg if {
     statefulset
-    some container in input.spec.template.spec.containers
+    some container in workload_containers
     not container_disallows_privilege_escalation(container)
     msg := "GWE004: containers must disable privilege escalation"
 }
@@ -134,28 +150,28 @@ deny contains msg if {
 
 deny contains msg if {
     statefulset
-    some container in input.spec.template.spec.containers
+    some container in workload_containers
     not container_has_read_only_root_filesystem(container)
     msg := "GWE007: containers must use a read-only root filesystem"
 }
 
 deny contains msg if {
     statefulset
-    some container in input.spec.template.spec.containers
+    some container in workload_containers
     container_has_capability_additions(container)
     msg := "GWE008: containers must not add Linux capabilities"
 }
 
 deny contains msg if {
     statefulset
-    some container in input.spec.template.spec.containers
+    some container in workload_containers
     not container_drops_all_capabilities(container)
     msg := "GWE009: containers must drop ALL Linux capabilities"
 }
 
 deny contains msg if {
     statefulset
-    some container in input.spec.template.spec.containers
+    some container in workload_containers
     not container_has_bounded_resources(container)
     msg := "GWE010: containers must set CPU and memory requests and limits"
 }
@@ -168,7 +184,6 @@ deny contains msg if {
 
 deny contains msg if {
     statefulset
-    service_account_name := input.spec.template.spec.serviceAccountName
-    service_account_name != ""
-    msg := "GWE012: pods must not set a serviceAccountName"
+    service_account_override_present
+    msg := "GWE012: pods must not set serviceAccountName or serviceAccount"
 }
