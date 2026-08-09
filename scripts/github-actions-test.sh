@@ -141,6 +141,9 @@ expected_steps = [
         "run": 'echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"',
     },
     {
+        "uses": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+    },
+    {
         "run": "just workflow-test",
     },
     {
