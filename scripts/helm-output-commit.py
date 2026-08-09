@@ -7,6 +7,7 @@ import ctypes
 import errno
 import fcntl
 import os
+import secrets
 import stat
 import sys
 from dataclasses import dataclass
@@ -150,6 +151,38 @@ def validate_owned_directory(
         os.close(directory_fd)
 
 
+def snapshot_at(
+    parent_fd: int,
+    destination_name: str,
+    stage_name: str,
+    output_kind: str,
+    allow_generated_root: bool,
+) -> Snapshot:
+    """Capture approved child identities beneath an already locked parent."""
+    parent_identity = Identity.from_stat(os.fstat(parent_fd))
+    stage_status = entry_status(parent_fd, stage_name)
+    if stage_status is None or not stat.S_ISDIR(stage_status.st_mode):
+        raise UnsafeOutput
+    stage_identity = Identity.from_stat(stage_status)
+    validate_owned_directory(parent_fd, stage_name, stage_identity, output_kind, False)
+
+    destination_status = entry_status(parent_fd, destination_name)
+    if destination_status is None:
+        destination_identity = None
+    else:
+        if not stat.S_ISDIR(destination_status.st_mode):
+            raise UnsafeOutput
+        destination_identity = Identity.from_stat(destination_status)
+        validate_owned_directory(
+            parent_fd,
+            destination_name,
+            destination_identity,
+            output_kind,
+            allow_generated_root,
+        )
+    return Snapshot(parent_identity, destination_identity, stage_identity)
+
+
 def snapshot(
     parent_path: str,
     destination_name: str,
@@ -162,28 +195,82 @@ def snapshot(
     validate_name(stage_name)
     parent_fd = open_parent(parent_path)
     try:
-        parent_identity = Identity.from_stat(os.fstat(parent_fd))
+        return snapshot_at(
+            parent_fd,
+            destination_name,
+            stage_name,
+            output_kind,
+            allow_generated_root,
+        )
+    finally:
+        os.close(parent_fd)
+
+
+def create_stage(
+    parent_path: str,
+    destination_name: str,
+    output_kind: str,
+    allow_generated_root: bool,
+) -> tuple[str, Snapshot]:
+    """Create, mark, and snapshot a stage, removing it safely on preparation failure."""
+    validate_name(destination_name)
+    if not output_kind or "\n" in output_kind or "\r" in output_kind:
+        raise UnsafeOutput
+    parent_fd = open_parent(parent_path)
+    stage_name: str | None = None
+    stage_identity: Identity | None = None
+    try:
+        for _attempt in range(128):
+            candidate = f".{destination_name}.stage.{secrets.token_hex(6)}"
+            try:
+                os.mkdir(candidate, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            stage_name = candidate
+            break
+        if stage_name is None:
+            raise UnsafeOutput
         stage_status = entry_status(parent_fd, stage_name)
         if stage_status is None or not stat.S_ISDIR(stage_status.st_mode):
             raise UnsafeOutput
         stage_identity = Identity.from_stat(stage_status)
-        validate_owned_directory(parent_fd, stage_name, stage_identity, output_kind, False)
-
-        destination_status = entry_status(parent_fd, destination_name)
-        if destination_status is None:
-            destination_identity = None
-        else:
-            if not stat.S_ISDIR(destination_status.st_mode):
-                raise UnsafeOutput
-            destination_identity = Identity.from_stat(destination_status)
-            validate_owned_directory(
-                parent_fd,
-                destination_name,
-                destination_identity,
-                output_kind,
-                allow_generated_root,
+        stage_fd = open_directory(parent_fd, stage_name, stage_identity)
+        try:
+            marker_fd = os.open(
+                GENERATED_MARKER,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=stage_fd,
             )
-        return Snapshot(parent_identity, destination_identity, stage_identity)
+            try:
+                marker = f"{output_kind}\n".encode()
+                if os.write(marker_fd, marker) != len(marker):
+                    raise UnsafeOutput
+            finally:
+                os.close(marker_fd)
+        finally:
+            os.close(stage_fd)
+
+        approved = snapshot_at(
+            parent_fd,
+            destination_name,
+            stage_name,
+            output_kind,
+            allow_generated_root,
+        )
+        parent_status = os.stat(parent_path, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(parent_status.st_mode)
+            or Identity.from_stat(parent_status) != approved.parent
+        ):
+            raise UnsafeOutput
+        return stage_name, approved
+    except Exception:
+        if stage_name is not None and stage_identity is not None:
+            remove_directory_tree(
+                parent_fd, stage_name, stage_identity, stage_identity.device
+            )
+        raise
     finally:
         os.close(parent_fd)
 
@@ -251,36 +338,72 @@ def commit(
     allow_generated_root: bool,
     approved: Snapshot,
 ) -> None:
-    """Revalidate identities, atomically commit the stage, and remove only swapped output."""
+    """Revalidate identities and atomically commit, with no fallible post-commit work."""
     validate_name(destination_name)
     validate_name(stage_name)
     parent_fd = open_parent(parent_path, approved.parent)
+    committed = False
     try:
         stage_status = entry_status(parent_fd, stage_name)
+        destination_status = entry_status(parent_fd, destination_name)
+
+        if approved.destination is None:
+            if (
+                stage_status is None
+                and destination_status is not None
+                and stat.S_ISDIR(destination_status.st_mode)
+                and Identity.from_stat(destination_status) == approved.stage
+            ):
+                validate_owned_directory(
+                    parent_fd, destination_name, approved.stage, output_kind, False
+                )
+                committed = True
+                return
+            if (
+                stage_status is None
+                or not stat.S_ISDIR(stage_status.st_mode)
+                or Identity.from_stat(stage_status) != approved.stage
+                or destination_status is not None
+            ):
+                raise UnsafeOutput
+            validate_owned_directory(
+                parent_fd, stage_name, approved.stage, output_kind, False
+            )
+            renameat2(parent_fd, stage_name, destination_name, RENAME_NOREPLACE)
+            committed = True
+            return
+
+        if (
+            destination_status is not None
+            and stage_status is not None
+            and stat.S_ISDIR(destination_status.st_mode)
+            and stat.S_ISDIR(stage_status.st_mode)
+            and Identity.from_stat(destination_status) == approved.stage
+            and Identity.from_stat(stage_status) == approved.destination
+        ):
+            validate_owned_directory(
+                parent_fd, destination_name, approved.stage, output_kind, False
+            )
+            validate_owned_directory(
+                parent_fd,
+                stage_name,
+                approved.destination,
+                output_kind,
+                allow_generated_root,
+            )
+            committed = True
+            return
+
         if (
             stage_status is None
             or not stat.S_ISDIR(stage_status.st_mode)
             or Identity.from_stat(stage_status) != approved.stage
-        ):
-            raise UnsafeOutput
-        validate_owned_directory(parent_fd, stage_name, approved.stage, output_kind, False)
-
-        destination_status = entry_status(parent_fd, destination_name)
-        if approved.destination is None:
-            if destination_status is not None:
-                raise UnsafeOutput
-            renameat2(parent_fd, stage_name, destination_name, RENAME_NOREPLACE)
-            committed_status = entry_status(parent_fd, destination_name)
-            if committed_status is None or Identity.from_stat(committed_status) != approved.stage:
-                raise UnsafeOutput
-            return
-
-        if (
-            destination_status is None
+            or destination_status is None
             or not stat.S_ISDIR(destination_status.st_mode)
             or Identity.from_stat(destination_status) != approved.destination
         ):
             raise UnsafeOutput
+        validate_owned_directory(parent_fd, stage_name, approved.stage, output_kind, False)
         validate_owned_directory(
             parent_fd,
             destination_name,
@@ -289,44 +412,50 @@ def commit(
             allow_generated_root,
         )
         renameat2(parent_fd, stage_name, destination_name, RENAME_EXCHANGE)
-        committed_status = entry_status(parent_fd, destination_name)
-        swapped_status = entry_status(parent_fd, stage_name)
+        committed = True
+    finally:
+        try:
+            os.close(parent_fd)
+        except OSError:
+            if not committed:
+                raise
+
+
+def cleanup_identity(
+    parent_path: str,
+    stage_name: str,
+    parent_identity: Identity,
+    stage_identity: Identity,
+) -> None:
+    """Remove only a named stage matching explicit parent and directory identities."""
+    validate_name(stage_name)
+    parent_fd = open_parent(parent_path, parent_identity)
+    try:
+        stage_status = entry_status(parent_fd, stage_name)
+        if stage_status is None:
+            return
         if (
-            committed_status is None
-            or Identity.from_stat(committed_status) != approved.stage
-            or swapped_status is None
-            or Identity.from_stat(swapped_status) != approved.destination
+            not stat.S_ISDIR(stage_status.st_mode)
+            or Identity.from_stat(stage_status) != stage_identity
         ):
-            try:
-                renameat2(parent_fd, stage_name, destination_name, RENAME_EXCHANGE)
-            except (OSError, UnsafeOutput):
-                pass
             raise UnsafeOutput
         remove_directory_tree(
-            parent_fd,
-            stage_name,
-            approved.destination,
-            approved.destination.device,
+            parent_fd, stage_name, stage_identity, stage_identity.device
         )
     finally:
         os.close(parent_fd)
 
 
 def cleanup(parent_path: str, stage_name: str, approved: Snapshot) -> None:
-    """Remove only the unchanged prepared stage after a failed or interrupted generation."""
-    validate_name(stage_name)
-    parent_fd = open_parent(parent_path, approved.parent)
-    try:
-        stage_status = entry_status(parent_fd, stage_name)
-        if stage_status is None:
-            return
-        if Identity.from_stat(stage_status) != approved.stage:
-            raise UnsafeOutput
-        remove_directory_tree(
-            parent_fd, stage_name, approved.stage, approved.stage.device
-        )
-    finally:
-        os.close(parent_fd)
+    """Remove only the unchanged prepared stage after an uncommitted generation."""
+    cleanup_identity(parent_path, stage_name, approved.parent, approved.stage)
+
+
+def cleanup_committed(parent_path: str, stage_name: str, approved: Snapshot) -> None:
+    """Remove only the identity-checked old output left by a committed exchange."""
+    if approved.destination is None:
+        raise UnsafeOutput
+    cleanup_identity(parent_path, stage_name, approved.parent, approved.destination)
 
 
 def parse_boolean(value: str) -> bool:
@@ -349,9 +478,15 @@ def parse_snapshot(arguments: list[str]) -> Snapshot:
 
 
 def main() -> None:
-    """Dispatch snapshot, commit, or cleanup without disclosing caller-controlled values."""
+    """Dispatch preparation, commit, or cleanup without disclosing caller values."""
     try:
         command = sys.argv[1]
+        if command == "prepare" and len(sys.argv) == 6:
+            stage_name, approved = create_stage(
+                sys.argv[2], sys.argv[3], sys.argv[4], parse_boolean(sys.argv[5])
+            )
+            print(f"{stage_name} {approved.serialize()}")
+            return
         if command == "snapshot" and len(sys.argv) == 7:
             approved = snapshot(
                 sys.argv[2],
@@ -374,6 +509,19 @@ def main() -> None:
             return
         if command == "cleanup" and len(sys.argv) == 11:
             cleanup(sys.argv[2], sys.argv[3], parse_snapshot(sys.argv[4:]))
+            return
+        if command == "cleanup-committed" and len(sys.argv) == 11:
+            cleanup_committed(
+                sys.argv[2], sys.argv[3], parse_snapshot(sys.argv[4:])
+            )
+            return
+        if command == "cleanup-stage" and len(sys.argv) == 8:
+            cleanup_identity(
+                sys.argv[2],
+                sys.argv[3],
+                parse_identity(sys.argv[4], sys.argv[5]),
+                parse_identity(sys.argv[6], sys.argv[7]),
+            )
             return
         raise UnsafeOutput
     except (IndexError, OSError, OverflowError, UnsafeOutput, ValueError):

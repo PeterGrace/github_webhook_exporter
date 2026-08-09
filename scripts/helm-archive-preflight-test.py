@@ -95,6 +95,19 @@ def main() -> None:
             archive_path = root / archive_name
             write_archive(archive_path, members)
             expect_rejected(archive_path, "ARCHIVE004", members[1][0])
+            collision_destination = root / f"{archive_name}-extracted"
+            collision_destination.mkdir()
+            sentinel = collision_destination / "sentinel"
+            sentinel.write_text("preserve-me\n", encoding="utf-8")
+            try:
+                PREFLIGHT.extract_archive(archive_path, "chart", collision_destination)
+            except SystemExit as error:
+                assert str(error) == "Helm archive preflight failed: ARCHIVE004"
+                assert members[1][0] not in str(error)
+            else:
+                raise AssertionError("colliding archive unexpectedly reached extraction")
+            assert list(collision_destination.iterdir()) == [sentinel]
+            assert sentinel.read_text(encoding="utf-8") == "preserve-me\n"
 
         extraction_directory = root / "extracted"
         extraction_directory.mkdir()
