@@ -79,31 +79,24 @@ git tag v0.1.0
 git push origin v0.1.0
 docker pull ghcr.io/petergrace/github-webhook-exporter:0.1.0
 helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.0
-helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter \
-  --version 0.1.0
+helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.0
 ```
 
-Release policy treats published version tags as immutable. The workflow rejects an image tag that
-already exists and never publishes `latest`, branch, SHA, or prerelease tags. This client-side
-overwrite guard is not atomic with the registry push; repository administrators must prevent
-concurrent or manual pushes to release tags because GHCR does not enforce this repository policy.
-If validation fails, fix the source and create a new patch release rather than moving the failed
-repository tag. A transient workflow failure may be rerun only when the GHCR image does not exist;
-an existing image is a completed publication and must not be overwritten.
+Published version tags are immutable. The workflow rejects an image tag that already exists. The workflow never publishes `latest`, branch, SHA, or prerelease tags. The overwrite guard is not atomic with the registry push; repository administrators must prevent concurrent or manual pushes to release tags because GHCR does not enforce this repository policy. If validation fails, rerun the original failed workflow attempt without moving the tag. Only the image-existing/chart-missing state with an exact matching digest may resume as chart-only recovery. Completed, chart-only, and digest-conflict states fail closed without overwrite.
 
 #### Image and chart state matrix
 
 | Image state | Chart state | Result |
 | --- | --- | --- |
 | missing | missing | Publish the immutable image first, then the chart after validation. |
-| matching digest | missing | chart-only recovery; rerun the original failed workflow attempt and publish the chart only after the remote image configuration digest matches the rebuilt image. |
-| different digest | missing | Fail closed; do not overwrite. |
-| missing | present | Fail closed; chart-only registry state fails closed. |
-| matching digest | present | Completed; no overwrite. |
-| different digest | present | Fail closed; no overwrite. |
+| matching digest | missing | Chart-only recovery; rerun the original failed workflow attempt without moving the tag after confirming the remote image configuration digest exactly matches the rebuilt image. |
+| different digest | missing | Fail closed; digest-conflict state fails closed without overwrite. |
+| missing | present | Fail closed; chart-only registry state fails closed without overwrite. |
+| matching digest | present | Completed; fail closed without overwrite. |
+| different digest | present | Fail closed; digest-conflict state fails closed without overwrite. |
 
-chart-only recovery is only allowed when the remote image configuration digest matches the rebuilt
-image. Do not move the tag; rerun the original failed workflow attempt instead.
+The only resumable state is image-existing/chart-missing with an exact digest match. Any completed
+publication, chart-only registry state, or digest conflict must not be overwritten.
 
 ## Helm deployment
 

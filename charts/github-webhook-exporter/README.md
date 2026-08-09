@@ -20,25 +20,22 @@ StatefulSet uses the chart `appVersion`, currently `0.1.0`.
 
 ## Release consumption
 
-Stable `vMAJOR.MINOR.PATCH` tags publish one immutable image and one immutable Helm OCI chart. The
-chart lives at `oci://ghcr.io/petergrace/charts/github-webhook-exporter`. Pull requests and `main`
-remain validation-only; only a stable tag publishes the matching
-`ghcr.io/petergrace/github-webhook-exporter:MAJOR.MINOR.PATCH` image. The release tag without `v`,
-Cargo package version, chart version, and `appVersion` must match exactly.
-
-Consume a release with the same version on both sides:
+- Stable `vMAJOR.MINOR.PATCH` tags publish one immutable image and one immutable Helm OCI chart.
+- Pull requests and `main` remain validation-only; only a stable tag publishes the matching `ghcr.io/petergrace/github-webhook-exporter:MAJOR.MINOR.PATCH` image.
+- The chart lives at `oci://ghcr.io/petergrace/charts/github-webhook-exporter`.
+- Consume a release with matching versions on both sides:
 
 ```bash
 docker pull ghcr.io/petergrace/github-webhook-exporter:0.1.0
 helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.0
-helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter \
-  --version 0.1.0
+helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.0
 ```
 
-Release policy treats published version tags as immutable, and the workflow never publishes
-`latest`, branch, SHA, or prerelease tags. Its client-side overwrite guard is not atomic with the
-registry push, so repository administrators must also prevent concurrent or manual pushes to
-release tags. chart-only recovery is allowed only when the remote image configuration digest matches the rebuilt image; rerun the original failed workflow attempt rather than moving the tag.
+- Published version tags are immutable. The workflow never publishes `latest`, branch, SHA, or prerelease tags.
+- The client-side overwrite guard is not atomic with the registry push, so repository administrators must also prevent concurrent or manual pushes to release tags.
+- If validation fails, rerun the original failed workflow attempt without moving the tag.
+- Only the image-existing/chart-missing state with an exact matching digest may resume as chart-only recovery.
+- Completed, chart-only, and digest-conflict states fail closed without overwrite.
 
 ## Install
 

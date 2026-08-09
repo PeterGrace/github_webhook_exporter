@@ -65,6 +65,22 @@ def require_fragment(file_path: str, fragment: str) -> None:
         fail(f"missing required documentation reference in {file_path}: {fragment}")
 
 
+shared_release_fragments = (
+    "ghcr.io/petergrace/github-webhook-exporter",
+    "vMAJOR.MINOR.PATCH",
+    "validation-only",
+    "immutable",
+    "overwrite guard is not atomic",
+    "`latest`",
+    "oci://ghcr.io/petergrace/charts/github-webhook-exporter",
+    "helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.0",
+    "helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.0",
+    "Published version tags are immutable.",
+    "The workflow never publishes `latest`, branch, SHA, or prerelease tags.",
+    "Only the image-existing/chart-missing state with an exact matching digest may resume as chart-only recovery.",
+    "Completed, chart-only, and digest-conflict states fail closed without overwrite.",
+)
+
 for file_path in (
     "charts/github-webhook-exporter/README.md",
     "docs/operations.md",
@@ -77,22 +93,20 @@ for file_path in (
         file_path,
         "passing static checks does not prove cluster lifecycle behavior",
     )
-    require_fragment(file_path, "ghcr.io/petergrace/github-webhook-exporter")
-    require_fragment(file_path, "vMAJOR.MINOR.PATCH")
-    require_fragment(file_path, "validation-only")
-    require_fragment(file_path, "immutable")
-    require_fragment(file_path, "overwrite guard is not atomic")
-    require_fragment(file_path, "`latest`")
-    require_fragment(file_path, "oci://ghcr.io/petergrace/charts/github-webhook-exporter")
-    require_fragment(file_path, "helm pull")
-    require_fragment(file_path, "helm install")
-    require_fragment(file_path, "digest matches")
-    require_fragment(file_path, "chart-only recovery")
+    for fragment in shared_release_fragments:
+        require_fragment(file_path, fragment)
 
 require_fragment("docs/operations.md", "`just helm-render` first")
 require_fragment("docs/operations.md", "Image state")
 require_fragment("docs/operations.md", "Chart state")
-require_fragment("docs/operations.md", "chart-only registry state fails closed")
+require_fragment(
+    "docs/operations.md",
+    "If validation fails, rerun the original failed workflow attempt without moving the tag.",
+)
+require_fragment(
+    "docs/operations.md",
+    "chart-only registry state fails closed without overwrite.",
+)
 
 if not isinstance(workflow, dict):
     fail("workflow did not parse as a mapping")
