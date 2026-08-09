@@ -31,7 +31,8 @@ build_image() {
     local source_date_epoch="$2"
     local created_timestamp="$3"
 
-    docker build \
+    docker buildx build \
+        --load \
         --no-cache \
         --platform linux/amd64 \
         --provenance=false \

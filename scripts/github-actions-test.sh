@@ -48,6 +48,11 @@ with open("scripts/helm-package-test.sh", encoding="utf-8") as file_handle:
 if 'readonly PACKAGE_NAME="github-webhook-exporter-0.1.0.tgz"' in package_test:
     fail("Helm package validation must not hard-code the current chart version")
 
+with open("scripts/image-reproducibility-test.sh", encoding="utf-8") as file_handle:
+    reproducibility_test = file_handle.read()
+if "docker buildx build" not in reproducibility_test or "--load" not in reproducibility_test:
+    fail("image reproducibility test must use the release buildx load path")
+
 
 result = subprocess.run(
     ["yq", "eval", "-o=json", ".", workflow_path],

@@ -105,6 +105,7 @@ if not isinstance(config_digest, str):
     raise SystemExit(1)
 if re.fullmatch(r"sha256:[0-9a-f]{64}", config_digest) is None:
     raise SystemExit(1)
+# For a single-platform manifest, both values identify the same image config blob.
 print("matching" if config_digest == local_image_id else "different")
 ' "${local_image_id}" "${manifest_json}" 2>"${TEMPORARY_DIRECTORY}/parser.stderr")"; then
         fail "image inspection failed"
