@@ -99,7 +99,10 @@ jobs:
         id: version
         run: |
           version="$(scripts/release-version.sh "$GITHUB_REF_NAME")"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          commit_timestamp="$(git show -s --format=%cI "$GITHUB_SHA")"
+          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          printf 'version=%s\ncommit_timestamp=%s\nsource_date_epoch=%s\n' \
+              "$version" "$commit_timestamp" "$source_date_epoch" >> "$GITHUB_OUTPUT"
 
       - name: Install pinned CI tools
         run: scripts/install-ci-tools.sh "$RUNNER_TEMP/ci-tools"
@@ -152,6 +155,7 @@ jobs:
           images: ghcr.io/petergrace/github-webhook-exporter
           tags: type=raw,value=${{ steps.version.outputs.version }}
           flavor: latest=false
+          labels: org.opencontainers.image.created=${{ steps.version.outputs.commit_timestamp }}
 
       - name: Build the production image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
@@ -162,6 +166,7 @@ jobs:
           push: false
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
+          build-args: SOURCE_DATE_EPOCH=${{ steps.version.outputs.source_date_epoch }}
           cache-from: type=gha,scope=production-image
           cache-to: type=gha,mode=max,scope=production-image
 

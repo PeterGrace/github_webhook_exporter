@@ -233,7 +233,7 @@ expected_publish_steps = [
     {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"},
     {
         "id": "version",
-        "run": 'version="$(scripts/release-version.sh "$GITHUB_REF_NAME")"\necho "version=${version}" >> "$GITHUB_OUTPUT"\n',
+        "run": 'version="$(scripts/release-version.sh "$GITHUB_REF_NAME")"\ncommit_timestamp="$(git show -s --format=%cI "$GITHUB_SHA")"\nsource_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"\nprintf \'version=%s\\ncommit_timestamp=%s\\nsource_date_epoch=%s\\n\' \\\n    "$version" "$commit_timestamp" "$source_date_epoch" >> "$GITHUB_OUTPUT"\n',
     },
     {"run": 'scripts/install-ci-tools.sh "$RUNNER_TEMP/ci-tools"'},
     {"run": 'echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"'},
@@ -253,6 +253,7 @@ expected_publish_steps = [
             "images": "ghcr.io/petergrace/github-webhook-exporter",
             "tags": "type=raw,value=${{ steps.version.outputs.version }}",
             "flavor": "latest=false",
+            "labels": "org.opencontainers.image.created=${{ steps.version.outputs.commit_timestamp }}",
         },
     },
     {
@@ -264,6 +265,7 @@ expected_publish_steps = [
             "push": False,
             "tags": "${{ steps.metadata.outputs.tags }}",
             "labels": "${{ steps.metadata.outputs.labels }}",
+            "build-args": "SOURCE_DATE_EPOCH=${{ steps.version.outputs.source_date_epoch }}",
             "cache-from": "type=gha,scope=production-image",
             "cache-to": "type=gha,mode=max,scope=production-image",
         },
@@ -305,9 +307,21 @@ for index, expected_step in enumerate(expected_publish_steps):
     if actual_contract != expected_step:
         fail(f"workflow publication step {index + 1} does not match the expected contract")
 
-metadata_tags = publish_steps[7].get("with", {}).get("tags", "").lower()
+metadata_inputs = publish_steps[7].get("with", {})
+metadata_tags = metadata_inputs.get("tags", "").lower()
 if any(disallowed in metadata_tags for disallowed in ("latest", "branch", "sha")):
     fail("workflow publication metadata must use only the normalized release tag")
+
+expected_created_label = (
+    "org.opencontainers.image.created="
+    "${{ steps.version.outputs.commit_timestamp }}"
+)
+if metadata_inputs.get("labels") != expected_created_label:
+    fail("workflow image created label must use the checked-out commit timestamp")
+
+version_step_run = publish_steps[1].get("run", "")
+if "git show -s --format=%cI \"$GITHUB_SHA\"" not in version_step_run:
+    fail("workflow image created label source must not use unconstrained current time")
 
 for index, step in enumerate(publish_steps):
     if step.get("with", {}).get("push") is True:
