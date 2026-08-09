@@ -50,6 +50,27 @@ def fail(message: str) -> None:
     raise SystemExit(message)
 
 
+def require_fragment(file_path: str, fragment: str) -> None:
+    with open(file_path, encoding="utf-8") as file_handle:
+        contents = file_handle.read()
+    if fragment not in contents:
+        fail(f"missing required documentation reference in {file_path}: {fragment}")
+
+
+for file_path in (
+    "charts/github-webhook-exporter/README.md",
+    "docs/operations.md",
+):
+    require_fragment(file_path, "just helm-static")
+    require_fragment(file_path, "just image-smoke")
+    require_fragment(file_path, "dist/github-webhook-exporter-0.1.0.tgz")
+    require_fragment(file_path, "1.31.0 through 1.35.0")
+    require_fragment(
+        file_path,
+        "passing static checks does not prove cluster lifecycle behavior",
+    )
+
+
 if not isinstance(workflow, dict):
     fail("workflow did not parse as a mapping")
 

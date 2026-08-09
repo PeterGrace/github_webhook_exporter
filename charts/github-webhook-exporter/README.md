@@ -371,13 +371,21 @@ liveness and readiness.
 From the repository root, run:
 
 ```bash
-just helm-lint
-just helm-test
+just helm-static
+just image-smoke
+helm show chart dist/github-webhook-exporter-0.1.0.tgz
+helm show values dist/github-webhook-exporter-0.1.0.tgz
+helm template archive dist/github-webhook-exporter-0.1.0.tgz --kube-version 1.35.0 >/dev/null
 just helm-kind-acceptance
 ```
 
-`helm-lint` validates chart metadata and defaults. `helm-test` checks schema, rendering, security,
-storage, Secret-reference, probe, PDB, and shutdown-boundary contracts. `helm-kind-acceptance`
-creates a disposable Kind cluster and confirms that Kubernetes accepts the StatefulSet, Service,
-ConfigMap, and PVC APIs. It does not wait for the unpublished application image, test readiness, or
-exercise runtime lifecycle behavior.
+`just helm-static` validates chart metadata, rendering, schema, policy, secret, and packaged
+archive contracts across the supported Kubernetes range 1.31.0 through 1.35.0. `just image-smoke`
+builds the production image and checks the runtime and persistence contract locally. The packaged
+chart archive is always `dist/github-webhook-exporter-0.1.0.tgz`; use `helm show chart` and `helm
+show values` for local inspection before distributing or reusing it. `helm template archive` with
+`--kube-version 1.35.0` inspects the packaged chart without talking to a cluster.
+
+`just helm-kind-acceptance` creates a disposable Kind cluster and confirms that Kubernetes accepts
+the StatefulSet, Service, ConfigMap, and PVC APIs. It does not prove cluster lifecycle behavior,
+and passing static checks does not prove cluster lifecycle behavior.

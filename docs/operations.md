@@ -86,6 +86,50 @@ in the pod template causes ConfigMap-backed value changes to trigger the Statefu
 by itself guarantee Recreate-equivalent handoff or prevent writer overlap on every storage
 provider; see the chart README for this lifecycle limitation.
 
+## Helm package validation and maintenance
+
+Prerequisites: `just`, `helm`, `docker`, `kubeconform`, `conftest`, and `yq` on PATH. The pinned
+CI install script keeps those versions aligned with the workflow contract.
+
+Run these focused checks from the repository root after installing the pinned CI tools:
+
+```bash
+just helm-static
+just image-smoke
+just workflow-test
+just helm-kind-acceptance
+```
+
+`just helm-static` validates chart metadata, rendering, schema, policy, secret, and packaged
+archive contracts across the supported Kubernetes range 1.31.0 through 1.35.0. `just image-smoke`
+builds and exercises the production image locally. `just workflow-test` checks the GitHub Actions
+contract, including the exact archive path `dist/github-webhook-exporter-0.1.0.tgz`. `just
+helm-kind-acceptance` is the later cluster-acceptance step: it confirms API acceptance for the
+rendered StatefulSet, Service, ConfigMap, and PVC, but it does not prove cluster lifecycle
+behavior.
+
+For local archive inspection, use the fixed package name directly:
+
+```bash
+helm show chart dist/github-webhook-exporter-0.1.0.tgz
+helm show values dist/github-webhook-exporter-0.1.0.tgz
+helm template archive dist/github-webhook-exporter-0.1.0.tgz --kube-version 1.35.0 >/dev/null
+```
+
+If `just helm-policy` fails, inspect the rendered manifests under `dist/rendered/` and compare them
+with the bounded policy fixtures under `ci/helm/negative/policy/`. If `just helm-secrets` fails,
+inspect the rendered manifests and ensure the chart never copies credentials into ConfigMaps,
+Services, Ingresses, ServiceMonitors, or NetworkPolicies. The chart README documents the exact
+Secret contract for runtime credentials.
+
+When updating CI tools, edit `ci/tool-versions.env` and the corresponding checksums together, then
+re-run `scripts/install-ci-tools.sh` or `just workflow-test` to confirm the pinned downloads still
+validate. Do not rely on runner-provided tools or silently accept checksum drift.
+
+Static validation only covers packaging, render, schema, policy, and smoke-test contracts.
+passing static checks does not prove cluster lifecycle behavior.
+Runtime readiness and rollout remain a cluster responsibility.
+
 ## Remote telemetry
 
 Structured stderr logging is always active. Remote trace and log export is optional and starts only
