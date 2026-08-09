@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly REPOSITORY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPOSITORY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly REPOSITORY_ROOT
 readonly VALIDATOR="${REPOSITORY_ROOT}/scripts/release-version.sh"
-readonly TEMPORARY_DIRECTORY="$(mktemp -d)"
+TEMPORARY_DIRECTORY="$(mktemp -d)"
+readonly TEMPORARY_DIRECTORY
 trap 'rm -rf "${TEMPORARY_DIRECTORY}"' EXIT
 
 fail() {

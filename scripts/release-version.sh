@@ -45,9 +45,12 @@ if [[ ! "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$
 fi
 
 readonly RELEASE_VERSION="${RELEASE_TAG#v}"
-readonly CARGO_VERSION="$(extract_cargo_version "${CARGO_MANIFEST}")"
-readonly CHART_VERSION="$(extract_chart_value version "${CHART_METADATA}")"
-readonly APP_VERSION="$(extract_chart_value appVersion "${CHART_METADATA}")"
+CARGO_VERSION="$(extract_cargo_version "${CARGO_MANIFEST}")"
+readonly CARGO_VERSION
+CHART_VERSION="$(extract_chart_value version "${CHART_METADATA}")"
+readonly CHART_VERSION
+APP_VERSION="$(extract_chart_value appVersion "${CHART_METADATA}")"
+readonly APP_VERSION
 
 [[ -n "${CARGO_VERSION}" ]] || fail "Cargo package version is missing"
 [[ -n "${CHART_VERSION}" ]] || fail "Helm chart version is missing"
