@@ -256,8 +256,6 @@
         "tracesEndpoint",
         "logsEndpoint",
         "timeoutMilliseconds",
-        "tracesTimeoutMilliseconds",
-        "logsTimeoutMilliseconds",
         "serviceName",
         "queueCapacity",
         "batchSize",
@@ -307,7 +305,7 @@
     "persistence": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["storageClass", "accessModes", "size"],
+      "required": ["accessModes", "size"],
       "properties": {
         "storageClass": {
           "type": ["string", "null"]

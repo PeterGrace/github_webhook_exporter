@@ -1,0 +1,3 @@
+webhookIngress:
+  enabled: true
+  host: hooks.example.test

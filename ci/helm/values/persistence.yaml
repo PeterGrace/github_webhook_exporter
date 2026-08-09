@@ -1,0 +1,3 @@
+persistence:
+  storageClass: fast-ssd
+  size: 2Gi

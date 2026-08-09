@@ -13,10 +13,41 @@ test:
 helm-lint:
     helm lint "{{helm-chart}}"
 
+# Render the deterministic supported Helm matrix.
+helm-render output-directory="dist/rendered":
+    scripts/helm-render-matrix.sh "{{helm-chart}}" "{{output-directory}}"
+
 # Exercise Helm chart schema, rendering, and Secret argument contracts.
 helm-test:
     scripts/helm-chart-test.sh "{{helm-chart}}"
     scripts/helm-kind-secret-argv-test.sh scripts/helm-kind-acceptance.sh "{{helm-chart}}"
+
+# Validate the exact shared render matrix against Kubernetes schemas.
+helm-kubeconform: helm-render
+    scripts/helm-kubeconform.sh "dist/rendered"
+
+# Validate the exact shared render matrix against the workload security policy.
+helm-policy: helm-render
+    scripts/helm-policy-test.sh "dist/rendered"
+
+# Scan chart source, fixtures, and the exact shared render matrix for credentials.
+helm-secrets: helm-render
+    scripts/helm-secret-scan.sh --test "{{helm-chart}}" "dist/rendered"
+
+# Package the Helm chart and revalidate the extracted archive.
+helm-package output-directory="dist":
+    scripts/helm-package-test.sh "{{helm-chart}}" "{{output-directory}}"
+
+# Run the full static Helm chart validation suite.
+helm-static: helm-lint helm-test helm-kubeconform helm-policy helm-secrets helm-package
+
+# Run focused Helm output, archive, installer, and workflow security regressions.
+helm-security-test:
+    scripts/helm-security-self-test.sh
+
+# Verify the GitHub Actions workflow contract.
+workflow-test:
+    scripts/github-actions-test.sh .github/workflows/helm-package-ci.yml
 
 # Verify the rendered chart is accepted by a disposable Kind cluster.
 helm-kind-acceptance:

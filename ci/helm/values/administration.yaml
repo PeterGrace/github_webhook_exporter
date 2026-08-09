@@ -1,0 +1,6 @@
+administration:
+  service:
+    enabled: true
+  ingress:
+    enabled: true
+    host: admin.example.test

@@ -1,0 +1,70 @@
+name: Helm package CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    env:
+      CONTAINER_IMAGE: github-webhook-exporter:ci
+      RUSTUP_TOOLCHAIN: 1.97.1
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install pinned CI tools
+        run: scripts/install-ci-tools.sh "$RUNNER_TEMP/ci-tools"
+
+      - name: Add CI tools to PATH
+        run: echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+
+      - name: Verify workflow contract
+        run: just workflow-test
+
+      - name: ShellCheck tracked shell scripts
+        run: |
+          mapfile -t shell_files < <(git ls-files -- '*.sh')
+          shellcheck "${shell_files[@]}"
+
+      - name: Validate Helm chart contracts
+        run: just helm-static
+
+      - name: Smoke test the production image
+        run: just image-smoke
+
+      - name: Verify Rust formatting
+        run: just fmt
+
+      - name: Build the project
+        run: cargo build --locked
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: just test
+
+      - name: Generate documentation
+        run: cargo doc --no-deps --locked
+
+      - name: Upload packaged Helm chart
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: helm-package
+          path: dist/github-webhook-exporter-0.1.0.tgz
+          if-no-files-found: error
+          retention-days: 30
