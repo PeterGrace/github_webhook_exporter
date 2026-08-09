@@ -1,0 +1,4 @@
+telemetry:
+  endpoint: https://collector.example.test:4318
+  tracesEndpoint: https://traces.example.test/v1/traces
+  logsEndpoint: https://logs.example.test/v1/logs

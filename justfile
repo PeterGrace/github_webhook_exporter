@@ -13,6 +13,10 @@ test:
 helm-lint:
     helm lint "{{helm-chart}}"
 
+# Render the deterministic supported Helm matrix.
+helm-render output-directory="dist/rendered":
+    scripts/helm-render-matrix.sh "{{helm-chart}}" "{{output-directory}}"
+
 # Exercise Helm chart schema, rendering, and Secret argument contracts.
 helm-test:
     scripts/helm-chart-test.sh "{{helm-chart}}"

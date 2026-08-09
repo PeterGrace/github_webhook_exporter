@@ -1,0 +1,10 @@
+default
+persistence
+external-secret
+otlp
+pdb
+webhook-ingress
+metrics
+administration
+network-policy-default-deny
+network-policy-bounded
