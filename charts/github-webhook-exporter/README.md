@@ -380,11 +380,12 @@ just helm-kind-acceptance
 ```
 
 `just helm-static` validates chart metadata, rendering, schema, policy, secret, and packaged
-archive contracts across the supported Kubernetes range 1.31.0 through 1.35.0. `just image-smoke`
-builds the production image and checks the runtime and persistence contract locally. The packaged
-chart archive is always `dist/github-webhook-exporter-0.1.0.tgz`; use `helm show chart` and `helm
-show values` for local inspection before distributing or reusing it. `helm template archive` with
-`--kube-version 1.35.0` inspects the packaged chart without talking to a cluster.
+archive contracts across the supported Kubernetes range 1.31.0 through 1.35.0
+(`>=1.31.0-0 <1.36.0-0`). `just image-smoke` builds the production image and checks the runtime
+and persistence contract locally. The packaged chart archive is always
+`dist/github-webhook-exporter-0.1.0.tgz`; use `helm show chart` and `helm show values` for local
+inspection before distributing or reusing it. `helm template archive` with `--kube-version
+1.35.0` inspects the packaged chart without talking to a cluster.
 
 `just helm-kind-acceptance` creates a disposable Kind cluster and confirms that Kubernetes accepts
 the StatefulSet, Service, ConfigMap, and PVC APIs. It does not prove cluster lifecycle behavior,

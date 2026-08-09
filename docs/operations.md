@@ -101,12 +101,12 @@ just helm-kind-acceptance
 ```
 
 `just helm-static` validates chart metadata, rendering, schema, policy, secret, and packaged
-archive contracts across the supported Kubernetes range 1.31.0 through 1.35.0. `just image-smoke`
-builds and exercises the production image locally. `just workflow-test` checks the GitHub Actions
-contract, including the exact archive path `dist/github-webhook-exporter-0.1.0.tgz`. `just
-helm-kind-acceptance` is the later cluster-acceptance step: it confirms API acceptance for the
-rendered StatefulSet, Service, ConfigMap, and PVC, but it does not prove cluster lifecycle
-behavior.
+archive contracts across the supported Kubernetes range 1.31.0 through 1.35.0
+(`>=1.31.0-0 <1.36.0-0`). `just image-smoke` builds and exercises the production image locally.
+`just workflow-test` checks the GitHub Actions contract, including the exact archive path
+`dist/github-webhook-exporter-0.1.0.tgz`. `just helm-kind-acceptance` is the later
+cluster-acceptance step: it confirms API acceptance for the rendered StatefulSet, Service,
+ConfigMap, and PVC, but it does not prove cluster lifecycle behavior.
 
 For local archive inspection, use the fixed package name directly:
 
