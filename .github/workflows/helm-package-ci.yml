@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CONTAINER_IMAGE: github-webhook-exporter:ci
+      KIND_ARTIFACT_DIRECTORY: dist/kind-lifecycle
       RUSTUP_TOOLCHAIN: 1.97.1
     steps:
       - name: Check out repository
@@ -46,6 +47,9 @@ jobs:
       - name: Smoke test the production image
         run: just image-smoke
 
+      - name: Exercise lifecycle and persistence in Kind
+        run: just helm-kind-lifecycle
+
       - name: Verify Rust formatting
         run: just fmt
 
@@ -68,3 +72,12 @@ jobs:
           path: dist/github-webhook-exporter-0.1.0.tgz
           if-no-files-found: error
           retention-days: 30
+
+      - name: Upload Kind lifecycle diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kind-lifecycle-diagnostics
+          path: dist/kind-lifecycle
+          if-no-files-found: warn
+          retention-days: 14

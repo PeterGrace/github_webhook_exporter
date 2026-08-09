@@ -126,6 +126,9 @@ if not isinstance(job_env, dict):
 if job_env.get("CONTAINER_IMAGE") != "github-webhook-exporter:ci":
     fail("workflow must set CONTAINER_IMAGE=github-webhook-exporter:ci")
 
+if job_env.get("KIND_ARTIFACT_DIRECTORY") != "dist/kind-lifecycle":
+    fail("workflow must use the fixed Kind lifecycle artifact directory")
+
 steps = job.get("steps")
 if not isinstance(steps, list):
     fail("workflow validate job must define steps")
@@ -156,6 +159,9 @@ expected_steps = [
         "run": "just image-smoke",
     },
     {
+        "run": "just helm-kind-lifecycle",
+    },
+    {
         "run": "just fmt",
     },
     {
@@ -179,51 +185,46 @@ expected_steps = [
             "retention-days": 30,
         },
     },
+    {
+        "if": "always()",
+        "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "with": {
+            "name": "kind-lifecycle-diagnostics",
+            "path": "dist/kind-lifecycle",
+            "if-no-files-found": "warn",
+            "retention-days": 14,
+        },
+    },
 ]
 
 if len(steps) != len(expected_steps):
     fail("workflow must contain the expected validation steps only")
 
 cargo_doc_index = None
-upload_index = None
+package_upload_index = None
+diagnostics_upload_index = None
 
 for index, expected_step in enumerate(expected_steps):
     step = steps[index]
     if not isinstance(step, dict):
         fail(f"workflow step {index + 1} must be a mapping")
 
-    if "uses" in expected_step:
-        if step.get("uses") != expected_step["uses"]:
-            fail(f"workflow step {index + 1} uses the wrong action reference")
+    actual_contract = {key: value for key, value in step.items() if key != "name"}
+    if actual_contract != expected_step:
+        fail(f"workflow step {index + 1} does not match the expected contract")
 
-        if index == len(expected_steps) - 1:
-            with_section = step.get("with")
-            if not isinstance(with_section, dict):
-                fail("upload-artifact step must define with:")
-            if with_section != expected_step["with"]:
-                fail("workflow must upload the exact packaged archive path")
-            if any(key not in {"name", "uses", "with"} for key in step):
-                fail(f"workflow step {index + 1} contains unexpected fields")
-            upload_index = index
-        else:
-            if any(key not in {"name", "uses"} for key in step):
-                fail(f"workflow step {index + 1} contains unexpected fields")
-    else:
-        if step.get("run") != expected_step["run"]:
-            fail(f"workflow step {index + 1} must run the expected command")
-
-        if any(key not in {"name", "run"} for key in step):
-            fail(f"workflow step {index + 1} contains unexpected fields")
-
-        if expected_step["run"] == "cargo doc --no-deps --locked":
-            cargo_doc_index = index
+    if expected_step.get("run") == "cargo doc --no-deps --locked":
+        cargo_doc_index = index
+    with_section = expected_step.get("with", {})
+    if with_section.get("name") == "helm-package":
+        package_upload_index = index
+    if with_section.get("name") == "kind-lifecycle-diagnostics":
+        diagnostics_upload_index = index
 
 if cargo_doc_index is None:
     fail("workflow must generate documentation")
-
-if upload_index is None:
-    fail("workflow must upload the packaged archive")
-
-if upload_index <= cargo_doc_index:
-    fail("workflow must upload the archive after cargo doc")
+if package_upload_index is None or package_upload_index <= cargo_doc_index:
+    fail("workflow must upload the packaged archive after cargo doc")
+if diagnostics_upload_index is None or diagnostics_upload_index <= package_upload_index:
+    fail("workflow must upload Kind diagnostics after the packaged archive")
 PY

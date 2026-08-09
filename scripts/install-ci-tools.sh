@@ -18,6 +18,10 @@ readonly EXPECTED_KEYS=(
     SHELLCHECK_SHA256
     JUST_VERSION
     JUST_SHA256
+    KIND_VERSION
+    KIND_SHA256
+    KUBECTL_VERSION
+    KUBECTL_SHA256
     RUST_VERSION
 )
 readonly SUPPORTED_ARCHITECTURE="amd64"
@@ -108,7 +112,7 @@ parse_tool_versions() {
         fi
     done
 
-    for expected_key in HELM KUBECONFORM CONFTEST YQ SHELLCHECK JUST; do
+    for expected_key in HELM KUBECONFORM CONFTEST YQ SHELLCHECK JUST KIND KUBECTL; do
         if [[ -z "${TOOL_HASHES[${expected_key}]+x}" ]]; then
             fail "missing required checksum key: ${expected_key}_SHA256"
         fi
@@ -249,6 +253,28 @@ install_just() {
     extract_expected_member "${archive_path}" "just" "${INSTALL_DIRECTORY}/just"
 }
 
+install_kind() {
+    local version="$1"
+    local checksum="$2"
+    local architecture="$3"
+    local binary_path="${TEMPORARY_DIRECTORY}/kind"
+    local url="https://github.com/kubernetes-sigs/kind/releases/download/v${version}/kind-linux-${architecture}"
+
+    download_release_asset "${url}" "${checksum}" "${binary_path}"
+    install_regular_file "${binary_path}" "${INSTALL_DIRECTORY}/kind"
+}
+
+install_kubectl() {
+    local version="$1"
+    local checksum="$2"
+    local architecture="$3"
+    local binary_path="${TEMPORARY_DIRECTORY}/kubectl"
+    local url="https://dl.k8s.io/release/v${version}/bin/linux/${architecture}/kubectl"
+
+    download_release_asset "${url}" "${checksum}" "${binary_path}"
+    install_regular_file "${binary_path}" "${INSTALL_DIRECTORY}/kubectl"
+}
+
 install_rust_toolchain() {
     local version="$1"
 
@@ -290,7 +316,7 @@ main() {
     mkdir -p -- "${INSTALL_DIRECTORY}"
 
     local target_name
-    for target_name in helm kubeconform conftest yq shellcheck just; do
+    for target_name in helm kubeconform conftest yq shellcheck just kind kubectl; do
         if [[ -e "${INSTALL_DIRECTORY}/${target_name}" ||
               -L "${INSTALL_DIRECTORY}/${target_name}" ]]; then
             fail "installation target already exists: ${target_name}"
@@ -314,6 +340,8 @@ main() {
     install_yq "${TOOL_VERSIONS[YQ_VERSION]}" "${TOOL_HASHES[YQ]}" "${architecture}"
     install_shellcheck "${TOOL_VERSIONS[SHELLCHECK_VERSION]}" "${TOOL_HASHES[SHELLCHECK]}" "${architecture}"
     install_just "${TOOL_VERSIONS[JUST_VERSION]}" "${TOOL_HASHES[JUST]}" "${architecture}"
+    install_kind "${TOOL_VERSIONS[KIND_VERSION]}" "${TOOL_HASHES[KIND]}" "${architecture}"
+    install_kubectl "${TOOL_VERSIONS[KUBECTL_VERSION]}" "${TOOL_HASHES[KUBECTL]}" "${architecture}"
     install_rust_toolchain "${TOOL_VERSIONS[RUST_VERSION]}"
 
     print_version_output "${TOOL_VERSIONS[RUST_VERSION]}" rustc --version
@@ -326,6 +354,8 @@ main() {
     "${INSTALL_DIRECTORY}/yq" --version
     "${INSTALL_DIRECTORY}/shellcheck" --version
     "${INSTALL_DIRECTORY}/just" --version
+    "${INSTALL_DIRECTORY}/kind" version
+    "${INSTALL_DIRECTORY}/kubectl" version --client
 }
 
 main "$@"

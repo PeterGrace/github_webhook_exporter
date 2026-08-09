@@ -377,6 +377,7 @@ helm show chart dist/github-webhook-exporter-0.1.0.tgz
 helm show values dist/github-webhook-exporter-0.1.0.tgz
 helm template archive dist/github-webhook-exporter-0.1.0.tgz --kube-version 1.35.0 >/dev/null
 just helm-kind-acceptance
+KIND_ARTIFACT_DIRECTORY=dist/kind-lifecycle just helm-kind-lifecycle
 ```
 
 `just helm-static` validates chart metadata, rendering, schema, policy, secret, and packaged
@@ -388,5 +389,17 @@ inspection before distributing or reusing it. `helm template archive` with `--ku
 1.35.0` inspects the packaged chart without talking to a cluster.
 
 `just helm-kind-acceptance` creates a disposable Kind cluster and confirms that Kubernetes accepts
-the StatefulSet, Service, ConfigMap, and PVC APIs. It does not prove cluster lifecycle behavior,
-and passing static checks does not prove cluster lifecycle behavior.
+the StatefulSet, Service, ConfigMap, and PVC APIs. It does not start the exporter. Passing static
+checks does not prove runtime behavior; passing static checks does not prove cluster lifecycle behavior.
+
+`just helm-kind-lifecycle` is the runtime acceptance gate. It builds and loads the production image,
+creates runtime-only credentials, installs the chart, and verifies probes, signed administration
+and webhook traffic, bounded metrics, persistence across pod replacement, delivery deduplication,
+pull-request queue state, merge-group transitions, unavailable-collector isolation, broken database
+readiness, graceful SIGTERM, and an observed maximum of one running exporter attached to the SQLite
+PVC during a chart rollout. Rollout sampling bounds observed Kubernetes status; it cannot prove
+that overlap shorter than the sample interval is impossible. The generated cluster is deleted on
+success and failure. Diagnostics default to
+`dist/kind-lifecycle`, are scanned for generated credentials, signatures, and forbidden payload
+material, and are uploaded by CI even when the test fails. `KEEP_KIND_CLUSTER=true` is an explicit
+local debugging escape hatch; remove the printed cluster and private temporary directory manually.
