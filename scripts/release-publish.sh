@@ -8,11 +8,34 @@ readonly IMAGE_REFERENCE="ghcr.io/petergrace/github-webhook-exporter:${VERSION}"
 readonly CHART_REFERENCE="oci://ghcr.io/petergrace/charts/github-webhook-exporter"
 readonly CHART_REFERENCE_PATH="${CHART_REFERENCE#oci://}"
 readonly CHART_REPOSITORY="oci://ghcr.io/petergrace/charts"
+TEMPORARY_DIRECTORY=""
+LOCAL_IMAGE_ID=""
+REMOTE_IMAGE_STATE=""
+CHART_STATE=""
 
 fail() {
     printf 'release publication failed: %s\n' "$1" >&2
     exit 1
 }
+
+cleanup() {
+    if [[ -n "${TEMPORARY_DIRECTORY}" ]]; then
+        rm -rf -- "${TEMPORARY_DIRECTORY}"
+        TEMPORARY_DIRECTORY=""
+    fi
+}
+
+terminate() {
+    local exit_status="$1"
+    trap - EXIT HUP INT TERM
+    cleanup
+    exit "${exit_status}"
+}
+
+trap cleanup EXIT
+trap 'terminate 129' HUP
+trap 'terminate 130' INT
+trap 'terminate 143' TERM
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
@@ -32,24 +55,29 @@ validate_inputs() {
 
     require_command docker
     require_command helm
+    require_command mktemp
     require_command python3
+    require_command rm
+}
+
+create_temporary_directory() {
+    if ! TEMPORARY_DIRECTORY="$(mktemp -d)"; then
+        fail "could not create private temporary directory"
+    fi
 }
 
 capture_local_image_id() {
-    local stdout_path stderr_path local_image_id
-    stdout_path="$(mktemp)"
-    stderr_path="$(mktemp)"
+    local stdout_path="${TEMPORARY_DIRECTORY}/stdout"
+    local stderr_path="${TEMPORARY_DIRECTORY}/stderr"
 
-    if ! docker image inspect --format '{{.Id}}' "${LOCAL_IMAGE}" >"${stdout_path}" 2>"${stderr_path}"; then
-        rm -f -- "${stdout_path}" "${stderr_path}"
+    if ! docker image inspect --format '{{.Id}}' "${LOCAL_IMAGE}" \
+        >"${stdout_path}" 2>"${stderr_path}"; then
         fail "local image inspection failed"
     fi
 
-    local_image_id="$(<"${stdout_path}")"
-    rm -f -- "${stdout_path}" "${stderr_path}"
-
-    [[ "${local_image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "local image inspection failed"
-    printf '%s\n' "${local_image_id}"
+    LOCAL_IMAGE_ID="$(<"${stdout_path}")"
+    [[ "${LOCAL_IMAGE_ID}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+        || fail "local image inspection failed"
 }
 
 parse_remote_image_state() {
@@ -78,98 +106,85 @@ if not isinstance(config_digest, str):
 if re.fullmatch(r"sha256:[0-9a-f]{64}", config_digest) is None:
     raise SystemExit(1)
 print("matching" if config_digest == local_image_id else "different")
-' "${local_image_id}" "${manifest_json}")"; then
+' "${local_image_id}" "${manifest_json}" 2>"${TEMPORARY_DIRECTORY}/parser.stderr")"; then
         fail "image inspection failed"
     fi
 
-    printf '%s\n' "${python_output}"
+    REMOTE_IMAGE_STATE="${python_output}"
 }
 
 inspect_remote_image_state() {
-    local local_image_id="$1"
-    local stdout_path stderr_path diagnostics manifest_json remote_image_state
-    stdout_path="$(mktemp)"
-    stderr_path="$(mktemp)"
+    local stdout_path="${TEMPORARY_DIRECTORY}/stdout"
+    local stderr_path="${TEMPORARY_DIRECTORY}/stderr"
+    local diagnostics manifest_json
 
     if ! docker manifest inspect "${IMAGE_REFERENCE}" >"${stdout_path}" 2>"${stderr_path}"; then
         diagnostics="$(<"${stderr_path}")"
-        rm -f -- "${stdout_path}" "${stderr_path}"
-        if [[ "${diagnostics}" == *"manifest unknown"* || "${diagnostics}" == *"no such manifest"* ]]; then
-            printf 'missing\n'
+        if [[ "${diagnostics}" == *"manifest unknown"* \
+            || "${diagnostics}" == *"no such manifest"* ]]; then
+            REMOTE_IMAGE_STATE="missing"
             return 0
         fi
         fail "image inspection failed"
     fi
 
     manifest_json="$(<"${stdout_path}")"
-    rm -f -- "${stdout_path}" "${stderr_path}"
-
-    remote_image_state="$(parse_remote_image_state "${local_image_id}" "${manifest_json}")"
-    printf '%s\n' "${remote_image_state}"
+    parse_remote_image_state "${LOCAL_IMAGE_ID}" "${manifest_json}"
 }
 
 inspect_chart_state() {
     local stdout_path stderr_path diagnostics chart_not_found_marker
-    stdout_path="$(mktemp)"
-    stderr_path="$(mktemp)"
+    stdout_path="${TEMPORARY_DIRECTORY}/stdout"
+    stderr_path="${TEMPORARY_DIRECTORY}/stderr"
     chart_not_found_marker="${CHART_REFERENCE_PATH}:${VERSION}: not found"
 
     if ! helm show chart "${CHART_REFERENCE}" --version "${VERSION}" \
         >"${stdout_path}" 2>"${stderr_path}"; then
         diagnostics="$(<"${stderr_path}")"
-        rm -f -- "${stdout_path}" "${stderr_path}"
         if [[ "${diagnostics}" == *"${chart_not_found_marker}"* ]]; then
-            printf 'missing\n'
+            CHART_STATE="missing"
             return 0
         fi
         fail "chart inspection failed"
     fi
 
-    rm -f -- "${stdout_path}" "${stderr_path}"
-    printf 'present\n'
+    CHART_STATE="present"
 }
 
 push_image() {
-    local stdout_path stderr_path
-    stdout_path="$(mktemp)"
-    stderr_path="$(mktemp)"
+    local stdout_path="${TEMPORARY_DIRECTORY}/stdout"
+    local stderr_path="${TEMPORARY_DIRECTORY}/stderr"
 
     if ! docker push "${IMAGE_REFERENCE}" >"${stdout_path}" 2>"${stderr_path}"; then
-        rm -f -- "${stdout_path}" "${stderr_path}"
         fail "image push failed"
     fi
-
-    rm -f -- "${stdout_path}" "${stderr_path}"
 }
 
 push_chart() {
     local failure_message="$1"
-    local stdout_path stderr_path
-    stdout_path="$(mktemp)"
-    stderr_path="$(mktemp)"
+    local stdout_path="${TEMPORARY_DIRECTORY}/stdout"
+    local stderr_path="${TEMPORARY_DIRECTORY}/stderr"
 
-    if ! helm push "${CHART_ARCHIVE}" "${CHART_REPOSITORY}" >"${stdout_path}" 2>"${stderr_path}"; then
-        rm -f -- "${stdout_path}" "${stderr_path}"
+    if ! helm push "${CHART_ARCHIVE}" "${CHART_REPOSITORY}" \
+        >"${stdout_path}" 2>"${stderr_path}"; then
         fail "${failure_message}"
     fi
-
-    rm -f -- "${stdout_path}" "${stderr_path}"
 }
 
 main() {
     validate_inputs "$@"
+    create_temporary_directory
 
-    local local_image_id remote_image_state chart_state
-    local_image_id="$(capture_local_image_id)"
-    remote_image_state="$(inspect_remote_image_state "${local_image_id}")"
+    capture_local_image_id
+    inspect_remote_image_state
 
-    if [[ "${remote_image_state}" == "index" ]]; then
+    if [[ "${REMOTE_IMAGE_STATE}" == "index" ]]; then
         fail "unsupported remote image manifest"
     fi
 
-    if [[ "${remote_image_state}" == "different" ]]; then
-        chart_state="$(inspect_chart_state)"
-        case "${chart_state}" in
+    if [[ "${REMOTE_IMAGE_STATE}" == "different" ]]; then
+        inspect_chart_state
+        case "${CHART_STATE}" in
             missing|present)
                 fail "digest conflict"
                 ;;
@@ -179,9 +194,9 @@ main() {
         esac
     fi
 
-    chart_state="$(inspect_chart_state)"
+    inspect_chart_state
 
-    case "${remote_image_state}:${chart_state}" in
+    case "${REMOTE_IMAGE_STATE}:${CHART_STATE}" in
         missing:missing)
             push_image
             push_chart \
@@ -199,7 +214,7 @@ main() {
             fail "release is already published"
             ;;
         *)
-            fail "unsupported publication state ${remote_image_state}:${chart_state}"
+            fail "unsupported publication state ${REMOTE_IMAGE_STATE}:${CHART_STATE}"
             ;;
     esac
 }

@@ -10,9 +10,13 @@ readonly CHART_REFERENCE="oci://ghcr.io/petergrace/charts/github-webhook-exporte
 readonly CHART_REFERENCE_PATH="${CHART_REFERENCE#oci://}"
 readonly CHART_REPOSITORY="oci://ghcr.io/petergrace/charts"
 readonly FAKE_LOCAL_IMAGE_ID_DEFAULT="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+REAL_MKTEMP="$(command -v mktemp)"
+readonly REAL_MKTEMP
 TEMPORARY_DIRECTORY=""
 FAKE_BIN_DIRECTORY=""
 COMMAND_LOG=""
+MKTEMP_LOG=""
+PUBLISHER_TEMP_ROOT=""
 DUMMY_ARCHIVE=""
 RUN_STATUS=0
 RUN_STDOUT=""
@@ -73,6 +77,15 @@ if (($# == 3)) && [[ "$1" == "manifest" && "$2" == "inspect" ]]; then
             ;;
         index)
             printf '%s\n' '{"schemaVersion":2,"manifests":[{"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}]}'
+            ;;
+        malformed_json)
+            printf '%s\n' '{"schemaVersion":2'
+            ;;
+        missing_config_digest)
+            printf '%s\n' '{"schemaVersion":2,"config":{}}'
+            ;;
+        invalid_config_digest)
+            printf '%s\n' '{"schemaVersion":2,"config":{"digest":"sha256:not-a-digest"}}'
             ;;
         missing)
             printf '%s\n' "${FAKE_REMOTE_IMAGE_MISSING_DIAGNOSTIC:-manifest unknown}" >&2
@@ -157,12 +170,31 @@ exit 64
 EOF
     chmod +x "${FAKE_BIN_DIRECTORY}/helm"
 
+    cat >"${FAKE_BIN_DIRECTORY}/mktemp" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if (($# == 0)); then
+    printf '<none>\n' >>"${MKTEMP_LOG}"
+else
+    printf '%s\n' "$*" >>"${MKTEMP_LOG}"
+fi
+exec "${REAL_MKTEMP}" "$@"
+EOF
+    chmod +x "${FAKE_BIN_DIRECTORY}/mktemp"
+
     export PATH="${FAKE_BIN_DIRECTORY}:${PATH}"
 }
 
 setup_fixtures() {
     TEMPORARY_DIRECTORY="$(mktemp -d)"
     trap cleanup EXIT
+    PUBLISHER_TEMP_ROOT="${TEMPORARY_DIRECTORY}/publisher-tmp"
+    mkdir -p -- "${PUBLISHER_TEMP_ROOT}"
+    COMMAND_LOG="${TEMPORARY_DIRECTORY}/command.log"
+    MKTEMP_LOG="${TEMPORARY_DIRECTORY}/mktemp.log"
+    export COMMAND_LOG MKTEMP_LOG PUBLISHER_TEMP_ROOT REAL_MKTEMP
+    export TMPDIR="${PUBLISHER_TEMP_ROOT}"
     create_fake_commands
     DUMMY_ARCHIVE="${TEMPORARY_DIRECTORY}/github-webhook-exporter-${VERSION}.tgz"
     : >"${DUMMY_ARCHIVE}"
@@ -177,6 +209,7 @@ reset_fixture_state() {
     unset FAKE_DOCKER_PUSH_STATE
     unset FAKE_HELM_PUSH_STATE
     : >"${COMMAND_LOG}"
+    : >"${MKTEMP_LOG}"
     RUN_STATUS=0
     RUN_STDOUT=""
     RUN_STDERR=""
@@ -194,6 +227,26 @@ run_publisher() {
 
     RUN_STDOUT="$(<"${stdout_path}")"
     RUN_STDERR="$(<"${stderr_path}")"
+
+    local mktemp_invocations
+    mktemp_invocations="$(<"${MKTEMP_LOG}")"
+    if [[ -n "${mktemp_invocations}" && "${mktemp_invocations}" != "-d" ]]; then
+        fail "publisher must create exactly one private temporary directory"
+    fi
+    if find "${PUBLISHER_TEMP_ROOT}" -mindepth 1 -print -quit | grep -q .; then
+        fail "publisher left temporary registry output behind"
+    fi
+}
+
+assert_signal_cleanup_contract() {
+    local publisher_source
+    publisher_source="$(<"${RELEASE_PUBLISHER}")"
+
+    for signal_name in EXIT HUP INT TERM; do
+        if ! grep -Eq "^trap .* ${signal_name}$" <<<"${publisher_source}"; then
+            fail "publisher must install a cleanup trap for ${signal_name}"
+        fi
+    done
 }
 
 assert_status() {
@@ -274,12 +327,38 @@ run_failure_case() {
     assert_pushes_follow_inspection
 }
 
+run_manifest_parse_failure_case() {
+    local image_state="$1"
+
+    reset_fixture_state
+    export FAKE_REMOTE_IMAGE_STATE="${image_state}"
+    run_failure_case "image inspection failed" \
+        "${VERSION}" "${IMAGE_REFERENCE}" "${DUMMY_ARCHIVE}"
+    assert_no_push_logged
+    assert_command_log \
+        "docker image inspect --format {{.Id}} ${IMAGE_REFERENCE}" \
+        "docker manifest inspect ${IMAGE_REFERENCE}"
+}
+
 main() {
     [[ -x "${RELEASE_PUBLISHER}" ]] || fail "release publication helper is missing"
 
     setup_fixtures
+    assert_signal_cleanup_contract
 
     run_success_case "missing" "missing" \
+        "docker push ${IMAGE_REFERENCE}" \
+        "helm push ${DUMMY_ARCHIVE} ${CHART_REPOSITORY}"
+
+    reset_fixture_state
+    export FAKE_REMOTE_IMAGE_MISSING_DIAGNOSTIC="no such manifest"
+    run_publisher "${VERSION}" "${IMAGE_REFERENCE}" "${DUMMY_ARCHIVE}"
+    assert_status 0
+    assert_pushes_follow_inspection
+    assert_command_log \
+        "docker image inspect --format {{.Id}} ${IMAGE_REFERENCE}" \
+        "docker manifest inspect ${IMAGE_REFERENCE}" \
+        "helm show chart ${CHART_REFERENCE} --version ${VERSION}" \
         "docker push ${IMAGE_REFERENCE}" \
         "helm push ${DUMMY_ARCHIVE} ${CHART_REPOSITORY}"
 
@@ -306,6 +385,10 @@ main() {
     assert_command_log \
         "docker image inspect --format {{.Id}} ${IMAGE_REFERENCE}" \
         "docker manifest inspect ${IMAGE_REFERENCE}"
+
+    run_manifest_parse_failure_case "malformed_json"
+    run_manifest_parse_failure_case "missing_config_digest"
+    run_manifest_parse_failure_case "invalid_config_digest"
 
     reset_fixture_state
     export FAKE_REMOTE_IMAGE_STATE="missing"

@@ -82,7 +82,14 @@ helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.
 helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.0
 ```
 
-Published version tags are immutable. The workflow rejects an image tag that already exists. The workflow never publishes `latest`, branch, SHA, or prerelease tags. The overwrite guard is not atomic with the registry push; repository administrators must prevent concurrent or manual pushes to release tags because GHCR does not enforce this repository policy. If validation fails, rerun the original failed workflow attempt without moving the tag. Only the image-existing/chart-missing state with an exact matching digest may resume as chart-only recovery. Completed, chart-only, and digest-conflict states fail closed without overwrite.
+Published version tags are immutable. Existing image tags are never overwritten. An exact matching
+existing image permits chart-only recovery only when the chart is absent. The workflow never
+publishes `latest`, branch, SHA, or prerelease tags. The overwrite guard is not atomic with the
+registry push; repository administrators must prevent concurrent or manual pushes to release tags
+because GHCR does not enforce this repository policy. If validation fails, rerun the original failed
+workflow attempt without moving the tag. Only the image-existing/chart-missing state with an exact
+matching digest may resume as chart-only recovery. Completed, chart-only, and digest-conflict states
+fail closed without overwrite.
 
 #### Image and chart state matrix
 

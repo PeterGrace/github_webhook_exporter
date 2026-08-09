@@ -74,6 +74,10 @@ helm-kind-acceptance:
 image-build:
     docker build --platform linux/amd64 --tag "{{container-image}}" .
 
+# Prove two cache-disabled production builds export the same image ID.
+image-reproducibility-test:
+    scripts/image-reproducibility-test.sh
+
 # Build and exercise the production image contracts.
 image-smoke: image-build
     scripts/container-smoke.sh "{{container-image}}"

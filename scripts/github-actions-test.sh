@@ -61,7 +61,9 @@ workflow = json.loads(result.stdout)
 def require_fragment(file_path: str, fragment: str) -> None:
     with open(file_path, encoding="utf-8") as file_handle:
         contents = file_handle.read()
-    if fragment not in contents:
+    normalized_contents = " ".join(contents.split())
+    normalized_fragment = " ".join(fragment.split())
+    if normalized_fragment not in normalized_contents:
         fail(f"missing required documentation reference in {file_path}: {fragment}")
 
 
@@ -106,6 +108,14 @@ require_fragment(
 require_fragment(
     "docs/operations.md",
     "chart-only registry state fails closed without overwrite.",
+)
+require_fragment("docs/operations.md", "Existing image tags are never overwritten.")
+require_fragment(
+    "docs/operations.md",
+    (
+        "An exact matching existing image permits chart-only recovery only when "
+        "the chart is absent."
+    ),
 )
 
 if not isinstance(workflow, dict):
@@ -180,6 +190,7 @@ expected_validate_steps = [
     {"run": "mapfile -t shell_files < <(git ls-files -- '*.sh')\nshellcheck \"${shell_files[@]}\"\n"},
     {"run": "just helm-static"},
     {"run": "just image-smoke"},
+    {"run": "just image-reproducibility-test"},
     {"run": "just helm-kind-lifecycle"},
     {"run": "just fmt"},
     {"run": "cargo build --locked"},
@@ -285,6 +296,7 @@ expected_publish_steps = [
             "platforms": "linux/amd64",
             "load": True,
             "push": False,
+            "provenance": False,
             "tags": "${{ steps.metadata.outputs.tags }}",
             "labels": "${{ steps.metadata.outputs.labels }}",
             "build-args": "SOURCE_DATE_EPOCH=${{ steps.version.outputs.source_date_epoch }}",

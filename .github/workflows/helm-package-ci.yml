@@ -49,6 +49,9 @@ jobs:
       - name: Smoke test the production image
         run: just image-smoke
 
+      - name: Verify production image reproducibility
+        run: just image-reproducibility-test
+
       - name: Exercise lifecycle and persistence in Kind
         run: just helm-kind-lifecycle
 
@@ -164,6 +167,7 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
+          provenance: false
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           build-args: SOURCE_DATE_EPOCH=${{ steps.version.outputs.source_date_epoch }}
