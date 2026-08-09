@@ -4,7 +4,7 @@
   and that normalized logs omit the configured path.
 - Added controlled HTTP and one-second retention activity during SIGTERM, with bounded shutdown-stage
   and replacement timing assertions.
-- Added Helm rollout sampling that proves at most one running exporter container references the
-  SQLite PVC.
+- Added Helm rollout sampling that asserts the observed maximum running exporter count referencing
+  the SQLite PVC is one.
 - Made artifact privacy scanning binary-safe and extended it to signatures and ignored payload
   material without printing matched values.

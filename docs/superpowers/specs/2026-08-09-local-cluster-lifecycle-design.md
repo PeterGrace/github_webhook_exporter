@@ -62,7 +62,9 @@ included in assertion messages.
    process exits and replacement becomes Ready within the configured termination grace period,
    without a `preStop` hook.
 9. Trigger a chart/config rollout and sample running pod/container identities that reference the
-   StatefulSet PVC. Record and assert a maximum of one active exporter container with that volume.
+   StatefulSet PVC. Record and assert an observed maximum of one active exporter container with
+   that volume; this bounds observed Kubernetes status rather than claiming sub-sample overlap is
+   impossible.
 
 ## Diagnostics and Privacy
 

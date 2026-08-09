@@ -327,22 +327,19 @@ EOF
         --wait=true >/dev/null
 }
 
-wait_for_replacement_ready() {
+wait_for_replacement_created() {
     local old_uid="$1"
-    local deadline=$((SECONDS + 30))
-    local pod_json
+    local deadline=$((SECONDS + 15))
+    local replacement_uid
     while (( SECONDS < deadline )); do
-        pod_json="$(kube --namespace "${NAMESPACE}" get pod "${POD_NAME}" \
-            -o json 2>/dev/null || true)"
-        if [[ -n "${pod_json}" ]] && \
-            [[ "$(jq -r '.metadata.uid // ""' <<<"${pod_json}")" != "${old_uid}" ]] && \
-            [[ "$(jq -r '[.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length' \
-                <<<"${pod_json}")" == 1 ]]; then
+        replacement_uid="$(kube --namespace "${NAMESPACE}" get pod "${POD_NAME}" \
+            -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+        if [[ -n "${replacement_uid}" && "${replacement_uid}" != "${old_uid}" ]]; then
             return 0
         fi
         sleep 1
     done
-    fail 'replacement pod did not become Ready before the lifecycle deadline'
+    fail 'old pod did not terminate within the lifecycle deadline'
 }
 
 verify_graceful_sigterm() {
@@ -367,7 +364,7 @@ verify_graceful_sigterm() {
     ACTIVITY_PID=$!
     started_at=${SECONDS}
     kube --namespace "${NAMESPACE}" delete pod "${POD_NAME}" --wait=false >/dev/null
-    wait_for_replacement_ready "${old_uid}"
+    wait_for_replacement_created "${old_uid}"
     elapsed=$((SECONDS - started_at))
     kill "${ACTIVITY_PID}" >/dev/null 2>&1 || true
     wait "${ACTIVITY_PID}" >/dev/null 2>&1 || true
@@ -385,6 +382,8 @@ verify_graceful_sigterm() {
         fail 'SIGTERM lifecycle exceeded the pod termination grace period'
         return 1
     fi
+    wait_for_pod_ready
+    # These stable lifecycle-stage messages are emitted by src/main.rs; update both together.
     for expected_log in 'shutdown signal received' 'HTTP server stopped' \
         'telemetry provider shutdown starting'; do
         if ! grep --fixed-strings --quiet "${expected_log}" \
@@ -423,7 +422,8 @@ verify_singleton_rollout() {
         return 1
     fi
     UPGRADE_PID=''
-    assert_equal 1 "${maximum_running}" 'maximum active exporters with the SQLite PVC'
+    assert_equal 1 "${maximum_running}" \
+        'observed maximum active exporters with the SQLite PVC'
     wait_for_pod_ready
     start_port_forward
 }

@@ -115,7 +115,8 @@ The script must:
 ```text
 validate tools and inputs -> create private temp/artifact directories ->
 build collision-resistant cluster name -> create Kind cluster -> kind load docker-image ->
-create namespace -> create Secret from mode-600 files -> helm install --wait --atomic
+create namespace -> create Secret from mode-600 files ->
+helm install --wait --rollback-on-failure
 ```
 
 Use a dedicated kubeconfig. The EXIT trap stores the original status, captures diagnostics when the
@@ -213,7 +214,9 @@ Stop and reap every background process in cleanup.
 Change a harmless ConfigMap-backed chart value with `helm upgrade`, then sample pods and container
 statuses until rollout completion. For every Running exporter container, inspect its pod volume
 claim reference; append timestamp, UID, and container ID to `rollout-samples.txt`. Track the maximum
-simultaneous running containers referencing the target PVC and assert it equals one.
+simultaneous running containers referencing the target PVC and assert the observed maximum equals
+one. This is an observation of Kubernetes status during the rollout, not proof that sub-sample
+process overlap is impossible.
 
 - [ ] **Step 6: Capture and scan diagnostics**
 

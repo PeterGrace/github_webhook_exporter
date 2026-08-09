@@ -396,8 +396,10 @@ checks does not prove runtime behavior; passing static checks does not prove clu
 creates runtime-only credentials, installs the chart, and verifies probes, signed administration
 and webhook traffic, bounded metrics, persistence across pod replacement, delivery deduplication,
 pull-request queue state, merge-group transitions, unavailable-collector isolation, broken database
-readiness, graceful SIGTERM, and a maximum of one running exporter attached to the SQLite PVC during
-a chart rollout. The generated cluster is deleted on success and failure. Diagnostics default to
+readiness, graceful SIGTERM, and an observed maximum of one running exporter attached to the SQLite
+PVC during a chart rollout. Rollout sampling bounds observed Kubernetes status; it cannot prove
+that overlap shorter than the sample interval is impossible. The generated cluster is deleted on
+success and failure. Diagnostics default to
 `dist/kind-lifecycle`, are scanned for generated credentials, signatures, and forbidden payload
 material, and are uploaded by CI even when the test fails. `KEEP_KIND_CLUSTER=true` is an explicit
 local debugging escape hatch; remove the printed cluster and private temporary directory manually.
