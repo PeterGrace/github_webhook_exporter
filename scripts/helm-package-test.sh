@@ -15,7 +15,6 @@ readonly ARCHIVE_PREFLIGHT="${SCRIPT_DIRECTORY}/helm-archive-preflight.py"
 readonly ARCHIVE_PREFLIGHT_TEST="${SCRIPT_DIRECTORY}/helm-archive-preflight-test.py"
 readonly RENDER_COMPARE="${SCRIPT_DIRECTORY}/helm-render-compare.py"
 readonly RENDER_CASES_FILE="${SCRIPT_DIRECTORY}/../ci/helm/render-cases.txt"
-readonly PACKAGE_NAME="github-webhook-exporter-0.1.0.tgz"
 readonly KUBE_VERSION="1.31.0"
 TEMPORARY_DIRECTORY=""
 export HELM_OUTPUT_ERROR_PREFIX="Helm package test"
@@ -54,7 +53,7 @@ main() {
     if [[ -z "${CHART_DIRECTORY}" || -z "${OUTPUT_DIRECTORY}" ]]; then
         usage
     fi
-    for command in find helm mktemp mv python3 rm rmdir sort; do
+    for command in awk find helm mktemp mv python3 rm rmdir sort; do
         require_command "${command}"
     done
     for required_file in "${OUTPUT_GUARD}" "${ARCHIVE_PREFLIGHT}" \
@@ -87,10 +86,18 @@ main() {
     fi
 
     local package_path="${package_files[0]}"
-    if [[ "${package_path##*/}" != "${PACKAGE_NAME}" ]]; then
+    local chart_metadata chart_name chart_version expected_package_name
+    chart_metadata="$(helm show chart "${package_path}")"
+    chart_name="$(awk '/^name:[[:space:]]*/ { sub(/^name:[[:space:]]*/, ""); print; exit }' \
+        <<<"${chart_metadata}")"
+    chart_version="$(awk '/^version:[[:space:]]*/ { sub(/^version:[[:space:]]*/, ""); print; exit }' \
+        <<<"${chart_metadata}")"
+    [[ -n "${chart_name}" && -n "${chart_version}" ]] \
+        || fail "packaged archive metadata is missing name or version"
+    expected_package_name="${chart_name}-${chart_version}.tgz"
+    if [[ "${package_path##*/}" != "${expected_package_name}" ]]; then
         fail "unexpected packaged archive name"
     fi
-    helm show chart "${package_path}" >/dev/null
     helm show values "${package_path}" >/dev/null
     helm template archive "${package_path}" --kube-version "${KUBE_VERSION}" >/dev/null
 
@@ -114,7 +121,7 @@ main() {
         "${archive_rendered_directory}" >/dev/null
 
     helm_output_commit
-    printf 'Validated packaged Helm chart: %s/%s\n' "${HELM_OUTPUT_DIRECTORY}" "${PACKAGE_NAME}"
+    printf 'Validated packaged Helm chart: %s/%s\n' "${HELM_OUTPUT_DIRECTORY}" "${expected_package_name}"
 }
 
 main "$@"

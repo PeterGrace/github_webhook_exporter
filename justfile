@@ -49,6 +49,10 @@ helm-security-test:
 release-version-test:
     scripts/release-version-test.sh
 
+# Verify immutable image and Helm chart publication transitions.
+release-publish-test:
+    scripts/release-publish-test.sh
+
 # Verify the GitHub Actions workflow contract.
 workflow-test:
     scripts/github-actions-test.sh .github/workflows/helm-package-ci.yml
@@ -69,6 +73,10 @@ helm-kind-acceptance:
 # Build the supported linux/amd64 production image.
 image-build:
     docker build --platform linux/amd64 --tag "{{container-image}}" .
+
+# Prove two cache-disabled production builds export the same image ID.
+image-reproducibility-test:
+    scripts/image-reproducibility-test.sh
 
 # Build and exercise the production image contracts.
 image-smoke: image-build

@@ -6,7 +6,7 @@ on:
     branches:
       - main
     tags:
-      - "v*"
+      - "v[0-9]+.[0-9]+.[0-9]+"
 
 permissions:
   contents: read
@@ -49,6 +49,9 @@ jobs:
       - name: Smoke test the production image
         run: just image-smoke
 
+      - name: Verify production image reproducibility
+        run: just image-reproducibility-test
+
       - name: Exercise lifecycle and persistence in Kind
         run: just helm-kind-lifecycle
 
@@ -71,7 +74,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: helm-package
-          path: dist/github-webhook-exporter-0.1.0.tgz
+          path: dist/github-webhook-exporter-*.tgz
           if-no-files-found: error
           retention-days: 30
 
@@ -84,8 +87,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  publish-image:
-    if: startsWith(github.ref, 'refs/tags/v')
+  publish-release:
+    if: github.ref_type == 'tag'
     needs: validate
     runs-on: ubuntu-24.04
     permissions:
@@ -99,7 +102,51 @@ jobs:
         id: version
         run: |
           version="$(scripts/release-version.sh "$GITHUB_REF_NAME")"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          commit_timestamp="$(git show -s --format=%cI "$GITHUB_SHA")"
+          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          printf 'version=%s\ncommit_timestamp=%s\nsource_date_epoch=%s\n' \
+              "$version" "$commit_timestamp" "$source_date_epoch" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned CI tools
+        run: scripts/install-ci-tools.sh "$RUNNER_TEMP/ci-tools"
+
+      - name: Add CI tools to PATH
+        run: echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"
+
+      - name: Download validated Helm chart
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: helm-package
+          path: dist/release
+
+      - name: Validate downloaded Helm chart
+        id: chart
+        run: |
+          mapfile -d '' -t chart_archives < <(
+              find dist/release -maxdepth 1 -type f -name '*.tgz' -print0
+          )
+          if (( ${#chart_archives[@]} != 1 )); then
+              printf 'expected exactly one downloaded chart archive, found %s\n' \
+                  "${#chart_archives[@]}" >&2
+              exit 1
+          fi
+
+          archive="${chart_archives[0]}"
+          expected_archive="dist/release/github-webhook-exporter-${{ steps.version.outputs.version }}.tgz"
+          if [[ "$archive" != "$expected_archive" ]]; then
+              printf 'unexpected chart archive: %s\n' "$archive" >&2
+              exit 1
+          fi
+
+          chart_version="$(helm show chart "$archive" | yq eval '.version' -)"
+          if [[ "$chart_version" != "${{ steps.version.outputs.version }}" ]]; then
+              printf 'chart archive version does not match release version\n' >&2
+              exit 1
+          fi
+
+          helm template github-webhook-exporter "$archive" \
+              --kube-version 1.35.0 >/dev/null
+          printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
@@ -111,6 +158,7 @@ jobs:
           images: ghcr.io/petergrace/github-webhook-exporter
           tags: type=raw,value=${{ steps.version.outputs.version }}
           flavor: latest=false
+          labels: org.opencontainers.image.created=${{ steps.version.outputs.commit_timestamp }}
 
       - name: Build the production image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
@@ -119,8 +167,10 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
+          provenance: false
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
+          build-args: SOURCE_DATE_EPOCH=${{ steps.version.outputs.source_date_epoch }}
           cache-from: type=gha,scope=production-image
           cache-to: type=gha,mode=max,scope=production-image
 
@@ -129,23 +179,23 @@ jobs:
           RELEASE_IMAGE: ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}
         run: scripts/container-smoke.sh "$RELEASE_IMAGE"
 
-      - name: Authenticate to GHCR
+      - name: Authenticate Docker to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Reject an existing versioned image tag
+      - name: Authenticate Helm to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | helm registry login ghcr.io \
+              --username "${{ github.actor }}" --password-stdin
+
+      - name: Publish immutable release artifacts
         env:
           RELEASE_IMAGE: ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}
         run: |
-          if docker manifest inspect "$RELEASE_IMAGE" >/dev/null 2>&1; then
-              printf 'release image already exists: %s\n' "$RELEASE_IMAGE" >&2
-              exit 1
-          fi
-
-      - name: Publish the versioned image tag
-        env:
-          RELEASE_IMAGE: ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}
-        run: docker push "$RELEASE_IMAGE"
+          scripts/release-publish.sh "${{ steps.version.outputs.version }}" \
+              "$RELEASE_IMAGE" "${{ steps.chart.outputs.archive }}"

@@ -37,6 +37,23 @@ import subprocess
 import sys
 
 workflow_path = sys.argv[1]
+
+
+def fail(message: str) -> None:
+    raise SystemExit(message)
+
+
+with open("scripts/helm-package-test.sh", encoding="utf-8") as file_handle:
+    package_test = file_handle.read()
+if 'readonly PACKAGE_NAME="github-webhook-exporter-0.1.0.tgz"' in package_test:
+    fail("Helm package validation must not hard-code the current chart version")
+
+with open("scripts/image-reproducibility-test.sh", encoding="utf-8") as file_handle:
+    reproducibility_test = file_handle.read()
+if "docker buildx build" not in reproducibility_test or "--load" not in reproducibility_test:
+    fail("image reproducibility test must use the release buildx load path")
+
+
 result = subprocess.run(
     ["yq", "eval", "-o=json", ".", workflow_path],
     check=True,
@@ -46,16 +63,30 @@ result = subprocess.run(
 workflow = json.loads(result.stdout)
 
 
-def fail(message: str) -> None:
-    raise SystemExit(message)
-
-
 def require_fragment(file_path: str, fragment: str) -> None:
     with open(file_path, encoding="utf-8") as file_handle:
         contents = file_handle.read()
-    if fragment not in contents:
+    normalized_contents = " ".join(contents.split())
+    normalized_fragment = " ".join(fragment.split())
+    if normalized_fragment not in normalized_contents:
         fail(f"missing required documentation reference in {file_path}: {fragment}")
 
+
+shared_release_fragments = (
+    "ghcr.io/petergrace/github-webhook-exporter",
+    "vMAJOR.MINOR.PATCH",
+    "validation-only",
+    "immutable",
+    "overwrite guard is not atomic",
+    "`latest`",
+    "oci://ghcr.io/petergrace/charts/github-webhook-exporter",
+    "helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.0",
+    "helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.0",
+    "Published version tags are immutable.",
+    "The workflow never publishes `latest`, branch, SHA, or prerelease tags.",
+    "Only the image-existing/chart-missing state with an exact matching digest may resume as chart-only recovery.",
+    "Completed, chart-only, and digest-conflict states fail closed without overwrite.",
+)
 
 for file_path in (
     "charts/github-webhook-exporter/README.md",
@@ -63,21 +94,34 @@ for file_path in (
 ):
     require_fragment(file_path, "just helm-static")
     require_fragment(file_path, "just image-smoke")
-    require_fragment(file_path, "dist/github-webhook-exporter-0.1.0.tgz")
     require_fragment(file_path, "1.31.0 through 1.35.0")
     require_fragment(file_path, ">=1.31.0-0 <1.36.0-0")
     require_fragment(
         file_path,
         "passing static checks does not prove cluster lifecycle behavior",
     )
-    require_fragment(file_path, "ghcr.io/petergrace/github-webhook-exporter")
-    require_fragment(file_path, "vMAJOR.MINOR.PATCH")
-    require_fragment(file_path, "validation-only")
-    require_fragment(file_path, "immutable")
-    require_fragment(file_path, "overwrite guard is not atomic")
-    require_fragment(file_path, "`latest`")
+    for fragment in shared_release_fragments:
+        require_fragment(file_path, fragment)
 
 require_fragment("docs/operations.md", "`just helm-render` first")
+require_fragment("docs/operations.md", "Image state")
+require_fragment("docs/operations.md", "Chart state")
+require_fragment(
+    "docs/operations.md",
+    "If validation fails, rerun the original failed workflow attempt without moving the tag.",
+)
+require_fragment(
+    "docs/operations.md",
+    "chart-only registry state fails closed without overwrite.",
+)
+require_fragment("docs/operations.md", "Existing image tags are never overwritten.")
+require_fragment(
+    "docs/operations.md",
+    (
+        "An exact matching existing image permits chart-only recovery only when "
+        "the chart is absent."
+    ),
+)
 
 if not isinstance(workflow, dict):
     fail("workflow did not parse as a mapping")
@@ -99,8 +143,8 @@ if not isinstance(push_section, dict):
 if push_section.get("branches") != ["main"]:
     fail("workflow branch push trigger must target main only")
 
-if push_section.get("tags") != ["v*"]:
-    fail("workflow tag push trigger must target version-like tags for strict validation")
+if push_section.get("tags") != ["v[0-9]+.[0-9]+.[0-9]+"]:
+    fail("workflow tag trigger must target stable semantic-version-shaped tags")
 
 permissions = workflow.get("permissions")
 if permissions != {"contents": "read"}:
@@ -118,8 +162,8 @@ jobs = workflow.get("jobs")
 if not isinstance(jobs, dict):
     fail("workflow must define jobs")
 
-if list(jobs) != ["validate", "publish-image"]:
-    fail("workflow must define validation followed by image publication")
+if list(jobs) != ["validate", "publish-release"]:
+    fail("workflow must define validation followed by release publication")
 
 validate_job = jobs["validate"]
 if not isinstance(validate_job, dict):
@@ -151,6 +195,7 @@ expected_validate_steps = [
     {"run": "mapfile -t shell_files < <(git ls-files -- '*.sh')\nshellcheck \"${shell_files[@]}\"\n"},
     {"run": "just helm-static"},
     {"run": "just image-smoke"},
+    {"run": "just image-reproducibility-test"},
     {"run": "just helm-kind-lifecycle"},
     {"run": "just fmt"},
     {"run": "cargo build --locked"},
@@ -161,7 +206,7 @@ expected_validate_steps = [
         "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
         "with": {
             "name": "helm-package",
-            "path": "dist/github-webhook-exporter-0.1.0.tgz",
+            "path": "dist/github-webhook-exporter-*.tgz",
             "if-no-files-found": "error",
             "retention-days": 30,
         },
@@ -189,29 +234,54 @@ for index, expected_step in enumerate(expected_validate_steps):
     if actual_contract != expected_step:
         fail(f"workflow validation step {index + 1} does not match the expected contract")
 
-publish_job = jobs["publish-image"]
+if validate_job.get("permissions", {}).get("packages") == "write":
+    fail("workflow validation job must not grant packages: write")
+
+for index, step in enumerate(validate_steps):
+    serialized_step = json.dumps(step, sort_keys=True).lower()
+    if (
+        "login-action" in serialized_step
+        or "registry login" in serialized_step
+        or "docker push" in serialized_step
+        or "helm push" in serialized_step
+        or "release-publish.sh" in serialized_step
+        or step.get("with", {}).get("push") is True
+    ):
+        fail(f"workflow validation step {index + 1} must not authenticate or publish")
+
+publish_job = jobs["publish-release"]
 if not isinstance(publish_job, dict):
-    fail("workflow publish-image job must be a mapping")
+    fail("workflow publish-release job must be a mapping")
 
 expected_publish_job_contract = {
-    "if": "startsWith(github.ref, 'refs/tags/v')",
+    "if": "github.ref_type == 'tag'",
     "needs": "validate",
     "runs-on": "ubuntu-24.04",
     "permissions": {"contents": "read", "packages": "write"},
 }
 for key, expected_value in expected_publish_job_contract.items():
     if publish_job.get(key) != expected_value:
-        fail(f"workflow publish-image job has an invalid {key} contract")
+        fail(f"workflow publish-release job has an invalid {key} contract")
 
 publish_steps = publish_job.get("steps")
 if not isinstance(publish_steps, list):
-    fail("workflow publish-image job must define steps")
+    fail("workflow publish-release job must define steps")
 
 expected_publish_steps = [
     {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"},
     {
         "id": "version",
-        "run": 'version="$(scripts/release-version.sh "$GITHUB_REF_NAME")"\necho "version=${version}" >> "$GITHUB_OUTPUT"\n',
+        "run": 'version="$(scripts/release-version.sh "$GITHUB_REF_NAME")"\ncommit_timestamp="$(git show -s --format=%cI "$GITHUB_SHA")"\nsource_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"\nprintf \'version=%s\\ncommit_timestamp=%s\\nsource_date_epoch=%s\\n\' \\\n    "$version" "$commit_timestamp" "$source_date_epoch" >> "$GITHUB_OUTPUT"\n',
+    },
+    {"run": 'scripts/install-ci-tools.sh "$RUNNER_TEMP/ci-tools"'},
+    {"run": 'echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"'},
+    {
+        "uses": "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+        "with": {"name": "helm-package", "path": "dist/release"},
+    },
+    {
+        "id": "chart",
+        "run": "mapfile -d '' -t chart_archives < <(\n    find dist/release -maxdepth 1 -type f -name '*.tgz' -print0\n)\nif (( ${#chart_archives[@]} != 1 )); then\n    printf 'expected exactly one downloaded chart archive, found %s\\n' \\\n        \"${#chart_archives[@]}\" >&2\n    exit 1\nfi\n\narchive=\"${chart_archives[0]}\"\nexpected_archive=\"dist/release/github-webhook-exporter-${{ steps.version.outputs.version }}.tgz\"\nif [[ \"$archive\" != \"$expected_archive\" ]]; then\n    printf 'unexpected chart archive: %s\\n' \"$archive\" >&2\n    exit 1\nfi\n\nchart_version=\"$(helm show chart \"$archive\" | yq eval '.version' -)\"\nif [[ \"$chart_version\" != \"${{ steps.version.outputs.version }}\" ]]; then\n    printf 'chart archive version does not match release version\\n' >&2\n    exit 1\nfi\n\nhelm template github-webhook-exporter \"$archive\" \\\n    --kube-version 1.35.0 >/dev/null\nprintf 'archive=%s\\n' \"$archive\" >> \"$GITHUB_OUTPUT\"\n",
     },
     {"uses": "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f"},
     {
@@ -221,6 +291,7 @@ expected_publish_steps = [
             "images": "ghcr.io/petergrace/github-webhook-exporter",
             "tags": "type=raw,value=${{ steps.version.outputs.version }}",
             "flavor": "latest=false",
+            "labels": "org.opencontainers.image.created=${{ steps.version.outputs.commit_timestamp }}",
         },
     },
     {
@@ -230,8 +301,10 @@ expected_publish_steps = [
             "platforms": "linux/amd64",
             "load": True,
             "push": False,
+            "provenance": False,
             "tags": "${{ steps.metadata.outputs.tags }}",
             "labels": "${{ steps.metadata.outputs.labels }}",
+            "build-args": "SOURCE_DATE_EPOCH=${{ steps.version.outputs.source_date_epoch }}",
             "cache-from": "type=gha,scope=production-image",
             "cache-to": "type=gha,mode=max,scope=production-image",
         },
@@ -251,16 +324,14 @@ expected_publish_steps = [
         },
     },
     {
-        "env": {
-            "RELEASE_IMAGE": "ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}"
-        },
-        "run": "if docker manifest inspect \"$RELEASE_IMAGE\" >/dev/null 2>&1; then\n    printf 'release image already exists: %s\\n' \"$RELEASE_IMAGE\" >&2\n    exit 1\nfi\n",
+        "env": {"GHCR_TOKEN": "${{ secrets.GITHUB_TOKEN }}"},
+        "run": "printf '%s' \"$GHCR_TOKEN\" | helm registry login ghcr.io \\\n    --username \"${{ github.actor }}\" --password-stdin\n",
     },
     {
         "env": {
             "RELEASE_IMAGE": "ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}"
         },
-        "run": 'docker push "$RELEASE_IMAGE"',
+        "run": "scripts/release-publish.sh \"${{ steps.version.outputs.version }}\" \\\n    \"$RELEASE_IMAGE\" \"${{ steps.chart.outputs.archive }}\"\n",
     },
 ]
 
@@ -274,4 +345,24 @@ for index, expected_step in enumerate(expected_publish_steps):
     actual_contract = {key: value for key, value in step.items() if key != "name"}
     if actual_contract != expected_step:
         fail(f"workflow publication step {index + 1} does not match the expected contract")
+
+metadata_inputs = publish_steps[7].get("with", {})
+metadata_tags = metadata_inputs.get("tags", "").lower()
+if any(disallowed in metadata_tags for disallowed in ("latest", "branch", "sha")):
+    fail("workflow publication metadata must use only the normalized release tag")
+
+expected_created_label = (
+    "org.opencontainers.image.created="
+    "${{ steps.version.outputs.commit_timestamp }}"
+)
+if metadata_inputs.get("labels") != expected_created_label:
+    fail("workflow image created label must use the checked-out commit timestamp")
+
+version_step_run = publish_steps[1].get("run", "")
+if "git show -s --format=%cI \"$GITHUB_SHA\"" not in version_step_run:
+    fail("workflow image created label source must not use unconstrained current time")
+
+for index, step in enumerate(publish_steps):
+    if step.get("with", {}).get("push") is True:
+        fail(f"workflow publication step {index + 1} must not use action-level push")
 PY

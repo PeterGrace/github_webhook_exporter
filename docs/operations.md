@@ -62,28 +62,48 @@ telemetry providers receive their full shutdown boundaries.
 
 ### GHCR releases
 
-Pull requests and `main` are validation-only: they build and smoke-test the production image but
-never authenticate to GHCR or publish a package. A push of a stable `vMAJOR.MINOR.PATCH` repository
-tag publishes exactly one `linux/amd64` image to
-`ghcr.io/petergrace/github-webhook-exporter:MAJOR.MINOR.PATCH`. The release workflow requires the
-tag without `v`, the Cargo package version, the Helm chart version, and the Helm `appVersion` to
-match exactly before it authenticates.
+Pull requests and `main` are validation-only: they build and smoke-test the production image,
+validate the packaged chart, and never authenticate to GHCR or publish a package. Their temporary
+chart artifacts are retained for 30 days through workflow artifacts.
 
-For example, after all four version fields are `0.1.0`, create and push the release tag:
+A stable `vMAJOR.MINOR.PATCH` repository tag publishes one immutable `linux/amd64` image and one
+Helm OCI chart only after full validation passes. The release workflow requires the tag without
+`v`, the Cargo package version, the Helm chart version, and the Helm `appVersion` to match exactly
+before it authenticates.
+
+For example, after all four version fields are `0.1.0`, create and push the release tag, then
+consume the published image and chart:
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 docker pull ghcr.io/petergrace/github-webhook-exporter:0.1.0
+helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.0
+helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.0
 ```
 
-Release policy treats published version tags as immutable. The workflow rejects an image tag that
-already exists and never publishes `latest`, branch, SHA, or prerelease tags. This client-side
-overwrite guard is not atomic with the registry push; repository administrators must prevent
-concurrent or manual pushes to release tags because GHCR does not enforce this repository policy.
-If validation fails, fix the source and create a new patch release rather than moving the failed
-repository tag. A transient workflow failure may be rerun only when the GHCR image does not exist;
-an existing image is a completed publication and must not be overwritten.
+Published version tags are immutable. Existing image tags are never overwritten. An exact matching
+existing image permits chart-only recovery only when the chart is absent. The workflow never
+publishes `latest`, branch, SHA, or prerelease tags. The overwrite guard is not atomic with the
+registry push; repository administrators must prevent concurrent or manual pushes to release tags
+because GHCR does not enforce this repository policy. If validation fails, rerun the original failed
+workflow attempt without moving the tag. Only the image-existing/chart-missing state with an exact
+matching digest may resume as chart-only recovery. Completed, chart-only, and digest-conflict states
+fail closed without overwrite.
+
+#### Image and chart state matrix
+
+| Image state | Chart state | Result |
+| --- | --- | --- |
+| missing | missing | Publish the immutable image first, then the chart after validation. |
+| matching digest | missing | Chart-only recovery; rerun the original failed workflow attempt without moving the tag after confirming the remote image configuration digest exactly matches the rebuilt image. |
+| different digest | missing | Fail closed; digest-conflict state fails closed without overwrite. |
+| missing | present | Fail closed; chart-only registry state fails closed without overwrite. |
+| matching digest | present | Completed; fail closed without overwrite. |
+| different digest | present | Fail closed; digest-conflict state fails closed without overwrite. |
+
+The only resumable state is image-existing/chart-missing with an exact digest match. Any completed
+publication, chart-only registry state, or digest conflict must not be overwritten.
 
 ## Helm deployment
 
