@@ -48,12 +48,12 @@ def validated_members(archive: tarfile.TarFile, archive_root: str) -> list[tarfi
         fail("ARCHIVE002")
 
     members = archive.getmembers()
-    seen_names: set[str] = set()
+    seen_targets: set[tuple[str, ...]] = set()
     for member in members:
-        validate_member_name(member.name, archive_root)
-        if member.name in seen_names:
+        extraction_target = validate_member_name(member.name, archive_root)
+        if extraction_target in seen_targets:
             fail("ARCHIVE004")
-        seen_names.add(member.name)
+        seen_targets.add(extraction_target)
         if not (member.isfile() or member.isdir()):
             fail("ARCHIVE005")
     if not members:

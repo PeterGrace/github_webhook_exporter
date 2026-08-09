@@ -75,7 +75,11 @@ def reference_context(path: tuple[str, ...], key: str) -> bool:
     """Allow non-secret names/keys used only to reference an external Secret."""
     normalized_path = tuple(normalized_key(component) for component in path)
     normalized = normalized_key(key)
-    if "secretkeyref" in normalized_path:
+    if normalized_path[-1:] == ("secretkeyref",) and normalized in {
+        "name",
+        "key",
+        "optional",
+    }:
         return True
     if "existingsecret" in normalized_path and (
         "keys" in normalized_path or normalized == "name"

@@ -2,6 +2,10 @@
 
 # Shared output-directory guard for Helm generation scripts. This file is sourced.
 
+HELM_OUTPUT_GUARD_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly HELM_OUTPUT_GUARD_DIRECTORY
+readonly HELM_OUTPUT_COMMIT_HELPER="${HELM_OUTPUT_GUARD_DIRECTORY}/helm-output-commit.py"
+
 helm_output_fail() {
     printf '%s failed: unsafe output directory\n' "${HELM_OUTPUT_ERROR_PREFIX:-Helm output}" >&2
     return 1
@@ -65,9 +69,15 @@ PY
     mapfile -t helm_output_paths <<<"${path_result}"
     HELM_OUTPUT_DIRECTORY="${helm_output_paths[0]}"
     local canonical_repository="${helm_output_paths[1]}"
-    local output_parent="${HELM_OUTPUT_DIRECTORY%/*}"
-    local output_name="${HELM_OUTPUT_DIRECTORY##*/}"
+    HELM_OUTPUT_PARENT="${HELM_OUTPUT_DIRECTORY%/*}"
+    HELM_OUTPUT_NAME="${HELM_OUTPUT_DIRECTORY##*/}"
     HELM_OUTPUT_MARKER="${HELM_OUTPUT_DIRECTORY}/.gwe-generated-output"
+    HELM_OUTPUT_ALLOW_GENERATED_ROOT=0
+    HELM_OUTPUT_STAGE=""
+    HELM_OUTPUT_SNAPSHOT=()
+    if [[ "${HELM_OUTPUT_DIRECTORY}" == "${canonical_repository}/dist" ]]; then
+        HELM_OUTPUT_ALLOW_GENERATED_ROOT=1
+    fi
 
     if [[ -L "${HELM_OUTPUT_DIRECTORY}" ]]; then
         helm_output_fail
@@ -93,10 +103,10 @@ PY
         fi
     fi
 
-    if [[ ! -d "${output_parent}" ]]; then
+    if [[ ! -d "${HELM_OUTPUT_PARENT}" ]]; then
         case "${HELM_OUTPUT_DIRECTORY}" in
             "${canonical_repository}/dist"/*)
-                mkdir -p -- "${output_parent}"
+                mkdir -p -- "${HELM_OUTPUT_PARENT}"
                 printf '%s\n' "gwe-generated-root" \
                     >"${canonical_repository}/dist/.gwe-generated-root"
                 ;;
@@ -107,41 +117,48 @@ PY
         esac
     fi
 
-    if [[ -L "${output_parent}" || ! -d "${output_parent}" ]]; then
+    if [[ -L "${HELM_OUTPUT_PARENT}" || ! -d "${HELM_OUTPUT_PARENT}" ||
+          ! -f "${HELM_OUTPUT_COMMIT_HELPER}" ]]; then
         helm_output_fail
         return 1
     fi
 
-    HELM_OUTPUT_STAGE="$(mktemp -d "${output_parent}/.${output_name}.stage.XXXXXX")"
+    HELM_OUTPUT_STAGE="$(mktemp -d \
+        "${HELM_OUTPUT_PARENT}/.${HELM_OUTPUT_NAME}.stage.XXXXXX")"
     printf '%s\n' "${output_kind}" >"${HELM_OUTPUT_STAGE}/.gwe-generated-output"
+
+    local snapshot_result
+    if ! snapshot_result="$(python3 "${HELM_OUTPUT_COMMIT_HELPER}" snapshot \
+        "${HELM_OUTPUT_PARENT}" "${HELM_OUTPUT_NAME}" "${HELM_OUTPUT_STAGE##*/}" \
+        "${output_kind}" "${HELM_OUTPUT_ALLOW_GENERATED_ROOT}")"; then
+        helm_output_fail
+        return 1
+    fi
+    read -r -a HELM_OUTPUT_SNAPSHOT <<<"${snapshot_result}"
+    if [[ ${#HELM_OUTPUT_SNAPSHOT[@]} -ne 7 ]]; then
+        helm_output_fail
+        return 1
+    fi
+    HELM_OUTPUT_KIND="${output_kind}"
 }
 
 helm_output_commit() {
-    local backup_directory=""
-
-    if [[ -e "${HELM_OUTPUT_DIRECTORY}" ]]; then
-        backup_directory="$(mktemp -d \
-            "${HELM_OUTPUT_DIRECTORY%/*}/.${HELM_OUTPUT_DIRECTORY##*/}.old.XXXXXX")"
-        rmdir -- "${backup_directory}"
-        mv -- "${HELM_OUTPUT_DIRECTORY}" "${backup_directory}"
-    fi
-
-    if ! mv -- "${HELM_OUTPUT_STAGE}" "${HELM_OUTPUT_DIRECTORY}"; then
-        if [[ -n "${backup_directory}" ]]; then
-            mv -- "${backup_directory}" "${HELM_OUTPUT_DIRECTORY}"
-        fi
+    if ! python3 "${HELM_OUTPUT_COMMIT_HELPER}" commit \
+        "${HELM_OUTPUT_PARENT}" "${HELM_OUTPUT_NAME}" "${HELM_OUTPUT_STAGE##*/}" \
+        "${HELM_OUTPUT_KIND}" "${HELM_OUTPUT_ALLOW_GENERATED_ROOT}" \
+        "${HELM_OUTPUT_SNAPSHOT[@]}"; then
         helm_output_fail
         return 1
     fi
     HELM_OUTPUT_STAGE=""
-
-    if [[ -n "${backup_directory}" ]]; then
-        rm -rf -- "${backup_directory}"
-    fi
 }
 
 helm_output_cleanup_stage() {
-    if [[ -n "${HELM_OUTPUT_STAGE:-}" && -d "${HELM_OUTPUT_STAGE}" ]]; then
-        rm -rf -- "${HELM_OUTPUT_STAGE}"
+    if [[ -n "${HELM_OUTPUT_STAGE:-}" && ${#HELM_OUTPUT_SNAPSHOT[@]} -eq 7 ]]; then
+        if python3 "${HELM_OUTPUT_COMMIT_HELPER}" cleanup \
+            "${HELM_OUTPUT_PARENT}" "${HELM_OUTPUT_STAGE##*/}" \
+            "${HELM_OUTPUT_SNAPSHOT[@]}"; then
+            HELM_OUTPUT_STAGE=""
+        fi
     fi
 }

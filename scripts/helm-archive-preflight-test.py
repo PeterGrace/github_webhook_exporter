@@ -36,6 +36,9 @@ def write_archive(path: pathlib.Path, members: list[tuple[str, bytes, str]]) -> 
                 member.type = tarfile.LNKTYPE
                 member.linkname = "chart/Chart.yaml"
                 member.size = 0
+            elif member_type == "directory":
+                member.type = tarfile.DIRTYPE
+                member.size = 0
             else:
                 raise AssertionError(f"unknown test member type: {member_type}")
             archive.addfile(member, io.BytesIO(contents) if member.size else None)
@@ -47,7 +50,7 @@ def expect_rejected(path: pathlib.Path, expected_category: str, sensitive_name: 
         PREFLIGHT.validate_archive(str(path), "chart")
     except SystemExit as error:
         diagnostic = str(error)
-        assert expected_category in diagnostic
+        assert diagnostic == f"Helm archive preflight failed: {expected_category}"
         assert sensitive_name not in diagnostic
     else:
         raise AssertionError("unsafe archive unexpectedly passed preflight")
@@ -78,6 +81,21 @@ def main() -> None:
             ("symlink.tgz", "chart/sensitive-symlink", "symlink", "ARCHIVE005"),
             ("hardlink.tgz", "chart/sensitive-hardlink", "hardlink", "ARCHIVE005"),
         ]
+        collisions = [
+            (
+                "normalized-collision.tgz",
+                [("chart/file", b"first", "file"), ("chart/./file", b"second", "file")],
+            ),
+            (
+                "file-directory-alias.tgz",
+                [("chart/alias/", b"", "directory"), ("chart/alias", b"data", "file")],
+            ),
+        ]
+        for archive_name, members in collisions:
+            archive_path = root / archive_name
+            write_archive(archive_path, members)
+            expect_rejected(archive_path, "ARCHIVE004", members[1][0])
+
         extraction_directory = root / "extracted"
         extraction_directory.mkdir()
         for archive_name, member_name, member_type, category in attacks:
@@ -87,6 +105,7 @@ def main() -> None:
             try:
                 PREFLIGHT.extract_archive(archive_path, "chart", extraction_directory)
             except SystemExit as error:
+                assert str(error) == f"Helm archive preflight failed: {category}"
                 assert member_name not in str(error)
             else:
                 raise AssertionError("unsafe archive unexpectedly reached extraction")
