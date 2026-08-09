@@ -30,6 +30,17 @@ helm-kubeconform:
 helm-policy:
     scripts/helm-policy-test.sh "{{helm-chart}}"
 
+# Scan chart source, fixtures, and rendered output for credential leaks.
+helm-secrets:
+    scripts/helm-secret-scan.sh --test "{{helm-chart}}"
+
+# Package the Helm chart and revalidate the extracted archive.
+helm-package output-directory="dist":
+    scripts/helm-package-test.sh "{{helm-chart}}" "{{output-directory}}"
+
+# Run the full static Helm chart validation suite.
+helm-static: helm-lint helm-test helm-kubeconform helm-policy helm-secrets helm-package
+
 # Verify the rendered chart is accepted by a disposable Kind cluster.
 helm-kind-acceptance:
     scripts/helm-kind-acceptance.sh "{{helm-chart}}"
