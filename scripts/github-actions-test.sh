@@ -70,6 +70,12 @@ for file_path in (
         file_path,
         "passing static checks does not prove cluster lifecycle behavior",
     )
+    require_fragment(file_path, "ghcr.io/petergrace/github-webhook-exporter")
+    require_fragment(file_path, "vMAJOR.MINOR.PATCH")
+    require_fragment(file_path, "validation-only")
+    require_fragment(file_path, "immutable")
+    require_fragment(file_path, "overwrite guard is not atomic")
+    require_fragment(file_path, "`latest`")
 
 require_fragment("docs/operations.md", "`just helm-render` first")
 
@@ -91,7 +97,10 @@ if not isinstance(push_section, dict):
     fail("workflow push trigger must be a mapping")
 
 if push_section.get("branches") != ["main"]:
-    fail("workflow push trigger must target main only")
+    fail("workflow branch push trigger must target main only")
+
+if push_section.get("tags") != ["v*"]:
+    fail("workflow tag push trigger must target version-like tags for strict validation")
 
 permissions = workflow.get("permissions")
 if permissions != {"contents": "read"}:
@@ -109,17 +118,17 @@ jobs = workflow.get("jobs")
 if not isinstance(jobs, dict):
     fail("workflow must define jobs")
 
-if list(jobs) != ["validate"]:
-    fail("workflow must define exactly one validate job")
+if list(jobs) != ["validate", "publish-image"]:
+    fail("workflow must define validation followed by image publication")
 
-job = jobs["validate"]
-if not isinstance(job, dict):
+validate_job = jobs["validate"]
+if not isinstance(validate_job, dict):
     fail("workflow validate job must be a mapping")
 
-if job.get("runs-on") != "ubuntu-24.04":
-    fail("workflow must run on ubuntu-24.04")
+if validate_job.get("runs-on") != "ubuntu-24.04":
+    fail("workflow must run validation on ubuntu-24.04")
 
-job_env = job.get("env")
+job_env = validate_job.get("env")
 if not isinstance(job_env, dict):
     fail("workflow validate job must define env")
 
@@ -129,53 +138,25 @@ if job_env.get("CONTAINER_IMAGE") != "github-webhook-exporter:ci":
 if job_env.get("KIND_ARTIFACT_DIRECTORY") != "dist/kind-lifecycle":
     fail("workflow must use the fixed Kind lifecycle artifact directory")
 
-steps = job.get("steps")
-if not isinstance(steps, list):
+validate_steps = validate_job.get("steps")
+if not isinstance(validate_steps, list):
     fail("workflow validate job must define steps")
 
-expected_steps = [
-    {
-        "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
-    },
-    {
-        "run": 'scripts/install-ci-tools.sh "$RUNNER_TEMP/ci-tools"',
-    },
-    {
-        "run": 'echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"',
-    },
-    {
-        "uses": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
-    },
-    {
-        "run": "just workflow-test",
-    },
-    {
-        "run": "mapfile -t shell_files < <(git ls-files -- '*.sh')\nshellcheck \"${shell_files[@]}\"\n",
-    },
-    {
-        "run": "just helm-static",
-    },
-    {
-        "run": "just image-smoke",
-    },
-    {
-        "run": "just helm-kind-lifecycle",
-    },
-    {
-        "run": "just fmt",
-    },
-    {
-        "run": "cargo build --locked",
-    },
-    {
-        "run": "cargo clippy --all-targets -- -D warnings",
-    },
-    {
-        "run": "just test",
-    },
-    {
-        "run": "cargo doc --no-deps --locked",
-    },
+expected_validate_steps = [
+    {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"},
+    {"run": 'scripts/install-ci-tools.sh "$RUNNER_TEMP/ci-tools"'},
+    {"run": 'echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"'},
+    {"uses": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"},
+    {"run": "just workflow-test"},
+    {"run": "mapfile -t shell_files < <(git ls-files -- '*.sh')\nshellcheck \"${shell_files[@]}\"\n"},
+    {"run": "just helm-static"},
+    {"run": "just image-smoke"},
+    {"run": "just helm-kind-lifecycle"},
+    {"run": "just fmt"},
+    {"run": "cargo build --locked"},
+    {"run": "cargo clippy --all-targets -- -D warnings"},
+    {"run": "just test"},
+    {"run": "cargo doc --no-deps --locked"},
     {
         "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
         "with": {
@@ -197,34 +178,100 @@ expected_steps = [
     },
 ]
 
-if len(steps) != len(expected_steps):
+if len(validate_steps) != len(expected_validate_steps):
     fail("workflow must contain the expected validation steps only")
 
-cargo_doc_index = None
-package_upload_index = None
-diagnostics_upload_index = None
-
-for index, expected_step in enumerate(expected_steps):
-    step = steps[index]
+for index, expected_step in enumerate(expected_validate_steps):
+    step = validate_steps[index]
     if not isinstance(step, dict):
-        fail(f"workflow step {index + 1} must be a mapping")
-
+        fail(f"workflow validation step {index + 1} must be a mapping")
     actual_contract = {key: value for key, value in step.items() if key != "name"}
     if actual_contract != expected_step:
-        fail(f"workflow step {index + 1} does not match the expected contract")
+        fail(f"workflow validation step {index + 1} does not match the expected contract")
 
-    if expected_step.get("run") == "cargo doc --no-deps --locked":
-        cargo_doc_index = index
-    with_section = expected_step.get("with", {})
-    if with_section.get("name") == "helm-package":
-        package_upload_index = index
-    if with_section.get("name") == "kind-lifecycle-diagnostics":
-        diagnostics_upload_index = index
+publish_job = jobs["publish-image"]
+if not isinstance(publish_job, dict):
+    fail("workflow publish-image job must be a mapping")
 
-if cargo_doc_index is None:
-    fail("workflow must generate documentation")
-if package_upload_index is None or package_upload_index <= cargo_doc_index:
-    fail("workflow must upload the packaged archive after cargo doc")
-if diagnostics_upload_index is None or diagnostics_upload_index <= package_upload_index:
-    fail("workflow must upload Kind diagnostics after the packaged archive")
+expected_publish_job_contract = {
+    "if": "startsWith(github.ref, 'refs/tags/v')",
+    "needs": "validate",
+    "runs-on": "ubuntu-24.04",
+    "permissions": {"contents": "read", "packages": "write"},
+}
+for key, expected_value in expected_publish_job_contract.items():
+    if publish_job.get(key) != expected_value:
+        fail(f"workflow publish-image job has an invalid {key} contract")
+
+publish_steps = publish_job.get("steps")
+if not isinstance(publish_steps, list):
+    fail("workflow publish-image job must define steps")
+
+expected_publish_steps = [
+    {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"},
+    {
+        "id": "version",
+        "run": 'version="$(scripts/release-version.sh "$GITHUB_REF_NAME")"\necho "version=${version}" >> "$GITHUB_OUTPUT"\n',
+    },
+    {"uses": "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f"},
+    {
+        "id": "metadata",
+        "uses": "docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051",
+        "with": {
+            "images": "ghcr.io/petergrace/github-webhook-exporter",
+            "tags": "type=raw,value=${{ steps.version.outputs.version }}",
+            "flavor": "latest=false",
+        },
+    },
+    {
+        "uses": "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8",
+        "with": {
+            "context": ".",
+            "platforms": "linux/amd64",
+            "load": True,
+            "push": False,
+            "tags": "${{ steps.metadata.outputs.tags }}",
+            "labels": "${{ steps.metadata.outputs.labels }}",
+            "cache-from": "type=gha,scope=production-image",
+            "cache-to": "type=gha,mode=max,scope=production-image",
+        },
+    },
+    {
+        "env": {
+            "RELEASE_IMAGE": "ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}"
+        },
+        "run": 'scripts/container-smoke.sh "$RELEASE_IMAGE"',
+    },
+    {
+        "uses": "docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9",
+        "with": {
+            "registry": "ghcr.io",
+            "username": "${{ github.actor }}",
+            "password": "${{ secrets.GITHUB_TOKEN }}",
+        },
+    },
+    {
+        "env": {
+            "RELEASE_IMAGE": "ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}"
+        },
+        "run": "if docker manifest inspect \"$RELEASE_IMAGE\" >/dev/null 2>&1; then\n    printf 'release image already exists: %s\\n' \"$RELEASE_IMAGE\" >&2\n    exit 1\nfi\n",
+    },
+    {
+        "env": {
+            "RELEASE_IMAGE": "ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}"
+        },
+        "run": 'docker push "$RELEASE_IMAGE"',
+    },
+]
+
+if len(publish_steps) != len(expected_publish_steps):
+    fail("workflow must contain the expected publication steps only")
+
+for index, expected_step in enumerate(expected_publish_steps):
+    step = publish_steps[index]
+    if not isinstance(step, dict):
+        fail(f"workflow publication step {index + 1} must be a mapping")
+    actual_contract = {key: value for key, value in step.items() if key != "name"}
+    if actual_contract != expected_step:
+        fail(f"workflow publication step {index + 1} does not match the expected contract")
 PY

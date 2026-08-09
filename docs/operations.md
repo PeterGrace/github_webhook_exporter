@@ -60,6 +60,31 @@ the orchestrator termination grace period greater than the sum of
 `GHE_SHUTDOWN_TIMEOUT_SECONDS` and `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` so both application work and
 telemetry providers receive their full shutdown boundaries.
 
+### GHCR releases
+
+Pull requests and `main` are validation-only: they build and smoke-test the production image but
+never authenticate to GHCR or publish a package. A push of a stable `vMAJOR.MINOR.PATCH` repository
+tag publishes exactly one `linux/amd64` image to
+`ghcr.io/petergrace/github-webhook-exporter:MAJOR.MINOR.PATCH`. The release workflow requires the
+tag without `v`, the Cargo package version, the Helm chart version, and the Helm `appVersion` to
+match exactly before it authenticates.
+
+For example, after all four version fields are `0.1.0`, create and push the release tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+docker pull ghcr.io/petergrace/github-webhook-exporter:0.1.0
+```
+
+Release policy treats published version tags as immutable. The workflow rejects an image tag that
+already exists and never publishes `latest`, branch, SHA, or prerelease tags. This client-side
+overwrite guard is not atomic with the registry push; repository administrators must prevent
+concurrent or manual pushes to release tags because GHCR does not enforce this repository policy.
+If validation fails, fix the source and create a new patch release rather than moving the failed
+repository tag. A transient workflow failure may be rerun only when the GHCR image does not exist;
+an existing image is a completed publication and must not be overwritten.
+
 ## Helm deployment
 
 The supported singleton Helm package is documented in the
@@ -75,9 +100,9 @@ and IPv6 wildcard listener. Liveness remains process-only, readiness checks SQLi
 availability affects neither probe.
 
 An empty `image.tag` selects the chart `appVersion`; the default repository is
-`ghcr.io/petergrace/github-webhook-exporter`. Issue #50 supplies the required GHCR publication.
-Until that release exists, operators may override `image.repository` and `image.tag` with an image
-the cluster can pull.
+`ghcr.io/petergrace/github-webhook-exporter`. Stable release tags publish the matching immutable
+image version, so the chart default resolves without an image override. Operators may still set
+`image.repository` and `image.tag` when using a separately published compatible image.
 
 The pod termination grace period must be strictly greater than the sum of the application and
 telemetry shutdown timeouts. The chart adds no `preStop` delay. A deterministic ConfigMap checksum
