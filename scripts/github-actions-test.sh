@@ -83,8 +83,16 @@ for file_path in (
     require_fragment(file_path, "immutable")
     require_fragment(file_path, "overwrite guard is not atomic")
     require_fragment(file_path, "`latest`")
+    require_fragment(file_path, "oci://ghcr.io/petergrace/charts/github-webhook-exporter")
+    require_fragment(file_path, "helm pull")
+    require_fragment(file_path, "helm install")
+    require_fragment(file_path, "digest matches")
+    require_fragment(file_path, "chart-only recovery")
 
 require_fragment("docs/operations.md", "`just helm-render` first")
+require_fragment("docs/operations.md", "Image state")
+require_fragment("docs/operations.md", "Chart state")
+require_fragment("docs/operations.md", "chart-only registry state fails closed")
 
 if not isinstance(workflow, dict):
     fail("workflow did not parse as a mapping")

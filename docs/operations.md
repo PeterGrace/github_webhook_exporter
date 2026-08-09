@@ -62,19 +62,25 @@ telemetry providers receive their full shutdown boundaries.
 
 ### GHCR releases
 
-Pull requests and `main` are validation-only: they build and smoke-test the production image but
-never authenticate to GHCR or publish a package. A push of a stable `vMAJOR.MINOR.PATCH` repository
-tag publishes exactly one `linux/amd64` image to
-`ghcr.io/petergrace/github-webhook-exporter:MAJOR.MINOR.PATCH`. The release workflow requires the
-tag without `v`, the Cargo package version, the Helm chart version, and the Helm `appVersion` to
-match exactly before it authenticates.
+Pull requests and `main` are validation-only: they build and smoke-test the production image,
+validate the packaged chart, and never authenticate to GHCR or publish a package. Their temporary
+chart artifacts are retained for 30 days through workflow artifacts.
 
-For example, after all four version fields are `0.1.0`, create and push the release tag:
+A stable `vMAJOR.MINOR.PATCH` repository tag publishes one immutable `linux/amd64` image and one
+Helm OCI chart only after full validation passes. The release workflow requires the tag without
+`v`, the Cargo package version, the Helm chart version, and the Helm `appVersion` to match exactly
+before it authenticates.
+
+For example, after all four version fields are `0.1.0`, create and push the release tag, then
+consume the published image and chart:
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 docker pull ghcr.io/petergrace/github-webhook-exporter:0.1.0
+helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.0
+helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter \
+  --version 0.1.0
 ```
 
 Release policy treats published version tags as immutable. The workflow rejects an image tag that
@@ -84,6 +90,20 @@ concurrent or manual pushes to release tags because GHCR does not enforce this r
 If validation fails, fix the source and create a new patch release rather than moving the failed
 repository tag. A transient workflow failure may be rerun only when the GHCR image does not exist;
 an existing image is a completed publication and must not be overwritten.
+
+#### Image and chart state matrix
+
+| Image state | Chart state | Result |
+| --- | --- | --- |
+| missing | missing | Publish the immutable image first, then the chart after validation. |
+| matching digest | missing | chart-only recovery; rerun the original failed workflow attempt and publish the chart only after the remote image configuration digest matches the rebuilt image. |
+| different digest | missing | Fail closed; do not overwrite. |
+| missing | present | Fail closed; chart-only registry state fails closed. |
+| matching digest | present | Completed; no overwrite. |
+| different digest | present | Fail closed; no overwrite. |
+
+chart-only recovery is only allowed when the remote image configuration digest matches the rebuilt
+image. Do not move the tag; rerun the original failed workflow attempt instead.
 
 ## Helm deployment
 
