@@ -68,7 +68,7 @@ done
 if unsupported_output="$(kubeconform \
     -strict \
     -summary \
-    -output pretty \
+    -output json \
     -kubernetes-version 1.31.0 \
     -schema-location "${SCHEMA_DIRECTORY}" \
     -schema-location "${CUSTOM_SCHEMA_LOCATION}" \
@@ -80,12 +80,12 @@ if ! grep -Fq 'Ingress' <<<"${unsupported_output}"; then
     fail 'unsupported API rejection did not mention Ingress'
 fi
 
-if ! grep -Fq 'could not find schema for Ingress' <<<"${unsupported_output}"; then
-    fail 'unsupported API rejection did not report the missing Ingress schema'
+if ! grep -Fq 'extensions/v1beta1' <<<"${unsupported_output}"; then
+    fail 'unsupported API rejection did not mention extensions/v1beta1'
 fi
 
-if ! grep -Fq 'extensions/v1beta1' "${NEGATIVE_FIXTURE}"; then
-    fail 'unsupported API fixture is missing the required apiVersion'
+if ! grep -Fq 'could not find schema for Ingress' <<<"${unsupported_output}"; then
+    fail 'unsupported API rejection did not report the missing Ingress schema'
 fi
 
 printf 'Unsupported API fixture rejected as expected: extensions/v1beta1 Ingress\n'
