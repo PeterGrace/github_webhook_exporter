@@ -45,6 +45,10 @@ helm-static: helm-lint helm-test helm-kubeconform helm-policy helm-secrets helm-
 helm-security-test:
     scripts/helm-security-self-test.sh
 
+# Verify release tag and package version alignment.
+release-version-test:
+    scripts/release-version-test.sh
+
 # Verify the GitHub Actions workflow contract.
 workflow-test:
     scripts/github-actions-test.sh .github/workflows/helm-package-ci.yml
