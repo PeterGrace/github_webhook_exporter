@@ -126,7 +126,7 @@ jobs:
 
       - name: Smoke test the release image
         env:
-          RELEASE_IMAGE: ${{ steps.metadata.outputs.tags }}
+          RELEASE_IMAGE: ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}
         run: scripts/container-smoke.sh "$RELEASE_IMAGE"
 
       - name: Authenticate to GHCR
@@ -136,16 +136,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Reject an existing immutable image tag
+      - name: Reject an existing versioned image tag
         env:
-          RELEASE_IMAGE: ${{ steps.metadata.outputs.tags }}
+          RELEASE_IMAGE: ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}
         run: |
           if docker manifest inspect "$RELEASE_IMAGE" >/dev/null 2>&1; then
               printf 'release image already exists: %s\n' "$RELEASE_IMAGE" >&2
               exit 1
           fi
 
-      - name: Publish the immutable image tag
+      - name: Publish the versioned image tag
         env:
-          RELEASE_IMAGE: ${{ steps.metadata.outputs.tags }}
+          RELEASE_IMAGE: ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}
         run: docker push "$RELEASE_IMAGE"

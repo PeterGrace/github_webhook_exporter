@@ -81,4 +81,13 @@ run_failure_case "v1.2.3" "Helm chart version"
 write_metadata "1.2.3" "1.2.3" "1.2.4"
 run_failure_case "v1.2.3" "Helm appVersion"
 
+write_metadata "" "1.2.3" "1.2.3"
+run_failure_case "v1.2.3" "Cargo package version is missing"
+
+write_metadata "1.2.3" "" "1.2.3"
+run_failure_case "v1.2.3" "Helm chart version is missing"
+
+write_metadata "1.2.3" "1.2.3" ""
+run_failure_case "v1.2.3" "Helm appVersion is missing"
+
 printf 'release version tests passed\n'

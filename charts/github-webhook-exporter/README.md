@@ -18,9 +18,11 @@ disabled by default.
 The chart defaults to `ghcr.io/petergrace/github-webhook-exporter`. When `image.tag` is empty, the
 StatefulSet uses the chart `appVersion`, currently `0.1.0`. Pull requests and `main` are
 validation-only; only a stable `vMAJOR.MINOR.PATCH` repository tag publishes the matching
-`ghcr.io/petergrace/github-webhook-exporter:MAJOR.MINOR.PATCH` image. Published version tags are
-immutable, and the workflow never publishes `latest`, branch, SHA, or prerelease tags. The release
-tag without `v`, Cargo package version, chart version, and `appVersion` must match exactly.
+`ghcr.io/petergrace/github-webhook-exporter:MAJOR.MINOR.PATCH` image. Release policy treats
+published version tags as immutable, and the workflow never publishes `latest`, branch, SHA, or
+prerelease tags. Its client-side overwrite guard is not atomic with the registry push, so repository
+administrators must also prevent concurrent or manual pushes to release tags. The release tag
+without `v`, Cargo package version, chart version, and `appVersion` must match exactly.
 
 ## Install
 

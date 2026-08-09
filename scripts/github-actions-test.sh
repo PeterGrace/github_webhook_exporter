@@ -74,6 +74,7 @@ for file_path in (
     require_fragment(file_path, "vMAJOR.MINOR.PATCH")
     require_fragment(file_path, "validation-only")
     require_fragment(file_path, "immutable")
+    require_fragment(file_path, "overwrite guard is not atomic")
     require_fragment(file_path, "`latest`")
 
 require_fragment("docs/operations.md", "`just helm-render` first")
@@ -236,7 +237,9 @@ expected_publish_steps = [
         },
     },
     {
-        "env": {"RELEASE_IMAGE": "${{ steps.metadata.outputs.tags }}"},
+        "env": {
+            "RELEASE_IMAGE": "ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}"
+        },
         "run": 'scripts/container-smoke.sh "$RELEASE_IMAGE"',
     },
     {
@@ -248,11 +251,15 @@ expected_publish_steps = [
         },
     },
     {
-        "env": {"RELEASE_IMAGE": "${{ steps.metadata.outputs.tags }}"},
+        "env": {
+            "RELEASE_IMAGE": "ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}"
+        },
         "run": "if docker manifest inspect \"$RELEASE_IMAGE\" >/dev/null 2>&1; then\n    printf 'release image already exists: %s\\n' \"$RELEASE_IMAGE\" >&2\n    exit 1\nfi\n",
     },
     {
-        "env": {"RELEASE_IMAGE": "${{ steps.metadata.outputs.tags }}"},
+        "env": {
+            "RELEASE_IMAGE": "ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}"
+        },
         "run": 'docker push "$RELEASE_IMAGE"',
     },
 ]

@@ -77,11 +77,13 @@ git push origin v0.1.0
 docker pull ghcr.io/petergrace/github-webhook-exporter:0.1.0
 ```
 
-Published version tags are immutable. The workflow rejects an image tag that already exists and
-never publishes `latest`, branch, SHA, or prerelease tags. If validation fails, fix the source and
-create a new patch release rather than moving the failed repository tag. A transient workflow
-failure may be rerun only when the GHCR image does not exist; an existing image is a completed
-publication and must not be overwritten.
+Release policy treats published version tags as immutable. The workflow rejects an image tag that
+already exists and never publishes `latest`, branch, SHA, or prerelease tags. This client-side
+overwrite guard is not atomic with the registry push; repository administrators must prevent
+concurrent or manual pushes to release tags because GHCR does not enforce this repository policy.
+If validation fails, fix the source and create a new patch release rather than moving the failed
+repository tag. A transient workflow failure may be rerun only when the GHCR image does not exist;
+an existing image is a completed publication and must not be overwritten.
 
 ## Helm deployment
 
