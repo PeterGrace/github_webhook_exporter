@@ -7,6 +7,7 @@ readonly RELEASE_PUBLISHER="${SCRIPT_DIRECTORY}/release-publish.sh"
 readonly VERSION="1.2.3"
 readonly IMAGE_REFERENCE="ghcr.io/petergrace/github-webhook-exporter:${VERSION}"
 readonly CHART_REFERENCE="oci://ghcr.io/petergrace/charts/github-webhook-exporter"
+readonly CHART_REFERENCE_PATH="${CHART_REFERENCE#oci://}"
 readonly CHART_REPOSITORY="oci://ghcr.io/petergrace/charts"
 readonly FAKE_LOCAL_IMAGE_ID_DEFAULT="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 TEMPORARY_DIRECTORY=""
@@ -32,7 +33,7 @@ create_fake_commands() {
     FAKE_BIN_DIRECTORY="${TEMPORARY_DIRECTORY}/bin"
     mkdir -p -- "${FAKE_BIN_DIRECTORY}"
     COMMAND_LOG="${TEMPORARY_DIRECTORY}/command.log"
-    export COMMAND_LOG
+    export COMMAND_LOG CHART_REFERENCE_PATH
     : >"${COMMAND_LOG}"
 
     cat >"${FAKE_BIN_DIRECTORY}/docker" <<'EOF'
@@ -123,7 +124,11 @@ if (($# == 5)) && [[ "$1" == "show" && "$2" == "chart" && "$4" == "--version" ]]
             printf 'apiVersion: v2\nname: github-webhook-exporter\nversion: %s\n' "$5"
             ;;
         missing)
-            printf 'not found\n' >&2
+            printf '%s: not found\n' "${CHART_REFERENCE_PATH}:$5" >&2
+            exit 1
+            ;;
+        ambiguous)
+            printf 'configuration file not found\n' >&2
             exit 1
             ;;
         error)
@@ -332,6 +337,16 @@ main() {
     assert_command_log \
         "docker image inspect --format {{.Id}} ${IMAGE_REFERENCE}" \
         "docker manifest inspect ${IMAGE_REFERENCE}"
+
+    reset_fixture_state
+    export FAKE_REMOTE_IMAGE_STATE="missing"
+    export FAKE_CHART_STATE="ambiguous"
+    run_failure_case "chart inspection failed" "${VERSION}" "${IMAGE_REFERENCE}" "${DUMMY_ARCHIVE}"
+    assert_no_push_logged
+    assert_command_log \
+        "docker image inspect --format {{.Id}} ${IMAGE_REFERENCE}" \
+        "docker manifest inspect ${IMAGE_REFERENCE}" \
+        "helm show chart ${CHART_REFERENCE} --version ${VERSION}"
 
     reset_fixture_state
     export FAKE_REMOTE_IMAGE_STATE="missing"

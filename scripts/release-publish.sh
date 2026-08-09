@@ -6,6 +6,7 @@ readonly LOCAL_IMAGE="${2:-}"
 readonly CHART_ARCHIVE="${3:-}"
 readonly IMAGE_REFERENCE="ghcr.io/petergrace/github-webhook-exporter:${VERSION}"
 readonly CHART_REFERENCE="oci://ghcr.io/petergrace/charts/github-webhook-exporter"
+readonly CHART_REFERENCE_PATH="${CHART_REFERENCE#oci://}"
 readonly CHART_REPOSITORY="oci://ghcr.io/petergrace/charts"
 
 fail() {
@@ -108,15 +109,16 @@ inspect_remote_image_state() {
 }
 
 inspect_chart_state() {
-    local stdout_path stderr_path diagnostics
+    local stdout_path stderr_path diagnostics chart_not_found_marker
     stdout_path="$(mktemp)"
     stderr_path="$(mktemp)"
+    chart_not_found_marker="${CHART_REFERENCE_PATH}:${VERSION}: not found"
 
     if ! helm show chart "${CHART_REFERENCE}" --version "${VERSION}" \
         >"${stdout_path}" 2>"${stderr_path}"; then
         diagnostics="$(<"${stderr_path}")"
         rm -f -- "${stdout_path}" "${stderr_path}"
-        if [[ "${diagnostics}" == *"not found"* ]]; then
+        if [[ "${diagnostics}" == *"${chart_not_found_marker}"* ]]; then
             printf 'missing\n'
             return 0
         fi
