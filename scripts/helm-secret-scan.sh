@@ -67,8 +67,10 @@ scan_file() {
         return 0
     fi
     local secret_key_ref_indent=0
+    local -a lines=()
+    mapfile -t lines <"${file_path}"
 
-    while IFS= read -r line || [[ -n "${line}" ]]; do
+    for line in "${lines[@]}"; do
         line_number=$((line_number + 1))
 
         if [[ "${line}" =~ ^([[:space:]]*)secretKeyRef:[[:space:]]*$ ]]; then
@@ -118,7 +120,7 @@ scan_file() {
             printf '%s:%d:%s\n' "${file_path}" "${line_number}" "${category_id}" >&2
             matched=1
         fi
-    done <"${file_path}"
+    done
 
     return "${matched}"
 }

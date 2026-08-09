@@ -68,7 +68,7 @@ validate_archive_members() {
     local package_path="$2"
     local suppress_errors="${3:-0}"
 
-    while IFS=' ' read -r mode owner_group size date time archive_entry extra ||
+    while IFS=' ' read -r mode _ _ _ _ archive_entry _ ||
         [[ -n "${mode}" ]]; do
         case "${mode}" in
             ""|total)

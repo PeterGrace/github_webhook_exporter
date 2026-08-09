@@ -41,6 +41,10 @@ helm-package output-directory="dist":
 # Run the full static Helm chart validation suite.
 helm-static: helm-lint helm-test helm-kubeconform helm-policy helm-secrets helm-package
 
+# Verify the GitHub Actions workflow contract.
+workflow-test:
+    scripts/github-actions-test.sh .github/workflows/helm-package-ci.yml
+
 # Verify the rendered chart is accepted by a disposable Kind cluster.
 helm-kind-acceptance:
     scripts/helm-kind-acceptance.sh "{{helm-chart}}"

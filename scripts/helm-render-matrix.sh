@@ -3,7 +3,8 @@ set -Eeuo pipefail
 
 readonly CHART_DIRECTORY="${1:-}"
 readonly OUTPUT_DIRECTORY="${2:-}"
-readonly SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIRECTORY
 readonly CASES_FILE="${SCRIPT_DIRECTORY}/../ci/helm/render-cases.txt"
 readonly VALUES_DIRECTORY="${SCRIPT_DIRECTORY}/../ci/helm/values"
 readonly HELM_RELEASE_NAME="github-webhook-exporter"
@@ -43,7 +44,8 @@ if [[ ! -f "${CASES_FILE}" ]]; then
     fail "missing render matrix contract: ${CASES_FILE}"
 fi
 
-readonly TEMPORARY_DIRECTORY="$(mktemp -d)"
+TEMPORARY_DIRECTORY="$(mktemp -d)"
+readonly TEMPORARY_DIRECTORY
 cleanup() {
     rm -rf "${TEMPORARY_DIRECTORY}"
 }
