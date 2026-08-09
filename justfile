@@ -49,6 +49,10 @@ helm-security-test:
 release-version-test:
     scripts/release-version-test.sh
 
+# Verify immutable image and Helm chart publication transitions.
+release-publish-test:
+    scripts/release-publish-test.sh
+
 # Verify the GitHub Actions workflow contract.
 workflow-test:
     scripts/github-actions-test.sh .github/workflows/helm-package-ci.yml
