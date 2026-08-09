@@ -184,6 +184,11 @@ it does not query SQLite or any external system. The readiness probe calls `GET 
 runs the application's lightweight SQLite check. A readiness failure removes the pod from Service
 endpoints without making liveness fail.
 
+Standard Kubernetes NetworkPolicy always permits ingress from the pod's node, so kubelet probes do
+not require an explicit allowance in this chart's policy. CNI-specific host-firewall policies are
+separate controls; operators using them must verify that they independently permit kubelet
+liveness and readiness probes.
+
 OTLP collector availability and export failures affect neither probe. Remote telemetry is optional:
 with no generic or signal-specific endpoint configured, the service retains local structured
 logging without creating a remote provider.

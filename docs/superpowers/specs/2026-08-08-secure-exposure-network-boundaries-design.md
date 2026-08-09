@@ -49,9 +49,11 @@ become an all-namespace or all-pod allowance.
 
 Egress allowances are separate rules for cluster DNS and OTLP collectors. DNS defaults off and,
 when enabled, permits TCP and UDP port 53 to configured namespace and pod selectors. OTLP accepts a
-list of explicitly configured peers (namespace/pod selectors or CIDR blocks) and TCP ports. The
-policy is independent of health probes because probes are inbound kubelet traffic and application
-readiness never depends on collector reachability.
+list of explicitly configured peers (namespace/pod selectors or CIDR blocks) and TCP ports.
+Standard Kubernetes NetworkPolicy always permits ingress from the pod's node, so kubelet probes do
+not require an explicit policy allowance. CNI-specific host-firewall controls are separate from
+NetworkPolicy and must independently permit kubelet probes. Application readiness never depends on
+collector reachability.
 
 NetworkPolicy is pod/port based. Because every Service reaches the same pod listener, neither the
 policy nor separate Services can distinguish `/webhooks/github`, `/metrics`, and

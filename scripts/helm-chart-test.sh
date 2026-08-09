@@ -936,6 +936,10 @@ assert_contains \
     'authorization proxy' \
     "${CHART_DIRECTORY}/README.md" \
     'README must identify an authorization proxy as an L7 enforcement option'
+assert_contains \
+    'CNI-specific host-firewall' \
+    "${CHART_DIRECTORY}/README.md" \
+    'README must distinguish CNI host-firewall controls from standard NetworkPolicy'
 
 while IFS= read -r rendered_fixture; do
     assert_no_sensitive_content "${rendered_fixture}"
