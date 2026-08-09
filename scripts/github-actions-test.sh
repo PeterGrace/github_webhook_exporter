@@ -13,6 +13,13 @@ usage() {
     exit 2
 }
 
+require_command() {
+    local command_name="$1"
+    if ! command -v "${command_name}" >/dev/null 2>&1; then
+        fail "required command not found: ${command_name}"
+    fi
+}
+
 if [[ -z "${WORKFLOW_PATH}" ]]; then
     usage
 fi
@@ -21,133 +28,173 @@ if [[ ! -f "${WORKFLOW_PATH}" ]]; then
     fail "missing workflow file: ${WORKFLOW_PATH}"
 fi
 
-python3 - "$WORKFLOW_PATH" <<'PY'
+require_command yq
+require_command python3
+
+python3 - "${WORKFLOW_PATH}" <<'PY'
+import json
+import subprocess
 import sys
-from pathlib import Path
 
-import yaml
+workflow_path = sys.argv[1]
+result = subprocess.run(
+    ["yq", "eval", "-o=json", ".", workflow_path],
+    check=True,
+    capture_output=True,
+    text=True,
+)
+workflow = json.loads(result.stdout)
 
-workflow_path = Path(sys.argv[1])
-with workflow_path.open("r", encoding="utf-8") as handle:
-    workflow = yaml.load(handle, Loader=yaml.BaseLoader)
+
+def fail(message: str) -> None:
+    raise SystemExit(message)
+
 
 if not isinstance(workflow, dict):
-    raise SystemExit("workflow did not parse as a mapping")
+    fail("workflow did not parse as a mapping")
 
 on_section = workflow.get("on")
 if not isinstance(on_section, dict):
-    raise SystemExit("workflow must define pull_request and push triggers")
+    fail("workflow must define pull_request and push triggers")
 
 if "pull_request" not in on_section:
-    raise SystemExit("workflow must trigger on pull_request")
+    fail("workflow must trigger on pull_request")
 
-push_section = on_section.get("push")
+if "push" not in on_section:
+    fail("workflow must define a push trigger")
+
+push_section = on_section["push"]
 if not isinstance(push_section, dict):
-    raise SystemExit("workflow must define a push trigger")
+    fail("workflow push trigger must be a mapping")
 
-branches = push_section.get("branches")
-if branches != ["main"]:
-    raise SystemExit("workflow push trigger must target main only")
+if push_section.get("branches") != ["main"]:
+    fail("workflow push trigger must target main only")
 
 permissions = workflow.get("permissions")
 if permissions != {"contents": "read"}:
-    raise SystemExit("workflow must use least-privilege contents: read permissions")
-
-jobs = workflow.get("jobs")
-if not isinstance(jobs, dict) or len(jobs) != 1:
-    raise SystemExit("workflow must define exactly one job")
-
-_, job = next(iter(jobs.items()))
-if not isinstance(job, dict):
-    raise SystemExit("workflow job must be a mapping")
-
-if job.get("runs-on") != "ubuntu-24.04":
-    raise SystemExit("workflow must run on ubuntu-24.04")
+    fail("workflow must use least-privilege contents: read permissions")
 
 concurrency = workflow.get("concurrency")
-if not isinstance(concurrency, dict):
-    raise SystemExit("workflow must define concurrency")
+expected_concurrency = {
+    "group": "${{ github.workflow }}-${{ github.ref }}",
+    "cancel-in-progress": True,
+}
+if concurrency != expected_concurrency:
+    fail("workflow concurrency must cancel stale branch runs")
 
-if concurrency.get("group") != "${{ github.workflow }}-${{ github.ref }}":
-    raise SystemExit("workflow concurrency group must cancel stale branch runs")
+jobs = workflow.get("jobs")
+if not isinstance(jobs, dict):
+    fail("workflow must define jobs")
 
-if concurrency.get("cancel-in-progress") != "true":
-    raise SystemExit("workflow concurrency must cancel in progress runs")
+if list(jobs) != ["validate"]:
+    fail("workflow must define exactly one validate job")
+
+job = jobs["validate"]
+if not isinstance(job, dict):
+    fail("workflow validate job must be a mapping")
+
+if job.get("runs-on") != "ubuntu-24.04":
+    fail("workflow must run on ubuntu-24.04")
 
 job_env = job.get("env")
-if not isinstance(job_env, dict) or job_env.get("CONTAINER_IMAGE") != "github-webhook-exporter:ci":
-    raise SystemExit("workflow must set CONTAINER_IMAGE=github-webhook-exporter:ci")
+if not isinstance(job_env, dict):
+    fail("workflow validate job must define env")
+
+if job_env.get("CONTAINER_IMAGE") != "github-webhook-exporter:ci":
+    fail("workflow must set CONTAINER_IMAGE=github-webhook-exporter:ci")
 
 steps = job.get("steps")
 if not isinstance(steps, list):
-    raise SystemExit("workflow job must define steps")
+    fail("workflow validate job must define steps")
 
-allowed_uses = {
-    f"actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
-    f"actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
-}
-
-for step in steps:
-    if not isinstance(step, dict):
-        raise SystemExit("workflow steps must be mappings")
-    uses = step.get("uses")
-    if uses is None:
-        continue
-    if uses not in allowed_uses:
-        if "@" in uses:
-            raise SystemExit(f"workflow uses mutable or unexpected action reference: {uses}")
-        raise SystemExit(f"workflow uses an unexpected action: {uses}")
-
-ordered_markers = [
-    "scripts/install-ci-tools.sh",
-    "shellcheck",
-    "just helm-static",
-    "just image-smoke",
-    "just fmt",
-    "cargo build --locked",
-    "cargo clippy --all-targets -- -D warnings",
-    "just test",
-    "cargo doc --no-deps --locked",
+expected_steps = [
+    {
+        "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+    },
+    {
+        "run": 'scripts/install-ci-tools.sh "$RUNNER_TEMP/ci-tools"',
+    },
+    {
+        "run": 'echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"',
+    },
+    {
+        "run": "mapfile -t shell_files < <(git ls-files -- '*.sh')\nshellcheck \"${shell_files[@]}\"\n",
+    },
+    {
+        "run": "just helm-static",
+    },
+    {
+        "run": "just image-smoke",
+    },
+    {
+        "run": "just fmt",
+    },
+    {
+        "run": "cargo build --locked",
+    },
+    {
+        "run": "cargo clippy --all-targets -- -D warnings",
+    },
+    {
+        "run": "just test",
+    },
+    {
+        "run": "cargo doc --no-deps --locked",
+    },
+    {
+        "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "with": {
+            "name": "helm-package",
+            "path": "dist/github-webhook-exporter-0.1.0.tgz",
+            "if-no-files-found": "error",
+            "retention-days": 30,
+        },
+    },
 ]
 
-step_index_by_marker: dict[str, int] = {}
-for index, step in enumerate(steps):
+if len(steps) != len(expected_steps):
+    fail("workflow must contain the expected validation steps only")
+
+cargo_doc_index = None
+upload_index = None
+
+for index, expected_step in enumerate(expected_steps):
+    step = steps[index]
     if not isinstance(step, dict):
-        raise SystemExit("workflow steps must be mappings")
-    run = step.get("run")
-    if not isinstance(run, str):
-        continue
-    for marker in ordered_markers:
-        if marker in run and marker not in step_index_by_marker:
-            step_index_by_marker[marker] = index
+        fail(f"workflow step {index + 1} must be a mapping")
 
-missing = [marker for marker in ordered_markers if marker not in step_index_by_marker]
-if missing:
-    raise SystemExit(f"workflow is missing required commands: {', '.join(missing)}")
+    if "uses" in expected_step:
+        if step.get("uses") != expected_step["uses"]:
+            fail(f"workflow step {index + 1} uses the wrong action reference")
 
-indices = [step_index_by_marker[marker] for marker in ordered_markers]
-if indices != sorted(indices):
-    raise SystemExit("workflow commands are not in the required order")
+        if index == len(expected_steps) - 1:
+            with_section = step.get("with")
+            if not isinstance(with_section, dict):
+                fail("upload-artifact step must define with:")
+            if with_section != expected_step["with"]:
+                fail("workflow must upload the exact packaged archive path")
+            if any(key not in {"name", "uses", "with"} for key in step):
+                fail(f"workflow step {index + 1} contains unexpected fields")
+            upload_index = index
+        else:
+            if any(key not in {"name", "uses"} for key in step):
+                fail(f"workflow step {index + 1} contains unexpected fields")
+    else:
+        if step.get("run") != expected_step["run"]:
+            fail(f"workflow step {index + 1} must run the expected command")
 
-upload_step = None
-for step in steps:
-    if isinstance(step, dict) and step.get("uses") == "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02":
-        upload_step = step
-        break
+        if any(key not in {"name", "run"} for key in step):
+            fail(f"workflow step {index + 1} contains unexpected fields")
 
-if upload_step is None:
-    raise SystemExit("workflow must upload the packaged archive")
+        if expected_step["run"] == "cargo doc --no-deps --locked":
+            cargo_doc_index = index
 
-with_section = upload_step.get("with")
-if not isinstance(with_section, dict):
-    raise SystemExit("upload-artifact step must define with:")
+if cargo_doc_index is None:
+    fail("workflow must generate documentation")
 
-if with_section.get("path") != "dist/github-webhook-exporter-0.1.0.tgz":
-    raise SystemExit("workflow must upload the exact packaged archive path")
+if upload_index is None:
+    fail("workflow must upload the packaged archive")
 
-if with_section.get("if-no-files-found") != "error":
-    raise SystemExit("workflow must fail when the packaged archive is missing")
-
-if with_section.get("retention-days") != "30":
-    raise SystemExit("workflow must set a fixed artifact retention period")
+if upload_index <= cargo_doc_index:
+    fail("workflow must upload the archive after cargo doc")
 PY
