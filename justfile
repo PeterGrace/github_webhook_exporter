@@ -53,6 +53,11 @@ workflow-test:
 helm-kind-lifecycle-unit:
     scripts/helm-kind-lifecycle-lib-test.sh
 
+# Exercise lifecycle and persistence in a disposable Kind cluster.
+helm-kind-lifecycle: image-build
+    scripts/helm-kind-lifecycle.sh "{{helm-chart}}" "{{container-image}}" \
+        "${KIND_ARTIFACT_DIRECTORY:-dist/kind-lifecycle}"
+
 # Verify the rendered chart is accepted by a disposable Kind cluster.
 helm-kind-acceptance:
     scripts/helm-kind-acceptance.sh "{{helm-chart}}"
