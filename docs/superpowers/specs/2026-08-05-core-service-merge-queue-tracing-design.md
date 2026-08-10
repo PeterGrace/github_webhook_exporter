@@ -28,12 +28,13 @@ raw statements and database details are outside the allowlist.
 
 ## Span hierarchy
 
-Each routed HTTP request creates an `http.request` span containing only:
+Each routed HTTP request creates an `http.request` span containing:
 
 - HTTP method;
 - Axum matched route template;
 - response status;
-- normalized request result.
+- normalized request result; and
+- canonical repository name when webhook authentication succeeds.
 
 The request middleware obtains the matched route after the inner service completes, so it records a
 route template rather than a raw URI. Unknown routes use a bounded fallback value.
@@ -93,7 +94,8 @@ specialized merge-group or pull-request transition span or outcome event.
 
 Merge-group `destroyed` preserves bounded reasons, including authoritative `merged` and normalized
 `dequeued`. Pull-request dequeue remains outcome `unknown` with reason
-`unclassified_dequeue`. Existing persistence and Prometheus behavior remains unchanged.
+`unclassified_dequeue`. Repository-scoped Prometheus families include the authenticated canonical
+`owner/repository` label.
 
 Queue-state persistence failures still return authenticated `204`. The active specialized span
 records a bounded failure event and error status; ordinary logs retain only their existing bounded
@@ -122,10 +124,11 @@ They verify:
 - duplicate deliveries omit repeated specialized transition spans and events;
 - group `dequeued` and PR `unknown/unclassified_dequeue` semantics;
 - only allowlisted bounded attributes and approved span-only identifiers are captured;
-- span-only identifiers are absent from stderr, OTLP logs, and Prometheus output;
+- span-only identifiers are absent from stderr and OTLP logs; Prometheus contains only the approved
+  authenticated canonical repository label and no other span-only identifier;
 - forbidden secrets, headers, payload fragments, commands, actors, raw reasons, and raw URLs are
   absent from every capture;
-- existing response, persistence, and metric tests remain unchanged and passing.
+- existing response and persistence tests pass, and metric tests enforce repository-scoped series.
 
 The implementation is complete only after `just fmt`, `cargo build`,
 `cargo clippy --all-targets -- -D warnings`, `just test`, and `cargo doc --no-deps` pass.

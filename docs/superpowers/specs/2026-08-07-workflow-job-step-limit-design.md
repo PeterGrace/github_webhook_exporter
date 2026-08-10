@@ -64,7 +64,8 @@ duplicate generic accounting or surprise historical emission.
 
 ## Prometheus metrics
 
-Register the unlabeled histogram `github_workflow_job_steps` with finite buckets:
+Register the repository-scoped histogram `github_workflow_job_steps{repository}` with finite
+buckets:
 
 ```text
 0, 5, 10, 20, 40, 64, 128, 256, 512, 1024
@@ -72,13 +73,13 @@ Register the unlabeled histogram `github_workflow_job_steps` with finite buckets
 
 Observe one value for every newly claimed completed workflow job whose admission envelope,
 identifiers, and step array are structurally valid. Accepted and over-limit jobs are both observed.
-Malformed projections and duplicates are not observed. Repository names and workflow identifiers
-are never metric labels.
+Malformed projections and duplicates are not observed. The repository label is the authenticated
+canonical lowercase `owner/repository` name. Workflow identifiers are never metric labels.
 
 Register the counter family:
 
 ```text
-github_workflow_job_trace_rejections_total{reason="too_many_steps"}
+github_workflow_job_trace_rejections_total{repository,reason="too_many_steps"}
 ```
 
 The rejection reason is represented by a closed Rust enum. Seed the single supported reason at
