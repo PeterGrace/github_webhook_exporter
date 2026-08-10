@@ -199,9 +199,15 @@ scripts/helm-sqlite-maintenance.sh backup \
 ```
 
 The command uses the current kubectl context. Set `KUBECONFIG` and `KUBECTL_CONTEXT` when operating
-against a non-default context. The backup file initially resides on the application PVC. Copy it to
-an encrypted, access-controlled backup system or take a provider snapshot after the command
-completes. A backup retained only on the application PVC does not protect against PVC loss.
+against a non-default context. An online backup mounts the `ReadWriteOnce` PVC in a second Pod while
+the exporter holds it, so the command pins the maintenance Pod to the exporter's current node. This
+same-node placement is required: the single-node Kind test cannot exercise cross-node CSI attachment,
+and a provider that forbids even same-node multi-Pod mounts cannot use the online procedure. For
+such a provider, keep maintenance mode enabled and use a coordinated offline platform snapshot.
+
+The backup file initially resides on the application PVC. Copy it to an encrypted,
+access-controlled backup system or take a provider snapshot after the command completes. A backup
+retained only on the application PVC does not protect against PVC loss.
 
 Do not copy the active `github-webhook-exporter.db` file by itself. SQLite may have committed state
 in its WAL, so a live file copy is unsupported and may be inconsistent. The production image
@@ -231,7 +237,9 @@ scripts/helm-sqlite-maintenance.sh restore \
 ```
 
 Restore fails before creating a maintenance Pod unless desired replicas equal zero and ordinal `0`
-is absent. It validates the backup and restored database, creates the replacement as UID/GID
+is absent. Those checks are point-in-time rather than an atomic lock; keep `maintenanceMode=true`
+and prevent another operator or controller from scaling the StatefulSet until restore exits. It
+validates the backup and restored database, creates the replacement as UID/GID
 `65532:65532`, verifies mode `0600`, removes stale WAL/shared-memory files, and retains the replaced
 database as `github-webhook-exporter.db.pre-restore`. Do not delete that file or the source backup
 until recovery is accepted.

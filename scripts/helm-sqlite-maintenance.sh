@@ -54,7 +54,19 @@ kube() {
     kubectl "${KUBECTL_GLOBAL_ARGUMENTS[@]}" "$@"
 }
 
+MAINTENANCE_NODE_NAME=''
+if [[ "${OPERATION}" == backup ]]; then
+    MAINTENANCE_NODE_NAME="$(kube --namespace "${NAMESPACE}" get pod "${STATEFULSET}-0" \
+        --output=jsonpath='{.spec.nodeName}')" || fail 'could not inspect the exporter pod node'
+    if (( ${#MAINTENANCE_NODE_NAME} > 253 )) || \
+        [[ ! "${MAINTENANCE_NODE_NAME}" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]]; then
+        fail 'online backup requires a scheduled exporter pod'
+    fi
+fi
+readonly MAINTENANCE_NODE_NAME
+
 if [[ "${OPERATION}" == restore ]]; then
+    # These checks are point-in-time. Keep Helm maintenance mode enabled until restore completes.
     replicas="$(kube --namespace "${NAMESPACE}" get statefulset "${STATEFULSET}" \
         --output=jsonpath='{.spec.replicas}')" || fail 'could not inspect StatefulSet replicas'
     if [[ "${replicas}" != 0 ]]; then
@@ -153,6 +165,9 @@ metadata:
 spec:
   restartPolicy: Never
   automountServiceAccountToken: false
+$(if [[ -n "${MAINTENANCE_NODE_NAME}" ]]; then
+    printf '  nodeName: "%s"\n' "${MAINTENANCE_NODE_NAME}"
+fi)
   securityContext:
     runAsNonRoot: true
     runAsUser: 65532
@@ -170,6 +185,10 @@ spec:
         - |
 $(printf '%s\n' "${MAINTENANCE_COMMAND}" | sed 's/^/          /')
       workingDir: /data
+      # Keep SQLite temporary files on the PVC because the root filesystem is read-only.
+      env:
+        - name: SQLITE_TMPDIR
+          value: /data
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true

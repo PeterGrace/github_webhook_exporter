@@ -26,7 +26,12 @@ arguments=" $* "
 if [[ "${arguments}" == *' get statefulset '* ]]; then
     printf '%s' "${FAKE_REPLICAS:-1}"
 elif [[ "${arguments}" == *' get pod '* ]]; then
-    [[ "${FAKE_POD_EXISTS:-true}" == true ]]
+    if [[ "${FAKE_POD_EXISTS:-true}" != true ]]; then
+        exit 1
+    fi
+    if [[ "${arguments}" == *'{.spec.nodeName}'* ]]; then
+        printf '%s' "${FAKE_NODE_NAME:-kind-maintenance-worker}"
+    fi
 elif [[ "${arguments}" == *' apply -f - '* || "${arguments}" == *' apply -f -' ]]; then
     cat >"${FAKE_KUBECTL_MANIFEST}"
     printf '%s\n' 'pod/sqlite-maintenance created'
@@ -82,6 +87,9 @@ assert_manifest_contains '.backup /data/backup-20260809.db'
 assert_manifest_contains 'PRAGMA integrity_check;'
 assert_manifest_contains 'chmod 0600 /data/backup-20260809.db'
 assert_manifest_contains 'automountServiceAccountToken: false'
+assert_manifest_contains 'nodeName: "kind-maintenance-worker"'
+assert_manifest_contains 'name: SQLITE_TMPDIR'
+assert_manifest_contains 'value: /data'
 
 : >"${FAKE_LOG}"
 export FAKE_REPLICAS=1

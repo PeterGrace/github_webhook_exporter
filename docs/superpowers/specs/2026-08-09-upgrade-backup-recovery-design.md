@@ -18,8 +18,10 @@ snapshot controllers, or multi-region recovery.
 
 A focused Bash maintenance command will create a short-lived Kubernetes Pod mounting the existing
 PVC. The Pod uses SQLite 3.50.4 from a linux/amd64 digest-pinned maintenance image and runs as the
-same non-root UID/GID 65532 as the exporter. The production image and Helm chart gain no shell,
-SQLite CLI, sidecar, Job, CronJob, or additional credential access.
+same non-root UID/GID 65532 as the exporter. Online backup pins the maintenance Pod to the running
+exporter's node so the `ReadWriteOnce` PVC is not requested from another node. Providers that forbid
+same-node multi-Pod mounts require the documented offline snapshot alternative. The production image
+and Helm chart gain no shell, SQLite CLI, sidecar, Job, CronJob, or additional credential access.
 
 The chart adds `maintenanceMode: false`. The default still renders exactly one replica;
 maintenance mode renders zero replicas without adding a container or resource. This lets Helm record

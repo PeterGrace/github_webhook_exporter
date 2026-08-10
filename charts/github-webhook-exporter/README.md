@@ -283,9 +283,13 @@ scripts/helm-sqlite-maintenance.sh backup \
 ```
 
 The command creates a hardened non-root Pod, runs SQLite's online `.backup`, validates the result,
-and sets mode `0600`. Move the backup to encrypted storage or snapshot the PVC after completion; a
-copy retained only on the PVC does not survive PVC loss. Copying the active database file alone is
-unsupported because committed state may remain in its WAL.
+and sets mode `0600`. Because online backup mounts the `ReadWriteOnce` PVC from a second Pod while
+the exporter holds it, the command pins that Pod to the exporter's current node. The single-node
+Kind test cannot validate cross-node CSI attachment; providers that forbid same-node multi-Pod
+mounts require a coordinated offline platform snapshot instead. Move the backup to encrypted
+storage or snapshot the PVC after completion; a copy retained only on the PVC does not survive PVC
+loss. Copying the active database file alone is unsupported because committed state may remain in
+its WAL.
 
 Restore only in maintenance mode:
 
@@ -304,8 +308,10 @@ helm upgrade github-webhook-exporter charts/github-webhook-exporter \
   --set maintenanceMode=false --wait
 ```
 
-Restore refuses to start unless desired replicas are zero and ordinal `0` is absent. It validates
-the source and restored database, enforces UID/GID `65532:65532` and mode `0600`, removes stale WAL
+Restore refuses to start unless desired replicas are zero and ordinal `0` is absent. These are
+point-in-time checks, so keep maintenance mode enabled and prevent any other controller or operator
+from scaling the StatefulSet until the command exits. It validates the source and restored database,
+enforces UID/GID `65532:65532` and mode `0600`, removes stale WAL
 files, and retains the replaced database as `.pre-restore`. Before accepting recovery, verify
 readiness and migrations, repository-secret decryption with a signed webhook, expected metrics,
 pre-backup delivery deduplication, and pre-backup merge-queue state. Keep the source backup and
