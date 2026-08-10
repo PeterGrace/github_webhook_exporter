@@ -86,5 +86,10 @@ image-reproducibility-test:
 image-smoke: image-build
     scripts/container-smoke.sh "{{container-image}}"
 
+# Prepare the patch release commit and tag locally, without pushing.
 release-patch:
-  cargo release --no-publish --no-verify patch --execute
+    cargo release --no-publish --no-verify --no-push patch --execute
+
+# Land the prepared release commit through a pull request, then publish its tag.
+release-ship:
+    scripts/release-ship.sh
