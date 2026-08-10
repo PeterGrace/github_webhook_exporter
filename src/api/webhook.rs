@@ -120,7 +120,11 @@ async fn webhook_handler(
         }
         Err(WebhookAuthenticationError::Unavailable) => {
             trace::set_status(&authentication_span, OperationOutcome::Failure);
-            return Err(unavailable_error(&state, FailureStage::Authentication));
+            return Err(unavailable_error(
+                &state,
+                None,
+                FailureStage::Authentication,
+            ));
         }
     };
     drop(authentication_span);
@@ -139,20 +143,24 @@ async fn webhook_handler(
         let claim = state.delivery_store().claim(&request.delivery_id).await;
         match claim {
             Ok(DeliveryClaim::Duplicate) => {
-                state.metrics().record_duplicate();
+                state.metrics().record_duplicate(&request.repository_name);
                 Ok(OperationOutcome::Duplicate)
             }
             Ok(DeliveryClaim::New) => {
-                state
-                    .metrics()
-                    .observe_event(event_type, action, request.body.len());
+                state.metrics().observe_event(
+                    &request.repository_name,
+                    event_type,
+                    action,
+                    request.body.len(),
+                );
                 if event_type == EventType::WorkflowJob && action == Action::Completed {
                     if let Some(admission) =
                         workflow_job::inspect_completed_job(request.body.as_ref())
                     {
-                        state
-                            .metrics()
-                            .observe_workflow_job_steps(admission.step_count());
+                        state.metrics().observe_workflow_job_steps(
+                            &request.repository_name,
+                            admission.step_count(),
+                        );
                         let step_limit = state.workflow_job_max_steps();
                         if admission.step_count() > step_limit {
                             record_workflow_trace_rejection(
@@ -175,9 +183,11 @@ async fn webhook_handler(
                 if let Some(transition) =
                     event_projection.merge_group_transition(event_type, action)
                 {
-                    state
-                        .metrics()
-                        .record_merge_group_event(transition.action, transition.reason);
+                    state.metrics().record_merge_group_event(
+                        &request.repository_name,
+                        transition.action,
+                        transition.reason,
+                    );
                     let update_span = trace::operation_span(Operation::MergeQueueUpdate);
                     trace::set_queue_entity(&update_span, QueueEntity::MergeGroup);
                     trace::set_webhook_event(&update_span, event_type, action);
@@ -206,12 +216,16 @@ async fn webhook_handler(
                         metrics: state.metrics(),
                     };
                     if processor.process(pull_request).await.is_err() {
-                        record_queue_state_failure(&state);
+                        record_queue_state_failure(&state, &request.repository_name);
                     }
                 }
                 Ok(OperationOutcome::Success)
             }
-            Err(_) => Err(unavailable_error(&state, FailureStage::DeliveryClaim)),
+            Err(_) => Err(unavailable_error(
+                &state,
+                Some(&request.repository_name),
+                FailureStage::DeliveryClaim,
+            )),
         }
     }
     .instrument(process_span.clone())
@@ -236,9 +250,10 @@ fn record_workflow_trace_rejection(
     admission: &workflow_job::WorkflowJobAdmission,
     step_limit: usize,
 ) {
-    state
-        .metrics()
-        .record_workflow_trace_rejection(WorkflowTraceRejectionReason::TooManySteps);
+    state.metrics().record_workflow_trace_rejection(
+        repository_name,
+        WorkflowTraceRejectionReason::TooManySteps,
+    );
     let _parentless_context = Context::new().attach();
     let mut delivery_buffer = uuid::Uuid::encode_buffer();
     warn!(
@@ -263,7 +278,7 @@ async fn observe_webhook_request(
     let started_at = Instant::now();
     let response = next.run(request).await;
     let result = result_for_status(response.status());
-    metrics.observe_request(result, started_at.elapsed());
+    metrics.observe_request(None, result, started_at.elapsed());
     info!(
         parent: None,
         result = result.as_str(),
@@ -272,8 +287,10 @@ async fn observe_webhook_request(
     response
 }
 
-fn record_queue_state_failure(state: &AppState) {
-    state.metrics().record_failure(FailureStage::QueueState);
+fn record_queue_state_failure(state: &AppState, repository_name: &CanonicalRepositoryName) {
+    state
+        .metrics()
+        .record_failure(Some(repository_name), FailureStage::QueueState);
     let error = AppError::webhook_unavailable();
     let error_correlation_id = error
         .correlation_id()
@@ -287,8 +304,12 @@ fn record_queue_state_failure(state: &AppState) {
     );
 }
 
-fn unavailable_error(state: &AppState, stage: FailureStage) -> AppError {
-    state.metrics().record_failure(stage);
+fn unavailable_error(
+    state: &AppState,
+    repository_name: Option<&CanonicalRepositoryName>,
+    stage: FailureStage,
+) -> AppError {
+    state.metrics().record_failure(repository_name, stage);
     let error = AppError::webhook_unavailable();
     let error_correlation_id = error
         .correlation_id()
