@@ -16,7 +16,7 @@ use tracing::{error, info, warn, Instrument};
 
 use crate::{
     api::{merge_group::EventProjection, pull_request::QueueProcessor, workflow_job},
-    app::AppState,
+    app::{AppState, RequestRepositoryContext},
     domain::delivery::DeliveryId,
     error::AppError,
     metrics::{
@@ -57,6 +57,7 @@ struct RepositoryProjection {
 struct WebhookRequest {
     body: Bytes,
     repository_name: CanonicalRepositoryName,
+    repository_context: RequestRepositoryContext,
     event_type: String,
     delivery_id: DeliveryId,
     signature: WebhookSignature,
@@ -67,6 +68,11 @@ impl FromRequest<AppState> for WebhookRequest {
 
     async fn from_request(request: Request, state: &AppState) -> Result<Self, Self::Rejection> {
         let (parts, body) = request.into_parts();
+        let repository_context = parts
+            .extensions
+            .get::<RequestRepositoryContext>()
+            .cloned()
+            .expect("HTTP middleware installs repository context");
         validate_content_type(&parts)?;
         let event_type = required_header(&parts.headers, "X-GitHub-Event")?.to_owned();
         let delivery_id = DeliveryId::parse(required_header(&parts.headers, "X-GitHub-Delivery")?)
@@ -85,6 +91,7 @@ impl FromRequest<AppState> for WebhookRequest {
         Ok(Self {
             body,
             repository_name,
+            repository_context,
             event_type,
             delivery_id,
             signature,
@@ -110,6 +117,9 @@ async fn webhook_handler(
         .await;
     let repository_id = match authentication {
         Ok(repository_id) => {
+            request
+                .repository_context
+                .authenticate(&request.repository_name);
             trace::set_repository_id(&authentication_span, repository_id);
             trace::set_status(&authentication_span, OperationOutcome::Success);
             repository_id
@@ -275,10 +285,19 @@ async fn observe_webhook_request(
     request: Request,
     next: Next,
 ) -> Response {
+    let repository_context = request
+        .extensions()
+        .get::<RequestRepositoryContext>()
+        .cloned()
+        .expect("HTTP middleware installs repository context");
     let started_at = Instant::now();
     let response = next.run(request).await;
     let result = result_for_status(response.status());
-    metrics.observe_request(None, result, started_at.elapsed());
+    metrics.observe_request(
+        repository_context.repository(),
+        result,
+        started_at.elapsed(),
+    );
     info!(
         parent: None,
         result = result.as_str(),
