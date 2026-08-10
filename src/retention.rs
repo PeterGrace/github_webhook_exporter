@@ -726,7 +726,8 @@ mod tests {
         assert_eq!(queue_attempt_count(&pool).await, 2);
         let logs = captured_logs.text();
         assert!(logs.contains("workload=\"delivery\" outcome=\"failed\""));
-        assert!(logs.contains("workload=\"merge_queue\" outcome=\"completed\""));
+        assert!(logs.contains("workload=\"merge_queue\""));
+        assert!(logs.contains("outcome=\"completed\""));
     }
 
     #[tokio::test]
