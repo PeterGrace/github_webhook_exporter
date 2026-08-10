@@ -85,3 +85,6 @@ image-reproducibility-test:
 # Build and exercise the production image contracts.
 image-smoke: image-build
     scripts/container-smoke.sh "{{container-image}}"
+
+release-patch:
+  cargo release --no-publish --no-verify patch --execute
