@@ -518,8 +518,8 @@ verify_backup_restore_recovery() {
     send_webhook pull_request 550e8400-e29b-41d4-a716-446655440107 \
         "${PULL_REQUEST_DEQUEUED}" queue_completion_after_restore
     assert_metric 'github_repository_configurations 1'
-    assert_metric 'github_webhook_duplicates_total 1'
-    assert_metric 'github_merge_queue_pr_outcomes_total{outcome="unknown",reason="unclassified_dequeue"} 1'
+    assert_metric "github_webhook_duplicates_total{repository=\"${REPOSITORY_NAME}\"} 1"
+    assert_metric "github_merge_queue_pr_outcomes_total{repository=\"${REPOSITORY_NAME}\",outcome=\"unknown\",reason=\"unclassified_dequeue\"} 1"
     request_status GET /metrics metrics_after_restore 200
     printf '%s\n' 'post_recovery_checks=completed' >>"${RECOVERY_STATUS_FILE}"
 }
@@ -576,8 +576,8 @@ send_webhook pull_request 550e8400-e29b-41d4-a716-446655440101 \
 send_webhook merge_group 550e8400-e29b-41d4-a716-446655440102 \
     "${MERGE_GROUP_OPEN}" merge_group_open
 assert_metric 'github_repository_configurations 1'
-assert_metric 'github_webhook_events_total{event_type="pull_request",action="enqueued"} 1'
-assert_metric 'github_webhook_events_total{event_type="merge_group",action="checks_requested"} 1'
+assert_metric "github_webhook_events_total{repository=\"${REPOSITORY_NAME}\",event_type=\"pull_request\",action=\"enqueued\"} 1"
+assert_metric "github_webhook_events_total{repository=\"${REPOSITORY_NAME}\",event_type=\"merge_group\",action=\"checks_requested\"} 1"
 
 old_uid="$(kube --namespace "${NAMESPACE}" get pod "${POD_NAME}" -o jsonpath='{.metadata.uid}')"
 kube --namespace "${NAMESPACE}" delete pod "${POD_NAME}" --wait=true >/dev/null
@@ -603,10 +603,10 @@ send_webhook pull_request 550e8400-e29b-41d4-a716-446655440103 \
     "${PULL_REQUEST_DEQUEUED}" pull_request_dequeue_after_restart
 send_webhook merge_group 550e8400-e29b-41d4-a716-446655440104 \
     "${MERGE_GROUP_CLOSE}" merge_group_close_after_restart
-assert_metric 'github_webhook_duplicates_total 1'
-assert_metric 'github_merge_queue_pr_outcomes_total{outcome="unknown",reason="unclassified_dequeue"} 1'
-assert_metric 'github_merge_queue_attempt_duration_seconds_count{outcome="unknown"} 1'
-assert_metric 'github_webhook_events_total{event_type="merge_group",action="destroyed"} 1'
+assert_metric "github_webhook_duplicates_total{repository=\"${REPOSITORY_NAME}\"} 1"
+assert_metric "github_merge_queue_pr_outcomes_total{repository=\"${REPOSITORY_NAME}\",outcome=\"unknown\",reason=\"unclassified_dequeue\"} 1"
+assert_metric "github_merge_queue_attempt_duration_seconds_count{repository=\"${REPOSITORY_NAME}\",outcome=\"unknown\"} 1"
+assert_metric "github_webhook_events_total{repository=\"${REPOSITORY_NAME}\",event_type=\"merge_group\",action=\"destroyed\"} 1"
 
 collector_failure_seen=false
 for ((attempt = 0; attempt < 30; attempt++)); do
