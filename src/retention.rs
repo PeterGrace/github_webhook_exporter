@@ -331,8 +331,8 @@ mod tests {
     use crate::storage::{open_database, DeliveryStore, MergeQueueStore};
 
     use super::{
-        prune_expired_deliveries, run_retention, RetentionConfig, RetentionError,
-        RetentionPassOutcome, StorePruneOutcome,
+        prune_expired_deliveries, run_retention, run_retention_once, RetentionConfig,
+        RetentionError, RetentionPassOutcome, StorePruneOutcome,
     };
 
     #[derive(Clone, Default)]
@@ -705,7 +705,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delivery table is removed");
-        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
         let captured_logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .without_time()
@@ -718,24 +718,12 @@ mod tests {
             Duration::from_secs(90 * 86_400),
         )
         .expect("retention configuration is valid");
-        let runner = tokio::spawn(
-            run_retention(delivery_store, queue_store, config, shutdown_receiver)
-                .with_subscriber(subscriber),
-        );
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while queue_attempt_count(&pool).await != 2 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "queue pruning did not finish after the delivery failure"
-            );
-            tokio::task::yield_now().await;
-        }
-        shutdown_sender
-            .send(true)
-            .expect("retention runner receives shutdown");
-        runner.await.expect("retention runner joins");
+        run_retention_once(&delivery_store, &queue_store, config, &shutdown_receiver)
+            .with_subscriber(subscriber)
+            .await;
 
+        assert_eq!(queue_attempt_count(&pool).await, 2);
         let logs = captured_logs.text();
         assert!(logs.contains("workload=\"delivery\" outcome=\"failed\""));
         assert!(logs.contains("workload=\"merge_queue\" outcome=\"completed\""));
