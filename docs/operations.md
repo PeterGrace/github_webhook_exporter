@@ -31,8 +31,8 @@ Set `CONTAINER_IMAGE` when a release or registry-specific tag is required. The s
 the image exercised by the smoke verification:
 
 ```bash
-CONTAINER_IMAGE=registry.example/github-webhook-exporter:0.1.0 just image-build
-CONTAINER_IMAGE=registry.example/github-webhook-exporter:0.1.0 just image-smoke
+CONTAINER_IMAGE=registry.example/github-webhook-exporter:0.1.1 just image-build
+CONTAINER_IMAGE=registry.example/github-webhook-exporter:0.1.1 just image-smoke
 ```
 
 The image working and data directory is `/var/lib/github-webhook-exporter`. Mount persistent
@@ -71,15 +71,16 @@ Helm OCI chart only after full validation passes. The release workflow requires 
 `v`, the Cargo package version, the Helm chart version, and the Helm `appVersion` to match exactly
 before it authenticates.
 
-For example, after all four version fields are `0.1.0`, create and push the release tag, then
-consume the published image and chart:
+Prepare and ship the tag with `just release-patch` and `just release-ship`, which keep all four
+version fields aligned and land the release commit through a pull request; the `main` ruleset
+rejects a direct push. See [RELEASE.md](../RELEASE.md) for the full procedure.
+
+For example, after all four version fields are `0.1.1`, consume the published image and chart:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
-docker pull ghcr.io/petergrace/github-webhook-exporter:0.1.0
-helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.0
-helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.0
+docker pull ghcr.io/petergrace/github-webhook-exporter:0.1.1
+helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.1
+helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.1
 ```
 
 Published version tags are immutable. Existing image tags are never overwritten. An exact matching
@@ -301,7 +302,7 @@ KIND_ARTIFACT_DIRECTORY=dist/kind-lifecycle just helm-kind-lifecycle
 archive contracts across the supported Kubernetes range 1.31.0 through 1.35.0
 (`>=1.31.0-0 <1.36.0-0`). `just image-smoke` builds and exercises the production image locally.
 `just workflow-test` checks the GitHub Actions contract, including the exact archive path
-`dist/github-webhook-exporter-0.1.0.tgz`. `just helm-kind-acceptance` confirms API acceptance for the
+`dist/github-webhook-exporter-0.1.1.tgz`. `just helm-kind-acceptance` confirms API acceptance for the
 rendered StatefulSet, Service, ConfigMap, and PVC; it does not start the exporter.
 
 `just helm-kind-lifecycle` builds and loads the `linux/amd64` production image into a uniquely named
@@ -325,9 +326,9 @@ Kubernetes 1.35.0 node image by digest. CI uploads the diagnostics for 14 days w
 For local archive inspection, use the fixed package name directly:
 
 ```bash
-helm show chart dist/github-webhook-exporter-0.1.0.tgz
-helm show values dist/github-webhook-exporter-0.1.0.tgz
-helm template archive dist/github-webhook-exporter-0.1.0.tgz --kube-version 1.35.0 >/dev/null
+helm show chart dist/github-webhook-exporter-0.1.1.tgz
+helm show values dist/github-webhook-exporter-0.1.1.tgz
+helm template archive dist/github-webhook-exporter-0.1.1.tgz --kube-version 1.35.0 >/dev/null
 ```
 
 If `just helm-policy` fails, run `just helm-render` first, then inspect the rendered manifests under

@@ -33,19 +33,36 @@ require_command python3
 
 python3 - "${WORKFLOW_PATH}" <<'PY'
 import json
+import re
 import subprocess
 import sys
 
 workflow_path = sys.argv[1]
+
+CHART_METADATA = "charts/github-webhook-exporter/Chart.yaml"
 
 
 def fail(message: str) -> None:
     raise SystemExit(message)
 
 
+def chart_version() -> str:
+    """Read the declared chart version so a release bump needs no edit here."""
+    with open(CHART_METADATA, encoding="utf-8") as file_handle:
+        match = re.search(r"^version:\s*(\S+)$", file_handle.read(), re.MULTILINE)
+    if match is None:
+        fail(f"missing chart version in {CHART_METADATA}")
+    return match.group(1)
+
+
+CHART_VERSION = chart_version()
+
+
 with open("scripts/helm-package-test.sh", encoding="utf-8") as file_handle:
     package_test = file_handle.read()
-if 'readonly PACKAGE_NAME="github-webhook-exporter-0.1.0.tgz"' in package_test:
+if re.search(
+    r'readonly PACKAGE_NAME="github-webhook-exporter-\d+\.\d+\.\d+\.tgz"', package_test
+):
     fail("Helm package validation must not hard-code the current chart version")
 
 with open("scripts/image-reproducibility-test.sh", encoding="utf-8") as file_handle:
@@ -80,8 +97,8 @@ shared_release_fragments = (
     "overwrite guard is not atomic",
     "`latest`",
     "oci://ghcr.io/petergrace/charts/github-webhook-exporter",
-    "helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.0",
-    "helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.0",
+    f"helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version {CHART_VERSION}",
+    f"helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter --version {CHART_VERSION}",
     "Published version tags are immutable.",
     "The workflow never publishes `latest`, branch, SHA, or prerelease tags.",
     "Only the image-existing/chart-missing state with an exact matching digest may resume as chart-only recovery.",
