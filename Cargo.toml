@@ -4,6 +4,14 @@ version = "0.1.1"
 edition = "2021"
 authors = ["Peter Grace <pete.grace@gmail.com>"]
 
+# Keep the Helm chart in lockstep with the crate; scripts/release-version.sh
+# rejects a release tag whose Cargo, chart, and appVersion values disagree.
+[package.metadata.release]
+pre-release-replacements = [
+    { file = "charts/github-webhook-exporter/Chart.yaml", search = "(?m)^version: .*$", replace = "version: {{version}}", exactly = 1 },
+    { file = "charts/github-webhook-exporter/Chart.yaml", search = "(?m)^appVersion: .*$", replace = "appVersion: \"{{version}}\"", exactly = 1 },
+]
+
 [dependencies]
 aes = { version = "0.8", features = ["zeroize"] }
 aes-gcm = { version = "0.10", features = ["zeroize"] }

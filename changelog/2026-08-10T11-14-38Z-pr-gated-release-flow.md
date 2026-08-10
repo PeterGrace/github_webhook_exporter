@@ -41,10 +41,26 @@ Helm chart versions by the existing `scripts/release-version.sh`.
 Tag pushes trigger the `v[0-9]+.[0-9]+.[0-9]+` branch of `helm-package-ci.yml`, so
 packaging still runs from the tag exactly as before.
 
+## Helm chart version drift
+
+Preparing the release surfaced a second defect. `cargo release` bumped only
+`Cargo.toml` and `Cargo.lock`, leaving `charts/github-webhook-exporter/Chart.yaml`
+at `0.1.0`, so `scripts/release-version.sh v0.1.1` failed on a chart version
+mismatch. The `v0.1.1` tag prepared before this change is therefore internally
+inconsistent.
+
+`[package.metadata.release]` now carries `pre-release-replacements` that rewrite
+the chart `version` and `appVersion` alongside the crate version, and `Chart.yaml`
+is corrected to `0.1.1` so the release commit lands coherent. A `cargo release`
+dry run confirms the next bump rewrites both chart fields.
+
 ## Files
 
 - `justfile` — `release-patch` gains `--no-push`; new `release-ship` recipe.
 - `scripts/release-ship.sh` — new.
+- `Cargo.toml` — `pre-release-replacements` keep the chart in lockstep.
+- `charts/github-webhook-exporter/Chart.yaml` — corrected to `0.1.1`.
+- `RELEASE.md` — new; the release how-to.
 
 ## Follow-up
 
