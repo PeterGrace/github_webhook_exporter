@@ -7,7 +7,7 @@ metadata:
     {{- include "github-webhook-exporter.labels" . | nindent 4 }}
 spec:
   serviceName: {{ include "github-webhook-exporter.fullname" . }}
-  replicas: {{ .Values.replicaCount }}
+  replicas: {{ ternary 0 .Values.replicaCount .Values.maintenanceMode }}
   podManagementPolicy: OrderedReady
   updateStrategy:
     type: RollingUpdate

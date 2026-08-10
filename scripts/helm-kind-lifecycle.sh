@@ -26,6 +26,9 @@ readonly PULL_REQUEST_ENQUEUED="${REPOSITORY_ROOT}/ci/kind/pull-request-enqueued
 readonly PULL_REQUEST_DEQUEUED="${REPOSITORY_ROOT}/ci/kind/pull-request-dequeued.json"
 readonly MERGE_GROUP_OPEN="${REPOSITORY_ROOT}/ci/kind/merge-group-checks-requested.json"
 readonly MERGE_GROUP_CLOSE="${REPOSITORY_ROOT}/ci/kind/merge-group-destroyed.json"
+readonly MAINTENANCE_SCRIPT="${SCRIPT_DIRECTORY}/helm-sqlite-maintenance.sh"
+readonly MAINTENANCE_IMAGE='docker.io/keinos/sqlite3:3.50.4@sha256:d9e50ca08f59d96055c514175f3f4b1fcacaca97fa93508a0334c62eb9de9382'
+readonly RECOVERY_BACKUP='recovery-backup.db'
 
 for command_name in base64 cp curl cut date docker find grep head helm jq kind kubectl mktemp \
     python3 rm sleep tr; do
@@ -57,6 +60,8 @@ readonly SIGNATURE_PATTERNS_FILE="${TEMPORARY_DIRECTORY}/signatures"
 readonly FORBIDDEN_PATTERNS_FILE="${TEMPORARY_DIRECTORY}/forbidden-patterns"
 readonly STATUS_FILE="${ARTIFACT_DIRECTORY}/http-statuses.txt"
 readonly ROLLOUT_SAMPLES_FILE="${ARTIFACT_DIRECTORY}/rollout-samples.txt"
+readonly RECOVERY_SAMPLES_FILE="${ARTIFACT_DIRECTORY}/recovery-samples.txt"
+readonly RECOVERY_STATUS_FILE="${ARTIFACT_DIRECTORY}/recovery-statuses.txt"
 CLUSTER_SUFFIX="$(head -c 9 /dev/urandom | base64 | tr '/+' 'ab' | tr -d '=')"
 CLUSTER_SUFFIX="${CLUSTER_SUFFIX,,}"
 readonly CLUSTER_NAME="gwe-lifecycle-${CLUSTER_SUFFIX}"
@@ -395,6 +400,11 @@ verify_graceful_sigterm() {
     start_port_forward
 }
 
+sample_running_pvc_exporters() {
+    kube --namespace "${NAMESPACE}" get pods -o json | jq \
+        '[.items[] | select(any(.spec.volumes[]?; .persistentVolumeClaim.claimName == "data-github-webhook-exporter-0")) | .status.containerStatuses[]? | select(.name == "github-webhook-exporter" and .state.running != null)] | length'
+}
+
 verify_singleton_rollout() {
     local running_count
     local maximum_running=0
@@ -406,8 +416,7 @@ verify_singleton_rollout() {
         >"${TEMPORARY_DIRECTORY}/helm-upgrade.log" 2>&1 &
     UPGRADE_PID=$!
     while kill -0 "${UPGRADE_PID}" >/dev/null 2>&1; do
-        running_count="$(kube --namespace "${NAMESPACE}" get pods -o json | jq \
-            '[.items[] | select(any(.spec.volumes[]?; .persistentVolumeClaim.claimName == "data-github-webhook-exporter-0")) | .status.containerStatuses[]? | select(.name == "github-webhook-exporter" and .state.running != null)] | length')"
+        running_count="$(sample_running_pvc_exporters)"
         printf '%s running_pvc_exporters=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
             "${running_count}" >>"${ROLLOUT_SAMPLES_FILE}"
         if (( running_count > maximum_running )); then
@@ -428,6 +437,93 @@ verify_singleton_rollout() {
     start_port_forward
 }
 
+run_sqlite_maintenance() {
+    KUBECONFIG="${KUBECONFIG_PATH}" KUBECTL_CONTEXT="${KUBE_CONTEXT}" \
+        "${MAINTENANCE_SCRIPT}" "$1" "${NAMESPACE}" "${RESOURCE_NAME}" \
+        'data-github-webhook-exporter-0' "${RECOVERY_BACKUP}"
+}
+
+verify_backup_restore_recovery() {
+    local running_count
+    local maximum_running=0
+
+    : >"${RECOVERY_STATUS_FILE}"
+    : >"${RECOVERY_SAMPLES_FILE}"
+    run_sqlite_maintenance backup >/dev/null
+    printf '%s\n' 'online_backup=completed' >>"${RECOVERY_STATUS_FILE}"
+
+    if run_sqlite_maintenance restore >"${TEMPORARY_DIRECTORY}/unsafe-restore.log" 2>&1; then
+        fail 'restore succeeded while the StatefulSet was active'
+        return 1
+    fi
+    printf '%s\n' 'active_restore=rejected' >>"${RECOVERY_STATUS_FILE}"
+
+    send_webhook pull_request 550e8400-e29b-41d4-a716-446655440107 \
+        "${PULL_REQUEST_DEQUEUED}" post_backup_queue_mutation
+    stop_port_forward
+    kube --namespace "${NAMESPACE}" scale statefulset "${RESOURCE_NAME}" \
+        --replicas=0 >/dev/null
+    kube --namespace "${NAMESPACE}" wait --for=delete "pod/${POD_NAME}" \
+        --timeout=120s >/dev/null
+    assert_equal 0 "$(sample_running_pvc_exporters)" \
+        'active exporters before maintenance upgrade'
+
+    helm upgrade "${RELEASE_NAME}" "${CHART_DIRECTORY}" \
+        --namespace "${NAMESPACE}" --kubeconfig "${KUBECONFIG_PATH}" \
+        --kube-context "${KUBE_CONTEXT}" --reuse-values --wait --timeout 3m \
+        --set maintenanceMode=true --set-string application.rustLog=warn >/dev/null
+    assert_equal 0 "$(sample_running_pvc_exporters)" \
+        'active exporters during maintenance-mode upgrade'
+    run_sqlite_maintenance restore >/dev/null
+    printf '%s\n' 'offline_restore=completed' >>"${RECOVERY_STATUS_FILE}"
+    printf '%s\n' 'restored_metadata=65532:65532_0600' >>"${RECOVERY_STATUS_FILE}"
+
+    helm upgrade "${RELEASE_NAME}" "${CHART_DIRECTORY}" \
+        --namespace "${NAMESPACE}" --kubeconfig "${KUBECONFIG_PATH}" \
+        --kube-context "${KUBE_CONTEXT}" --reuse-values --wait --timeout 3m \
+        --set maintenanceMode=false >"${TEMPORARY_DIRECTORY}/recovery-upgrade.log" 2>&1 &
+    UPGRADE_PID=$!
+    while kill -0 "${UPGRADE_PID}" >/dev/null 2>&1; do
+        running_count="$(sample_running_pvc_exporters)"
+        printf '%s running_pvc_exporters=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            "${running_count}" >>"${RECOVERY_SAMPLES_FILE}"
+        if (( running_count > maximum_running )); then
+            maximum_running=${running_count}
+        fi
+        sleep 0.2
+    done
+    if ! wait "${UPGRADE_PID}"; then
+        UPGRADE_PID=''
+        cat "${TEMPORARY_DIRECTORY}/recovery-upgrade.log" >&2
+        fail 'recovery scale-up failed'
+        return 1
+    fi
+    UPGRADE_PID=''
+    assert_equal 1 "${maximum_running}" \
+        'observed maximum active exporters during recovery'
+    wait_for_pod_ready
+    start_port_forward
+
+    request_status GET /health/live live_after_restore 200
+    request_status GET /health/ready ready_after_restore 200
+    admin_request GET /api/v1/repositories '' repository_list_after_restore 200
+    if ! jq --exit-status --arg name "${REPOSITORY_NAME}" \
+        'length == 1 and .[0].full_name == $name and .[0].enabled == true' \
+        "${HTTP_RESPONSE_FILE}" >/dev/null; then
+        fail 'encrypted repository configuration was not recovered'
+        return 1
+    fi
+    send_webhook pull_request 550e8400-e29b-41d4-a716-446655440106 \
+        "${PULL_REQUEST_ENQUEUED}" duplicate_after_restore
+    send_webhook pull_request 550e8400-e29b-41d4-a716-446655440107 \
+        "${PULL_REQUEST_DEQUEUED}" queue_completion_after_restore
+    assert_metric 'github_repository_configurations 1'
+    assert_metric 'github_webhook_duplicates_total 1'
+    assert_metric 'github_merge_queue_pr_outcomes_total{outcome="unknown",reason="unclassified_dequeue"} 1'
+    request_status GET /metrics metrics_after_restore 200
+    printf '%s\n' 'post_recovery_checks=completed' >>"${RECOVERY_STATUS_FILE}"
+}
+
 rm -rf "${ARTIFACT_DIRECTORY}"
 mkdir -p "${ARTIFACT_DIRECTORY}"
 : >"${STATUS_FILE}"
@@ -443,6 +539,8 @@ CLUSTER_CREATED=true
 kind create cluster --name "${CLUSTER_NAME}" --kubeconfig "${KUBECONFIG_PATH}" \
     --image "${KIND_NODE_IMAGE}" --wait 90s
 kind load docker-image "${IMAGE}" --name "${CLUSTER_NAME}"
+docker pull --platform linux/amd64 "${MAINTENANCE_IMAGE}" >/dev/null
+kind load docker-image "${MAINTENANCE_IMAGE}" --name "${CLUSTER_NAME}"
 kube create namespace "${NAMESPACE}"
 kube --namespace "${NAMESPACE}" create secret generic "${RESOURCE_NAME}" \
     --from-file="master-key=${MASTER_KEY_FILE}" \
@@ -529,12 +627,15 @@ request_status GET /health/live live_during_collector_outage 200
 request_status GET /health/ready ready_during_collector_outage 200
 send_webhook merge_group 550e8400-e29b-41d4-a716-446655440105 \
     "${MERGE_GROUP_OPEN}" webhook_during_collector_outage
+send_webhook pull_request 550e8400-e29b-41d4-a716-446655440106 \
+    "${PULL_REQUEST_ENQUEUED}" queue_pending_before_backup
 
 verify_broken_database_readiness
 verify_graceful_sigterm
 verify_singleton_rollout
 request_status GET /health/live live_after_rollout 200
 request_status GET /health/ready ready_after_rollout 200
+verify_backup_restore_recovery
 fetch_metrics
 cp "${TEMPORARY_DIRECTORY}/metrics" "${ARTIFACT_DIRECTORY}/metrics.txt"
 

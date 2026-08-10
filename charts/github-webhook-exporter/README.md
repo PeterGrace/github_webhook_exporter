@@ -94,7 +94,8 @@ ConfigMap.
 
 | Value | Default | Description |
 | --- | --- | --- |
-| `replicaCount` | `1` | Fixed singleton count; every other value is rejected. |
+| `replicaCount` | `1` | Fixed running singleton count; every other value is rejected. |
+| `maintenanceMode` | `false` | Render zero replicas for an explicit stopped upgrade or restore window. |
 | `image.repository` | `ghcr.io/petergrace/github-webhook-exporter` | Container repository. |
 | `image.tag` | `""` | Container tag; empty selects `Chart.appVersion`. |
 | `image.pullPolicy` | `IfNotPresent` | Kubernetes image pull policy. |
@@ -244,11 +245,76 @@ disruption, and provides no protection from involuntary failures.
 
 The StatefulSet pod template contains a deterministic checksum of the rendered ConfigMap. Changing
 any ConfigMap-backed value during `helm upgrade` changes that annotation and triggers the configured
-`RollingUpdate`, so the replacement pod reads the new environment values. The strategy and
-`ReadWriteOnce` do not guarantee safe volume handoff on every storage provider. The
-Recreate-equivalent operator procedure is deferred to #48; until that procedure is available, do
-not claim that chart-driven upgrades prevent overlapping attachment or SQLite writers on providers
-where overlap is possible.
+`RollingUpdate`, so the replacement pod reads the new environment values. With one replica,
+Kubernetes normally terminates ordinal `0` before creating its replacement. Use this path only when
+the storage provider reliably completes volume handoff before a replacement can mount the PVC.
+
+For providers that may permit attachment overlap, perform a stopped upgrade:
+
+```bash
+: "${GHE_IMAGE_TAG:?set GHE_IMAGE_TAG to an immutable published version}"
+kubectl --namespace github-webhook-exporter scale \
+  statefulset/github-webhook-exporter --replicas=0
+kubectl --namespace github-webhook-exporter wait --for=delete \
+  pod/github-webhook-exporter-0 --timeout=180s
+helm upgrade github-webhook-exporter charts/github-webhook-exporter \
+  --namespace github-webhook-exporter --reuse-values \
+  --set maintenanceMode=true --set-string image.tag="${GHE_IMAGE_TAG}" --wait
+helm upgrade github-webhook-exporter charts/github-webhook-exporter \
+  --namespace github-webhook-exporter --reuse-values \
+  --set maintenanceMode=false --wait
+```
+
+`maintenanceMode=true` renders zero desired replicas without adding a sidecar or maintenance
+resource, allowing Helm to record an upgrade while the exporter remains stopped. Confirm provider
+volume release before the first Helm command, then disable maintenance mode to restore exactly one
+replica. This procedure intentionally causes downtime. The singleton and optional fixed
+`minAvailable: 0` PodDisruptionBudget cannot preserve availability during voluntary disruption.
+
+## Back up and restore SQLite
+
+Use the repository's digest-pinned maintenance command for a consistent online backup:
+
+```bash
+backup_name="backup-$(date -u +%Y%m%dT%H%M%SZ).db"
+scripts/helm-sqlite-maintenance.sh backup \
+  github-webhook-exporter github-webhook-exporter \
+  data-github-webhook-exporter-0 "${backup_name}"
+```
+
+The command creates a hardened non-root Pod, runs SQLite's online `.backup`, validates the result,
+and sets mode `0600`. Move the backup to encrypted storage or snapshot the PVC after completion; a
+copy retained only on the PVC does not survive PVC loss. Copying the active database file alone is
+unsupported because committed state may remain in its WAL.
+
+Restore only in maintenance mode:
+
+```bash
+: "${BACKUP_NAME:?set BACKUP_NAME to the validated .db backup basename}"
+helm upgrade github-webhook-exporter charts/github-webhook-exporter \
+  --namespace github-webhook-exporter --reuse-values \
+  --set maintenanceMode=true --wait
+kubectl --namespace github-webhook-exporter wait --for=delete \
+  pod/github-webhook-exporter-0 --timeout=180s
+scripts/helm-sqlite-maintenance.sh restore \
+  github-webhook-exporter github-webhook-exporter \
+  data-github-webhook-exporter-0 "${BACKUP_NAME}"
+helm upgrade github-webhook-exporter charts/github-webhook-exporter \
+  --namespace github-webhook-exporter --reuse-values \
+  --set maintenanceMode=false --wait
+```
+
+Restore refuses to start unless desired replicas are zero and ordinal `0` is absent. It validates
+the source and restored database, enforces UID/GID `65532:65532` and mode `0600`, removes stale WAL
+files, and retains the replaced database as `.pre-restore`. Before accepting recovery, verify
+readiness and migrations, repository-secret decryption with a signed webhook, expected metrics,
+pre-backup delivery deduplication, and pre-backup merge-queue state. Keep the source backup and
+pre-restore file until those checks pass.
+
+The chart does not automate backup scheduling or external retention. `helm rollback` does not undo
+SQLite migrations, PVC-template changes, or incompatible application downgrades. See
+[Service Operations](../../docs/operations.md#back-up-sqlite-online) for detailed recovery checks
+and troubleshooting.
 
 ## Exposure and network boundaries
 
@@ -390,6 +456,7 @@ From the repository root, run:
 ```bash
 just helm-static
 just image-smoke
+just helm-maintenance-unit
 helm show chart dist/github-webhook-exporter-0.1.0.tgz
 helm show values dist/github-webhook-exporter-0.1.0.tgz
 helm template archive dist/github-webhook-exporter-0.1.0.tgz --kube-version 1.35.0 >/dev/null
@@ -413,9 +480,10 @@ checks does not prove runtime behavior; passing static checks does not prove clu
 creates runtime-only credentials, installs the chart, and verifies probes, signed administration
 and webhook traffic, bounded metrics, persistence across pod replacement, delivery deduplication,
 pull-request queue state, merge-group transitions, unavailable-collector isolation, broken database
-readiness, graceful SIGTERM, and an observed maximum of one running exporter attached to the SQLite
-PVC during a chart rollout. Rollout sampling bounds observed Kubernetes status; it cannot prove
-that overlap shorter than the sample interval is impossible. The generated cluster is deleted on
+readiness, graceful SIGTERM, online backup, active-restore rejection, stopped restore, restored
+ownership and mode, post-recovery application state, and an observed maximum of one running exporter
+attached to the SQLite PVC during chart rollout and recovery. Sampling bounds observed Kubernetes
+status; it cannot prove that overlap shorter than the sample interval is impossible. The generated cluster is deleted on
 success and failure. Diagnostics default to
 `dist/kind-lifecycle`, are scanned for generated credentials, signatures, and forbidden payload
 material, and are uploaded by CI even when the test fails. `KEEP_KIND_CLUSTER=true` is an explicit

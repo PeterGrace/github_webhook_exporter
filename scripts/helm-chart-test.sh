@@ -146,6 +146,16 @@ assert_yq \
      .spec.podManagementPolicy == "OrderedReady"' \
     "${TEMPORARY_DIRECTORY}/default-statefulset.yaml" \
     'StatefulSet must use singleton ordered rolling-update semantics'
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --set maintenanceMode=true >"${TEMPORARY_DIRECTORY}/maintenance.yaml"
+assert_yq \
+    'select(.kind == "StatefulSet").spec.replicas == 0' \
+    "${TEMPORARY_DIRECTORY}/maintenance.yaml" \
+    'maintenance mode must render a stopped StatefulSet'
+assert_yq \
+    'select(.kind == "StatefulSet").spec.template.spec.containers | length == 1' \
+    "${TEMPORARY_DIRECTORY}/maintenance.yaml" \
+    'maintenance mode must not add a sidecar or maintenance container'
 assert_yq \
     '(.metadata.labels | length) == 5 and
      .metadata.labels."helm.sh/chart" == "github-webhook-exporter-0.1.0" and

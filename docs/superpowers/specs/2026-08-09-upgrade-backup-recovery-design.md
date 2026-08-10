@@ -21,6 +21,11 @@ PVC. The Pod uses SQLite 3.50.4 from a linux/amd64 digest-pinned maintenance ima
 same non-root UID/GID 65532 as the exporter. The production image and Helm chart gain no shell,
 SQLite CLI, sidecar, Job, CronJob, or additional credential access.
 
+The chart adds `maintenanceMode: false`. The default still renders exactly one replica;
+maintenance mode renders zero replicas without adding a container or resource. This lets Helm record
+an upgrade while preserving the stopped maintenance window instead of reconciling a manual scale-down
+back to one replica.
+
 The command has two operations:
 
 - `backup` runs SQLite's online `.backup` operation while the exporter may remain available, checks
@@ -39,8 +44,9 @@ no privilege escalation, all capabilities dropped, runtime-default seccomp, and 
 
 Normal environments may use the chart's one-replica StatefulSet `RollingUpdate` and wait for
 readiness. Providers whose attachment transitions may overlap must use the documented safer flow:
-scale to zero, wait for the exporter pod and volume attachment to release, run `helm upgrade`, then
-scale to exactly one and wait for readiness. The singleton and optional `minAvailable: 0` PDB permit
+scale to zero, wait for the exporter pod and volume attachment to release, run `helm upgrade` with
+`maintenanceMode=true`, then disable maintenance mode to restore exactly one replica and wait for
+readiness. The singleton and optional `minAvailable: 0` PDB permit
 intentional downtime. Storage-template changes and application/database downgrades are not promised
 rollback paths.
 
