@@ -2,8 +2,6 @@
 
 - Replaced periodic-scheduler polling in the single-pass delivery-failure retention test with the
   existing deterministic one-pass helper.
-- Preserved assertions that delivery failure is logged, merge-queue pruning completes in the same
-  pass, and expired queue attempts are removed.
-- Removed shutdown timing from a test whose contract does not concern scheduler cancellation.
-- Asserted workload and outcome fields independently so tracing formatter field placement cannot
-  obscure the tested semantic event.
+- Asserted the durable merge-queue result directly after a delivery-store failure in the same pass.
+- Removed shutdown timing and incidental tracing capture from a test whose contract concerns neither
+  scheduler cancellation nor log formatting; dedicated tests retain failure-log coverage.

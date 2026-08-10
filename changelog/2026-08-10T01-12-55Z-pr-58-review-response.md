@@ -7,5 +7,5 @@
 - Documented that restore preconditions are point-in-time checks requiring maintenance mode to stay
   enabled through completion.
 - Kept the strict single-line maintenance success sentinel to reject unexpected stdout.
-- Required merge-queue workload and completed outcome fields to co-occur on one captured log line
-  without depending on tracing field order.
+- Removed incidental tracing assertions from the same-pass retention behavior test and retained the
+  stronger durable queue-state assertion; dedicated tests continue to cover failure logging.

@@ -706,12 +706,6 @@ mod tests {
             .await
             .expect("delivery table is removed");
         let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
-        let captured_logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(captured_logs.clone())
-            .finish();
         let config = RetentionConfig::new(
             Duration::from_millis(10),
             Duration::from_secs(86_400),
@@ -719,16 +713,9 @@ mod tests {
         )
         .expect("retention configuration is valid");
 
-        run_retention_once(&delivery_store, &queue_store, config, &shutdown_receiver)
-            .with_subscriber(subscriber)
-            .await;
+        run_retention_once(&delivery_store, &queue_store, config, &shutdown_receiver).await;
 
         assert_eq!(queue_attempt_count(&pool).await, 2);
-        let logs = captured_logs.text();
-        assert!(logs.contains("workload=\"delivery\" outcome=\"failed\""));
-        assert!(logs.lines().any(|line| {
-            line.contains("workload=\"merge_queue\"") && line.contains("outcome=\"completed\"")
-        }));
     }
 
     #[tokio::test]
