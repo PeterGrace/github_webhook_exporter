@@ -54,13 +54,46 @@ the chart `version` and `appVersion` alongside the crate version, and `Chart.yam
 is corrected to `0.1.1` so the release commit lands coherent. A `cargo release`
 dry run confirms the next bump rewrites both chart fields.
 
+## Hard-coded version references
+
+Bumping the chart then failed `just helm-static` and `just workflow-test`, and the
+same failure was already red on the pull request:
+
+```
+Helm chart check failed: resources must receive all standard common labels
+```
+
+`scripts/helm-chart-test.sh` asserted the literal `github-webhook-exporter-0.1.0`
+chart label, `app.kubernetes.io/version: 0.1.0`, and the `:0.1.0` image tag, and
+`scripts/github-actions-test.sh` required the operator docs to quote
+`--version 0.1.0`. Any version bump broke the validate job, independently of the
+push-protection problem.
+
+Both suites now read the version from `Chart.yaml` — the shell assertions through
+`strenv`, the Python contract through a `version:` match — so no release edits them.
+The guard forbidding a hard-coded package filename became a regex, so it catches
+every version rather than only `0.1.0`.
+
+The pinned install examples in the chart README and `docs/operations.md` are
+rewritten by `pre-release-replacements`. The plan and spec documents under
+`docs/superpowers/` are left alone; they record what was true when written.
+
+`docs/operations.md` also documented `git tag` followed by `git push origin`, the
+exact sequence the ruleset rejects. It now points at `RELEASE.md`.
+
 ## Files
 
 - `justfile` — `release-patch` gains `--no-push`; new `release-ship` recipe.
 - `scripts/release-ship.sh` — new.
-- `Cargo.toml` — `pre-release-replacements` keep the chart in lockstep.
+- `Cargo.toml` — `pre-release-replacements` keep the chart and docs in lockstep.
 - `charts/github-webhook-exporter/Chart.yaml` — corrected to `0.1.1`.
 - `RELEASE.md` — new; the release how-to.
+- `scripts/helm-chart-test.sh` — derives chart and app versions instead of
+  asserting `0.1.0`.
+- `scripts/github-actions-test.sh` — derives the chart version; the hard-coded
+  filename guard became version-agnostic.
+- `charts/github-webhook-exporter/README.md`, `docs/operations.md` — version
+  examples bumped; the operations release procedure now defers to `RELEASE.md`.
 
 ## Follow-up
 

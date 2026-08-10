@@ -26,6 +26,14 @@ helm() {
     fi
 }
 
+# Assertions read the declared versions rather than hard-coding them, so a release
+# bump does not require editing this file. `strenv` keeps the yq expressions below
+# single-quoted.
+CHART_VERSION="$(yq '.version' "${CHART_DIRECTORY}/Chart.yaml")"
+export CHART_VERSION
+APP_VERSION="$(yq '.appVersion' "${CHART_DIRECTORY}/Chart.yaml")"
+export APP_VERSION
+
 TEMPORARY_DIRECTORY="$(mktemp -d)"
 readonly TEMPORARY_DIRECTORY
 
@@ -158,10 +166,11 @@ assert_yq \
     'maintenance mode must not add a sidecar or maintenance container'
 assert_yq \
     '(.metadata.labels | length) == 5 and
-     .metadata.labels."helm.sh/chart" == "github-webhook-exporter-0.1.0" and
+     .metadata.labels."helm.sh/chart" ==
+       ("github-webhook-exporter-" + strenv(CHART_VERSION)) and
      .metadata.labels."app.kubernetes.io/name" == "github-webhook-exporter" and
      .metadata.labels."app.kubernetes.io/instance" == "github-webhook-exporter" and
-     .metadata.labels."app.kubernetes.io/version" == "0.1.0" and
+     .metadata.labels."app.kubernetes.io/version" == strenv(APP_VERSION) and
      .metadata.labels."app.kubernetes.io/managed-by" == "Helm"' \
     "${TEMPORARY_DIRECTORY}/default-statefulset.yaml" \
     'resources must receive all standard common labels'
@@ -184,7 +193,7 @@ assert_yq \
     'Service and StatefulSet must share stable pod selector labels'
 assert_yq \
     '.spec.template.spec.containers[0].image ==
-     "ghcr.io/petergrace/github-webhook-exporter:0.1.0" and
+     ("ghcr.io/petergrace/github-webhook-exporter:" + strenv(APP_VERSION)) and
      .spec.template.spec.containers[0].ports[0].name == "http" and
      .spec.template.spec.containers[0].ports[0].containerPort == 8080 and
      .spec.template.spec.containers[0].ports[0].protocol == "TCP" and
