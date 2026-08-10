@@ -102,6 +102,7 @@
   "additionalProperties": false,
   "required": [
     "replicaCount",
+    "maintenanceMode",
     "image",
     "existingSecret",
     "service",
@@ -122,6 +123,9 @@
     "replicaCount": {
       "type": "integer",
       "const": 1
+    },
+    "maintenanceMode": {
+      "type": "boolean"
     },
     "image": {
       "type": "object",

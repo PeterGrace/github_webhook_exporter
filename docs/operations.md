@@ -129,7 +129,157 @@ telemetry shutdown timeouts. The chart adds no `preStop` delay. A deterministic 
 in the pod template causes ConfigMap-backed value changes to trigger the StatefulSet's
 `RollingUpdate`, ensuring replacement pods read updated environment values. This rollout does not
 by itself guarantee Recreate-equivalent handoff or prevent writer overlap on every storage
-provider; see the chart README for this lifecycle limitation.
+provider; use the stopped upgrade procedure below when attachment overlap is possible.
+
+## Upgrade a singleton deployment
+
+A normal one-replica StatefulSet `RollingUpdate` terminates ordinal `0` before creating its
+replacement. Use it only when the storage provider reliably completes volume handoff before a
+replacement process can mount the PVC:
+
+```bash
+: "${GHE_IMAGE_TAG:?set GHE_IMAGE_TAG to an immutable published version}"
+helm upgrade github-webhook-exporter charts/github-webhook-exporter \
+  --namespace github-webhook-exporter \
+  --reuse-values \
+  --set-string image.tag="${GHE_IMAGE_TAG}" \
+  --wait
+kubectl --namespace github-webhook-exporter rollout status \
+  statefulset/github-webhook-exporter --timeout=180s
+```
+
+When a storage provider can permit attachment overlap during transitions, use a
+Recreate-equivalent stopped upgrade. This procedure intentionally causes downtime:
+
+```bash
+: "${GHE_IMAGE_TAG:?set GHE_IMAGE_TAG to an immutable published version}"
+kubectl --namespace github-webhook-exporter scale \
+  statefulset/github-webhook-exporter --replicas=0
+kubectl --namespace github-webhook-exporter wait --for=delete \
+  pod/github-webhook-exporter-0 --timeout=180s
+
+helm upgrade github-webhook-exporter charts/github-webhook-exporter \
+  --namespace github-webhook-exporter \
+  --reuse-values \
+  --set maintenanceMode=true \
+  --set-string image.tag="${GHE_IMAGE_TAG}" \
+  --wait
+
+helm upgrade github-webhook-exporter charts/github-webhook-exporter \
+  --namespace github-webhook-exporter \
+  --reuse-values \
+  --set maintenanceMode=false \
+  --wait
+kubectl --namespace github-webhook-exporter wait --for=condition=Ready \
+  pod/github-webhook-exporter-0 --timeout=180s
+```
+
+`maintenanceMode=true` records the upgraded Helm release with zero desired replicas, so Helm does
+not undo the stopped maintenance window. Disabling it restores exactly one replica. Confirm the old
+pod is absent before applying the maintenance-mode upgrade; if volume detachment is asynchronous,
+also wait for the provider's attachment object or console to report release.
+
+The optional `minAvailable: 0` PodDisruptionBudget intentionally permits voluntary disruption. It
+cannot preserve availability for a singleton, and maintenance mode is not a high-availability
+mechanism.
+
+## Back up SQLite online
+
+Run the repository's pinned maintenance command while the exporter is available. It mounts the PVC
+in a separate non-root Pod, uses SQLite's online `.backup` operation, validates the resulting
+database, and sets mode `0600`:
+
+```bash
+backup_name="backup-$(date -u +%Y%m%dT%H%M%SZ).db"
+scripts/helm-sqlite-maintenance.sh backup \
+  github-webhook-exporter \
+  github-webhook-exporter \
+  data-github-webhook-exporter-0 \
+  "${backup_name}"
+```
+
+The command uses the current kubectl context. Set `KUBECONFIG` and `KUBECTL_CONTEXT` when operating
+against a non-default context. An online backup mounts the `ReadWriteOnce` PVC in a second Pod while
+the exporter holds it, so the command pins the maintenance Pod to the exporter's current node. This
+same-node placement is required: the single-node Kind test cannot exercise cross-node CSI attachment,
+and a provider that forbids even same-node multi-Pod mounts cannot use the online procedure. For
+such a provider, keep maintenance mode enabled and use a coordinated offline platform snapshot.
+
+The backup file initially resides on the application PVC. Copy it to an encrypted,
+access-controlled backup system or take a provider snapshot after the command completes. A backup
+retained only on the application PVC does not protect against PVC loss.
+
+Do not copy the active `github-webhook-exporter.db` file by itself. SQLite may have committed state
+in its WAL, so a live file copy is unsupported and may be inconsistent. The production image
+intentionally contains no shell or SQLite client; use the digest-pinned maintenance Pod or a
+storage-platform snapshot workflow that provides equivalent consistency.
+
+## Restore and verify a backup
+
+Ensure the selected backup is present on the target PVC, then stop the exporter through Helm and
+wait for its pod to disappear:
+
+```bash
+: "${BACKUP_NAME:?set BACKUP_NAME to the validated .db backup basename}"
+helm upgrade github-webhook-exporter charts/github-webhook-exporter \
+  --namespace github-webhook-exporter \
+  --reuse-values \
+  --set maintenanceMode=true \
+  --wait
+kubectl --namespace github-webhook-exporter wait --for=delete \
+  pod/github-webhook-exporter-0 --timeout=180s
+
+scripts/helm-sqlite-maintenance.sh restore \
+  github-webhook-exporter \
+  github-webhook-exporter \
+  data-github-webhook-exporter-0 \
+  "${BACKUP_NAME}"
+```
+
+Restore fails before creating a maintenance Pod unless desired replicas equal zero and ordinal `0`
+is absent. Those checks are point-in-time rather than an atomic lock; keep `maintenanceMode=true`
+and prevent another operator or controller from scaling the StatefulSet until restore exits. It
+validates the backup and restored database, creates the replacement as UID/GID
+`65532:65532`, verifies mode `0600`, removes stale WAL/shared-memory files, and retains the replaced
+database as `github-webhook-exporter.db.pre-restore`. Do not delete that file or the source backup
+until recovery is accepted.
+
+Restart exactly one replica and verify recovery:
+
+```bash
+helm upgrade github-webhook-exporter charts/github-webhook-exporter \
+  --namespace github-webhook-exporter \
+  --reuse-values \
+  --set maintenanceMode=false \
+  --wait
+kubectl --namespace github-webhook-exporter wait --for=condition=Ready \
+  pod/github-webhook-exporter-0 --timeout=180s
+kubectl --namespace github-webhook-exporter port-forward \
+  service/github-webhook-exporter 8080:8080
+```
+
+In a separate shell, require all of these checks before accepting the recovery:
+
+1. `GET /health/ready` returns `200`, proving startup migrations and SQLite probing completed.
+2. `GET /api/v1/repositories` lists the expected encrypted repository configuration.
+3. A correctly signed webhook using a pre-backup repository secret returns `204`.
+4. `/metrics` exposes the repository gauge and expected bounded webhook families.
+5. Replaying a pre-backup delivery ID increments the duplicate counter instead of processing twice.
+6. A pre-backup pending merge-queue attempt can complete after recovery.
+
+Use runtime-provided administrator and webhook credentials for those checks; never place them in a
+command history, manifest, values file, or diagnostic artifact.
+
+If the maintenance command reports a metadata failure, keep maintenance mode enabled and correct
+the storage provider's UID/GID 65532 and permission behavior before retrying. If readiness fails,
+inspect normalized pod logs and PVC events without printing the database or Secret. If repository
+decryption fails, verify that the original master-key Secret was restored; a database backup alone
+cannot recover a lost encryption key.
+
+Helm rollback can restore rendered configuration, but it does not reverse SQLite migrations,
+storage-template changes, or an incompatible application downgrade. Recover those cases from a
+validated pre-upgrade backup with a compatible image. Do not treat `helm rollback` as database
+rollback.
 
 ## Helm package validation and maintenance
 
@@ -142,6 +292,7 @@ Run these focused checks from the repository root after installing the pinned CI
 just helm-static
 just image-smoke
 just workflow-test
+just helm-maintenance-unit
 just helm-kind-acceptance
 KIND_ARTIFACT_DIRECTORY=dist/kind-lifecycle just helm-kind-lifecycle
 ```
@@ -157,7 +308,9 @@ rendered StatefulSet, Service, ConfigMap, and PVC; it does not start the exporte
 disposable Kind cluster. It creates private test credentials at runtime, installs the chart, and
 proves probes, repository administration, signed webhooks, bounded metrics, SQLite persistence,
 delivery deduplication, pull-request queue completion across restart, collector-failure isolation,
-broken-storage readiness, bounded SIGTERM, and singleton PVC rollout behavior. Its default
+broken-storage readiness, bounded SIGTERM, singleton PVC rollout behavior, online backup, stopped
+restore, restored metadata, and post-recovery encrypted repository, deduplication, queue, and metric
+behavior. Its default
 diagnostics directory is `dist/kind-lifecycle`; set `KIND_ARTIFACT_DIRECTORY` to isolate concurrent
 runs. The suite replaces that directory at startup and scans rendered objects, status records,
 events, descriptions, and logs for generated credentials, signatures, and forbidden payload

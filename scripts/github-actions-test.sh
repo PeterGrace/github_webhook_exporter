@@ -196,6 +196,7 @@ expected_validate_steps = [
     {"run": "just helm-static"},
     {"run": "just image-smoke"},
     {"run": "just image-reproducibility-test"},
+    {"run": "just helm-maintenance-unit"},
     {"run": "just helm-kind-lifecycle"},
     {"run": "just fmt"},
     {"run": "cargo build --locked"},

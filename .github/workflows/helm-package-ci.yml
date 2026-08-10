@@ -52,6 +52,9 @@ jobs:
       - name: Verify production image reproducibility
         run: just image-reproducibility-test
 
+      - name: Verify SQLite maintenance contracts
+        run: just helm-maintenance-unit
+
       - name: Exercise lifecycle and persistence in Kind
         run: just helm-kind-lifecycle
 

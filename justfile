@@ -57,6 +57,10 @@ release-publish-test:
 workflow-test:
     scripts/github-actions-test.sh .github/workflows/helm-package-ci.yml
 
+# Verify fail-closed SQLite backup and restore command contracts.
+helm-maintenance-unit:
+    scripts/helm-sqlite-maintenance-test.sh
+
 # Verify deterministic Kind lifecycle helper contracts.
 helm-kind-lifecycle-unit:
     scripts/helm-kind-lifecycle-lib-test.sh
