@@ -11,7 +11,9 @@ use std::sync::{
 use thiserror::Error;
 
 use crate::metrics::{TelemetryExportFailureReason, TelemetrySignal};
-use crate::telemetry::diagnostics::DiagnosticsObserver;
+use crate::telemetry::diagnostics::{
+    DiagnosticsObserver, ExportFailureContext, ExportFailureDetail,
+};
 
 #[derive(Debug)]
 pub(super) struct ObservingHttpClient<C> {
@@ -35,9 +37,39 @@ impl<C> ObservingHttpClient<C> {
         Arc::clone(&self.classified_failures)
     }
 
-    fn record_failure(&self, reason: TelemetryExportFailureReason) {
+    fn record_failure(&self, failure: ClassifiedHttpFailure) {
         self.classified_failures.fetch_add(1, Ordering::Relaxed);
-        self.observer.export_failure(self.signal, reason);
+        self.observer
+            .export_failure_with_context(self.signal, failure.reason, failure.context);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClassifiedHttpFailure {
+    reason: TelemetryExportFailureReason,
+    context: ExportFailureContext,
+}
+
+impl ClassifiedHttpFailure {
+    fn new(reason: TelemetryExportFailureReason) -> Self {
+        Self {
+            reason,
+            context: ExportFailureContext::default(),
+        }
+    }
+
+    fn with_status(reason: TelemetryExportFailureReason, status: u16) -> Self {
+        Self {
+            reason,
+            context: ExportFailureContext::with_status(status),
+        }
+    }
+
+    fn with_detail(reason: TelemetryExportFailureReason, detail: ExportFailureDetail) -> Self {
+        Self {
+            reason,
+            context: ExportFailureContext::with_detail(detail),
+        }
     }
 }
 
@@ -51,11 +83,11 @@ impl<C: HttpClient> HttpClient for ObservingHttpClient<C> {
         let response = match self.inner.send_bytes(request).await {
             Ok(response) => response,
             Err(error) => {
-                let reason = error.downcast_ref::<reqwest::Error>().map_or(
-                    TelemetryExportFailureReason::Transport,
+                let failure = error.downcast_ref::<reqwest::Error>().map_or_else(
+                    || ClassifiedHttpFailure::new(TelemetryExportFailureReason::Transport),
                     classify_reqwest_error,
                 );
-                self.record_failure(reason);
+                self.record_failure(failure);
                 return Err(error);
             }
         };
@@ -69,20 +101,34 @@ impl<C: HttpClient> HttpClient for ObservingHttpClient<C> {
             }
         };
         if !valid {
-            self.record_failure(TelemetryExportFailureReason::Encoding);
+            self.record_failure(ClassifiedHttpFailure::new(
+                TelemetryExportFailureReason::Encoding,
+            ));
             return Err(Box::new(InvalidOtlpResponse));
         }
         Ok(response)
     }
 }
 
-fn classify_reqwest_error(error: &reqwest::Error) -> TelemetryExportFailureReason {
+fn classify_reqwest_error(error: &reqwest::Error) -> ClassifiedHttpFailure {
     if error.is_timeout() {
-        TelemetryExportFailureReason::Timeout
-    } else if error.status().is_some() {
-        TelemetryExportFailureReason::HttpResponse
+        ClassifiedHttpFailure::new(TelemetryExportFailureReason::Timeout)
+    } else if let Some(status) = error.status() {
+        ClassifiedHttpFailure::with_status(
+            TelemetryExportFailureReason::HttpResponse,
+            status.as_u16(),
+        )
     } else {
-        TelemetryExportFailureReason::Transport
+        let detail = if error.is_connect() {
+            ExportFailureDetail::Connect
+        } else if error.is_builder() {
+            ExportFailureDetail::RequestBuilder
+        } else if error.is_redirect() {
+            ExportFailureDetail::Redirect
+        } else {
+            ExportFailureDetail::Request
+        };
+        ClassifiedHttpFailure::with_detail(TelemetryExportFailureReason::Transport, detail)
     }
 }
 
@@ -101,8 +147,8 @@ mod tests {
     use crate::{
         metrics::{Metrics, TelemetryExportFailureReason, TelemetrySignal},
         telemetry::{
-            diagnostics::DiagnosticsObserver,
-            http_client::{classify_reqwest_error, ObservingHttpClient},
+            diagnostics::{DiagnosticsObserver, ExportFailureDetail},
+            http_client::{classify_reqwest_error, ClassifiedHttpFailure, ObservingHttpClient},
         },
     };
 
@@ -171,18 +217,77 @@ mod tests {
         );
         let timeout = request_error(Some(b""), Duration::from_millis(10));
         let transport = request_error(None, Duration::from_secs(1));
+        let builder = reqwest::blocking::Client::new()
+            .get("ftp://collector.invalid/v1/logs")
+            .send()
+            .expect_err("unsupported transport fails request construction");
+        let request = request_error(Some(b"not an HTTP response"), Duration::from_secs(1));
 
         assert_eq!(
             classify_reqwest_error(&status),
-            TelemetryExportFailureReason::HttpResponse
+            ClassifiedHttpFailure::with_status(TelemetryExportFailureReason::HttpResponse, 503,)
         );
         assert_eq!(
             classify_reqwest_error(&timeout),
-            TelemetryExportFailureReason::Timeout
+            ClassifiedHttpFailure::new(TelemetryExportFailureReason::Timeout)
         );
         assert_eq!(
             classify_reqwest_error(&transport),
-            TelemetryExportFailureReason::Transport
+            ClassifiedHttpFailure::with_detail(
+                TelemetryExportFailureReason::Transport,
+                ExportFailureDetail::Connect,
+            )
+        );
+        assert_eq!(
+            classify_reqwest_error(&builder),
+            ClassifiedHttpFailure::with_detail(
+                TelemetryExportFailureReason::Transport,
+                ExportFailureDetail::RequestBuilder,
+            )
+        );
+        assert_eq!(
+            classify_reqwest_error(&request),
+            ClassifiedHttpFailure::with_detail(
+                TelemetryExportFailureReason::Transport,
+                ExportFailureDetail::Request,
+            )
+        );
+    }
+
+    #[test]
+    fn redirect_policy_failures_have_bounded_detail() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener binds");
+        let address = listener
+            .local_addr()
+            .expect("listener address is available");
+        let location = format!("http://{address}/redirected");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test request arrives");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            let response =
+                format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n");
+            stream
+                .write_all(response.as_bytes())
+                .expect("redirect response writes");
+        });
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                attempt.error("blocked redirect")
+            }))
+            .build()
+            .expect("client builds");
+        let error = client
+            .get(format!("http://{address}"))
+            .send()
+            .expect_err("redirect policy rejects response");
+
+        assert_eq!(
+            classify_reqwest_error(&error),
+            ClassifiedHttpFailure::with_detail(
+                TelemetryExportFailureReason::Transport,
+                ExportFailureDetail::Redirect,
+            )
         );
     }
 
