@@ -40,6 +40,8 @@ import sys
 workflow_path = sys.argv[1]
 
 CHART_METADATA = "charts/github-webhook-exporter/Chart.yaml"
+CI_TOOL_VERSIONS = "ci/tool-versions.env"
+CI_TOOL_INSTALLER = "scripts/install-ci-tools.sh"
 
 
 def fail(message: str) -> None:
@@ -55,8 +57,39 @@ def chart_version() -> str:
     return match.group(1)
 
 
-CHART_VERSION = chart_version()
+def rust_version() -> str:
+    """Read the single pinned Rust version shared by every CI setup path."""
+    with open(CI_TOOL_VERSIONS, encoding="utf-8") as file_handle:
+        matches = re.findall(
+            r"^RUST_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$",
+            file_handle.read(),
+            re.MULTILINE,
+        )
+    if len(matches) != 1:
+        fail(f"expected exactly one valid RUST_VERSION in {CI_TOOL_VERSIONS}")
+    return matches[0]
 
+
+def rustup_install_options(contents: str, source: str) -> str:
+    """Extract normalized rustup profile and component options from a setup path."""
+    normalized = " ".join(contents.replace("\\\n", " ").split())
+    match = re.search(
+        r'rustup -q toolchain install "[^\"]+" '
+        r"(?P<options>--profile \S+(?: --component \S+)+ --no-self-update)",
+        normalized,
+    )
+    if match is None:
+        fail(f"missing pinned rustup install contract in {source}")
+    return match.group("options")
+
+
+CHART_VERSION = chart_version()
+RUST_VERSION = rust_version()
+
+with open(CI_TOOL_INSTALLER, encoding="utf-8") as file_handle:
+    installer_rustup_options = rustup_install_options(
+        file_handle.read(), CI_TOOL_INSTALLER
+    )
 
 with open("scripts/helm-package-test.sh", encoding="utf-8") as file_handle:
     package_test = file_handle.read()
@@ -246,12 +279,28 @@ if job_env.get("CONTAINER_IMAGE") != "github-webhook-exporter:ci":
 if job_env.get("KIND_ARTIFACT_DIRECTORY") != "dist/kind-lifecycle":
     fail("workflow must use the fixed Kind lifecycle artifact directory")
 
-if job_env.get("RUSTUP_TOOLCHAIN") != "1.97.1":
-    fail("workflow must pin RUSTUP_TOOLCHAIN=1.97.1")
+if job_env.get("RUSTUP_TOOLCHAIN") != RUST_VERSION:
+    fail(
+        "workflow RUSTUP_TOOLCHAIN must match "
+        f"RUST_VERSION={RUST_VERSION} from {CI_TOOL_VERSIONS}"
+    )
 
 validate_steps = validate_job.get("steps")
 if not isinstance(validate_steps, list):
     fail("workflow validate job must define steps")
+
+rustup_steps = [
+    step
+    for step in validate_steps
+    if isinstance(step, dict) and "rustup -q toolchain install" in step.get("run", "")
+]
+if len(rustup_steps) != 1:
+    fail("workflow must contain exactly one inline rustup install step")
+workflow_rustup_options = rustup_install_options(
+    rustup_steps[0]["run"], "workflow Rust toolchain step"
+)
+if workflow_rustup_options != installer_rustup_options:
+    fail("workflow and CI tool installer rustup options must match")
 
 expected_validate_steps = [
     {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"},
