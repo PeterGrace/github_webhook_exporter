@@ -95,6 +95,13 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
         }
       },
       "targets": [
@@ -139,6 +146,13 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
         }
       },
       "targets": [
@@ -183,6 +197,13 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
         }
       },
       "targets": [
@@ -227,6 +248,13 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
         }
       },
       "targets": [
@@ -612,6 +640,13 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        },
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
         }
       },
       "targets": [

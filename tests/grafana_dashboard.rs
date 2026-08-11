@@ -29,6 +29,36 @@ const REQUIRED_ROWS: [&str; 4] = [
     "Merge queue details",
     "Workflow and telemetry details",
 ];
+const REQUIRED_GROUPINGS: [(&str, &str); 10] = [
+    ("github_webhook_requests_total", "sum by (result)"),
+    ("github_webhook_events_total", "sum by (event_type, action)"),
+    (
+        "github_webhook_processing_duration_seconds_bucket",
+        "sum by (le, result)",
+    ),
+    ("github_webhook_processing_failures_total", "sum by (stage)"),
+    ("github_merge_group_events_total", "sum by (action, reason)"),
+    (
+        "github_merge_queue_pr_outcomes_total",
+        "sum by (outcome, reason)",
+    ),
+    (
+        "github_merge_queue_attempt_duration_seconds_bucket",
+        "sum by (le, outcome)",
+    ),
+    (
+        "github_workflow_job_trace_rejections_total",
+        "sum by (reason)",
+    ),
+    (
+        "github_telemetry_export_failures_total",
+        "sum by (signal, reason)",
+    ),
+    (
+        "github_telemetry_dropped_records_total",
+        "sum by (signal, reason)",
+    ),
+];
 
 fn dashboard() -> Value {
     serde_json::from_str(DASHBOARD).expect("example Grafana dashboard must be valid JSON")
@@ -145,6 +175,56 @@ fn every_prometheus_target_is_filtered_and_uses_the_selected_datasource() {
             expression.contains("repository=~\"$repository\""),
             !uses_global_metric,
             "repository filtering must match metric scope: {expression}"
+        );
+    }
+}
+
+#[test]
+fn stat_panels_explicitly_display_the_latest_non_null_value() {
+    let dashboard = dashboard();
+    let stat_panels: Vec<&Value> = dashboard["panels"]
+        .as_array()
+        .expect("dashboard must define panels")
+        .iter()
+        .filter(|panel| panel["type"] == "stat")
+        .collect();
+    assert!(!stat_panels.is_empty(), "dashboard must define stat panels");
+
+    for panel in stat_panels {
+        let reduce_options = &panel["options"]["reduceOptions"];
+        assert_eq!(
+            reduce_options["values"], false,
+            "stat panel must reduce its time series: {}",
+            panel["title"]
+        );
+        assert_eq!(
+            reduce_options["calcs"].as_array().map(Vec::len),
+            Some(1),
+            "stat panel must define exactly one reducer: {}",
+            panel["title"]
+        );
+        assert_eq!(
+            reduce_options["calcs"][0], "lastNotNull",
+            "stat panel must display the latest non-null value: {}",
+            panel["title"]
+        );
+    }
+}
+
+#[test]
+fn dashboard_queries_use_the_emitted_grouping_labels() {
+    let dashboard = dashboard();
+    let mut targets = Vec::new();
+    collect_targets(&dashboard["panels"], &mut targets);
+
+    for (metric, grouping) in REQUIRED_GROUPINGS {
+        assert!(
+            targets.iter().any(|target| {
+                target["expr"].as_str().is_some_and(|expression| {
+                    expression.contains(metric) && expression.contains(grouping)
+                })
+            }),
+            "dashboard has no {metric} query with {grouping}"
         );
     }
 }
