@@ -118,6 +118,16 @@ fn router_for_pool(pool: SqlitePool, body_limit: usize) -> Router {
 }
 
 async fn test_app(body_limit: usize, enabled: Option<bool>) -> TestApp {
+    let repositories = enabled.map_or_else(Vec::new, |enabled| {
+        vec![("owner/repository", SECRET, enabled)]
+    });
+    test_app_with_repositories(body_limit, &repositories).await
+}
+
+async fn test_app_with_repositories(
+    body_limit: usize,
+    repositories: &[(&str, &str, bool)],
+) -> TestApp {
     TRACING_INIT.call_once(|| {
         tracing::subscriber::set_global_default(tracing_subscriber::registry())
             .expect("test tracing registry initializes once");
@@ -131,12 +141,12 @@ async fn test_app(body_limit: usize, enabled: Option<bool>) -> TestApp {
     )
     .expect("repository cipher initializes");
     let store = RepositoryStore::new(pool.clone(), cipher);
-    if let Some(enabled) = enabled {
+    for (repository_name, secret, enabled) in repositories {
         store
             .create(
-                CanonicalRepositoryName::new("owner/repository").expect("repository name is valid"),
-                RepositorySecret::new(SECRET.to_owned()).expect("secret is valid"),
-                enabled,
+                CanonicalRepositoryName::new(repository_name).expect("repository name is valid"),
+                RepositorySecret::new((*secret).to_owned()).expect("secret is valid"),
+                *enabled,
             )
             .await
             .expect("repository fixture is created");
@@ -162,16 +172,12 @@ fn signature(secret: &str, body: &[u8]) -> String {
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
-fn webhook_request(
-    body: &'static [u8],
-    repository_secret: &str,
-    delivery_id: &str,
-) -> Request<Body> {
+fn webhook_request(body: &[u8], repository_secret: &str, delivery_id: &str) -> Request<Body> {
     webhook_request_for_event(body, repository_secret, delivery_id, "pull_request")
 }
 
 fn webhook_request_for_event(
-    body: &'static [u8],
+    body: &[u8],
     repository_secret: &str,
     delivery_id: &str,
     event_type: &str,
@@ -183,7 +189,7 @@ fn webhook_request_for_event(
         .header("X-GitHub-Event", event_type)
         .header("X-GitHub-Delivery", delivery_id)
         .header("X-Hub-Signature-256", signature(repository_secret, body))
-        .body(Body::from(body))
+        .body(Body::from(body.to_vec()))
         .expect("webhook request is valid")
 }
 
@@ -205,6 +211,59 @@ async fn metrics(router: Router) -> String {
         .await
         .expect("metrics request succeeds");
     String::from_utf8(response_body(response).await).expect("metrics are UTF-8")
+}
+
+#[tokio::test]
+async fn repository_scoped_metrics_distinguish_full_names() {
+    const FIRST_SECRET: &str = "first-repository-secret";
+    const SECOND_SECRET: &str = "second-repository-secret";
+    let app = test_app_with_repositories(
+        2_097_152,
+        &[
+            ("PeterGrace/GitHub-Webhook-Exporter", FIRST_SECRET, true),
+            ("Other/Repository", SECOND_SECRET, true),
+        ],
+    )
+    .await;
+    let first_body =
+        br#"{"action":"opened","repository":{"full_name":"PeterGrace/GitHub-Webhook-Exporter"}}"#;
+    let second_body = br#"{"action":"opened","repository":{"full_name":"Other/Repository"}}"#;
+
+    for (body, secret, delivery_id) in [
+        (
+            first_body.as_slice(),
+            FIRST_SECRET,
+            "650e8400-e29b-41d4-a716-446655440001",
+        ),
+        (
+            second_body.as_slice(),
+            SECOND_SECRET,
+            "650e8400-e29b-41d4-a716-446655440002",
+        ),
+    ] {
+        let response = app
+            .router
+            .clone()
+            .oneshot(webhook_request(body, secret, delivery_id))
+            .await
+            .expect("webhook request succeeds");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let exposition = metrics(app.router).await;
+    assert!(exposition.contains(
+        "github_webhook_requests_total{repository=\"petergrace/github-webhook-exporter\",result=\"accepted\"} 1"
+    ));
+    assert!(exposition.contains(
+        "github_webhook_requests_total{repository=\"other/repository\",result=\"accepted\"} 1"
+    ));
+    assert!(exposition.contains(
+        "github_webhook_events_total{repository=\"petergrace/github-webhook-exporter\",event_type=\"pull_request\",action=\"opened\"} 1"
+    ));
+    assert!(exposition.contains(
+        "github_webhook_events_total{repository=\"other/repository\",event_type=\"pull_request\",action=\"opened\"} 1"
+    ));
+    assert!(!exposition.contains("repository=\"github-webhook-exporter\""));
 }
 
 #[tokio::test]
@@ -249,9 +308,9 @@ async fn pull_request_queue_enqueue_and_dequeue_commit_one_unknown_completion() 
 
     let exposition = metrics(app.router).await;
     for expected in [
-        "github_merge_queue_pr_outcomes_total{outcome=\"unknown\",reason=\"unclassified_dequeue\"} 1",
-        "github_merge_queue_attempt_duration_seconds_count{outcome=\"unknown\"} 1",
-        "github_merge_queue_attempt_duration_seconds_sum{outcome=\"unknown\"} 120.0",
+        "github_merge_queue_pr_outcomes_total{repository=\"owner/repository\",outcome=\"unknown\",reason=\"unclassified_dequeue\"} 1",
+        "github_merge_queue_attempt_duration_seconds_count{repository=\"owner/repository\",outcome=\"unknown\"} 1",
+        "github_merge_queue_attempt_duration_seconds_sum{repository=\"owner/repository\",outcome=\"unknown\"} 120.0",
     ] {
         assert!(exposition.contains(expected), "missing {expected:?}");
     }
@@ -301,10 +360,10 @@ async fn pull_request_queue_replays_and_unmerged_close_are_idempotent() {
 
     let exposition = metrics(app.router).await;
     for expected in [
-        "github_merge_queue_pr_outcomes_total{outcome=\"succeeded\",reason=\"pull_request_merged\"} 1",
-        "github_merge_queue_attempt_duration_seconds_count{outcome=\"succeeded\"} 1",
-        "github_merge_queue_attempt_duration_seconds_sum{outcome=\"succeeded\"} 180.0",
-        "github_webhook_duplicates_total 1",
+        "github_merge_queue_pr_outcomes_total{repository=\"owner/repository\",outcome=\"succeeded\",reason=\"pull_request_merged\"} 1",
+        "github_merge_queue_attempt_duration_seconds_count{repository=\"owner/repository\",outcome=\"succeeded\"} 1",
+        "github_merge_queue_attempt_duration_seconds_sum{repository=\"owner/repository\",outcome=\"succeeded\"} 180.0",
+        "github_webhook_duplicates_total{repository=\"owner/repository\"} 1",
     ] {
         assert!(exposition.contains(expected), "missing {expected:?}");
     }
@@ -343,7 +402,8 @@ async fn pull_request_queue_attempt_completes_after_database_restart() {
         assert_eq!(enqueue_response.status(), StatusCode::NO_CONTENT);
     }
     let first_exposition = metrics(first_router).await;
-    assert!(first_exposition.contains("github_webhook_duplicates_total 1"));
+    assert!(first_exposition
+        .contains("github_webhook_duplicates_total{repository=\"owner/repository\"} 1"));
     first_pool.close().await;
 
     let second_pool = open_database(&database_path)
@@ -377,10 +437,10 @@ async fn pull_request_queue_attempt_completes_after_database_restart() {
     assert_eq!(delivery_count, 2);
     let exposition = metrics(second_router).await;
     for expected in [
-        "github_merge_queue_pr_outcomes_total{outcome=\"succeeded\",reason=\"pull_request_merged\"} 1",
-        "github_merge_queue_attempt_duration_seconds_count{outcome=\"succeeded\"} 1",
-        "github_webhook_duplicates_total 1",
-        "github_merge_group_events_total{action=\"destroyed\",reason=\"merged\"} 0",
+        "github_merge_queue_pr_outcomes_total{repository=\"owner/repository\",outcome=\"succeeded\",reason=\"pull_request_merged\"} 1",
+        "github_merge_queue_attempt_duration_seconds_count{repository=\"owner/repository\",outcome=\"succeeded\"} 1",
+        "github_webhook_duplicates_total{repository=\"owner/repository\"} 1",
+        "github_merge_group_events_total{repository=\"unknown\",action=\"destroyed\",reason=\"merged\"} 0",
     ] {
         assert!(exposition.contains(expected), "missing {expected:?}");
     }
@@ -420,8 +480,8 @@ async fn concurrent_pull_request_queue_completions_record_one_outcome() {
     }
     let exposition = metrics(app.router).await;
     for expected in [
-        "github_merge_queue_pr_outcomes_total{outcome=\"succeeded\",reason=\"pull_request_merged\"} 1",
-        "github_merge_queue_attempt_duration_seconds_count{outcome=\"succeeded\"} 1",
+        "github_merge_queue_pr_outcomes_total{repository=\"owner/repository\",outcome=\"succeeded\",reason=\"pull_request_merged\"} 1",
+        "github_merge_queue_attempt_duration_seconds_count{repository=\"owner/repository\",outcome=\"succeeded\"} 1",
     ] {
         assert!(exposition.contains(expected), "missing {expected:?}");
     }
@@ -494,10 +554,10 @@ async fn pull_request_queue_missing_and_invalid_duration_use_only_failure_metric
 
     let exposition = metrics(app.router).await;
     for expected in [
-        "github_merge_queue_transition_failures_total{reason=\"missing_active_attempt\"} 1",
-        "github_merge_queue_transition_failures_total{reason=\"invalid_duration\"} 1",
-        "github_merge_queue_pr_outcomes_total{outcome=\"unknown\",reason=\"unclassified_dequeue\"} 0",
-        "github_merge_queue_attempt_duration_seconds_count{outcome=\"unknown\"} 0",
+        "github_merge_queue_transition_failures_total{repository=\"owner/repository\",reason=\"missing_active_attempt\"} 1",
+        "github_merge_queue_transition_failures_total{repository=\"owner/repository\",reason=\"invalid_duration\"} 1",
+        "github_merge_queue_pr_outcomes_total{repository=\"unknown\",outcome=\"unknown\",reason=\"unclassified_dequeue\"} 0",
+        "github_merge_queue_attempt_duration_seconds_count{repository=\"unknown\",outcome=\"unknown\"} 0",
     ] {
         assert!(exposition.contains(expected), "missing {expected:?}");
     }
@@ -567,19 +627,22 @@ async fn pull_request_queue_state_failure_is_redacted_observable_and_returns_no_
 
     let exposition = metrics(app.router).await;
     assert!(
-        exposition.contains("github_webhook_processing_failures_total{stage=\"queue_state\"} 1")
+        exposition.contains("github_webhook_processing_failures_total{repository=\"owner/repository\",stage=\"queue_state\"} 1")
     );
-    assert!(exposition.contains("github_webhook_duplicates_total 1"));
+    assert!(
+        exposition.contains("github_webhook_duplicates_total{repository=\"owner/repository\"} 1")
+    );
     assert!(exposition.contains(
-        "github_merge_queue_pr_outcomes_total{outcome=\"unknown\",reason=\"unclassified_dequeue\"} 0"
+        "github_merge_queue_pr_outcomes_total{repository=\"unknown\",outcome=\"unknown\",reason=\"unclassified_dequeue\"} 0"
     ));
     let logs = captured_logs.text();
+    assert!(!response_text.contains("owner/repository"));
+    assert!(!logs.contains("owner/repository"));
     assert_eq!(logs.matches("GitHub webhook processing failed").count(), 1);
     assert!(logs.contains("stage=\"queue_state\""));
     assert!(logs.contains("error_correlation_id="));
     for output in [response_text.as_str(), exposition.as_str(), logs.as_str()] {
         for forbidden in [
-            "owner/repository",
             "malicious-raw-reason",
             "sensitive-queue-failure",
             "550e8400-e29b-41d4-a716-446655440081",
@@ -635,13 +698,13 @@ async fn supported_merge_group_events_update_bounded_metrics_without_attempt_sta
 
     let exposition = metrics(app.router).await;
     for expected in [
-        "github_webhook_events_total{event_type=\"merge_group\",action=\"checks_requested\"} 1",
-        "github_webhook_events_total{event_type=\"merge_group\",action=\"destroyed\"} 4",
-        "github_merge_group_events_total{action=\"checks_requested\",reason=\"none\"} 1",
-        "github_merge_group_events_total{action=\"destroyed\",reason=\"merged\"} 1",
-        "github_merge_group_events_total{action=\"destroyed\",reason=\"dequeued\"} 1",
-        "github_merge_group_events_total{action=\"destroyed\",reason=\"invalidated\"} 1",
-        "github_merge_group_events_total{action=\"destroyed\",reason=\"other\"} 1",
+        "github_webhook_events_total{repository=\"owner/repository\",event_type=\"merge_group\",action=\"checks_requested\"} 1",
+        "github_webhook_events_total{repository=\"owner/repository\",event_type=\"merge_group\",action=\"destroyed\"} 4",
+        "github_merge_group_events_total{repository=\"owner/repository\",action=\"checks_requested\",reason=\"none\"} 1",
+        "github_merge_group_events_total{repository=\"owner/repository\",action=\"destroyed\",reason=\"merged\"} 1",
+        "github_merge_group_events_total{repository=\"owner/repository\",action=\"destroyed\",reason=\"dequeued\"} 1",
+        "github_merge_group_events_total{repository=\"owner/repository\",action=\"destroyed\",reason=\"invalidated\"} 1",
+        "github_merge_group_events_total{repository=\"owner/repository\",action=\"destroyed\",reason=\"other\"} 1",
     ] {
         assert!(exposition.contains(expected), "missing {expected:?}");
     }
@@ -716,18 +779,21 @@ async fn merge_group_destroyed_untrusted_reasons_collapse_to_other_without_discl
 
     let exposition = metrics(app.router).await;
     assert!(exposition.contains(
-        "github_webhook_events_total{event_type=\"merge_group\",action=\"destroyed\"} 6"
+        "github_webhook_events_total{repository=\"owner/repository\",event_type=\"merge_group\",action=\"destroyed\"} 6"
     ));
     assert!(exposition
-        .contains("github_merge_group_events_total{action=\"destroyed\",reason=\"other\"} 6"));
+        .contains("github_merge_group_events_total{repository=\"owner/repository\",action=\"destroyed\",reason=\"other\"} 6"));
     let logs = captured_logs.text();
+    assert!(!logs.contains("owner/repository"));
+    assert!(response_texts
+        .iter()
+        .all(|response| !response.contains("owner/repository")));
     for output in response_texts
         .iter()
         .map(String::as_str)
         .chain([exposition.as_str(), logs.as_str()])
     {
         for forbidden in [
-            "owner/repository",
             "secret-group-sha",
             "merged\\nsha256=secret-group-sha",
             "550e8400-e29b-41d4-a716-446655440015",
@@ -767,10 +833,10 @@ async fn duplicate_merge_group_delivery_does_not_repeat_event_metrics() {
 
     let exposition = metrics(app.router).await;
     for expected in [
-        "github_webhook_requests_total{result=\"accepted\"} 2",
-        "github_webhook_duplicates_total 1",
-        "github_webhook_events_total{event_type=\"merge_group\",action=\"destroyed\"} 1",
-        "github_merge_group_events_total{action=\"destroyed\",reason=\"merged\"} 1",
+        "github_webhook_requests_total{repository=\"owner/repository\",result=\"accepted\"} 2",
+        "github_webhook_duplicates_total{repository=\"owner/repository\"} 1",
+        "github_webhook_events_total{repository=\"owner/repository\",event_type=\"merge_group\",action=\"destroyed\"} 1",
+        "github_merge_group_events_total{repository=\"owner/repository\",action=\"destroyed\",reason=\"merged\"} 1",
     ] {
         assert!(exposition.contains(expected), "missing {expected:?}");
     }
@@ -795,13 +861,13 @@ async fn unsupported_merge_group_action_updates_only_generic_metrics() {
 
     let exposition = metrics(app.router).await;
     assert!(exposition
-        .contains("github_webhook_events_total{event_type=\"merge_group\",action=\"created\"} 1"));
+        .contains("github_webhook_events_total{repository=\"owner/repository\",event_type=\"merge_group\",action=\"created\"} 1"));
     for expected_zero in [
-        "github_merge_group_events_total{action=\"checks_requested\",reason=\"none\"} 0",
-        "github_merge_group_events_total{action=\"destroyed\",reason=\"merged\"} 0",
-        "github_merge_group_events_total{action=\"destroyed\",reason=\"dequeued\"} 0",
-        "github_merge_group_events_total{action=\"destroyed\",reason=\"invalidated\"} 0",
-        "github_merge_group_events_total{action=\"destroyed\",reason=\"other\"} 0",
+        "github_merge_group_events_total{repository=\"unknown\",action=\"checks_requested\",reason=\"none\"} 0",
+        "github_merge_group_events_total{repository=\"unknown\",action=\"destroyed\",reason=\"merged\"} 0",
+        "github_merge_group_events_total{repository=\"unknown\",action=\"destroyed\",reason=\"dequeued\"} 0",
+        "github_merge_group_events_total{repository=\"unknown\",action=\"destroyed\",reason=\"invalidated\"} 0",
+        "github_merge_group_events_total{repository=\"unknown\",action=\"destroyed\",reason=\"other\"} 0",
     ] {
         assert!(
             exposition.contains(expected_zero),
@@ -925,10 +991,13 @@ async fn malformed_unsupported_and_oversized_requests_have_stable_results() {
         .expect("delivery count is readable");
     assert_eq!(delivery_count, 0);
     let exposition = metrics(app.router).await;
-    assert!(exposition.contains("github_webhook_requests_total{result=\"too_large\"} 1"));
-    assert!(exposition.contains("github_webhook_request_body_bytes_count 0"));
+    assert!(exposition
+        .contains("github_webhook_requests_total{repository=\"unknown\",result=\"too_large\"} 1"));
+    assert!(
+        exposition.contains("github_webhook_request_body_bytes_count{repository=\"unknown\"} 0")
+    );
     assert!(!exposition
-        .contains("github_webhook_events_total{event_type=\"pull_request\",action=\"opened\"}"));
+        .contains("github_webhook_events_total{repository=\"owner/repository\",event_type=\"pull_request\",action=\"opened\"}"));
 }
 
 #[tokio::test]
@@ -1103,13 +1172,13 @@ async fn restart_preserves_configuration_deduplication_and_bounded_metrics() {
     let exposition = metrics(router).await;
     for expected in [
         "github_repository_configurations 1",
-        "github_webhook_requests_total{result=\"accepted\"} 2",
-        "github_webhook_events_total{event_type=\"pull_request\",action=\"opened\"} 1",
-        "github_webhook_duplicates_total 1",
+        "github_webhook_requests_total{repository=\"owner/repository\",result=\"accepted\"} 2",
+        "github_webhook_events_total{repository=\"owner/repository\",event_type=\"pull_request\",action=\"opened\"} 1",
+        "github_webhook_duplicates_total{repository=\"owner/repository\"} 1",
     ] {
         assert!(exposition.contains(expected), "missing {expected:?}");
     }
-    for forbidden in ["owner/repository", DELIVERY_ID, SECRET, "sha256="] {
+    for forbidden in [DELIVERY_ID, SECRET, "sha256="] {
         assert!(!exposition.contains(forbidden));
     }
     let persisted_payloads: i64 = sqlx::query_scalar(
@@ -1142,11 +1211,16 @@ async fn duplicate_delivery_updates_only_request_and_duplicate_metrics() {
         .expect("delivery count is readable");
     assert_eq!(delivery_count, 1);
     let exposition = metrics(app.router).await;
-    assert!(exposition.contains("github_webhook_requests_total{result=\"accepted\"} 2"));
+    assert!(exposition.contains(
+        "github_webhook_requests_total{repository=\"owner/repository\",result=\"accepted\"} 2"
+    ));
     assert!(exposition
-        .contains("github_webhook_events_total{event_type=\"pull_request\",action=\"opened\"} 1"));
-    assert!(exposition.contains("github_webhook_request_body_bytes_count 1"));
-    assert!(exposition.contains("github_webhook_duplicates_total 1"));
+        .contains("github_webhook_events_total{repository=\"owner/repository\",event_type=\"pull_request\",action=\"opened\"} 1"));
+    assert!(exposition
+        .contains("github_webhook_request_body_bytes_count{repository=\"owner/repository\"} 1"));
+    assert!(
+        exposition.contains("github_webhook_duplicates_total{repository=\"owner/repository\"} 1")
+    );
 }
 
 #[tokio::test]
@@ -1218,8 +1292,9 @@ async fn authentication_and_claim_database_failures_return_service_unavailable()
     assert!(authentication_logs.text().contains(authentication_error_id));
     let authentication_exposition = metrics(authentication_app.router).await;
     assert!(authentication_exposition
-        .contains("github_webhook_processing_failures_total{stage=\"authentication\"} 1"));
-    assert!(authentication_exposition.contains("github_webhook_request_body_bytes_count 0"));
+        .contains("github_webhook_processing_failures_total{repository=\"unknown\",stage=\"authentication\"} 1"));
+    assert!(authentication_exposition
+        .contains("github_webhook_request_body_bytes_count{repository=\"unknown\"} 0"));
 
     let claim_app = test_app(2_097_152, Some(true)).await;
     sqlx::query("DROP TABLE processed_deliveries")
@@ -1251,7 +1326,9 @@ async fn authentication_and_claim_database_failures_return_service_unavailable()
     assert!(claim_logs.text().contains(claim_error_id));
     let exposition = metrics(claim_app.router).await;
     assert!(
-        exposition.contains("github_webhook_processing_failures_total{stage=\"delivery_claim\"} 1")
+        exposition.contains("github_webhook_processing_failures_total{repository=\"owner/repository\",stage=\"delivery_claim\"} 1")
     );
-    assert!(exposition.contains("github_webhook_request_body_bytes_count 0"));
+    assert!(
+        exposition.contains("github_webhook_request_body_bytes_count{repository=\"unknown\"} 0")
+    );
 }

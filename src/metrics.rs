@@ -18,10 +18,11 @@ use prometheus_client::{
     registry::Registry,
 };
 
-use crate::{app::AppState, error::AppError};
+use crate::{app::AppState, error::AppError, security::CanonicalRepositoryName};
 
 const OPEN_METRICS_CONTENT_TYPE: &str =
     "application/openmetrics-text; version=1.0.0; charset=utf-8";
+const UNKNOWN_REPOSITORY: &str = "unknown";
 const REQUEST_DURATION_BUCKETS: [f64; 11] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
@@ -403,13 +404,15 @@ pub enum MergeQueueCompletion {
 }
 
 impl MergeQueueCompletion {
-    fn labels(self) -> MergeQueueOutcomeLabels {
+    fn labels(self, repository: RepositoryLabel) -> MergeQueueOutcomeLabels {
         match self {
             Self::PullRequestMerged => MergeQueueOutcomeLabels {
+                repository,
                 outcome: MergeQueueOutcome::Succeeded,
                 reason: MergeQueueReason::PullRequestMerged,
             },
             Self::UnclassifiedDequeue => MergeQueueOutcomeLabels {
+                repository,
                 outcome: MergeQueueOutcome::Unknown,
                 reason: MergeQueueReason::UnclassifiedDequeue,
             },
@@ -601,46 +604,84 @@ impl EncodeLabelValue for FailureStage {
     }
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum RepositoryLabel {
+    Authenticated(CanonicalRepositoryName),
+    Unknown,
+}
+
+impl RepositoryLabel {
+    fn authenticated(repository: &CanonicalRepositoryName) -> Self {
+        Self::Authenticated(repository.clone())
+    }
+
+    fn optional(repository: Option<&CanonicalRepositoryName>) -> Self {
+        repository.map_or(Self::Unknown, Self::authenticated)
+    }
+}
+
+impl EncodeLabelValue for RepositoryLabel {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> fmt::Result {
+        encoder.write_str(match self {
+            Self::Authenticated(repository) => repository.as_str(),
+            Self::Unknown => UNKNOWN_REPOSITORY,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RepositoryLabels {
+    repository: RepositoryLabel,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct RequestLabels {
+    repository: RepositoryLabel,
     result: WebhookResult,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct EventLabels {
+    repository: RepositoryLabel,
     event_type: EventType,
     action: Action,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct FailureLabels {
+    repository: RepositoryLabel,
     stage: FailureStage,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct MergeGroupLabels {
+    repository: RepositoryLabel,
     action: MergeGroupAction,
     reason: MergeGroupReason,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct MergeQueueOutcomeLabels {
+    repository: RepositoryLabel,
     outcome: MergeQueueOutcome,
     reason: MergeQueueReason,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct MergeQueueDurationLabels {
+    repository: RepositoryLabel,
     outcome: MergeQueueOutcome,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct QueueTransitionFailureLabels {
+    repository: RepositoryLabel,
     reason: QueueTransitionFailureReason,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct WorkflowTraceRejectionLabels {
+    repository: RepositoryLabel,
     reason: WorkflowTraceRejectionReason,
 }
 
@@ -675,15 +716,15 @@ struct MetricsInner {
     webhook_requests: CounterFamily<RequestLabels>,
     webhook_events: CounterFamily<EventLabels>,
     processing_duration: HistogramFamily<RequestLabels>,
-    request_body_bytes: Histogram,
-    duplicates: Counter,
+    request_body_bytes: HistogramFamily<RepositoryLabels>,
+    duplicates: CounterFamily<RepositoryLabels>,
     processing_failures: CounterFamily<FailureLabels>,
     repository_configurations: RepositoryGauge,
     merge_group_events: CounterFamily<MergeGroupLabels>,
     merge_queue_pr_outcomes: CounterFamily<MergeQueueOutcomeLabels>,
     merge_queue_attempt_duration: HistogramFamily<MergeQueueDurationLabels>,
     merge_queue_transition_failures: CounterFamily<QueueTransitionFailureLabels>,
-    workflow_job_steps: Histogram,
+    workflow_job_steps: HistogramFamily<RepositoryLabels>,
     workflow_trace_rejections: CounterFamily<WorkflowTraceRejectionLabels>,
     telemetry_export_failures: CounterFamily<TelemetryExportFailureLabels>,
     telemetry_dropped_records: CounterFamily<TelemetryDropLabels>,
@@ -696,8 +737,9 @@ impl Metrics {
         let webhook_events = CounterFamily::default();
         let processing_duration =
             HistogramFamily::new_with_constructor(request_duration_histogram as fn() -> Histogram);
-        let request_body_bytes = request_body_size_histogram();
-        let duplicates = Counter::default();
+        let request_body_bytes =
+            HistogramFamily::new_with_constructor(request_body_size_histogram as fn() -> Histogram);
+        let duplicates = CounterFamily::default();
         let processing_failures = CounterFamily::default();
         let repository_configurations = RepositoryGauge::default();
         let merge_group_events = CounterFamily::default();
@@ -706,7 +748,9 @@ impl Metrics {
             merge_queue_attempt_duration_histogram as fn() -> Histogram,
         );
         let merge_queue_transition_failures = CounterFamily::default();
-        let workflow_job_steps = Histogram::new(WORKFLOW_JOB_STEP_BUCKETS);
+        let workflow_job_steps = HistogramFamily::new_with_constructor(
+            workflow_job_steps_histogram as fn() -> Histogram,
+        );
         let workflow_trace_rejections = CounterFamily::default();
         let telemetry_export_failures = CounterFamily::default();
         let telemetry_dropped_records = CounterFamily::default();
@@ -722,11 +766,21 @@ impl Metrics {
             WebhookResult::Unsupported,
             WebhookResult::Unavailable,
         ] {
-            let labels = RequestLabels { result };
+            let labels = RequestLabels {
+                repository: RepositoryLabel::Unknown,
+                result,
+            };
             let _ = webhook_requests.get_or_create(&labels);
             let _ = processing_duration.get_or_create(&labels);
         }
+        let repository_labels = RepositoryLabels {
+            repository: RepositoryLabel::Unknown,
+        };
+        let _ = request_body_bytes.get_or_create(&repository_labels);
+        let _ = duplicates.get_or_create(&repository_labels);
+        let _ = workflow_job_steps.get_or_create(&repository_labels);
         let _ = webhook_events.get_or_create(&EventLabels {
+            repository: RepositoryLabel::Unknown,
             event_type: EventType::Other,
             action: Action::Other,
         });
@@ -737,9 +791,13 @@ impl Metrics {
             FailureStage::Database,
             FailureStage::QueueState,
         ] {
-            let _ = processing_failures.get_or_create(&FailureLabels { stage });
+            let _ = processing_failures.get_or_create(&FailureLabels {
+                repository: RepositoryLabel::Unknown,
+                stage,
+            });
         }
         let _ = merge_group_events.get_or_create(&MergeGroupLabels {
+            repository: RepositoryLabel::Unknown,
             action: MergeGroupAction::ChecksRequested,
             reason: MergeGroupReason::None,
         });
@@ -750,6 +808,7 @@ impl Metrics {
             MergeGroupReason::Other,
         ] {
             let _ = merge_group_events.get_or_create(&MergeGroupLabels {
+                repository: RepositoryLabel::Unknown,
                 action: MergeGroupAction::Destroyed,
                 reason,
             });
@@ -764,19 +823,27 @@ impl Metrics {
                 MergeQueueReason::UnclassifiedDequeue,
             ),
         ] {
-            let _ =
-                merge_queue_pr_outcomes.get_or_create(&MergeQueueOutcomeLabels { outcome, reason });
-            let _ =
-                merge_queue_attempt_duration.get_or_create(&MergeQueueDurationLabels { outcome });
+            let _ = merge_queue_pr_outcomes.get_or_create(&MergeQueueOutcomeLabels {
+                repository: RepositoryLabel::Unknown,
+                outcome,
+                reason,
+            });
+            let _ = merge_queue_attempt_duration.get_or_create(&MergeQueueDurationLabels {
+                repository: RepositoryLabel::Unknown,
+                outcome,
+            });
         }
         for reason in [
             QueueTransitionFailureReason::MissingActiveAttempt,
             QueueTransitionFailureReason::InvalidDuration,
         ] {
-            let _ = merge_queue_transition_failures
-                .get_or_create(&QueueTransitionFailureLabels { reason });
+            let _ = merge_queue_transition_failures.get_or_create(&QueueTransitionFailureLabels {
+                repository: RepositoryLabel::Unknown,
+                reason,
+            });
         }
         let _ = workflow_trace_rejections.get_or_create(&WorkflowTraceRejectionLabels {
+            repository: RepositoryLabel::Unknown,
             reason: WorkflowTraceRejectionReason::TooManySteps,
         });
         for signal in TelemetrySignal::ALL {
@@ -890,9 +957,19 @@ impl Metrics {
 
     /// Records one webhook request and its end-to-end processing duration.
     ///
-    /// `result` is a closed enum and `duration` is observed in seconds.
-    pub fn observe_request(&self, result: WebhookResult, duration: Duration) {
-        let labels = RequestLabels { result };
+    /// `repository` is the authenticated canonical full name, or `None` when authentication did
+    /// not establish repository identity. `result` is bounded and `duration` is observed in
+    /// seconds.
+    pub fn observe_request(
+        &self,
+        repository: Option<&CanonicalRepositoryName>,
+        result: WebhookResult,
+        duration: Duration,
+    ) {
+        let labels = RequestLabels {
+            repository: RepositoryLabel::optional(repository),
+            result,
+        };
         self.inner.webhook_requests.get_or_create(&labels).inc();
         self.inner
             .processing_duration
@@ -901,24 +978,50 @@ impl Metrics {
     }
 
     /// Records one authenticated, newly claimed event and its request-body size.
-    pub fn observe_event(&self, event_type: EventType, action: Action, body_bytes: usize) {
+    pub fn observe_event(
+        &self,
+        repository: &CanonicalRepositoryName,
+        event_type: EventType,
+        action: Action,
+        body_bytes: usize,
+    ) {
+        let repository = RepositoryLabel::authenticated(repository);
         self.inner
             .webhook_events
-            .get_or_create(&EventLabels { event_type, action })
+            .get_or_create(&EventLabels {
+                repository: repository.clone(),
+                event_type,
+                action,
+            })
             .inc();
-        self.inner.request_body_bytes.observe(body_bytes as f64);
+        self.inner
+            .request_body_bytes
+            .get_or_create(&RepositoryLabels { repository })
+            .observe(body_bytes as f64);
     }
 
     /// Increments the authenticated duplicate-delivery total.
-    pub fn record_duplicate(&self) {
-        self.inner.duplicates.inc();
+    pub fn record_duplicate(&self, repository: &CanonicalRepositoryName) {
+        self.inner
+            .duplicates
+            .get_or_create(&RepositoryLabels {
+                repository: RepositoryLabel::authenticated(repository),
+            })
+            .inc();
     }
 
     /// Increments the processing-failure total for a bounded stage.
-    pub fn record_failure(&self, stage: FailureStage) {
+    pub fn record_failure(
+        &self,
+        repository: Option<&CanonicalRepositoryName>,
+        stage: FailureStage,
+    ) {
         self.inner
             .processing_failures
-            .get_or_create(&FailureLabels { stage })
+            .get_or_create(&FailureLabels {
+                repository: RepositoryLabel::optional(repository),
+                stage,
+            })
             .inc();
     }
 
@@ -926,14 +1029,23 @@ impl Metrics {
     ///
     /// `checks_requested` always records reason `none`, regardless of the supplied reason. This
     /// prevents callers from creating unsupported action/reason combinations.
-    pub fn record_merge_group_event(&self, action: MergeGroupAction, reason: MergeGroupReason) {
+    pub fn record_merge_group_event(
+        &self,
+        repository: &CanonicalRepositoryName,
+        action: MergeGroupAction,
+        reason: MergeGroupReason,
+    ) {
         let reason = match action {
             MergeGroupAction::ChecksRequested => MergeGroupReason::None,
             MergeGroupAction::Destroyed => reason,
         };
         self.inner
             .merge_group_events
-            .get_or_create(&MergeGroupLabels { action, reason })
+            .get_or_create(&MergeGroupLabels {
+                repository: RepositoryLabel::authenticated(repository),
+                action,
+                reason,
+            })
             .inc();
     }
 
@@ -943,17 +1055,19 @@ impl Metrics {
     /// bounded `invalid_duration` transition-failure counter.
     pub fn record_merge_queue_completion(
         &self,
+        repository: &CanonicalRepositoryName,
         completion: MergeQueueCompletion,
         duration: time::Duration,
     ) {
         if !(time::Duration::ZERO..=MAX_MERGE_QUEUE_ATTEMPT_DURATION).contains(&duration) {
             self.record_merge_queue_transition_failure(
+                repository,
                 QueueTransitionFailureReason::InvalidDuration,
             );
             return;
         }
 
-        let labels = completion.labels();
+        let labels = completion.labels(RepositoryLabel::authenticated(repository));
         self.inner
             .merge_queue_pr_outcomes
             .get_or_create(&labels)
@@ -961,29 +1075,53 @@ impl Metrics {
         self.inner
             .merge_queue_attempt_duration
             .get_or_create(&MergeQueueDurationLabels {
+                repository: labels.repository.clone(),
                 outcome: labels.outcome,
             })
             .observe(duration.as_seconds_f64());
     }
 
     /// Increments the merge-queue transition-failure total for a bounded reason.
-    pub fn record_merge_queue_transition_failure(&self, reason: QueueTransitionFailureReason) {
+    pub fn record_merge_queue_transition_failure(
+        &self,
+        repository: &CanonicalRepositoryName,
+        reason: QueueTransitionFailureReason,
+    ) {
         self.inner
             .merge_queue_transition_failures
-            .get_or_create(&QueueTransitionFailureLabels { reason })
+            .get_or_create(&QueueTransitionFailureLabels {
+                repository: RepositoryLabel::authenticated(repository),
+                reason,
+            })
             .inc();
     }
 
     /// Observes the step count reported by one structurally valid completed workflow job.
-    pub(crate) fn observe_workflow_job_steps(&self, step_count: usize) {
-        self.inner.workflow_job_steps.observe(step_count as f64);
+    pub(crate) fn observe_workflow_job_steps(
+        &self,
+        repository: &CanonicalRepositoryName,
+        step_count: usize,
+    ) {
+        self.inner
+            .workflow_job_steps
+            .get_or_create(&RepositoryLabels {
+                repository: RepositoryLabel::authenticated(repository),
+            })
+            .observe(step_count as f64);
     }
 
     /// Increments the bounded counter for one rejected workflow-job trace.
-    pub(crate) fn record_workflow_trace_rejection(&self, reason: WorkflowTraceRejectionReason) {
+    pub(crate) fn record_workflow_trace_rejection(
+        &self,
+        repository: &CanonicalRepositoryName,
+        reason: WorkflowTraceRejectionReason,
+    ) {
         self.inner
             .workflow_trace_rejections
-            .get_or_create(&WorkflowTraceRejectionLabels { reason })
+            .get_or_create(&WorkflowTraceRejectionLabels {
+                repository: RepositoryLabel::authenticated(repository),
+                reason,
+            })
             .inc();
     }
 
@@ -1064,6 +1202,10 @@ fn request_body_size_histogram() -> Histogram {
 
 fn merge_queue_attempt_duration_histogram() -> Histogram {
     Histogram::new(MERGE_QUEUE_ATTEMPT_DURATION_BUCKETS)
+}
+
+fn workflow_job_steps_histogram() -> Histogram {
+    Histogram::new(WORKFLOW_JOB_STEP_BUCKETS)
 }
 
 /// Normalizes an untrusted GitHub event header using the fixed v1 allowlist.
@@ -1151,6 +1293,8 @@ pub fn normalize_action(raw_action: Option<&str>) -> Action {
 mod tests {
     use std::time::Duration;
 
+    use crate::security::CanonicalRepositoryName;
+
     use super::{
         normalize_action, normalize_event_type, normalize_merge_group_destroyed_reason, Action,
         EventType, FailureStage, MergeGroupAction, MergeGroupReason, MergeQueueCompletion,
@@ -1158,6 +1302,10 @@ mod tests {
         TelemetryDropReason, TelemetryExportFailureReason, TelemetrySignal, WebhookResult,
         WorkflowTraceRejectionReason,
     };
+
+    fn repository_name(value: &str) -> CanonicalRepositoryName {
+        CanonicalRepositoryName::new(value).expect("repository name is valid")
+    }
 
     #[test]
     fn normalization_preserves_every_allowed_event_type() {
@@ -1251,25 +1399,49 @@ mod tests {
     }
 
     #[test]
+    fn repository_scoped_metrics_use_full_canonical_names() {
+        let metrics = Metrics::new();
+        let first = repository_name("PeterGrace/GitHub-Webhook-Exporter");
+        let second = repository_name("Other/Repository");
+
+        metrics.observe_event(&first, EventType::Push, Action::None, 128);
+        metrics.observe_event(&second, EventType::Push, Action::None, 256);
+
+        let exposition = metrics.encode().expect("metrics encode");
+        assert!(exposition.contains(
+            "github_webhook_events_total{repository=\"petergrace/github-webhook-exporter\",event_type=\"push\",action=\"none\"} 1"
+        ));
+        assert!(exposition.contains(
+            "github_webhook_events_total{repository=\"other/repository\",event_type=\"push\",action=\"none\"} 1"
+        ));
+        assert!(!exposition.contains("repository=\"github-webhook-exporter\""));
+    }
+
+    #[test]
     fn metric_updates_record_every_required_instrument() {
         let metrics = Metrics::new();
 
-        metrics.observe_request(WebhookResult::Accepted, Duration::from_millis(25));
-        metrics.observe_event(EventType::Push, Action::None, 1_024);
-        metrics.record_duplicate();
-        metrics.record_failure(FailureStage::Metrics);
+        metrics.observe_request(None, WebhookResult::Accepted, Duration::from_millis(25));
+        metrics.observe_event(
+            &repository_name("owner/repository"),
+            EventType::Push,
+            Action::None,
+            1_024,
+        );
+        metrics.record_duplicate(&repository_name("owner/repository"));
+        metrics.record_failure(None, FailureStage::Metrics);
         metrics.set_repository_configurations(7);
 
         let exposition = metrics.encode().expect("metrics encode into a String");
         for expected_sample in [
-            "github_webhook_requests_total{result=\"accepted\"} 1",
-            "github_webhook_events_total{event_type=\"push\",action=\"none\"} 1",
-            "github_webhook_processing_duration_seconds_count{result=\"accepted\"} 1",
-            "github_webhook_processing_duration_seconds_sum{result=\"accepted\"} 0.025",
-            "github_webhook_request_body_bytes_count 1",
-            "github_webhook_request_body_bytes_sum 1024.0",
-            "github_webhook_duplicates_total 1",
-            "github_webhook_processing_failures_total{stage=\"metrics\"} 1",
+            "github_webhook_requests_total{repository=\"unknown\",result=\"accepted\"} 1",
+            "github_webhook_events_total{repository=\"owner/repository\",event_type=\"push\",action=\"none\"} 1",
+            "github_webhook_processing_duration_seconds_count{repository=\"unknown\",result=\"accepted\"} 1",
+            "github_webhook_processing_duration_seconds_sum{repository=\"unknown\",result=\"accepted\"} 0.025",
+            "github_webhook_request_body_bytes_count{repository=\"owner/repository\"} 1",
+            "github_webhook_request_body_bytes_sum{repository=\"owner/repository\"} 1024.0",
+            "github_webhook_duplicates_total{repository=\"owner/repository\"} 1",
+            "github_webhook_processing_failures_total{repository=\"unknown\",stage=\"metrics\"} 1",
             "github_repository_configurations 7",
         ] {
             assert!(
@@ -1306,20 +1478,23 @@ mod tests {
     fn workflow_job_metrics_observe_sizes_and_bounded_rejections() {
         let metrics = Metrics::new();
 
-        metrics.observe_workflow_job_steps(0);
-        metrics.observe_workflow_job_steps(36);
-        metrics.observe_workflow_job_steps(1_500);
-        metrics.record_workflow_trace_rejection(WorkflowTraceRejectionReason::TooManySteps);
+        metrics.observe_workflow_job_steps(&repository_name("owner/repository"), 0);
+        metrics.observe_workflow_job_steps(&repository_name("owner/repository"), 36);
+        metrics.observe_workflow_job_steps(&repository_name("owner/repository"), 1_500);
+        metrics.record_workflow_trace_rejection(
+            &repository_name("owner/repository"),
+            WorkflowTraceRejectionReason::TooManySteps,
+        );
 
         let exposition = metrics.encode().expect("metrics encode");
         for sample in [
-            "github_workflow_job_steps_bucket{le=\"0.0\"} 1",
-            "github_workflow_job_steps_bucket{le=\"40.0\"} 2",
-            "github_workflow_job_steps_bucket{le=\"1024.0\"} 2",
-            "github_workflow_job_steps_bucket{le=\"+Inf\"} 3",
-            "github_workflow_job_steps_count 3",
-            "github_workflow_job_steps_sum 1536.0",
-            "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 1",
+            "github_workflow_job_steps_bucket{le=\"0.0\",repository=\"owner/repository\"} 1",
+            "github_workflow_job_steps_bucket{le=\"40.0\",repository=\"owner/repository\"} 2",
+            "github_workflow_job_steps_bucket{le=\"1024.0\",repository=\"owner/repository\"} 2",
+            "github_workflow_job_steps_bucket{le=\"+Inf\",repository=\"owner/repository\"} 3",
+            "github_workflow_job_steps_count{repository=\"owner/repository\"} 3",
+            "github_workflow_job_steps_sum{repository=\"owner/repository\"} 1536.0",
+            "github_workflow_job_trace_rejections_total{repository=\"owner/repository\",reason=\"too_many_steps\"} 1",
         ] {
             assert!(
                 exposition.contains(sample),
@@ -1347,10 +1522,10 @@ mod tests {
         ];
 
         for (result, _) in results {
-            metrics.observe_request(result, Duration::ZERO);
+            metrics.observe_request(None, result, Duration::ZERO);
         }
         for (stage, _) in stages {
-            metrics.record_failure(stage);
+            metrics.record_failure(None, stage);
         }
 
         let exposition = metrics.encode().expect("metrics encode into a String");
@@ -1373,10 +1548,17 @@ mod tests {
             let worker_metrics = metrics.clone();
             workers.push(std::thread::spawn(move || {
                 for _ in 0..UPDATES_PER_THREAD {
-                    worker_metrics.record_duplicate();
-                    worker_metrics.observe_event(EventType::Push, Action::None, 128);
-                    worker_metrics.observe_workflow_job_steps(1);
+                    worker_metrics.record_duplicate(&repository_name("owner/repository"));
+                    worker_metrics.observe_event(
+                        &repository_name("owner/repository"),
+                        EventType::Push,
+                        Action::None,
+                        128,
+                    );
+                    worker_metrics
+                        .observe_workflow_job_steps(&repository_name("owner/repository"), 1);
                     worker_metrics.record_workflow_trace_rejection(
+                        &repository_name("owner/repository"),
                         WorkflowTraceRejectionReason::TooManySteps,
                     );
                 }
@@ -1389,20 +1571,23 @@ mod tests {
         let exposition = metrics.encode().expect("metrics encode into a String");
         let expected_updates = THREADS * UPDATES_PER_THREAD;
         assert!(exposition.contains(&format!(
-            "github_webhook_duplicates_total {expected_updates}"
-        )));
-        assert!(exposition.contains(&format!(
-            "github_webhook_events_total{{event_type=\"push\",action=\"none\"}} \
+            "github_webhook_duplicates_total{{repository=\"owner/repository\"}} \
              {expected_updates}"
         )));
         assert!(exposition.contains(&format!(
-            "github_webhook_request_body_bytes_count {expected_updates}"
+            "github_webhook_events_total{{repository=\"owner/repository\",event_type=\"push\",action=\"none\"}} \
+             {expected_updates}"
         )));
         assert!(exposition.contains(&format!(
-            "github_workflow_job_steps_count {expected_updates}"
+            "github_webhook_request_body_bytes_count{{repository=\"owner/repository\"}} \
+             {expected_updates}"
         )));
         assert!(exposition.contains(&format!(
-            "github_workflow_job_trace_rejections_total{{reason=\"too_many_steps\"}} \
+            "github_workflow_job_steps_count{{repository=\"owner/repository\"}} \
+             {expected_updates}"
+        )));
+        assert!(exposition.contains(&format!(
+            "github_workflow_job_trace_rejections_total{{repository=\"owner/repository\",reason=\"too_many_steps\"}} \
              {expected_updates}"
         )));
     }
@@ -1467,10 +1652,10 @@ mod tests {
                 "other",
             ),
         ] {
-            metrics.record_merge_group_event(action, reason);
+            metrics.record_merge_group_event(&repository_name("owner/repository"), action, reason);
             let exposition = metrics.encode().expect("metrics encode into a String");
             assert!(exposition.contains(&format!(
-                "github_merge_group_events_total{{action=\"{encoded_action}\",reason=\"{encoded_reason}\"}} 1"
+                "github_merge_group_events_total{{repository=\"owner/repository\",action=\"{encoded_action}\",reason=\"{encoded_reason}\"}} 1"
             )));
         }
 
@@ -1503,10 +1688,14 @@ mod tests {
                 "unclassified_dequeue",
             ),
         ] {
-            metrics.record_merge_queue_completion(completion, time::Duration::seconds(1));
+            metrics.record_merge_queue_completion(
+                &repository_name("owner/repository"),
+                completion,
+                time::Duration::seconds(1),
+            );
             let exposition = metrics.encode().expect("metrics encode into a String");
             assert!(exposition.contains(&format!(
-                "github_merge_queue_pr_outcomes_total{{outcome=\"{encoded_outcome}\",reason=\"{encoded_reason}\"}} 1"
+                "github_merge_queue_pr_outcomes_total{{repository=\"owner/repository\",outcome=\"{encoded_outcome}\",reason=\"{encoded_reason}\"}} 1"
             )));
         }
 
@@ -1520,18 +1709,21 @@ mod tests {
                 "invalid_duration",
             ),
         ] {
-            metrics.record_merge_queue_transition_failure(reason);
+            metrics.record_merge_queue_transition_failure(
+                &repository_name("owner/repository"),
+                reason,
+            );
             let exposition = metrics.encode().expect("metrics encode into a String");
             assert!(exposition.contains(&format!(
-                "github_merge_queue_transition_failures_total{{reason=\"{encoded_reason}\"}} 1"
+                "github_merge_queue_transition_failures_total{{repository=\"owner/repository\",reason=\"{encoded_reason}\"}} 1"
             )));
         }
 
-        metrics.record_failure(FailureStage::QueueState);
+        metrics.record_failure(None, FailureStage::QueueState);
         assert!(metrics
             .encode()
             .expect("metrics encode into a String")
-            .contains("github_webhook_processing_failures_total{stage=\"queue_state\"} 1"));
+            .contains("github_webhook_processing_failures_total{repository=\"unknown\",stage=\"queue_state\"} 1"));
     }
 
     #[test]
@@ -1539,22 +1731,23 @@ mod tests {
         let metrics = Metrics::new();
 
         metrics.record_merge_queue_completion(
+            &repository_name("owner/repository"),
             MergeQueueCompletion::PullRequestMerged,
             time::Duration::seconds(90),
         );
 
         let exposition = metrics.encode().expect("metrics encode into a String");
         assert!(exposition.contains(
-            "github_merge_queue_pr_outcomes_total{outcome=\"succeeded\",reason=\"pull_request_merged\"} 1"
+            "github_merge_queue_pr_outcomes_total{repository=\"owner/repository\",outcome=\"succeeded\",reason=\"pull_request_merged\"} 1"
         ));
         assert!(exposition.contains(
-            "github_merge_queue_attempt_duration_seconds_count{outcome=\"succeeded\"} 1"
+            "github_merge_queue_attempt_duration_seconds_count{repository=\"owner/repository\",outcome=\"succeeded\"} 1"
         ));
         assert!(exposition.contains(
-            "github_merge_queue_attempt_duration_seconds_sum{outcome=\"succeeded\"} 90.0"
+            "github_merge_queue_attempt_duration_seconds_sum{repository=\"owner/repository\",outcome=\"succeeded\"} 90.0"
         ));
         assert!(exposition.contains(
-            "github_merge_queue_transition_failures_total{reason=\"invalid_duration\"} 0"
+            "github_merge_queue_transition_failures_total{repository=\"unknown\",reason=\"invalid_duration\"} 0"
         ));
     }
 
@@ -1563,16 +1756,17 @@ mod tests {
         let metrics = Metrics::new();
 
         metrics.record_merge_queue_completion(
+            &repository_name("owner/repository"),
             MergeQueueCompletion::PullRequestMerged,
             time::Duration::days(365),
         );
 
         let exposition = metrics.encode().expect("metrics encode into a String");
         assert!(exposition.contains(
-            "github_merge_queue_attempt_duration_seconds_count{outcome=\"succeeded\"} 1"
+            "github_merge_queue_attempt_duration_seconds_count{repository=\"owner/repository\",outcome=\"succeeded\"} 1"
         ));
         assert!(exposition.contains(
-            "github_merge_queue_transition_failures_total{reason=\"invalid_duration\"} 0"
+            "github_merge_queue_transition_failures_total{repository=\"unknown\",reason=\"invalid_duration\"} 0"
         ));
     }
 
@@ -1581,14 +1775,15 @@ mod tests {
         let metrics = Metrics::new();
 
         metrics.record_merge_queue_completion(
+            &repository_name("owner/repository"),
             MergeQueueCompletion::UnclassifiedDequeue,
             time::Duration::days(30),
         );
 
         let exposition = metrics.encode().expect("metrics encode into a String");
         for expected_sample in [
-            "github_merge_queue_attempt_duration_seconds_bucket{le=\"2592000.0\",outcome=\"unknown\"} 1",
-            "github_merge_queue_attempt_duration_seconds_bucket{le=\"31536000.0\",outcome=\"unknown\"} 1",
+            "github_merge_queue_attempt_duration_seconds_bucket{le=\"2592000.0\",repository=\"owner/repository\",outcome=\"unknown\"} 1",
+            "github_merge_queue_attempt_duration_seconds_bucket{le=\"31536000.0\",repository=\"owner/repository\",outcome=\"unknown\"} 1",
         ] {
             assert!(
                 exposition.contains(expected_sample),
@@ -1606,6 +1801,7 @@ mod tests {
             time::Duration::days(365) + time::Duration::nanoseconds(1),
         ] {
             metrics.record_merge_queue_completion(
+                &repository_name("owner/repository"),
                 MergeQueueCompletion::UnclassifiedDequeue,
                 invalid_duration,
             );
@@ -1613,12 +1809,13 @@ mod tests {
 
         let exposition = metrics.encode().expect("metrics encode into a String");
         assert!(exposition.contains(
-            "github_merge_queue_pr_outcomes_total{outcome=\"unknown\",reason=\"unclassified_dequeue\"} 0"
+            "github_merge_queue_pr_outcomes_total{repository=\"unknown\",outcome=\"unknown\",reason=\"unclassified_dequeue\"} 0"
         ));
-        assert!(exposition
-            .contains("github_merge_queue_attempt_duration_seconds_count{outcome=\"unknown\"} 0"));
         assert!(exposition.contains(
-            "github_merge_queue_transition_failures_total{reason=\"invalid_duration\"} 2"
+            "github_merge_queue_attempt_duration_seconds_count{repository=\"unknown\",outcome=\"unknown\"} 0"
+        ));
+        assert!(exposition.contains(
+            "github_merge_queue_transition_failures_total{repository=\"owner/repository\",reason=\"invalid_duration\"} 2"
         ));
     }
 
@@ -1631,10 +1828,12 @@ mod tests {
                 let worker_metrics = metrics.clone();
                 std::thread::spawn(move || {
                     worker_metrics.record_merge_group_event(
+                        &repository_name("owner/repository"),
                         MergeGroupAction::Destroyed,
                         MergeGroupReason::Merged,
                     );
                     worker_metrics.record_merge_queue_completion(
+                        &repository_name("owner/repository"),
                         MergeQueueCompletion::PullRequestMerged,
                         time::Duration::seconds(1),
                     );
@@ -1648,13 +1847,13 @@ mod tests {
 
         let exposition = metrics.encode().expect("metrics encode into a String");
         assert!(exposition.contains(&format!(
-            "github_merge_group_events_total{{action=\"destroyed\",reason=\"merged\"}} {THREADS}"
+            "github_merge_group_events_total{{repository=\"owner/repository\",action=\"destroyed\",reason=\"merged\"}} {THREADS}"
         )));
         assert!(exposition.contains(&format!(
-            "github_merge_queue_pr_outcomes_total{{outcome=\"succeeded\",reason=\"pull_request_merged\"}} {THREADS}"
+            "github_merge_queue_pr_outcomes_total{{repository=\"owner/repository\",outcome=\"succeeded\",reason=\"pull_request_merged\"}} {THREADS}"
         )));
         assert!(exposition.contains(&format!(
-            "github_merge_queue_attempt_duration_seconds_count{{outcome=\"succeeded\"}} {THREADS}"
+            "github_merge_queue_attempt_duration_seconds_count{{repository=\"owner/repository\",outcome=\"succeeded\"}} {THREADS}"
         )));
     }
 
@@ -1696,23 +1895,31 @@ mod tests {
         let metrics = Metrics::new();
 
         metrics.observe_event(
+            &repository_name("owner/repository"),
             normalize_event_type(&raw_event),
             normalize_action(Some(&raw_action)),
             64,
         );
         metrics.record_merge_group_event(
+            &repository_name("owner/repository"),
             MergeGroupAction::Destroyed,
             normalize_merge_group_destroyed_reason(&raw_group_reason),
         );
-        metrics.observe_workflow_job_steps(36);
-        metrics.record_workflow_trace_rejection(WorkflowTraceRejectionReason::TooManySteps);
+        metrics.observe_workflow_job_steps(&repository_name("owner/repository"), 36);
+        metrics.record_workflow_trace_rejection(
+            &repository_name("owner/repository"),
+            WorkflowTraceRejectionReason::TooManySteps,
+        );
 
         let exposition = metrics.encode().expect("metrics encode into a String");
+        assert!(exposition.contains(
+            "github_webhook_events_total{repository=\"owner/repository\",event_type=\"other\",action=\"other\"} 1"
+        ));
         assert!(exposition
-            .contains("github_webhook_events_total{event_type=\"other\",action=\"other\"} 1"));
-        assert!(exposition.contains("github_workflow_job_steps_count 1"));
-        assert!(exposition
-            .contains("github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 1"));
+            .contains("github_workflow_job_steps_count{repository=\"owner/repository\"} 1"));
+        assert!(exposition.contains(
+            "github_workflow_job_trace_rejections_total{repository=\"owner/repository\",reason=\"too_many_steps\"} 1"
+        ));
         for forbidden_value in forbidden_values {
             assert!(!exposition.contains(forbidden_value));
         }

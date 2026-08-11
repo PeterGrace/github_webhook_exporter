@@ -230,17 +230,17 @@ authoritative, while per-pull-request failure classification is initially best-e
 > and telemetry-health metrics. See the metrics table in [`README.md`](../README.md#metrics).
 
 ```text
-github_webhook_requests_total{result}
-github_webhook_events_total{event_type,action}
-github_webhook_processing_duration_seconds{result}
-github_webhook_request_body_bytes
+github_webhook_requests_total{repository,result}
+github_webhook_events_total{repository,event_type,action}
+github_webhook_processing_duration_seconds{repository,result}
+github_webhook_request_body_bytes{repository}
 
-github_merge_group_events_total{action,reason}
-github_merge_queue_pr_outcomes_total{outcome,reason}
-github_merge_queue_attempt_duration_seconds{outcome}
+github_merge_group_events_total{repository,action,reason}
+github_merge_queue_pr_outcomes_total{repository,outcome,reason}
+github_merge_queue_attempt_duration_seconds{repository,outcome}
 
-github_webhook_duplicates_total
-github_webhook_processing_failures_total{stage}
+github_webhook_duplicates_total{repository}
+github_webhook_processing_failures_total{repository,stage}
 github_repository_configurations
 ```
 
@@ -252,7 +252,8 @@ Bounded labels:
   `database`, and `queue_state`; there is no `telemetry` stage.
 - Merge-group actions and reasons use fixed enumerations.
 - Generic unknown actions collapse to `other`.
-- Repository identity is never a label.
+- Authenticated repository identity is the canonical lowercase `owner/repository` label; requests
+  that fail before authentication use the fixed value `unknown`.
 
 ## OpenTelemetry
 
@@ -275,8 +276,8 @@ Telemetry behavior:
 - Report exporter saturation or dropped telemetry loudly through local stderr logging.
 - Flush exporters during graceful shutdown with a bounded timeout.
 - Include service version, pod name, and Kubernetes namespace as resource attributes.
-- Do not attach payloads, repository names, pull request numbers, SHAs, secrets, or authorization
-  headers to spans.
+- Do not attach payloads, secrets, authorization headers, or unvalidated identifiers to spans.
+  Authenticated webhook spans use the canonical repository name.
 - A delivery ID may be included in trace context but never as a metric label.
 
 Primary spans:
@@ -343,7 +344,8 @@ removed from production builds.
 - Duplicate delivery IDs do not update event or merge-queue outcome metrics twice.
 - `merge_group` events expose `checks_requested` and destroyed-reason statistics.
 - Enqueued pull requests can be correlated with later queue outcomes across process restarts.
-- Repository names, pull request numbers, SHAs, and delivery IDs never appear as metric labels.
+- Authenticated canonical repository names label repository-scoped metrics; pull request numbers,
+  SHAs, and delivery IDs never appear as metric labels.
 - Webhook processing continues when the OTel collector is unavailable.
 - Payload and secret data do not appear in logs or traces.
 - The pod becomes unready when SQLite cannot be opened.

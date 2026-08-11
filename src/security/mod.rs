@@ -122,7 +122,7 @@ impl fmt::Debug for RepositorySecret {
 }
 
 /// A normalized repository name suitable for use as authenticated associated data.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct CanonicalRepositoryName(String);
 
 impl CanonicalRepositoryName {

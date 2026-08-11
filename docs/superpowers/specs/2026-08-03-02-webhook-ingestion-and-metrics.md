@@ -140,12 +140,12 @@ labels.
 ## Metrics
 
 ```text
-github_webhook_requests_total{result}
-github_webhook_events_total{event_type,action}
-github_webhook_processing_duration_seconds{result}
-github_webhook_request_body_bytes
-github_webhook_duplicates_total
-github_webhook_processing_failures_total{stage}
+github_webhook_requests_total{repository,result}
+github_webhook_events_total{repository,event_type,action}
+github_webhook_processing_duration_seconds{repository,result}
+github_webhook_request_body_bytes{repository}
+github_webhook_duplicates_total{repository}
+github_webhook_processing_failures_total{repository,stage}
 github_repository_configurations
 ```
 
@@ -153,13 +153,19 @@ Fixed `result` values are `accepted`, `malformed`, `unauthorized`, `too_large`, 
 `unavailable`. Fixed `stage` values for this specification are `authentication`, `delivery_claim`,
 `metrics`, and `database`.
 
+The `repository` label is the authenticated canonical lowercase GitHub full name in
+`owner/repository` form. Repository identity enters telemetry only after HMAC authentication
+succeeds. Requests that fail before authentication use the fixed label value `unknown`, so
+unauthenticated payload values cannot create metric series. Zero-valued startup series also use
+`unknown`.
+
 Request totals and duration include every webhook request. Event totals and body-size observations
 include only authenticated, newly claimed deliveries. `github_repository_configurations` reflects
-the current number of configured repository records and is refreshed after successful configuration
-mutations and once at startup.
+the current number of configured repository records and remains process-wide and unlabeled. It is
+refreshed after successful configuration mutations and once at startup.
 
-Repository names, delivery IDs, payload fields, signatures, URLs, pull-request numbers, SHAs, and
-other attacker-controlled values never appear as labels.
+Delivery IDs, payload fields, signatures, URLs, pull-request numbers, SHAs, and other
+attacker-controlled values never appear as labels.
 
 ## Logging
 
@@ -177,7 +183,8 @@ label.
   metric and request metrics.
 - Claim failures return `503` without event metric updates.
 - Every unknown event and action maps to `other`; missing actions map to `none`.
-- Prometheus output is scanned to prove forbidden values never appear as labels.
+- Prometheus output proves authenticated repositories create distinct canonical full-name series,
+  while unauthenticated candidates collapse to `repository="unknown"`.
 - Logs are scanned for payload fragments, repository names, delivery IDs, signatures, and secrets.
 - Retention tests use controlled time and verify bounded deletion.
 
@@ -187,7 +194,7 @@ label.
 - Invalid signatures and unknown or disabled repositories return `401`.
 - Bodies over 2 MiB return `413` without JSON parsing.
 - Ordinary duplicate deliveries do not update event metrics twice.
-- Metric label values come only from fixed enumerations.
+- Metric labels use fixed enumerations plus authenticated canonical `owner/repository` names.
 - No complete payload or secret data is persisted or logged.
 - SQLite unavailability during authentication or claiming returns `503`.
 - The documented crash boundary makes no exactly-once claim.

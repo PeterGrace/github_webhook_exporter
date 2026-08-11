@@ -1,6 +1,6 @@
 use std::{
     future::{Future, IntoFuture},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -18,13 +18,30 @@ use crate::{
     api, health,
     metrics::{self, Metrics},
     retention::{run_retention, RetentionConfig},
-    security::AdminAuthenticator,
+    security::{AdminAuthenticator, CanonicalRepositoryName},
     storage::{DeliveryStore, MergeQueueStore, RepositoryStore},
     telemetry::{
         trace::{self, Operation},
         WorkflowTraceEmitter,
     },
 };
+
+/// Request-local repository identity established by successful webhook authentication.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RequestRepositoryContext(Arc<OnceLock<CanonicalRepositoryName>>);
+
+impl RequestRepositoryContext {
+    /// Records the canonical authenticated repository exactly once for this request.
+    pub(crate) fn authenticate(&self, repository: &CanonicalRepositoryName) {
+        let inserted = self.0.set(repository.clone()).is_ok();
+        debug_assert!(inserted, "repository context is authenticated once");
+    }
+
+    /// Returns the authenticated canonical repository, if authentication succeeded.
+    pub(crate) fn repository(&self) -> Option<&CanonicalRepositoryName> {
+        self.0.get()
+    }
+}
 
 /// Immutable dependencies shared by all HTTP request handlers.
 #[derive(Clone)]
@@ -144,14 +161,19 @@ pub fn build_router(state: AppState) -> Router {
         .layer(middleware::from_fn(observe_http_request))
 }
 
-async fn observe_http_request(request: Request, next: Next) -> Response {
+async fn observe_http_request(mut request: Request, next: Next) -> Response {
     let method = request.method().clone();
+    let repository_context = RequestRepositoryContext::default();
+    request.extensions_mut().insert(repository_context.clone());
     let route = request.extensions().get::<MatchedPath>();
     let span = trace::operation_span(Operation::HttpRequest);
     trace::set_http_method(&span, &method);
     trace::set_http_route(&span, route);
 
     let response = next.run(request).instrument(span.clone()).await;
+    if let Some(repository) = repository_context.repository() {
+        trace::set_repository_name(&span, repository);
+    }
     trace::set_http_response(&span, response.status());
     response
 }

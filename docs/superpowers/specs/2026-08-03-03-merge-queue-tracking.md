@@ -80,15 +80,16 @@ reliable join mechanism.
 ## Metrics
 
 ```text
-github_merge_group_events_total{action,reason}
-github_merge_queue_pr_outcomes_total{outcome,reason}
-github_merge_queue_attempt_duration_seconds{outcome}
-github_merge_queue_transition_failures_total{reason}
+github_merge_group_events_total{repository,action,reason}
+github_merge_queue_pr_outcomes_total{repository,outcome,reason}
+github_merge_queue_attempt_duration_seconds{repository,outcome}
+github_merge_queue_transition_failures_total{repository,reason}
 ```
 
-All labels use fixed enums. Outcome counters and durations update only when a transaction changes an
-attempt from pending to completed. Negative or unreasonably large durations are omitted and counted
-as a normalized transition failure rather than observed.
+The `repository` label is the authenticated canonical lowercase GitHub full name in
+`owner/repository` form. All remaining labels use fixed enums. Outcome counters and durations update
+only when a transaction changes an attempt from pending to completed. Negative or unreasonably large
+durations are omitted and counted as a normalized transition failure rather than observed.
 
 ## Failure behavior
 
@@ -108,7 +109,7 @@ such failures.
 - Restart tests prove pending attempts can be completed after reopening SQLite.
 - Transaction rollback leaves attempts and outcome metrics unchanged.
 - Dequeue reasons always map to `unknown/unclassified_dequeue` and raw values are discarded.
-- Group reasons and all metric labels remain bounded.
+- Group reasons remain bounded, and repository labels contain only authenticated canonical names.
 - Retention removes only completed attempts older than the configured threshold.
 - Repository deletion cascades to queue attempts.
 
@@ -119,5 +120,6 @@ such failures.
   operation.
 - Dequeued attempts are reported as unknown rather than mislabeled as failures.
 - Group-level merge success remains separate and authoritative.
-- Raw reason strings and unbounded identifiers never become metric labels or logs.
+- Raw reason strings and unbounded identifiers other than authenticated canonical repository names
+  never become metric labels or logs.
 - Queue-state failures remain observable without changing authenticated webhook responses.

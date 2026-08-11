@@ -208,6 +208,7 @@ impl QueueProcessor<'_> {
         {
             CompletionTransition::Completed { enqueued_at } => {
                 self.metrics.record_merge_queue_completion(
+                    self.repository_name,
                     metric_completion,
                     completion.completed_at().duration_since(&enqueued_at),
                 );
@@ -216,6 +217,7 @@ impl QueueProcessor<'_> {
             CompletionTransition::AlreadyCompleted => Ok(OperationOutcome::NoOp),
             CompletionTransition::MissingActiveAttempt => {
                 self.metrics.record_merge_queue_transition_failure(
+                    self.repository_name,
                     QueueTransitionFailureReason::MissingActiveAttempt,
                 );
                 Ok(OperationOutcome::NoOp)
