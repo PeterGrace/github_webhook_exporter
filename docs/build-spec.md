@@ -1,8 +1,14 @@
 # Build Spec: GitHub Webhook Exporter
 
-> **Historical draft:** This monolithic draft has been superseded by the reviewed decomposition in
+> **Historical draft. Not a reference for the running service.** This monolithic draft has been
+> superseded by the reviewed decomposition in
 > [`docs/superpowers/specs/2026-08-03-github-webhook-exporter-design.md`](superpowers/specs/2026-08-03-github-webhook-exporter-design.md).
 > The scoped specifications govern wherever they conflict with this document.
+>
+> It is kept because the changelog and the superseding design cite it. Parts of it were never built
+> as described, and the text below is deliberately left as written rather than corrected, with
+> divergences from the implementation flagged inline. For current behavior see
+> [`README.md`](../README.md) and [`docs/operations.md`](operations.md).
 
 ## Objective
 
@@ -70,6 +76,9 @@ produce an error log, error trace event, and internal failure metric.
 
 ### Configuration API
 
+> **Diverged:** the implementation authenticates these routes with a separate `GHE_ADMIN_TOKEN`
+> bearer token, not the master key. The master key is used only to derive the encryption key.
+
 All routes require:
 
 ```http
@@ -100,6 +109,9 @@ It is used for:
 
 1. Constant-time configuration API authentication.
 2. Deriving a separate database encryption key through HKDF-SHA-256.
+
+> **Diverged:** only the second use was built. Configuration API authentication uses
+> `GHE_ADMIN_TOKEN`.
 
 Repository webhook secrets are encrypted with an authenticated encryption algorithm such as
 AES-256-GCM. Each encrypted value receives a fresh random nonce.
@@ -214,6 +226,9 @@ authoritative, while per-pull-request failure classification is initially best-e
 
 ## Prometheus Metrics
 
+> **Incomplete:** the service registers fifteen instruments. This list predates the workflow-job
+> and telemetry-health metrics. See the metrics table in [`README.md`](../README.md#metrics).
+
 ```text
 github_webhook_requests_total{repository,result}
 github_webhook_events_total{repository,event_type,action}
@@ -233,6 +248,8 @@ Bounded labels:
 
 - `result`: `accepted`, `malformed`, `unauthorized`, `too_large`, `unsupported`, or `unavailable`.
 - `stage`: `metrics`, `queue_state`, `database`, or `telemetry`.
+  **Diverged:** the implemented values are `authentication`, `delivery_claim`, `metrics`,
+  `database`, and `queue_state`; there is no `telemetry` stage.
 - Merge-group actions and reasons use fixed enumerations.
 - Generic unknown actions collapse to `other`.
 - Authenticated repository identity is the canonical lowercase `owner/repository` label; requests
@@ -274,12 +291,16 @@ config.repository.write
 sqlite.query
 ```
 
+> **Incomplete:** the implementation also emits `retention.run`, and `github.workflow.job` with
+> `github.workflow.step` children for completed workflow jobs.
+
 ## Kubernetes Operation
 
 - Single-replica StatefulSet.
 - PVC mounted for SQLite.
 - Configurable database path via `GHE_DATABASE_PATH`.
 - Kubernetes Secret supplies `GHE_MASTER_KEY` and optional OTLP headers.
+  **Diverged:** the Secret must also supply `GHE_ADMIN_TOKEN`; startup fails without it.
 - Graceful SIGTERM handling.
 - Pod disruption budget is optional for the singleton.
 - Use an update strategy that avoids concurrent pods mounting and writing the database.

@@ -11,7 +11,6 @@ use std::{
 use crate::metrics::{Metrics, TelemetryDropReason, TelemetryExportFailureReason, TelemetrySignal};
 
 const REPORT_INTERVAL_MILLIS: u64 = 60_000;
-const FAILURE_CATEGORY_COUNT: usize = 14;
 const DROP_CATEGORY_COUNT: usize = 4;
 
 pub(super) trait Clock: Debug + Send + Sync {
@@ -86,8 +85,48 @@ struct DiagnosticsInner {
     metrics: Metrics,
     clock: Arc<dyn Clock>,
     sink: Arc<dyn DiagnosticSink>,
-    failure_limiters: [CategoryLimiter; FAILURE_CATEGORY_COUNT],
     drop_limiters: [CategoryLimiter; DROP_CATEGORY_COUNT],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExportFailureDetail {
+    Connect,
+    RequestBuilder,
+    Redirect,
+    Request,
+}
+
+impl ExportFailureDetail {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::RequestBuilder => "request_builder",
+            Self::Redirect => "redirect",
+            Self::Request => "request",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ExportFailureContext {
+    status: Option<u16>,
+    detail: Option<ExportFailureDetail>,
+}
+
+impl ExportFailureContext {
+    pub(super) fn with_status(status: u16) -> Self {
+        Self {
+            status: Some(status),
+            detail: None,
+        }
+    }
+
+    pub(super) fn with_detail(detail: ExportFailureDetail) -> Self {
+        Self {
+            status: None,
+            detail: Some(detail),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -114,7 +153,6 @@ impl DiagnosticsObserver {
                 metrics,
                 clock,
                 sink,
-                failure_limiters: std::array::from_fn(|_| CategoryLimiter::new()),
                 drop_limiters: std::array::from_fn(|_| CategoryLimiter::new()),
             }),
         }
@@ -125,11 +163,31 @@ impl DiagnosticsObserver {
         signal: TelemetrySignal,
         reason: TelemetryExportFailureReason,
     ) {
+        self.export_failure_with_context(signal, reason, ExportFailureContext::default());
+    }
+
+    pub(super) fn export_failure_with_context(
+        &self,
+        signal: TelemetrySignal,
+        reason: TelemetryExportFailureReason,
+        context: ExportFailureContext,
+    ) {
         self.inner
             .metrics
             .record_telemetry_export_failure(signal, reason);
-        let limiter = &self.inner.failure_limiters[failure_index(signal, reason)];
-        self.report(limiter, "failure", signal.as_str(), reason.as_str());
+        let mut line = format!(
+            "telemetry pipeline diagnostic kind=failure signal={} reason={}",
+            signal.as_str(),
+            reason.as_str()
+        );
+        if let Some(status) = context.status {
+            line.push_str(&format!(" status={status}"));
+        }
+        if let Some(detail) = context.detail {
+            line.push_str(&format!(" detail={}", detail.as_str()));
+        }
+        line.push('\n');
+        drop(self.inner.sink.write(&line));
     }
 
     pub(super) fn drop_record(&self, signal: TelemetrySignal, reason: TelemetryDropReason) {
@@ -149,15 +207,15 @@ impl DiagnosticsObserver {
             .metrics
             .record_telemetry_drops(signal, reason, count);
         let limiter = &self.inner.drop_limiters[drop_index(signal, reason)];
-        self.report(limiter, "drop", signal.as_str(), reason.as_str());
+        self.report_drop(limiter, signal.as_str(), reason.as_str());
     }
 
-    fn report(&self, limiter: &CategoryLimiter, kind: &str, signal: &str, reason: &str) {
+    fn report_drop(&self, limiter: &CategoryLimiter, signal: &str, reason: &str) {
         let Some(suppressed) = limiter.claim_report(self.inner.clock.now_millis()) else {
             return;
         };
         let line = format!(
-            "telemetry pipeline diagnostic kind={kind} signal={signal} reason={reason} suppressed={suppressed}\n"
+            "telemetry pipeline diagnostic kind=drop signal={signal} reason={reason} suppressed={suppressed}\n"
         );
         drop(self.inner.sink.write(&line));
     }
@@ -168,19 +226,6 @@ fn signal_index(signal: TelemetrySignal) -> usize {
         TelemetrySignal::Trace => 0,
         TelemetrySignal::Log => 1,
     }
-}
-
-fn failure_index(signal: TelemetrySignal, reason: TelemetryExportFailureReason) -> usize {
-    let reason_index = match reason {
-        TelemetryExportFailureReason::Transport => 0,
-        TelemetryExportFailureReason::Timeout => 1,
-        TelemetryExportFailureReason::HttpResponse => 2,
-        TelemetryExportFailureReason::Encoding => 3,
-        TelemetryExportFailureReason::Shutdown => 4,
-        TelemetryExportFailureReason::Internal => 5,
-        TelemetryExportFailureReason::Other => 6,
-    };
-    signal_index(signal) * TelemetryExportFailureReason::ALL.len() + reason_index
 }
 
 fn drop_index(signal: TelemetrySignal, reason: TelemetryDropReason) -> usize {
@@ -205,7 +250,9 @@ mod tests {
 
     use crate::{
         metrics::{Metrics, TelemetryDropReason, TelemetryExportFailureReason, TelemetrySignal},
-        telemetry::diagnostics::{Clock, DiagnosticSink, DiagnosticsObserver},
+        telemetry::diagnostics::{
+            Clock, DiagnosticSink, DiagnosticsObserver, ExportFailureContext, ExportFailureDetail,
+        },
     };
 
     #[derive(Debug, Default)]
@@ -244,12 +291,14 @@ mod tests {
     }
 
     #[test]
-    fn one_report_per_category_per_minute_includes_suppressed_count() {
+    fn every_export_failure_is_reported() {
         let metrics = Metrics::new();
-        let clock = Arc::new(TestClock::default());
         let sink = Arc::new(CaptureSink::default());
-        let observer =
-            DiagnosticsObserver::with_dependencies(metrics.clone(), clock.clone(), sink.clone());
+        let observer = DiagnosticsObserver::with_dependencies(
+            metrics.clone(),
+            Arc::new(TestClock::default()),
+            sink.clone(),
+        );
 
         for _ in 0..3 {
             observer.export_failure(
@@ -257,23 +306,43 @@ mod tests {
                 TelemetryExportFailureReason::Timeout,
             );
         }
+
         assert_eq!(
             sink.lines(),
-            vec!["telemetry pipeline diagnostic kind=failure signal=trace reason=timeout suppressed=0\n"]
-        );
-
-        clock.advance(Duration::from_secs(60));
-        observer.export_failure(
-            TelemetrySignal::Trace,
-            TelemetryExportFailureReason::Timeout,
-        );
-        assert_eq!(
-            sink.lines()[1],
-            "telemetry pipeline diagnostic kind=failure signal=trace reason=timeout suppressed=2\n"
+            vec!["telemetry pipeline diagnostic kind=failure signal=trace reason=timeout\n"; 3]
         );
         assert!(metrics.encode().expect("metrics encode").contains(
-            "github_telemetry_export_failures_total{signal=\"trace\",reason=\"timeout\"} 4"
+            "github_telemetry_export_failures_total{signal=\"trace\",reason=\"timeout\"} 3"
         ));
+    }
+
+    #[test]
+    fn export_failure_context_uses_only_bounded_fields() {
+        let sink = Arc::new(CaptureSink::default());
+        let observer = DiagnosticsObserver::with_dependencies(
+            Metrics::new(),
+            Arc::new(TestClock::default()),
+            sink.clone(),
+        );
+
+        observer.export_failure_with_context(
+            TelemetrySignal::Log,
+            TelemetryExportFailureReason::HttpResponse,
+            ExportFailureContext::with_status(401),
+        );
+        observer.export_failure_with_context(
+            TelemetrySignal::Log,
+            TelemetryExportFailureReason::Transport,
+            ExportFailureContext::with_detail(ExportFailureDetail::RequestBuilder),
+        );
+
+        assert_eq!(
+            sink.lines(),
+            vec![
+                "telemetry pipeline diagnostic kind=failure signal=log reason=http_response status=401\n",
+                "telemetry pipeline diagnostic kind=failure signal=log reason=transport detail=request_builder\n",
+            ]
+        );
     }
 
     #[test]

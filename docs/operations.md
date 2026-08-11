@@ -63,8 +63,12 @@ telemetry providers receive their full shutdown boundaries.
 ### GHCR releases
 
 Pull requests and `main` are validation-only: they build and smoke-test the production image,
-validate the packaged chart, and never authenticate to GHCR or publish a package. Their temporary
-chart artifacts are retained for 30 days through workflow artifacts.
+validate the packaged chart, and never authenticate to GHCR or publish a package. Validation uses
+cargo-chef plus GitHub-hosted Cargo and BuildKit caches, and the smoke and Kind lifecycle checks
+reuse one loaded image. A cache miss always performs a complete verified build. Pull requests omit
+the expensive reproducibility comparison; pushes to `main` and stable release tags still perform
+two cache-disabled builds and require identical image IDs. Temporary chart artifacts are retained
+for 30 days through workflow artifacts.
 
 A stable `vMAJOR.MINOR.PATCH` repository tag publishes one immutable `linux/amd64` image and one
 Helm OCI chart only after full validation passes. The release workflow requires the tag without
@@ -353,7 +357,8 @@ when `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or
 `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set. With none of these variables, no remote provider or
 export queue is created and local logging remains fully functional. The generic HTTP endpoint
 receives `/v1/traces` and `/v1/logs` automatically; a signal-specific endpoint is used exactly as
-configured.
+configured. HTTPS OTLP endpoints use the bundled rustls client and do not require OpenSSL in the
+runtime image.
 
 The OTLP/HTTP protobuf exporters honor generic and signal-specific endpoint, header, and timeout
 variables. `OTEL_EXPORTER_OTLP_TIMEOUT` and its signal-specific variants are milliseconds. Header
@@ -399,11 +404,15 @@ Pipeline failures and rejected records are exposed through these local Prometheu
 collector response is an `encoding` failure; collector response bodies and transport error text are
 never exposed.
 
-Each counter update may also produce a direct stderr line containing only the diagnostic kind,
-signal, reason, and numeric suppression count. This path bypasses `tracing` and OpenTelemetry logs,
-so exporter diagnostics cannot recursively enter the failing log pipeline. Output is limited to one
-line per signal/reason category per monotonic minute. Repeated events still increment Prometheus;
-the next permitted line reports how many local lines were suppressed.
+Every failed export writes one direct stderr line and increments one bounded Prometheus series.
+HTTP failures may include `status=<code>`. Transport failures may include only
+`detail=connect|request_builder|redirect|request`. Raw errors, endpoint URLs, headers, credentials,
+request payloads, and collector response bodies are never written. This path bypasses `tracing` and
+OpenTelemetry logs, so exporter diagnostics cannot recursively enter the failing log pipeline.
+
+Queue-drop diagnostics remain limited to one line per signal/reason category per monotonic minute.
+Repeated drops still increment Prometheus; the next permitted line reports how many local lines were
+suppressed.
 
 Alert on sustained increases in
 `github_telemetry_export_failures_total{reason=~"transport|timeout|http_response"}` because they
