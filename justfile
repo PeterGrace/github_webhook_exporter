@@ -65,8 +65,11 @@ helm-maintenance-unit:
 helm-kind-lifecycle-unit:
     scripts/helm-kind-lifecycle-lib-test.sh
 
-# Exercise lifecycle and persistence in a disposable Kind cluster.
-helm-kind-lifecycle: image-build
+# Exercise lifecycle and persistence after building the production image.
+helm-kind-lifecycle: image-build helm-kind-lifecycle-loaded
+
+# Exercise lifecycle and persistence using an image already loaded into Docker.
+helm-kind-lifecycle-loaded:
     scripts/helm-kind-lifecycle.sh "{{helm-chart}}" "{{container-image}}" \
         "${KIND_ARTIFACT_DIRECTORY:-dist/kind-lifecycle}"
 
@@ -83,7 +86,10 @@ image-reproducibility-test:
     scripts/image-reproducibility-test.sh
 
 # Build and exercise the production image contracts.
-image-smoke: image-build
+image-smoke: image-build image-smoke-loaded
+
+# Exercise production image contracts using an image already loaded into Docker.
+image-smoke-loaded:
     scripts/container-smoke.sh "{{container-image}}"
 
 # Prepare the patch release commit and tag locally, without pushing.
