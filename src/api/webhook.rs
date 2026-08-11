@@ -12,7 +12,7 @@ use axum::{
 use opentelemetry::Context;
 use serde::Deserialize;
 use time::OffsetDateTime;
-use tracing::{error, info, warn, Instrument};
+use tracing::{debug, error, warn, Instrument};
 
 use crate::{
     api::{merge_group::EventProjection, pull_request::QueueProcessor, workflow_job},
@@ -27,7 +27,10 @@ use crate::{
         CanonicalRepositoryName, WebhookAuthenticationError, WebhookAuthenticator, WebhookSignature,
     },
     storage::DeliveryClaim,
-    telemetry::trace::{self, Operation, OperationOutcome, QueueEntity},
+    telemetry::{
+        trace::{self, Operation, OperationOutcome, QueueEntity},
+        LOCAL_ONLY_LOG_TARGET,
+    },
 };
 
 const JSON_CONTENT_TYPE: HeaderValue = HeaderValue::from_static("application/json");
@@ -298,7 +301,8 @@ async fn observe_webhook_request(
         result,
         started_at.elapsed(),
     );
-    info!(
+    debug!(
+        target: LOCAL_ONLY_LOG_TARGET,
         parent: None,
         result = result.as_str(),
         "GitHub webhook request processed"

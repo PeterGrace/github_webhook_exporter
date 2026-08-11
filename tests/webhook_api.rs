@@ -1229,6 +1229,7 @@ async fn normalized_logs_responses_and_metrics_exclude_sensitive_values() {
     let subscriber = tracing_subscriber::fmt()
         .without_time()
         .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
         .with_writer(captured_logs.clone())
         .finish();
     let app = test_app(2_097_152, None).await;
