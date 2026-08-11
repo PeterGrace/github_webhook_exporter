@@ -31,8 +31,8 @@ Set `CONTAINER_IMAGE` when a release or registry-specific tag is required. The s
 the image exercised by the smoke verification:
 
 ```bash
-CONTAINER_IMAGE=registry.example/github-webhook-exporter:0.1.1 just image-build
-CONTAINER_IMAGE=registry.example/github-webhook-exporter:0.1.1 just image-smoke
+CONTAINER_IMAGE=registry.example/github-webhook-exporter:0.1.2 just image-build
+CONTAINER_IMAGE=registry.example/github-webhook-exporter:0.1.2 just image-smoke
 ```
 
 The image working and data directory is `/var/lib/github-webhook-exporter`. Mount persistent
@@ -63,8 +63,12 @@ telemetry providers receive their full shutdown boundaries.
 ### GHCR releases
 
 Pull requests and `main` are validation-only: they build and smoke-test the production image,
-validate the packaged chart, and never authenticate to GHCR or publish a package. Their temporary
-chart artifacts are retained for 30 days through workflow artifacts.
+validate the packaged chart, and never authenticate to GHCR or publish a package. Validation uses
+cargo-chef plus GitHub-hosted Cargo and BuildKit caches, and the smoke and Kind lifecycle checks
+reuse one loaded image. A cache miss always performs a complete verified build. Pull requests omit
+the expensive reproducibility comparison; pushes to `main` and stable release tags still perform
+two cache-disabled builds and require identical image IDs. Temporary chart artifacts are retained
+for 30 days through workflow artifacts.
 
 A stable `vMAJOR.MINOR.PATCH` repository tag publishes one immutable `linux/amd64` image and one
 Helm OCI chart only after full validation passes. The release workflow requires the tag without
@@ -75,12 +79,12 @@ Prepare and ship the tag with `just release-patch` and `just release-ship`, whic
 version fields aligned and land the release commit through a pull request; the `main` ruleset
 rejects a direct push. See [RELEASE.md](../RELEASE.md) for the full procedure.
 
-For example, after all four version fields are `0.1.1`, consume the published image and chart:
+For example, after all four version fields are `0.1.2`, consume the published image and chart:
 
 ```bash
-docker pull ghcr.io/petergrace/github-webhook-exporter:0.1.1
-helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.1
-helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.1
+docker pull ghcr.io/petergrace/github-webhook-exporter:0.1.2
+helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.2
+helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.2
 ```
 
 Published version tags are immutable. Existing image tags are never overwritten. An exact matching
@@ -302,7 +306,7 @@ KIND_ARTIFACT_DIRECTORY=dist/kind-lifecycle just helm-kind-lifecycle
 archive contracts across the supported Kubernetes range 1.31.0 through 1.35.0
 (`>=1.31.0-0 <1.36.0-0`). `just image-smoke` builds and exercises the production image locally.
 `just workflow-test` checks the GitHub Actions contract, including the exact archive path
-`dist/github-webhook-exporter-0.1.1.tgz`. `just helm-kind-acceptance` confirms API acceptance for the
+`dist/github-webhook-exporter-0.1.2.tgz`. `just helm-kind-acceptance` confirms API acceptance for the
 rendered StatefulSet, Service, ConfigMap, and PVC; it does not start the exporter.
 
 `just helm-kind-lifecycle` builds and loads the `linux/amd64` production image into a uniquely named
@@ -326,9 +330,9 @@ Kubernetes 1.35.0 node image by digest. CI uploads the diagnostics for 14 days w
 For local archive inspection, use the fixed package name directly:
 
 ```bash
-helm show chart dist/github-webhook-exporter-0.1.1.tgz
-helm show values dist/github-webhook-exporter-0.1.1.tgz
-helm template archive dist/github-webhook-exporter-0.1.1.tgz --kube-version 1.35.0 >/dev/null
+helm show chart dist/github-webhook-exporter-0.1.2.tgz
+helm show values dist/github-webhook-exporter-0.1.2.tgz
+helm template archive dist/github-webhook-exporter-0.1.2.tgz --kube-version 1.35.0 >/dev/null
 ```
 
 If `just helm-policy` fails, run `just helm-render` first, then inspect the rendered manifests under
@@ -353,7 +357,8 @@ when `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or
 `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set. With none of these variables, no remote provider or
 export queue is created and local logging remains fully functional. The generic HTTP endpoint
 receives `/v1/traces` and `/v1/logs` automatically; a signal-specific endpoint is used exactly as
-configured.
+configured. HTTPS OTLP endpoints use the bundled rustls client and do not require OpenSSL in the
+runtime image.
 
 The OTLP/HTTP protobuf exporters honor generic and signal-specific endpoint, header, and timeout
 variables. `OTEL_EXPORTER_OTLP_TIMEOUT` and its signal-specific variants are milliseconds. Header
@@ -399,11 +404,15 @@ Pipeline failures and rejected records are exposed through these local Prometheu
 collector response is an `encoding` failure; collector response bodies and transport error text are
 never exposed.
 
-Each counter update may also produce a direct stderr line containing only the diagnostic kind,
-signal, reason, and numeric suppression count. This path bypasses `tracing` and OpenTelemetry logs,
-so exporter diagnostics cannot recursively enter the failing log pipeline. Output is limited to one
-line per signal/reason category per monotonic minute. Repeated events still increment Prometheus;
-the next permitted line reports how many local lines were suppressed.
+Every failed export writes one direct stderr line and increments one bounded Prometheus series.
+HTTP failures may include `status=<code>`. Transport failures may include only
+`detail=connect|request_builder|redirect|request`. Raw errors, endpoint URLs, headers, credentials,
+request payloads, and collector response bodies are never written. This path bypasses `tracing` and
+OpenTelemetry logs, so exporter diagnostics cannot recursively enter the failing log pipeline.
+
+Queue-drop diagnostics remain limited to one line per signal/reason category per monotonic minute.
+Repeated drops still increment Prometheus; the next permitted line reports how many local lines were
+suppressed.
 
 Alert on sustained increases in
 `github_telemetry_export_failures_total{reason=~"transport|timeout|http_response"}` because they
@@ -424,15 +433,17 @@ concurrently and shares one
 uses the same direct, redacted stderr diagnostic path and never changes a successful HTTP drain into
 a process failure.
 
-Repository, delivery, pull-request, commit, workflow, job, and step identifiers remain span-only.
-Allowing these identifiers in local or OTLP application logs is a deferred policy choice and is not
-current behavior.
+Delivery, pull-request, commit, workflow, job, and step identifiers remain span-only. Canonical
+repository names additionally appear on repository-scoped Prometheus series. None of these
+identifiers appears in local or OTLP application logs, except for the bounded workflow rejection
+warning documented below.
 
 ## Exported core traces
 
 The core trace vocabulary contains six stable service operations:
 
-- `http.request`: one root for each HTTP request.
+- `http.request`: one root for each HTTP request; authenticated webhook roots include
+  `github.repository.name`.
 - `github.webhook.authenticate`: repository lookup and HMAC authentication under the request root.
 - `github.webhook.process`: payload projection, durable delivery claim, and bounded event processing
   under an authenticated request.
@@ -454,9 +465,11 @@ events use closed bounded vocabularies.
 
 Repository names and database identifiers, delivery identifiers, pull-request numbers, valid full
 commit SHAs, workflow identifiers, and sanitized workflow names are diagnostic trace span
-attributes only, except for the bounded workflow-job rejection warning documented in
-[Completed workflow traces](#completed-workflow-traces). Outside that narrow exception, they are
-excluded from structured stderr, OTLP application logs, and Prometheus exposition.
+attributes. Canonical authenticated repository names also label repository-scoped Prometheus
+metrics. The bounded workflow-job rejection warning documented in
+[Completed workflow traces](#completed-workflow-traces) is the only application-log exception.
+Other identifiers remain excluded from structured stderr, OTLP application logs, and Prometheus
+exposition.
 
 Duplicate delivery claims emit an authentication span and a process span with outcome `duplicate`,
 but no second `merge_queue.update` span or specialized outcome. Queue-state persistence failures
@@ -486,12 +499,12 @@ delivery claim and after the bounded admission pass counts the reported steps in
 valid job, so a newly claimed over-limit job remains durably claimed and still returns
 authenticated `204 No Content`.
 
-Every structurally valid newly claimed completed job updates the unlabeled histogram
-`github_workflow_job_steps` once with its reported step count, regardless of later acceptance or
-rejection. The histogram buckets are `0`, `5`, `10`, `20`, `40`, `64`, `128`, `256`, `512`, and
-`1024` steps, plus Prometheus `+Inf`. Accepted jobs at or below the inclusive limit emit every
-reported step. Over-limit jobs emit no partial trace and increment
-`github_workflow_job_trace_rejections_total{reason="too_many_steps"}` once.
+Every structurally valid newly claimed completed job updates
+`github_workflow_job_steps{repository}` once with its reported step count, regardless of later
+acceptance or rejection. The histogram buckets are `0`, `5`, `10`, `20`, `40`, `64`, `128`, `256`,
+`512`, and `1024` steps, plus Prometheus `+Inf`. Accepted jobs at or below the inclusive limit emit
+every reported step. Over-limit jobs emit no partial trace and increment
+`github_workflow_job_trace_rejections_total{repository,reason="too_many_steps"}` once.
 
 Each accepted projection creates an independent root named `github.workflow.job`, with a new trace
 identity unrelated to the live `http.request` trace. Every projected step is a direct child named
@@ -586,6 +599,30 @@ semantics, then atomically claims the delivery UUID. A new authenticated deliver
 event/action and body-size metrics. An authenticated duplicate returns success and updates request
 and duplicate metrics only. Payloads are never persisted.
 
+Repository-scoped Prometheus families use the `repository` label with the authenticated canonical
+lowercase full name in `owner/repository` form. For example, `PeterGrace/github-webhook-exporter`
+normalizes to `petergrace/github-webhook-exporter`; it is never reduced to
+`github-webhook-exporter`. Requests that fail before authentication use the fixed value `unknown`,
+so an unauthenticated payload cannot create arbitrary series.
+
+Repository-scoped families are:
+
+- `github_webhook_requests_total{repository,result}`
+- `github_webhook_events_total{repository,event_type,action}`
+- `github_webhook_processing_duration_seconds{repository,result}`
+- `github_webhook_request_body_bytes{repository}`
+- `github_webhook_duplicates_total{repository}`
+- `github_webhook_processing_failures_total{repository,stage}`
+- `github_merge_group_events_total{repository,action,reason}`
+- `github_merge_queue_pr_outcomes_total{repository,outcome,reason}`
+- `github_merge_queue_attempt_duration_seconds{repository,outcome}`
+- `github_merge_queue_transition_failures_total{repository,reason}`
+- `github_workflow_job_steps{repository}`
+- `github_workflow_job_trace_rejections_total{repository,reason}`
+
+`github_repository_configurations`, `github_telemetry_export_failures_total`, and
+`github_telemetry_dropped_records_total` remain process-wide and do not carry `repository`.
+
 | Status | Meaning |
 | --- | --- |
 | `204 No Content` | Authenticated new or duplicate delivery. |
@@ -605,7 +642,7 @@ normalized result/stage values.
 ### Merge-group statistics
 
 A newly claimed `merge_group.checks_requested` delivery increments
-`github_merge_group_events_total{action="checks_requested",reason="none"}`. A newly claimed
+`github_merge_group_events_total{repository,action="checks_requested",reason="none"}`. A newly claimed
 `merge_group.destroyed` delivery uses action `destroyed` and maps the top-level `reason` exactly and
 case-sensitively to `merged`, `dequeued`, or `invalidated`; missing, non-string, mixed-case, and
 unknown values map to `other`. Unsupported merge-group actions update only the generic webhook
@@ -616,8 +653,8 @@ Group-level `destroyed` with reason `merged` is the authoritative merge-group su
 These group metrics remain intentionally separate from per-pull-request queue attempt outcomes. A
 merge group can contain multiple pull requests, and webhook ordering does not provide a reliable
 join, so merge-group deliveries never create or mutate pull-request attempt rows. Raw reasons,
-repository names, group identifiers, and head SHAs are discarded rather than logged or used as
-metric labels.
+group identifiers, and head SHAs are discarded rather than logged or used as metric labels; the
+authenticated canonical repository name remains the repository label.
 
 ### Pull-request merge-queue attempts
 
@@ -632,14 +669,14 @@ The processor uses a valid `pull_request.updated_at` for the transition timestam
 malformed, or unrepresentable timestamps fall back to the receipt time captured once for the
 request. Repeated enqueue and already-completed replay are no-ops. A completion with no active or
 completed attempt increments only
-`github_merge_queue_transition_failures_total{reason="missing_active_attempt"}`. Outcome and
+`github_merge_queue_transition_failures_total{repository,reason="missing_active_attempt"}`. Outcome and
 duration metrics update only after SQLite commits a pending-to-completed transition. Negative and
 over-365-day durations are omitted and increment only the bounded `invalid_duration` transition
 failure.
 
 Queue processing begins after the delivery claim commits. A queue-state persistence failure
 therefore still returns `204 No Content`, increments
-`github_webhook_processing_failures_total{stage="queue_state"}`, and emits one redacted local error
+`github_webhook_processing_failures_total{repository,stage="queue_state"}`, and emits one redacted local error
 with an opaque correlation ID. GitHub is not asked to redeliver the already claimed delivery: queue
 processing is intentionally at-most-once at this boundary. SQLite state and in-memory Prometheus
 metrics are also not one transaction; a crash after queue state commits but before metrics update

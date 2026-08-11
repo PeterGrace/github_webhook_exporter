@@ -2377,6 +2377,7 @@ async fn webhook_successes_emit_bounded_hierarchy_and_span_only_identifiers() {
     let (captured, output) = fixture.finish();
 
     let merge_request = captured.webhook_request_for_delivery(merge_group_delivery);
+    assert_attribute(merge_request, "github.repository.name", WEBHOOK_REPOSITORY);
     let merge_authenticate = captured.child_named(merge_request, "github.webhook.authenticate");
     let merge_process = captured.child_named(merge_request, "github.webhook.process");
     assert!(
@@ -2478,8 +2479,10 @@ async fn webhook_successes_emit_bounded_hierarchy_and_span_only_identifiers() {
 
     let normalized_sha_40 = WEBHOOK_SHA_40.to_ascii_lowercase();
     let normalized_sha_64 = WEBHOOK_SHA_64.to_ascii_lowercase();
+    assert!(exposition.contains(&format!("repository=\"{WEBHOOK_REPOSITORY}\"")));
+    captured.assert_logs_absent(WEBHOOK_REPOSITORY);
+    assert!(!output.contains(WEBHOOK_REPOSITORY));
     for identifier in [
-        WEBHOOK_REPOSITORY,
         merge_group_delivery,
         enqueue_delivery,
         dequeue_delivery,
@@ -2713,11 +2716,17 @@ async fn workflow_job_at_configured_step_limit_exports_complete_trace() {
     let captured = fixture.force_flush();
     let job = captured.workflow_job_for_delivery(delivery_id);
     assert_eq!(captured.child_count(job, "github.workflow.step"), 2);
-    assert_metric_line(&exposition, "github_workflow_job_steps_count 1");
-    assert_metric_line(&exposition, "github_workflow_job_steps_sum 2.0");
     assert_metric_line(
         &exposition,
-        "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 0",
+        "github_workflow_job_steps_count{repository=\"owner/webhook-private-repository\"} 1",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_steps_sum{repository=\"owner/webhook-private-repository\"} 2.0",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{repository=\"unknown\",reason=\"too_many_steps\"} 0",
     );
 }
 
@@ -2818,11 +2827,17 @@ async fn workflow_job_over_step_limit_emits_actionable_rejection_without_trace()
         0,
         "over-limit delivery emits no historical workflow spans"
     );
-    assert_metric_line(&exposition, "github_workflow_job_steps_count 1");
-    assert_metric_line(&exposition, "github_workflow_job_steps_sum 3.0");
     assert_metric_line(
         &exposition,
-        "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 1",
+        "github_workflow_job_steps_count{repository=\"owner/repository\"} 1",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_steps_sum{repository=\"owner/repository\"} 3.0",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{repository=\"owner/repository\",reason=\"too_many_steps\"} 1",
     );
 
     for approved in [
@@ -2919,9 +2934,8 @@ async fn workflow_job_over_step_limit_emits_actionable_rejection_without_trace()
         assert!(!stderr.contains(forbidden));
         assert!(!exposition.contains(forbidden));
     }
-    for identifier in [REPOSITORY_NAME, DELIVERY_ID] {
-        assert!(!exposition.contains(identifier));
-    }
+    assert!(exposition.contains(&format!("repository=\"{REPOSITORY_NAME}\"")));
+    assert!(!exposition.contains(DELIVERY_ID));
     for identifier in [WORKFLOW_RUN_ID, WORKFLOW_JOB_ID] {
         let identifier_text = identifier.to_string();
         assert!(
@@ -3019,21 +3033,27 @@ async fn unauthorized_and_non_completed_over_limit_jobs_skip_specialized_process
     let exposition = fixture.metrics_text().await;
     assert_metric_line(
         &exposition,
-        "github_webhook_requests_total{result=\"unauthorized\"} 1",
+        "github_webhook_requests_total{repository=\"unknown\",result=\"unauthorized\"} 1",
     );
     assert_metric_line(
         &exposition,
-        "github_webhook_requests_total{result=\"accepted\"} 1",
+        "github_webhook_requests_total{repository=\"owner/repository\",result=\"accepted\"} 1",
     );
     assert_metric_line(
         &exposition,
-        "github_webhook_events_total{event_type=\"workflow_job\",action=\"in_progress\"} 1",
+        "github_webhook_events_total{repository=\"owner/repository\",event_type=\"workflow_job\",action=\"in_progress\"} 1",
     );
-    assert_metric_line(&exposition, "github_workflow_job_steps_count 0");
-    assert_metric_line(&exposition, "github_workflow_job_steps_sum 0.0");
     assert_metric_line(
         &exposition,
-        "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 0",
+        "github_workflow_job_steps_count{repository=\"unknown\"} 0",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_steps_sum{repository=\"unknown\"} 0.0",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{repository=\"unknown\",reason=\"too_many_steps\"} 0",
     );
 
     let captured = fixture.force_flush();
@@ -3082,17 +3102,23 @@ async fn malformed_workflow_admission_after_authentication_has_no_specialized_ef
     let exposition = fixture.metrics_text().await;
     assert_metric_line(
         &exposition,
-        "github_webhook_requests_total{result=\"accepted\"} 1",
+        "github_webhook_requests_total{repository=\"owner/repository\",result=\"accepted\"} 1",
     );
     assert_metric_line(
         &exposition,
-        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 1",
+        "github_webhook_events_total{repository=\"owner/repository\",event_type=\"workflow_job\",action=\"completed\"} 1",
     );
-    assert_metric_line(&exposition, "github_workflow_job_steps_count 0");
-    assert_metric_line(&exposition, "github_workflow_job_steps_sum 0.0");
     assert_metric_line(
         &exposition,
-        "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 0",
+        "github_workflow_job_steps_count{repository=\"unknown\"} 0",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_steps_sum{repository=\"unknown\"} 0.0",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{repository=\"unknown\",reason=\"too_many_steps\"} 0",
     );
 
     let captured = fixture.force_flush();
@@ -3144,17 +3170,23 @@ async fn malformed_detailed_workflow_projection_observes_admission_once_without_
     let exposition = fixture.metrics_text().await;
     assert_metric_line(
         &exposition,
-        "github_webhook_requests_total{result=\"accepted\"} 1",
+        "github_webhook_requests_total{repository=\"owner/repository\",result=\"accepted\"} 1",
     );
     assert_metric_line(
         &exposition,
-        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 1",
+        "github_webhook_events_total{repository=\"owner/repository\",event_type=\"workflow_job\",action=\"completed\"} 1",
     );
-    assert_metric_line(&exposition, "github_workflow_job_steps_count 1");
-    assert_metric_line(&exposition, "github_workflow_job_steps_sum 1.0");
     assert_metric_line(
         &exposition,
-        "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 0",
+        "github_workflow_job_steps_count{repository=\"owner/repository\"} 1",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_steps_sum{repository=\"owner/repository\"} 1.0",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{repository=\"unknown\",reason=\"too_many_steps\"} 0",
     );
 
     let captured = fixture.force_flush();
@@ -3351,8 +3383,10 @@ async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent
     let run_id = WORKFLOW_PRIVACY_RUN_ID.to_string();
     let run_attempt = WORKFLOW_PRIVACY_RUN_ATTEMPT.to_string();
     let job_id = WORKFLOW_PRIVACY_JOB_ID.to_string();
+    assert!(exposition.contains(&format!("repository=\"{WEBHOOK_REPOSITORY}\"")));
+    captured.assert_logs_absent(WEBHOOK_REPOSITORY);
+    assert!(!stderr.contains(WEBHOOK_REPOSITORY));
     for approved_span_only_value in [
-        WEBHOOK_REPOSITORY,
         WORKFLOW_PRIVACY_DELIVERY,
         WORKFLOW_PRIVACY_SHA,
         WORKFLOW_SANITIZED_NAME,
@@ -3404,10 +3438,10 @@ async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent
         );
     }
     for expected in [
-        "github_webhook_requests_total{result=\"accepted\"} 1",
-        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 1",
-        "github_webhook_request_body_bytes_count 1",
-        "github_webhook_duplicates_total 0",
+        "github_webhook_requests_total{repository=\"owner/webhook-private-repository\",result=\"accepted\"} 1",
+        "github_webhook_events_total{repository=\"owner/webhook-private-repository\",event_type=\"workflow_job\",action=\"completed\"} 1",
+        "github_webhook_request_body_bytes_count{repository=\"owner/webhook-private-repository\"} 1",
+        "github_webhook_duplicates_total{repository=\"unknown\"} 0",
     ] {
         assert_metric_line(&exposition, expected);
     }
@@ -3872,15 +3906,16 @@ async fn unsupported_workflow_actions_and_projections_emit_no_historical_trace()
         let delivery_id = *delivery_id;
         let normalized_action = *normalized_action;
         let event_series = format!(
-            "github_webhook_events_total{{event_type=\"workflow_job\",action=\"{normalized_action}\"}}"
+            "github_webhook_events_total{{repository=\"owner/webhook-private-repository\",event_type=\"workflow_job\",action=\"{normalized_action}\"}}"
         );
+        let body_series =
+            "github_webhook_request_body_bytes_count{repository=\"owner/webhook-private-repository\"}";
+        let accepted_series =
+            "github_webhook_requests_total{repository=\"owner/webhook-private-repository\",result=\"accepted\"}";
         let before = fixture.metrics_text().await;
         let event_count = metric_u64_or_zero(&before, &event_series);
-        let body_count = metric_u64(&before, "github_webhook_request_body_bytes_count");
-        let accepted_count = metric_u64(
-            &before,
-            "github_webhook_requests_total{result=\"accepted\"}",
-        );
+        let body_count = metric_u64_or_zero(&before, body_series);
+        let accepted_count = metric_u64_or_zero(&before, accepted_series);
 
         let body = workflow_job_body(*action, workflow_job.clone());
         let response = fixture
@@ -3903,12 +3938,12 @@ async fn unsupported_workflow_actions_and_projections_emit_no_historical_trace()
             "generic event metric delta for {delivery_id}"
         );
         assert_eq!(
-            metric_u64(&after, "github_webhook_request_body_bytes_count"),
+            metric_u64(&after, body_series),
             body_count + 1,
             "generic body metric delta for {delivery_id}"
         );
         assert_eq!(
-            metric_u64(&after, "github_webhook_requests_total{result=\"accepted\"}",),
+            metric_u64(&after, accepted_series),
             accepted_count + 1,
             "accepted request metric delta for {delivery_id}"
         );
@@ -4002,10 +4037,10 @@ async fn duplicate_workflow_delivery_emits_one_historical_trace() {
         "reported",
     );
     for expected in [
-        "github_webhook_requests_total{result=\"accepted\"} 2",
-        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 1",
-        "github_webhook_request_body_bytes_count 1",
-        "github_webhook_duplicates_total 1",
+        "github_webhook_requests_total{repository=\"owner/webhook-private-repository\",result=\"accepted\"} 2",
+        "github_webhook_events_total{repository=\"owner/webhook-private-repository\",event_type=\"workflow_job\",action=\"completed\"} 1",
+        "github_webhook_request_body_bytes_count{repository=\"owner/webhook-private-repository\"} 1",
+        "github_webhook_duplicates_total{repository=\"owner/webhook-private-repository\"} 1",
     ] {
         assert_metric_line(&exposition, expected);
     }
@@ -4050,18 +4085,27 @@ async fn duplicate_over_limit_workflow_job_records_one_rejection() {
     let stderr = fixture.output.text();
     assert_metric_line(
         &exposition,
-        "github_webhook_requests_total{result=\"accepted\"} 2",
+        "github_webhook_requests_total{repository=\"owner/webhook-private-repository\",result=\"accepted\"} 2",
     );
     assert_metric_line(
         &exposition,
-        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 1",
+        "github_webhook_events_total{repository=\"owner/webhook-private-repository\",event_type=\"workflow_job\",action=\"completed\"} 1",
     );
-    assert_metric_line(&exposition, "github_webhook_duplicates_total 1");
-    assert_metric_line(&exposition, "github_workflow_job_steps_count 1");
-    assert_metric_line(&exposition, "github_workflow_job_steps_sum 3.0");
     assert_metric_line(
         &exposition,
-        "github_workflow_job_trace_rejections_total{reason=\"too_many_steps\"} 1",
+        "github_webhook_duplicates_total{repository=\"owner/webhook-private-repository\"} 1",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_steps_count{repository=\"owner/webhook-private-repository\"} 1",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_steps_sum{repository=\"owner/webhook-private-repository\"} 3.0",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{repository=\"owner/webhook-private-repository\",reason=\"too_many_steps\"} 1",
     );
     assert_eq!(
         captured
@@ -4192,7 +4236,11 @@ async fn collector_http_failure_is_classified_without_exposing_response_body() {
         .request(Method::GET, "/health/ready", None, None, Body::empty())
         .await;
     assert_eq!(ready.status(), StatusCode::OK);
-    tokio::task::block_in_place(|| fixture.runtime.force_flush().expect("providers flush"));
+    // This fixture intentionally rejects every export. Depending on worker timing, force-flush may
+    // return the expected aggregate export failure; the counters below verify completed attempts.
+    drop(tokio::task::block_in_place(|| {
+        fixture.runtime.force_flush()
+    }));
 
     let expected_failures = [
         ("trace", fixture.runtime.failed_trace_exports()),
@@ -4291,10 +4339,10 @@ async fn blocked_collector_does_not_change_completed_workflow_response() {
     assert_eq!(ready_after.status(), StatusCode::OK);
     let exposition = fixture.metrics_text().await;
     for expected in [
-        "github_webhook_requests_total{result=\"accepted\"} 1",
-        "github_webhook_events_total{event_type=\"workflow_job\",action=\"completed\"} 1",
-        "github_webhook_request_body_bytes_count 1",
-        "github_webhook_duplicates_total 0",
+        "github_webhook_requests_total{repository=\"owner/webhook-private-repository\",result=\"accepted\"} 1",
+        "github_webhook_events_total{repository=\"owner/webhook-private-repository\",event_type=\"workflow_job\",action=\"completed\"} 1",
+        "github_webhook_request_body_bytes_count{repository=\"owner/webhook-private-repository\"} 1",
+        "github_webhook_duplicates_total{repository=\"unknown\"} 0",
     ] {
         assert_metric_line(&exposition, expected);
     }
@@ -4512,10 +4560,12 @@ async fn webhook_queue_failure_is_bounded_and_duplicate_has_no_second_update() {
         })
         .count();
     assert_eq!(duplicate_processes, 1);
-    assert!(exposition.contains("github_webhook_duplicates_total 1"));
-    assert!(
-        exposition.contains("github_webhook_processing_failures_total{stage=\"queue_state\"} 1")
-    );
+    assert!(exposition.contains(
+        "github_webhook_duplicates_total{repository=\"owner/webhook-private-repository\"} 1"
+    ));
+    assert!(exposition.contains(
+        "github_webhook_processing_failures_total{repository=\"owner/webhook-private-repository\",stage=\"queue_state\"} 1"
+    ));
     for forbidden in [
         "queue-raw-reason-must-not-appear",
         "queue-store-detail-must-not-appear",
@@ -5028,8 +5078,10 @@ async fn integrated_core_trace_privacy() {
         "retention delivery identifiers must not appear in trace attributes"
     );
 
+    assert!(exposition.contains(&format!("repository=\"{PRIVACY_REPOSITORY}\"")));
+    captured.assert_logs_absent(PRIVACY_REPOSITORY);
+    assert!(!stderr.contains(PRIVACY_REPOSITORY));
     for approved_identifier in [
-        PRIVACY_REPOSITORY,
         PRIVACY_MERGE_GROUP_DELIVERY,
         PRIVACY_ENQUEUE_DELIVERY,
         PRIVACY_DEQUEUE_DELIVERY,
@@ -5083,10 +5135,12 @@ async fn integrated_core_trace_privacy() {
     let retention_pr_number_text = PRIVACY_RETENTION_PR_NUMBER.to_string();
     assert!(!stderr.contains(&retention_pr_number_text));
     assert!(!exposition.contains(&retention_pr_number_text));
-    assert!(exposition.contains("github_webhook_duplicates_total 1"));
-    assert!(
-        exposition.contains("github_webhook_processing_failures_total{stage=\"queue_state\"} 1")
-    );
+    assert!(exposition.contains(&format!(
+        "github_webhook_duplicates_total{{repository=\"{PRIVACY_REPOSITORY}\"}} 1"
+    )));
+    assert!(exposition.contains(&format!(
+        "github_webhook_processing_failures_total{{repository=\"{PRIVACY_REPOSITORY}\",stage=\"queue_state\"}} 1"
+    )));
 }
 
 mod retention {

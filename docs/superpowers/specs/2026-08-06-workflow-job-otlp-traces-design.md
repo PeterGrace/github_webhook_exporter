@@ -64,7 +64,8 @@ used by production startup and OTLP integration fixtures.
 ## Attribute policy
 
 All operation names and attribute keys are constants owned by the telemetry policy. Untrusted text
-is never used as a span name, Prometheus label, or log field.
+is never used as a span name or log field. Prometheus uses the authenticated canonical repository
+full name and otherwise accepts only bounded normalized label values.
 
 Where the OpenTelemetry CI/CD registry has a compatible attribute, spans use:
 
@@ -140,8 +141,10 @@ The workflow projection and emitted spans never export or log:
 - webhook signatures, repository secrets, authorization headers, or OTLP headers; or
 - raw unsupported actions or conclusions.
 
-Approved workflow identifiers and sanitized names appear only in OTLP spans. Integration tests scan
-captured spans, OTLP logs, structured stderr, and Prometheus exposition to enforce the boundary.
+Approved workflow identifiers and sanitized names appear only in OTLP spans, except that the
+canonical authenticated repository name also labels repository-scoped Prometheus metrics.
+Integration tests scan captured spans, OTLP logs, structured stderr, and Prometheus exposition to
+enforce the boundary.
 
 ## Validation
 
@@ -161,8 +164,8 @@ In-process OTLP receiver tests cover:
 - unsupported actions and malformed projections;
 - duplicate delivery suppression;
 - collector unavailability without response or state changes; and
-- span-only identifier/name visibility plus forbidden-value absence across spans, logs, stderr, and
-  Prometheus exposition.
+- span-only identifier/name visibility, authenticated repository metric labeling, and
+  forbidden-value absence across spans, logs, stderr, and Prometheus exposition.
 
 The final verification sequence is:
 

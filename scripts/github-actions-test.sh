@@ -40,6 +40,8 @@ import sys
 workflow_path = sys.argv[1]
 
 CHART_METADATA = "charts/github-webhook-exporter/Chart.yaml"
+CI_TOOL_VERSIONS = "ci/tool-versions.env"
+CI_TOOL_INSTALLER = "scripts/install-ci-tools.sh"
 
 
 def fail(message: str) -> None:
@@ -55,8 +57,39 @@ def chart_version() -> str:
     return match.group(1)
 
 
-CHART_VERSION = chart_version()
+def rust_version() -> str:
+    """Read the single pinned Rust version shared by every CI setup path."""
+    with open(CI_TOOL_VERSIONS, encoding="utf-8") as file_handle:
+        matches = re.findall(
+            r"^RUST_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$",
+            file_handle.read(),
+            re.MULTILINE,
+        )
+    if len(matches) != 1:
+        fail(f"expected exactly one valid RUST_VERSION in {CI_TOOL_VERSIONS}")
+    return matches[0]
 
+
+def rustup_install_options(contents: str, source: str) -> str:
+    """Extract normalized rustup profile and component options from a setup path."""
+    normalized = " ".join(contents.replace("\\\n", " ").split())
+    match = re.search(
+        r'rustup -q toolchain install "[^\"]+" '
+        r"(?P<options>--profile \S+(?: --component \S+)+ --no-self-update)",
+        normalized,
+    )
+    if match is None:
+        fail(f"missing pinned rustup install contract in {source}")
+    return match.group("options")
+
+
+CHART_VERSION = chart_version()
+RUST_VERSION = rust_version()
+
+with open(CI_TOOL_INSTALLER, encoding="utf-8") as file_handle:
+    installer_rustup_options = rustup_install_options(
+        file_handle.read(), CI_TOOL_INSTALLER
+    )
 
 with open("scripts/helm-package-test.sh", encoding="utf-8") as file_handle:
     package_test = file_handle.read()
@@ -69,6 +102,10 @@ with open("scripts/image-reproducibility-test.sh", encoding="utf-8") as file_han
     reproducibility_test = file_handle.read()
 if "docker buildx build" not in reproducibility_test or "--load" not in reproducibility_test:
     fail("image reproducibility test must use the release buildx load path")
+if "--no-cache" not in reproducibility_test:
+    fail("image reproducibility test must disable cache with --no-cache")
+if len(re.findall(r'^\s*build_image\s+"', reproducibility_test, re.MULTILINE)) != 2:
+    fail("image reproducibility test must call build_image exactly twice")
 
 
 result = subprocess.run(
@@ -87,6 +124,49 @@ def require_fragment(file_path: str, fragment: str) -> None:
     normalized_fragment = " ".join(fragment.split())
     if normalized_fragment not in normalized_contents:
         fail(f"missing required documentation reference in {file_path}: {fragment}")
+
+with open("Dockerfile", encoding="utf-8") as file_handle:
+    dockerfile = file_handle.read()
+
+required_dockerfile_fragments = (
+    "cargo install cargo-chef --version 0.1.71 --locked",
+    "FROM chef AS planner",
+    "cargo chef prepare --recipe-path recipe.json",
+    "FROM chef AS builder",
+    "COPY --from=planner /build/recipe.json recipe.json",
+    "cargo chef cook --locked --release --recipe-path recipe.json",
+    "cargo build --locked --release",
+    "install -D -m 0555 \\\n        target/release/github_webhook_exporter \\\n        /out/usr/local/bin/github_webhook_exporter",
+)
+for fragment in required_dockerfile_fragments:
+    if fragment not in dockerfile:
+        fail(f"Dockerfile is missing cache contract: {fragment}")
+
+if "target=/build/target" in dockerfile:
+    fail("Dockerfile must not mount /build/target as a BuildKit cache")
+if dockerfile.count("cargo build --locked --release") != 1:
+    fail("Dockerfile must compile the application exactly once")
+if dockerfile.index("cargo chef cook --locked --release") > dockerfile.rindex(
+    "COPY migrations/ migrations/"
+):
+    fail("Dockerfile must cook dependencies before copying application inputs")
+if dockerfile.index("cargo build --locked --release") > dockerfile.index(
+    "ARG SOURCE_DATE_EPOCH=0"
+):
+    fail("SOURCE_DATE_EPOCH must not invalidate application compilation")
+
+with open("justfile", encoding="utf-8") as file_handle:
+    justfile = file_handle.read()
+
+required_just_fragments = (
+    "image-smoke: image-build image-smoke-loaded",
+    'image-smoke-loaded:\n    scripts/container-smoke.sh "{{container-image}}"',
+    "helm-kind-lifecycle: image-build helm-kind-lifecycle-loaded",
+    'helm-kind-lifecycle-loaded:\n    scripts/helm-kind-lifecycle.sh "{{helm-chart}}" "{{container-image}}" \\\n        "${KIND_ARTIFACT_DIRECTORY:-dist/kind-lifecycle}"',
+)
+for fragment in required_just_fragments:
+    if fragment not in justfile:
+        fail(f"justfile is missing loaded-image contract: {fragment}")
 
 
 shared_release_fragments = (
@@ -199,24 +279,71 @@ if job_env.get("CONTAINER_IMAGE") != "github-webhook-exporter:ci":
 if job_env.get("KIND_ARTIFACT_DIRECTORY") != "dist/kind-lifecycle":
     fail("workflow must use the fixed Kind lifecycle artifact directory")
 
+if job_env.get("RUSTUP_TOOLCHAIN") != RUST_VERSION:
+    fail(
+        "workflow RUSTUP_TOOLCHAIN must match "
+        f"RUST_VERSION={RUST_VERSION} from {CI_TOOL_VERSIONS}"
+    )
+
 validate_steps = validate_job.get("steps")
 if not isinstance(validate_steps, list):
     fail("workflow validate job must define steps")
 
+rustup_steps = [
+    step
+    for step in validate_steps
+    if isinstance(step, dict) and "rustup -q toolchain install" in step.get("run", "")
+]
+if len(rustup_steps) != 1:
+    fail("workflow must contain exactly one inline rustup install step")
+workflow_rustup_options = rustup_install_options(
+    rustup_steps[0]["run"], "workflow Rust toolchain step"
+)
+if workflow_rustup_options != installer_rustup_options:
+    fail("workflow and CI tool installer rustup options must match")
+
 expected_validate_steps = [
     {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"},
-    {"run": 'scripts/install-ci-tools.sh "$RUNNER_TEMP/ci-tools"'},
+    {
+        "id": "ci-tools-cache",
+        "uses": "actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830",
+        "with": {
+            "path": "${{ runner.temp }}/ci-tools",
+            "key": "ci-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/tool-versions.env', 'scripts/install-ci-tools.sh') }}",
+        },
+    },
+    {
+        "if": "steps.ci-tools-cache.outputs.cache-hit != 'true'",
+        "run": 'scripts/install-ci-tools.sh "$RUNNER_TEMP/ci-tools"',
+    },
     {"run": 'echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"'},
+    {
+        "if": "steps.ci-tools-cache.outputs.cache-hit == 'true'",
+        "run": "rustup -q toolchain install \"$RUSTUP_TOOLCHAIN\" --profile minimal \\\n    --component rustfmt --component clippy --no-self-update\n",
+    },
     {"uses": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"},
     {"run": "just workflow-test"},
     {"run": "mapfile -t shell_files < <(git ls-files -- '*.sh')\nshellcheck \"${shell_files[@]}\"\n"},
     {"run": "just helm-static"},
-    {"run": "just image-smoke"},
-    {"run": "just image-reproducibility-test"},
+    {"uses": "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f"},
+    {
+        "uses": "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8",
+        "with": {
+            "context": ".",
+            "platforms": "linux/amd64",
+            "load": True,
+            "push": False,
+            "provenance": False,
+            "tags": "github-webhook-exporter:ci",
+            "cache-from": "type=gha,scope=production-image-linux-amd64",
+            "cache-to": "type=gha,mode=max,scope=production-image-linux-amd64",
+        },
+    },
+    {"run": "just image-smoke-loaded"},
+    {"if": "github.event_name == 'push'", "run": "just image-reproducibility-test"},
     {"run": "just helm-maintenance-unit"},
-    {"run": "just helm-kind-lifecycle"},
+    {"run": "just helm-kind-lifecycle-loaded"},
     {"run": "just fmt"},
-    {"run": "cargo build --locked"},
     {"run": "cargo clippy --all-targets -- -D warnings"},
     {"run": "just test"},
     {"run": "cargo doc --no-deps --locked"},
@@ -323,8 +450,8 @@ expected_publish_steps = [
             "tags": "${{ steps.metadata.outputs.tags }}",
             "labels": "${{ steps.metadata.outputs.labels }}",
             "build-args": "SOURCE_DATE_EPOCH=${{ steps.version.outputs.source_date_epoch }}",
-            "cache-from": "type=gha,scope=production-image",
-            "cache-to": "type=gha,mode=max,scope=production-image",
+            "cache-from": "type=gha,scope=production-image-linux-amd64",
+            "cache-to": "type=gha,mode=max,scope=production-image-linux-amd64",
         },
     },
     {
