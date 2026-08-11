@@ -122,7 +122,7 @@ required_just_fragments = (
     "image-smoke: image-build image-smoke-loaded",
     'image-smoke-loaded:\n    scripts/container-smoke.sh "{{container-image}}"',
     "helm-kind-lifecycle: image-build helm-kind-lifecycle-loaded",
-    'helm-kind-lifecycle-loaded:\n    scripts/helm-kind-lifecycle.sh "{{helm-chart}}" "{{container-image}}"',
+    'helm-kind-lifecycle-loaded:\n    scripts/helm-kind-lifecycle.sh "{{helm-chart}}" "{{container-image}}" \\\n        "${KIND_ARTIFACT_DIRECTORY:-dist/kind-lifecycle}"',
 )
 for fragment in required_just_fragments:
     if fragment not in justfile:
