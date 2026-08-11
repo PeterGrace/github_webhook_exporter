@@ -25,10 +25,16 @@ these template variables:
 - `job`: values discovered from `label_values(github_webhook_requests_total, job)`.
 - `instance`: values discovered from
   `label_values(github_webhook_requests_total{job=~"$job"}, instance)`.
+- `repository`: canonical repository names, plus the synthetic `unknown` pre-authentication value,
+  discovered from
+  `label_values(github_webhook_requests_total{job=~"$job", instance=~"$instance"}, repository)`.
 
-The `job` and `instance` variables allow multiple selections and an `All` selection. Every PromQL
-query applies `job=~"$job"` and `instance=~"$instance"`. Queries use `$__rate_interval` for rates
-and `$__range` for range totals where appropriate.
+The `job`, `instance`, and `repository` variables allow multiple selections and an `All` selection.
+Every PromQL query applies `job=~"$job"` and `instance=~"$instance"`. Queries for repository-scoped
+webhook, merge-queue, and workflow families additionally apply
+`repository=~"$repository"`. Global repository-count and telemetry-health metrics do not carry the
+repository label and therefore remain filtered only by job and instance. Queries use
+`$__rate_interval` for rates and `$__range` for range totals where appropriate.
 
 ## Dashboard layout
 
@@ -82,7 +88,9 @@ dropped records, grouped by their bounded labels. This row covers:
 
 Counter panels use `rate()` for time-series throughput and `increase()` for selected-range totals.
 Histogram percentiles use `histogram_quantile()` over rates of `_bucket` series while retaining the
-metric's meaningful bounded labels. Ratios guard against division by zero so idle exporters do not
+metric's meaningful bounded labels. Repository-scoped aggregations filter by the selected repository
+but need not retain `repository` in their output legends because the dashboard variable already
+identifies the selected scope. Ratios guard against division by zero so idle exporters do not
 produce misleading infinities. Gauge panels use the latest selected series without applying rate
 functions.
 
@@ -92,17 +100,19 @@ exporter's documented metric semantics.
 ## Documentation
 
 `examples/grafana/README.md` explains how to enable scraping, import the dashboard, select the
-Prometheus data source, and use the `job` and `instance` filters. It identifies Grafana 10+ as the
-example target and states the explicit non-goals.
+Prometheus data source, and use the `job`, `instance`, and `repository` filters. It explains that
+`unknown` represents requests for which authentication did not establish repository identity. It
+identifies Grafana 10+ as the example target and states the explicit non-goals.
 
 ## Validation
 
 A focused repository test parses the dashboard as JSON and verifies:
 
 - the dashboard has the expected title and schema version;
-- the three template variables exist;
+- the four template variables exist with the expected dependency order;
 - every one of the 15 emitted metric families appears in at least one query;
-- all Prometheus query targets use the datasource variable; and
+- all Prometheus query targets use the datasource variable and job/instance filters;
+- repository-scoped queries use the repository filter while global queries do not; and
 - the expected overview and detail rows exist.
 
 The implementation also runs `just fmt`, `cargo clippy --all-targets -- -D warnings`, and

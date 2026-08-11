@@ -11,8 +11,9 @@
 ## Global Constraints
 
 - Target Grafana 10 or newer and the standard Prometheus datasource plugin.
-- Define `${datasource}`, `${job}`, and `${instance}` variables; `job` and `instance` support multi-value and `All`.
+- Define `${datasource}`, `${job}`, `${instance}`, and `${repository}` variables; `job`, `instance`, and `repository` support multi-value and `All`.
 - Apply `job=~"$job"` and `instance=~"$instance"` to every metric selector.
+- Apply `repository=~"$repository"` to repository-scoped webhook, merge-queue, and workflow selectors, but not to global repository-count or telemetry-health selectors.
 - Use `$__rate_interval` for rates and `$__range` for selected-range totals.
 - Cover every one of the 15 metric families registered in `src/metrics.rs`.
 - Add no Grafana provisioning, alerts, recording rules, Helm integration, or generation dependency.
@@ -238,3 +239,65 @@ provisioning, alert, Helm, or dependency files were added.
 git add examples/grafana/README.md changelog/2026-08-10T15-25-59Z-example-grafana-dashboard.md
 git commit -m "docs: explain example Grafana dashboard"
 ```
+
+### Task 3: Repository dashboard filtering amendment
+
+**Files:**
+- Modify: `tests/grafana_dashboard.rs`
+- Modify: `examples/grafana/github-webhook-exporter.json`
+- Modify: `examples/grafana/README.md`
+- Modify: `docs/superpowers/specs/2026-08-10-grafana-dashboard-design.md`
+- Modify: `docs/superpowers/plans/2026-08-10-grafana-dashboard.md`
+- Create: `changelog/2026-08-11T13-42-41Z-grafana-repository-filter.md`
+
+**Interfaces:**
+- Consumes: the `repository` label added by repository-scoped observability on `origin/main`.
+- Produces: a dependent Grafana `repository` variable and repository-aware PromQL selectors.
+
+- [ ] **Step 1: Extend the contract test and verify RED**
+
+Require template variables in dependency order `datasource`, `job`, `instance`, `repository`.
+Require `repository` to be multi-value with `All`, and require its query to discover repository
+values from `github_webhook_requests_total` after job and instance filtering. Classify
+`github_repository_configurations`, `github_telemetry_export_failures_total`, and
+`github_telemetry_dropped_records_total` as global metrics. Assert every other target expression
+contains `repository=~\"$repository\"`, while expressions using only global metrics do not.
+
+Run `cargo test --test grafana_dashboard -- --nocapture` and expect failures for the absent variable
+and absent repository selectors.
+
+- [ ] **Step 2: Update the dashboard and verify GREEN**
+
+Add the repository variable after `instance`:
+
+```json
+{
+  "name": "repository",
+  "label": "Repository",
+  "type": "query",
+  "datasource": {"type": "prometheus", "uid": "${datasource}"},
+  "query": {
+    "query": "label_values(github_webhook_requests_total{job=~\"$job\", instance=~\"$instance\"}, repository)"
+  },
+  "refresh": 1,
+  "multi": true,
+  "includeAll": true,
+  "allValue": ".*"
+}
+```
+
+Add `repository=~"$repository"` to every selector for webhook, merge-group, merge-queue, and
+workflow metrics. Leave configured-repository and telemetry diagnostic selectors unchanged because
+those families have no repository label. Run the focused test and JSON parser; expect both to pass.
+
+- [ ] **Step 3: Update operator documentation and changelog**
+
+Document the Repository filter, multi-select behavior, `unknown` semantics, and the exporter-global
+scope of configured repository and telemetry panels. Record the merge from current `main`, query
+changes, contract coverage, and validation in the timestamped changelog.
+
+- [ ] **Step 4: Run full validation and commit**
+
+Run `just fmt`, `cargo clippy --all-targets -- -D warnings`, `just test`, the Python JSON parser, and
+`git diff --check`. Commit the amendment with `fix: filter dashboard by repository`, then push the
+updated PR branch.
