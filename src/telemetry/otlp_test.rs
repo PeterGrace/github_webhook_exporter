@@ -62,7 +62,9 @@ use tracing::{
 use crate::{config::TelemetryConfig, metrics::Metrics};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
-use super::{build_runtime, trace, TelemetryShutdownOutcome, TelemetryState};
+use super::{
+    build_runtime, trace, TelemetryShutdownOutcome, TelemetryState, LOCAL_ONLY_LOG_TARGET,
+};
 
 const QUEUE_CAPACITY: usize = 4;
 const SATURATION_RECORDS: usize = 10;
@@ -122,6 +124,7 @@ const WORKFLOW_FORBIDDEN_SIGNATURE: &str =
 const WORKFLOW_FORBIDDEN_HEADER: &str = "x-task6-private=forbidden-header-sentinel";
 const WORKFLOW_FORBIDDEN_FRAGMENT: &str = "task6-forbidden-raw-payload-fragment-sentinel";
 const WORKFLOW_UNKNOWN_CONCLUSION: &str = "task6-forbidden-unknown-conclusion-sentinel";
+const WEBHOOK_DEBUG_SENTINEL: &str = "webhook-debug-sentinel";
 
 const RESOURCE_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "service.name",
@@ -2340,9 +2343,21 @@ async fn webhook_completion_is_local_debug_only() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     drop(response);
 
-    let (captured, stderr) = fixture.finish();
-    assert!(stderr.contains("GitHub webhook request processed"));
-    assert!(stderr.contains("DEBUG"));
+    tracing::dispatcher::with_default(&fixture.dispatch, || {
+        tracing::debug!(target: "github_webhook_exporter", "{WEBHOOK_DEBUG_SENTINEL}");
+    });
+    tokio::task::block_in_place(|| fixture.runtime.force_flush().expect("providers flush"));
+
+    let stderr = fixture.output.text();
+    let completion_line = stderr
+        .lines()
+        .find(|line| line.contains("GitHub webhook request processed"))
+        .expect("local completion log is rendered to stderr");
+    assert!(completion_line.contains("DEBUG"));
+    assert!(completion_line.contains(LOCAL_ONLY_LOG_TARGET));
+
+    let (captured, _) = fixture.finish();
+    assert!(captured.has_log_body(WEBHOOK_DEBUG_SENTINEL));
     assert!(!captured.has_log_body("GitHub webhook request processed"));
 }
 
