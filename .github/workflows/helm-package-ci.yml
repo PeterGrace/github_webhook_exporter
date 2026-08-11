@@ -26,7 +26,20 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup -q toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal \
+              --component rustfmt --component clippy --no-self-update
+
+      - name: Cache pinned CI tools
+        id: ci-tools-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ runner.temp }}/ci-tools
+          key: ci-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/tool-versions.env', 'scripts/install-ci-tools.sh') }}
+
       - name: Install pinned CI tools
+        if: steps.ci-tools-cache.outputs.cache-hit != 'true'
         run: scripts/install-ci-tools.sh "$RUNNER_TEMP/ci-tools"
 
       - name: Add CI tools to PATH
@@ -46,23 +59,36 @@ jobs:
       - name: Validate Helm chart contracts
         run: just helm-static
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Build the cached validation image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          tags: github-webhook-exporter:ci
+          cache-from: type=gha,scope=production-image-linux-amd64
+          cache-to: type=gha,mode=max,scope=production-image-linux-amd64
+
       - name: Smoke test the production image
-        run: just image-smoke
+        run: just image-smoke-loaded
 
       - name: Verify production image reproducibility
+        if: github.event_name == 'push'
         run: just image-reproducibility-test
 
       - name: Verify SQLite maintenance contracts
         run: just helm-maintenance-unit
 
       - name: Exercise lifecycle and persistence in Kind
-        run: just helm-kind-lifecycle
+        run: just helm-kind-lifecycle-loaded
 
       - name: Verify Rust formatting
         run: just fmt
-
-      - name: Build the project
-        run: cargo build --locked
 
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -174,8 +200,8 @@ jobs:
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           build-args: SOURCE_DATE_EPOCH=${{ steps.version.outputs.source_date_epoch }}
-          cache-from: type=gha,scope=production-image
-          cache-to: type=gha,mode=max,scope=production-image
+          cache-from: type=gha,scope=production-image-linux-amd64
+          cache-to: type=gha,mode=max,scope=production-image-linux-amd64
 
       - name: Smoke test the release image
         env:
