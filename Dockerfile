@@ -16,20 +16,16 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 COPY --from=planner /build/recipe.json recipe.json
 RUN --mount=type=cache,id=ghe-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=ghe-target,target=/build/target,sharing=locked \
     cargo chef cook --locked --release --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo/ .cargo/
 COPY migrations/ migrations/
 COPY src/ src/
 RUN --mount=type=cache,id=ghe-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=ghe-target,target=/build/target,sharing=locked \
     cargo build --locked --release
 
 ARG SOURCE_DATE_EPOCH=0
-RUN --mount=type=cache,id=ghe-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=ghe-target,target=/build/target,sharing=locked \
-    install -D -m 0555 \
+RUN install -D -m 0555 \
         target/release/github_webhook_exporter \
         /out/usr/local/bin/github_webhook_exporter \
     && install -d -m 0700 -o 65532 -g 65532 \

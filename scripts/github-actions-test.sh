@@ -103,11 +103,14 @@ required_dockerfile_fragments = (
     "COPY --from=planner /build/recipe.json recipe.json",
     "cargo chef cook --locked --release --recipe-path recipe.json",
     "cargo build --locked --release",
+    "install -D -m 0555 \\\n        target/release/github_webhook_exporter \\\n        /out/usr/local/bin/github_webhook_exporter",
 )
 for fragment in required_dockerfile_fragments:
     if fragment not in dockerfile:
         fail(f"Dockerfile is missing cache contract: {fragment}")
 
+if "target=/build/target" in dockerfile:
+    fail("Dockerfile must not mount /build/target as a BuildKit cache")
 if dockerfile.count("cargo build --locked --release") != 1:
     fail("Dockerfile must compile the application exactly once")
 if dockerfile.index("cargo chef cook --locked --release") > dockerfile.rindex(
@@ -253,9 +256,6 @@ if not isinstance(validate_steps, list):
 expected_validate_steps = [
     {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"},
     {
-        "run": "rustup -q toolchain install \"$RUSTUP_TOOLCHAIN\" --profile minimal \\\n    --component rustfmt --component clippy --no-self-update\n",
-    },
-    {
         "id": "ci-tools-cache",
         "uses": "actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830",
         "with": {
@@ -268,6 +268,10 @@ expected_validate_steps = [
         "run": 'scripts/install-ci-tools.sh "$RUNNER_TEMP/ci-tools"',
     },
     {"run": 'echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"'},
+    {
+        "if": "steps.ci-tools-cache.outputs.cache-hit == 'true'",
+        "run": "rustup -q toolchain install \"$RUSTUP_TOOLCHAIN\" --profile minimal \\\n    --component rustfmt --component clippy --no-self-update\n",
+    },
     {"uses": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"},
     {"run": "just workflow-test"},
     {"run": "mapfile -t shell_files < <(git ls-files -- '*.sh')\nshellcheck \"${shell_files[@]}\"\n"},
