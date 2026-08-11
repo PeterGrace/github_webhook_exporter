@@ -115,6 +115,19 @@ if dockerfile.index("cargo build --locked --release") > dockerfile.index(
 ):
     fail("SOURCE_DATE_EPOCH must not invalidate application compilation")
 
+with open("justfile", encoding="utf-8") as file_handle:
+    justfile = file_handle.read()
+
+required_just_fragments = (
+    "image-smoke: image-build image-smoke-loaded",
+    'image-smoke-loaded:\n    scripts/container-smoke.sh "{{container-image}}"',
+    "helm-kind-lifecycle: image-build helm-kind-lifecycle-loaded",
+    'helm-kind-lifecycle-loaded:\n    scripts/helm-kind-lifecycle.sh "{{helm-chart}}" "{{container-image}}"',
+)
+for fragment in required_just_fragments:
+    if fragment not in justfile:
+        fail(f"justfile is missing loaded-image contract: {fragment}")
+
 
 shared_release_fragments = (
     "ghcr.io/petergrace/github-webhook-exporter",
