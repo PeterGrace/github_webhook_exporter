@@ -63,8 +63,12 @@ telemetry providers receive their full shutdown boundaries.
 ### GHCR releases
 
 Pull requests and `main` are validation-only: they build and smoke-test the production image,
-validate the packaged chart, and never authenticate to GHCR or publish a package. Their temporary
-chart artifacts are retained for 30 days through workflow artifacts.
+validate the packaged chart, and never authenticate to GHCR or publish a package. Validation uses
+cargo-chef plus GitHub-hosted Cargo and BuildKit caches, and the smoke and Kind lifecycle checks
+reuse one loaded image. A cache miss always performs a complete verified build. Pull requests omit
+the expensive reproducibility comparison; pushes to `main` and stable release tags still perform
+two cache-disabled builds and require identical image IDs. Temporary chart artifacts are retained
+for 30 days through workflow artifacts.
 
 A stable `vMAJOR.MINOR.PATCH` repository tag publishes one immutable `linux/amd64` image and one
 Helm OCI chart only after full validation passes. The release workflow requires the tag without
