@@ -62,7 +62,9 @@ use tracing::{
 use crate::{config::TelemetryConfig, metrics::Metrics};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
-use super::{build_runtime, trace, TelemetryShutdownOutcome, TelemetryState};
+use super::{
+    build_runtime, trace, TelemetryShutdownOutcome, TelemetryState, LOCAL_ONLY_LOG_TARGET,
+};
 
 const QUEUE_CAPACITY: usize = 4;
 const SATURATION_RECORDS: usize = 10;
@@ -122,6 +124,7 @@ const WORKFLOW_FORBIDDEN_SIGNATURE: &str =
 const WORKFLOW_FORBIDDEN_HEADER: &str = "x-task6-private=forbidden-header-sentinel";
 const WORKFLOW_FORBIDDEN_FRAGMENT: &str = "task6-forbidden-raw-payload-fragment-sentinel";
 const WORKFLOW_UNKNOWN_CONCLUSION: &str = "task6-forbidden-unknown-conclusion-sentinel";
+const WEBHOOK_DEBUG_SENTINEL: &str = "webhook-debug-sentinel";
 
 const RESOURCE_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "service.name",
@@ -714,12 +717,33 @@ struct WebhookTraceFixture {
 
 impl WebhookTraceFixture {
     async fn new() -> Self {
-        Self::new_with_exporter_timeout_and_step_limit(2_000, DEFAULT_WORKFLOW_JOB_MAX_STEPS, false)
-            .await
+        Self::new_with_exporter_timeout_and_step_limit(
+            2_000,
+            DEFAULT_WORKFLOW_JOB_MAX_STEPS,
+            false,
+            "github_webhook_exporter=info",
+        )
+        .await
+    }
+
+    async fn new_with_debug_logging() -> Self {
+        Self::new_with_exporter_timeout_and_step_limit(
+            2_000,
+            DEFAULT_WORKFLOW_JOB_MAX_STEPS,
+            false,
+            "github_webhook_exporter=debug",
+        )
+        .await
     }
 
     async fn new_with_workflow_job_max_steps(workflow_job_max_steps: usize) -> Self {
-        Self::new_with_exporter_timeout_and_step_limit(2_000, workflow_job_max_steps, true).await
+        Self::new_with_exporter_timeout_and_step_limit(
+            2_000,
+            workflow_job_max_steps,
+            true,
+            "github_webhook_exporter=info",
+        )
+        .await
     }
 
     async fn new_with_exporter_timeout(timeout_millis: u64) -> Self {
@@ -727,6 +751,7 @@ impl WebhookTraceFixture {
             timeout_millis,
             DEFAULT_WORKFLOW_JOB_MAX_STEPS,
             false,
+            "github_webhook_exporter=info",
         )
         .await
     }
@@ -735,6 +760,7 @@ impl WebhookTraceFixture {
         timeout_millis: u64,
         workflow_job_max_steps: usize,
         include_actionable_repository: bool,
+        rust_log: &str,
     ) -> Self {
         let otlp_guard = otlp_test_lock().lock_owned().await;
         let receiver = RunningReceiver::start_released().await;
@@ -745,13 +771,9 @@ impl WebhookTraceFixture {
         );
         let output = CapturedOutput::default();
         let metrics = Metrics::new();
-        let (runtime, subscriber) = build_runtime(
-            "github_webhook_exporter=info",
-            &config,
-            output.clone(),
-            metrics.clone(),
-        )
-        .expect("telemetry runtime initializes");
+        let (runtime, subscriber) =
+            build_runtime(rust_log, &config, output.clone(), metrics.clone())
+                .expect("telemetry runtime initializes");
         let span_lifecycles = CapturedSpanLifecycles::default();
         let dispatch = Dispatch::new(subscriber.with(span_lifecycles.clone()));
         let directory = tempfile::tempdir().expect("temporary directory is created");
@@ -2307,6 +2329,36 @@ async fn repository_store_failure_marks_http_and_write_spans_without_error_text(
     captured.assert_approved_attribute_keys();
     assert!(captured.has_log_body("request failed"));
     assert!(output.text().contains("request failed"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_completion_is_local_debug_only() {
+    let fixture = WebhookTraceFixture::new_with_debug_logging().await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440200";
+    let body = format!(r#"{{"repository":{{"full_name":"{WEBHOOK_REPOSITORY}"}}}}"#);
+
+    let response = fixture
+        .webhook(body.as_bytes(), "ping", delivery_id, WEBHOOK_SECRET)
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    tracing::dispatcher::with_default(&fixture.dispatch, || {
+        tracing::debug!(target: "github_webhook_exporter", "{WEBHOOK_DEBUG_SENTINEL}");
+    });
+    tokio::task::block_in_place(|| fixture.runtime.force_flush().expect("providers flush"));
+
+    let stderr = fixture.output.text();
+    let completion_line = stderr
+        .lines()
+        .find(|line| line.contains("GitHub webhook request processed"))
+        .expect("local completion log is rendered to stderr");
+    assert!(completion_line.contains("DEBUG"));
+    assert!(completion_line.contains(LOCAL_ONLY_LOG_TARGET));
+
+    let (captured, _) = fixture.finish();
+    assert!(captured.has_log_body(WEBHOOK_DEBUG_SENTINEL));
+    assert!(!captured.has_log_body("GitHub webhook request processed"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4325,13 +4377,18 @@ async fn blocked_collector_does_not_change_completed_workflow_response() {
 
     tokio::time::timeout(
         WEBHOOK_TIMEOUT,
-        wait_for_started_requests(&fixture.receiver.state, started_requests + 2),
+        wait_for_started_requests(&fixture.receiver.state, started_requests + 1),
     )
     .await
-    .expect("trace and log exports reach the blocked collector");
+    .expect("trace export reaches the blocked collector");
     let (blocked_traces, blocked_logs) = fixture.receiver.captured_requests();
     assert!(!blocked_traces.is_empty(), "a trace export is blocked");
-    assert!(!blocked_logs.is_empty(), "a log export is blocked");
+    // The generic completion event is local-only, and this success path emits no other logs.
+    // A future remotely eligible webhook log intentionally breaks this zero-export invariant.
+    assert!(
+        blocked_logs.is_empty(),
+        "local-only webhook completion logs must not reach the blocked collector"
+    );
 
     let ready_after = fixture
         .request(Method::GET, "/health/ready", None, None, Body::empty())

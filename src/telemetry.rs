@@ -45,6 +45,9 @@ use queue::AdmissionBoundary;
 
 const INSTRUMENTATION_SCOPE: &str = "github_webhook_exporter";
 
+/// Tracing target for local diagnostics that must never enter the OTLP log pipeline.
+pub(crate) const LOCAL_ONLY_LOG_TARGET: &str = "github_webhook_exporter::local_only";
+
 /// Whether remote OTLP export is enabled for at least one signal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TelemetryState {
@@ -401,7 +404,7 @@ where
             .with_filter(filter_fn(application_trace_metadata))
     });
     let log_layer = logger_provider.as_ref().map(|provider| {
-        OpenTelemetryTracingBridge::new(provider).with_filter(filter_fn(application_metadata))
+        OpenTelemetryTracingBridge::new(provider).with_filter(filter_fn(application_log_metadata))
     });
     let subscriber = Registry::default()
         .with(filter)
@@ -534,12 +537,20 @@ fn telemetry_resource(config: &TelemetryConfig) -> Resource {
         .build()
 }
 
+fn application_log_metadata(metadata: &Metadata<'_>) -> bool {
+    is_remote_log_target(metadata.target())
+}
+
 fn application_metadata(metadata: &Metadata<'_>) -> bool {
     is_application_target(metadata.target())
 }
 
 fn application_trace_metadata(metadata: &Metadata<'_>) -> bool {
     metadata.is_span() && application_metadata(metadata)
+}
+
+fn is_remote_log_target(target: &str) -> bool {
+    target != LOCAL_ONLY_LOG_TARGET && is_application_target(target)
 }
 
 fn is_application_target(target: &str) -> bool {
@@ -588,7 +599,8 @@ mod tests {
 
     use super::{
         build_blocking_http_client, build_runtime, build_subscriber, is_application_target,
-        run_shutdown_tasks, ShutdownTask, TelemetryShutdownOutcome, TelemetryState,
+        is_remote_log_target, run_shutdown_tasks, ShutdownTask, TelemetryShutdownOutcome,
+        TelemetryState, LOCAL_ONLY_LOG_TARGET,
     };
 
     #[derive(Clone, Default)]
@@ -740,6 +752,14 @@ mod tests {
         assert!(metrics.encode().expect("metrics encode").contains(
             "github_telemetry_export_failures_total{signal=\"log\",reason=\"transport\"} 1"
         ));
+    }
+
+    #[test]
+    fn remote_log_filter_rejects_only_the_local_only_application_target() {
+        assert!(!is_remote_log_target(LOCAL_ONLY_LOG_TARGET));
+        assert!(is_remote_log_target("github_webhook_exporter"));
+        assert!(is_remote_log_target("github_webhook_exporter::api"));
+        assert!(!is_remote_log_target("unrelated_dependency"));
     }
 
     #[test]
