@@ -69,6 +69,10 @@ with open("scripts/image-reproducibility-test.sh", encoding="utf-8") as file_han
     reproducibility_test = file_handle.read()
 if "docker buildx build" not in reproducibility_test or "--load" not in reproducibility_test:
     fail("image reproducibility test must use the release buildx load path")
+if "--no-cache" not in reproducibility_test:
+    fail("image reproducibility test must disable cache with --no-cache")
+if len(re.findall(r'^\s*build_image\s+"', reproducibility_test, re.MULTILINE)) != 2:
+    fail("image reproducibility test must call build_image exactly twice")
 
 
 result = subprocess.run(
@@ -238,6 +242,9 @@ if job_env.get("CONTAINER_IMAGE") != "github-webhook-exporter:ci":
 
 if job_env.get("KIND_ARTIFACT_DIRECTORY") != "dist/kind-lifecycle":
     fail("workflow must use the fixed Kind lifecycle artifact directory")
+
+if job_env.get("RUSTUP_TOOLCHAIN") != "1.97.1":
+    fail("workflow must pin RUSTUP_TOOLCHAIN=1.97.1")
 
 validate_steps = validate_job.get("steps")
 if not isinstance(validate_steps, list):
