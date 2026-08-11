@@ -4192,7 +4192,11 @@ async fn collector_http_failure_is_classified_without_exposing_response_body() {
         .request(Method::GET, "/health/ready", None, None, Body::empty())
         .await;
     assert_eq!(ready.status(), StatusCode::OK);
-    tokio::task::block_in_place(|| fixture.runtime.force_flush().expect("providers flush"));
+    // This fixture intentionally rejects every export. Depending on worker timing, force-flush may
+    // return the expected aggregate export failure; the counters below verify completed attempts.
+    drop(tokio::task::block_in_place(|| {
+        fixture.runtime.force_flush()
+    }));
 
     let expected_failures = [
         ("trace", fixture.runtime.failed_trace_exports()),

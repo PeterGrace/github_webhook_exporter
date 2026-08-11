@@ -571,10 +571,12 @@ mod tests {
         collections::HashMap,
         ffi::OsString,
         io::{self, Write},
+        net::TcpListener,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc, Barrier, Mutex,
         },
+        thread,
         time::{Duration, Instant},
     };
 
@@ -585,8 +587,8 @@ mod tests {
     };
 
     use super::{
-        build_runtime, build_subscriber, is_application_target, run_shutdown_tasks, ShutdownTask,
-        TelemetryShutdownOutcome, TelemetryState,
+        build_blocking_http_client, build_runtime, build_subscriber, is_application_target,
+        run_shutdown_tasks, ShutdownTask, TelemetryShutdownOutcome, TelemetryState,
     };
 
     #[derive(Clone, Default)]
@@ -631,6 +633,42 @@ mod tests {
     }
 
     #[test]
+    fn blocking_http_client_attempts_https_transport() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener binds");
+        listener
+            .set_nonblocking(true)
+            .expect("test listener becomes nonblocking");
+        let address = listener
+            .local_addr()
+            .expect("test listener address is available");
+        let accepted = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match listener.accept() {
+                    Ok((_stream, _peer)) => return true,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return false;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("test listener failed: {error}"),
+                }
+            }
+        });
+        let client = build_blocking_http_client(Duration::from_secs(1))
+            .expect("blocking HTTP client builds");
+
+        let result = client.get(format!("https://{address}")).send();
+
+        assert!(result.is_err(), "the fixture is not a TLS server");
+        assert!(
+            accepted.join().expect("test listener does not panic"),
+            "the production client must open a connection for an HTTPS URL"
+        );
+    }
+
+    #[test]
     fn subscriber_honors_the_validated_filter() {
         let output = SharedWriter::default();
         let subscriber = build_subscriber("github_webhook_exporter=debug", output.clone())
@@ -668,10 +706,18 @@ mod tests {
 
     #[test]
     fn enabled_runtime_preserves_structured_stderr() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener binds");
+        let unavailable_endpoint = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("test listener address is available")
+        );
+        drop(listener);
         let output = SharedWriter::default();
         let config = telemetry_config(&[
-            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9"),
-            ("OTEL_EXPORTER_OTLP_TIMEOUT", "1"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", &unavailable_endpoint),
+            ("OTEL_EXPORTER_OTLP_TIMEOUT", "1000"),
             ("GHE_OTEL_QUEUE_CAPACITY", "4"),
             ("GHE_OTEL_BATCH_SIZE", "1"),
         ]);
