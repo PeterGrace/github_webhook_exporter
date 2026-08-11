@@ -7,6 +7,8 @@
 - Added bounded HTTP status and transport-detail fields to direct exporter failure diagnostics.
 - Changed exporter failures to emit one direct stderr line per failed attempt while retaining
   rate-limited queue-drop diagnostics.
+- Made exporter-failure tests deterministic under concurrent CI execution by using a bounded
+  closed-port fixture and accepting the deliberate HTTP 503 flush failure.
 
 ## Security
 

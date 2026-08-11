@@ -706,10 +706,18 @@ mod tests {
 
     #[test]
     fn enabled_runtime_preserves_structured_stderr() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener binds");
+        let unavailable_endpoint = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("test listener address is available")
+        );
+        drop(listener);
         let output = SharedWriter::default();
         let config = telemetry_config(&[
-            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9"),
-            ("OTEL_EXPORTER_OTLP_TIMEOUT", "1"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", &unavailable_endpoint),
+            ("OTEL_EXPORTER_OTLP_TIMEOUT", "1000"),
             ("GHE_OTEL_QUEUE_CAPACITY", "4"),
             ("GHE_OTEL_BATCH_SIZE", "1"),
         ]);
