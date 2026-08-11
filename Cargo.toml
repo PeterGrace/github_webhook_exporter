@@ -20,6 +20,8 @@ pre-release-replacements = [
     { file = "docs/operations.md", search = "--version [0-9]+\\.[0-9]+\\.[0-9]+", replace = "--version {{version}}", min = 1 },
     { file = "docs/operations.md", search = "github-webhook-exporter-[0-9]+\\.[0-9]+\\.[0-9]+\\.tgz", replace = "github-webhook-exporter-{{version}}.tgz", min = 1 },
     { file = "docs/operations.md", search = "version fields are `[0-9]+\\.[0-9]+\\.[0-9]+`", replace = "version fields are `{{version}}`", exactly = 1 },
+    { file = "README.md", search = "github-webhook-exporter:[0-9]+\\.[0-9]+\\.[0-9]+", replace = "github-webhook-exporter:{{version}}", exactly = 1 },
+    { file = "README.md", search = "--version [0-9]+\\.[0-9]+\\.[0-9]+", replace = "--version {{version}}", exactly = 1 },
 ]
 
 [dependencies]
