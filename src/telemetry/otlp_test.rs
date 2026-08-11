@@ -4383,6 +4383,8 @@ async fn blocked_collector_does_not_change_completed_workflow_response() {
     .expect("trace export reaches the blocked collector");
     let (blocked_traces, blocked_logs) = fixture.receiver.captured_requests();
     assert!(!blocked_traces.is_empty(), "a trace export is blocked");
+    // The generic completion event is local-only, and this success path emits no other logs.
+    // A future remotely eligible webhook log intentionally breaks this zero-export invariant.
     assert!(
         blocked_logs.is_empty(),
         "local-only webhook completion logs must not reach the blocked collector"
