@@ -18,6 +18,11 @@ const REQUIRED_METRICS: [&str; 15] = [
     "github_telemetry_export_failures_total",
     "github_telemetry_dropped_records_total",
 ];
+const GLOBAL_METRICS: [&str; 3] = [
+    "github_repository_configurations",
+    "github_telemetry_export_failures_total",
+    "github_telemetry_dropped_records_total",
+];
 const REQUIRED_ROWS: [&str; 4] = [
     "Operational overview",
     "Webhook details",
@@ -60,13 +65,16 @@ fn dashboard_has_stable_identity_variables_and_rows() {
     let variables = dashboard["templating"]["list"]
         .as_array()
         .expect("dashboard must define a templating list");
-    for name in ["datasource", "job", "instance"] {
-        assert!(
-            variables.iter().any(|variable| variable["name"] == name),
-            "missing template variable {name}"
-        );
-    }
-    for name in ["job", "instance"] {
+    let variable_names: Vec<&str> = variables
+        .iter()
+        .filter_map(|variable| variable["name"].as_str())
+        .collect();
+    assert_eq!(
+        variable_names,
+        ["datasource", "job", "instance", "repository"],
+        "variables must follow their query dependency order"
+    );
+    for name in ["job", "instance", "repository"] {
         let variable = variables
             .iter()
             .find(|variable| variable["name"] == name)
@@ -76,6 +84,21 @@ fn dashboard_has_stable_identity_variables_and_rows() {
             "{name} must support multiple values"
         );
         assert_eq!(variable["includeAll"], true, "{name} must support All");
+    }
+    let repository_query = variables
+        .iter()
+        .find(|variable| variable["name"] == "repository")
+        .and_then(|variable| variable["query"]["query"].as_str())
+        .expect("repository variable must define a query");
+    assert!(
+        repository_query.contains("github_webhook_requests_total"),
+        "repository values must come from a repository-labelled metric"
+    );
+    for filter in ["job=~\"$job\"", "instance=~\"$instance\""] {
+        assert!(
+            repository_query.contains(filter),
+            "repository query must include dependent filter {filter}"
+        );
     }
 
     let row_titles: Vec<&str> = dashboard["panels"]
@@ -113,6 +136,15 @@ fn every_prometheus_target_is_filtered_and_uses_the_selected_datasource() {
         assert!(
             expression.contains("instance=~\"$instance\""),
             "target must filter by instance: {expression}"
+        );
+
+        let uses_global_metric = GLOBAL_METRICS
+            .iter()
+            .any(|metric| expression.contains(metric));
+        assert_eq!(
+            expression.contains("repository=~\"$repository\""),
+            !uses_global_metric,
+            "repository filtering must match metric scope: {expression}"
         );
     }
 }
