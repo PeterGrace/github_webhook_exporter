@@ -88,6 +88,33 @@ def require_fragment(file_path: str, fragment: str) -> None:
     if normalized_fragment not in normalized_contents:
         fail(f"missing required documentation reference in {file_path}: {fragment}")
 
+with open("Dockerfile", encoding="utf-8") as file_handle:
+    dockerfile = file_handle.read()
+
+required_dockerfile_fragments = (
+    "cargo install cargo-chef --version 0.1.71 --locked",
+    "FROM chef AS planner",
+    "cargo chef prepare --recipe-path recipe.json",
+    "FROM chef AS builder",
+    "COPY --from=planner /build/recipe.json recipe.json",
+    "cargo chef cook --locked --release --recipe-path recipe.json",
+    "cargo build --locked --release",
+)
+for fragment in required_dockerfile_fragments:
+    if fragment not in dockerfile:
+        fail(f"Dockerfile is missing cache contract: {fragment}")
+
+if dockerfile.count("cargo build --locked --release") != 1:
+    fail("Dockerfile must compile the application exactly once")
+if dockerfile.index("cargo chef cook --locked --release") > dockerfile.rindex(
+    "COPY migrations/ migrations/"
+):
+    fail("Dockerfile must cook dependencies before copying application inputs")
+if dockerfile.index("cargo build --locked --release") > dockerfile.index(
+    "ARG SOURCE_DATE_EPOCH=0"
+):
+    fail("SOURCE_DATE_EPOCH must not invalidate application compilation")
+
 
 shared_release_fragments = (
     "ghcr.io/petergrace/github-webhook-exporter",
