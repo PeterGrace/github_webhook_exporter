@@ -1,0 +1,64 @@
+# How to configure remote telemetry
+
+Structured stderr logging is always on and needs no configuration. Remote trace and log export
+over OTLP/HTTP is optional and off by default — it starts only once you set one of the endpoint
+variables below.
+
+## Point at a single collector for both signals
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://collector.example.test:4318
+export OTEL_EXPORTER_OTLP_TIMEOUT=10000
+github_webhook_exporter
+```
+
+The generic endpoint gets `/v1/traces` and `/v1/logs` appended automatically. HTTPS endpoints use
+the bundled `rustls` client, so you don't need OpenSSL in the runtime image.
+
+## Route traces and logs to different collectors
+
+Set each signal's endpoint to its *complete* URL, including the path:
+
+```bash
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://traces.example.test:4318/v1/traces
+export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=https://logs.example.test:4318/v1/logs
+```
+
+## Send auth headers to the collector
+
+Keep the encoded header value out of scripts and shell history where you can — read it from the
+operator's environment instead:
+
+```bash
+: "${OTEL_EXPORTER_OTLP_HEADERS:?set OTEL_EXPORTER_OTLP_HEADERS in the operator shell}"
+export OTEL_EXPORTER_OTLP_HEADERS
+```
+
+Set a signal-specific header variable (`OTEL_EXPORTER_OTLP_TRACES_HEADERS` or
+`_LOGS_HEADERS`) to override just that signal's headers, or set it to an explicitly empty value to
+clear the inherited generic headers for that signal only.
+
+## Under Helm
+
+Add the header value as a key on the Secret you already created for `master-key` and
+`admin-token`, then reference it from `existingSecret.*` — see the
+[chart README](https://github.com/PeterGrace/github_webhook_exporter/blob/main/charts/github-webhook-exporter/README.md)
+for the exact key names the chart projects as `OTEL_EXPORTER_OTLP_*` variables.
+
+## Tune the export queue
+
+Each enabled signal gets its own non-blocking bounded queue. Raise `GHE_OTEL_QUEUE_CAPACITY` if
+you're seeing `queue_full` drops under load, and keep `GHE_OTEL_BATCH_SIZE` at or below it. See
+[Remote telemetry export](../reference/telemetry.md) for defaults, the full failure/drop reason
+vocabulary, and what to alert on.
+
+## Confirm it's working
+
+```bash
+curl --silent http://localhost:8080/metrics | grep github_telemetry
+```
+
+`github_telemetry_export_failures_total` and `github_telemetry_dropped_records_total` should both
+be absent or zero. If they're not, [Remote telemetry export](../reference/telemetry.md) explains
+what each `reason` label means and which ones indicate a collector problem versus a tuning
+problem.

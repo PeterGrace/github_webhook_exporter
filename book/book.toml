@@ -1,0 +1,20 @@
+[book]
+title = "GitHub Webhook Exporter"
+description = "Turn GitHub webhook deliveries into bounded-cardinality Prometheus metrics and OpenTelemetry traces, without persisting payloads."
+authors = ["Peter Grace"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/PeterGrace/github_webhook_exporter"
+edit-url-template = "https://github.com/PeterGrace/github_webhook_exporter/edit/main/book/{path}"
+default-theme = "light"
+preferred-dark-theme = "navy"
+
+[output.html.search]
+enable = true
+limit-results = 20
+
+[output.html.fold]
+enable = true
+level = 1

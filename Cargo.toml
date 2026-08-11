@@ -6,8 +6,8 @@ authors = ["Peter Grace <pete.grace@gmail.com>"]
 
 # Keep the Helm chart in lockstep with the crate; scripts/release-version.sh
 # rejects a release tag whose Cargo, chart, and appVersion values disagree. The
-# chart README carries pinned install examples, so those are rewritten too; the
-# test suites derive the version instead of hard-coding it.
+# chart README and docs book carry pinned install examples, so those are
+# rewritten too; the test suites derive the version instead of hard-coding it.
 [package.metadata.release]
 pre-release-replacements = [
     { file = "charts/github-webhook-exporter/Chart.yaml", search = "(?m)^version: .*$", replace = "version: {{version}}", exactly = 1 },
@@ -16,10 +16,12 @@ pre-release-replacements = [
     { file = "charts/github-webhook-exporter/README.md", search = "--version [0-9]+\\.[0-9]+\\.[0-9]+", replace = "--version {{version}}", min = 1 },
     { file = "charts/github-webhook-exporter/README.md", search = "github-webhook-exporter-[0-9]+\\.[0-9]+\\.[0-9]+\\.tgz", replace = "github-webhook-exporter-{{version}}.tgz", min = 1 },
     { file = "charts/github-webhook-exporter/README.md", search = "currently `[0-9]+\\.[0-9]+\\.[0-9]+`", replace = "currently `{{version}}`", exactly = 1 },
-    { file = "docs/operations.md", search = "github-webhook-exporter:[0-9]+\\.[0-9]+\\.[0-9]+", replace = "github-webhook-exporter:{{version}}", min = 1 },
-    { file = "docs/operations.md", search = "--version [0-9]+\\.[0-9]+\\.[0-9]+", replace = "--version {{version}}", min = 1 },
-    { file = "docs/operations.md", search = "github-webhook-exporter-[0-9]+\\.[0-9]+\\.[0-9]+\\.tgz", replace = "github-webhook-exporter-{{version}}.tgz", min = 1 },
-    { file = "docs/operations.md", search = "version fields are `[0-9]+\\.[0-9]+\\.[0-9]+`", replace = "version fields are `{{version}}`", exactly = 1 },
+    { file = "book/src/reference/release-and-packaging.md", search = "github-webhook-exporter:[0-9]+\\.[0-9]+\\.[0-9]+", replace = "github-webhook-exporter:{{version}}", min = 1 },
+    { file = "book/src/reference/release-and-packaging.md", search = "--version [0-9]+\\.[0-9]+\\.[0-9]+", replace = "--version {{version}}", min = 1 },
+    { file = "book/src/reference/release-and-packaging.md", search = "github-webhook-exporter-[0-9]+\\.[0-9]+\\.[0-9]+\\.tgz", replace = "github-webhook-exporter-{{version}}.tgz", min = 1 },
+    { file = "book/src/reference/release-and-packaging.md", search = "version fields are `[0-9]+\\.[0-9]+\\.[0-9]+`", replace = "version fields are `{{version}}`", exactly = 1 },
+    { file = "book/src/tutorials/getting-started.md", search = "github-webhook-exporter:[0-9]+\\.[0-9]+\\.[0-9]+", replace = "github-webhook-exporter:{{version}}", exactly = 1 },
+    { file = "book/src/how-to/deploy-with-helm.md", search = "--version [0-9]+\\.[0-9]+\\.[0-9]+", replace = "--version {{version}}", min = 1 },
     { file = "README.md", search = "github-webhook-exporter:[0-9]+\\.[0-9]+\\.[0-9]+", replace = "github-webhook-exporter:{{version}}", exactly = 1 },
     { file = "README.md", search = "--version [0-9]+\\.[0-9]+\\.[0-9]+", replace = "--version {{version}}", exactly = 1 },
 ]

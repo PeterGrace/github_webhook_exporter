@@ -8,7 +8,8 @@
 > It is kept because the changelog and the superseding design cite it. Parts of it were never built
 > as described, and the text below is deliberately left as written rather than corrected, with
 > divergences from the implementation flagged inline. For current behavior see
-> [`README.md`](../README.md) and [`docs/operations.md`](operations.md).
+> [`README.md`](../README.md) and the
+> [documentation site](https://petergrace.github.io/github_webhook_exporter/).
 
 ## Objective
 
