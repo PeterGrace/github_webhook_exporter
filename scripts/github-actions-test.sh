@@ -187,7 +187,7 @@ shared_release_fragments = (
 
 for file_path in (
     "charts/github-webhook-exporter/README.md",
-    "docs/operations.md",
+    "book/src/reference/release-and-packaging.md",
 ):
     require_fragment(file_path, "just helm-static")
     require_fragment(file_path, "just image-smoke")
@@ -200,20 +200,20 @@ for file_path in (
     for fragment in shared_release_fragments:
         require_fragment(file_path, fragment)
 
-require_fragment("docs/operations.md", "`just helm-render` first")
-require_fragment("docs/operations.md", "Image state")
-require_fragment("docs/operations.md", "Chart state")
+require_fragment("book/src/reference/release-and-packaging.md", "`just helm-render` first")
+require_fragment("book/src/reference/release-and-packaging.md", "Image state")
+require_fragment("book/src/reference/release-and-packaging.md", "Chart state")
 require_fragment(
-    "docs/operations.md",
+    "book/src/reference/release-and-packaging.md",
     "If validation fails, rerun the original failed workflow attempt without moving the tag.",
 )
 require_fragment(
-    "docs/operations.md",
+    "book/src/reference/release-and-packaging.md",
     "chart-only registry state fails closed without overwrite.",
 )
-require_fragment("docs/operations.md", "Existing image tags are never overwritten.")
+require_fragment("book/src/reference/release-and-packaging.md", "Existing image tags are never overwritten.")
 require_fragment(
-    "docs/operations.md",
+    "book/src/reference/release-and-packaging.md",
     (
         "An exact matching existing image permits chart-only recovery only when "
         "the chart is absent."

@@ -319,8 +319,8 @@ pre-restore file until those checks pass.
 
 The chart does not automate backup scheduling or external retention. `helm rollback` does not undo
 SQLite migrations, PVC-template changes, or incompatible application downgrades. See
-[Service Operations](../../docs/operations.md#back-up-sqlite-online) for detailed recovery checks
-and troubleshooting.
+[How to back up and restore SQLite](https://petergrace.github.io/github_webhook_exporter/how-to/back-up-and-restore.html)
+for detailed recovery checks and troubleshooting.
 
 ## Exposure and network boundaries
 
