@@ -1,6 +1,6 @@
 # How to release a new version
 
-This takes a clean `main` to a published version tag. Releases go through
+This takes a clean, current `main` to a published version tag. Releases go through
 [`cargo-release`](https://github.com/crate-ci/cargo-release) and land via a pull request, because
 a repository ruleset forbids direct pushes to `main`.
 
@@ -17,7 +17,8 @@ a repository ruleset forbids direct pushes to `main`.
 just release-patch
 ```
 
-This bumps the crate version; rewrites `version` and `appVersion` in
+The preparation script first fetches `origin/main` and stops unless local `main` is exactly current.
+It then bumps the crate version; rewrites `version` and `appVersion` in
 `charts/github-webhook-exporter/Chart.yaml` to match; rewrites the pinned version strings in
 `README.md`, `charts/github-webhook-exporter/README.md`, and
 [Release and packaging](../reference/release-and-packaging.md) to match; commits the result; and
@@ -42,12 +43,16 @@ git tag --points-at HEAD
 just release-ship
 ```
 
-This pushes the release commit to `release/<tag>`, opens a pull request against `main`, merges it,
-and pushes the tag on its own once the merge lands. It finishes by fast-forwarding your local
-`main` onto the merge commit.
+This fetches `origin/main` again and verifies that the release commit's parent is still the current
+remote tip. It then pushes the release commit to `release/<tag>`, opens a pull request against
+`main`, and merges it. After GitHub reports the exact release-PR merge commit, the script moves the
+local annotated tag from the cargo-release commit to that merge commit and publishes the tag. It
+finishes by fast-forwarding local `main`.
 
-The script refuses to run unless you're on `main` with a clean tree and `HEAD` carries a tag, and
-it validates that tag against the Cargo and chart versions via `scripts/release-version.sh`.
+The script refuses to run unless you're on `main` with a clean tree, `HEAD` carries a tag, the
+release commit has exactly one parent equal to current `origin/main`, and the tag does not already
+exist remotely. It validates the tag against the Cargo and chart versions via
+`scripts/release-version.sh` before changing any remote refs.
 
 Pushing the tag triggers the tag job in `.github/workflows/helm-package-ci.yml`, which packages
 and publishes the image and chart — see
@@ -82,9 +87,14 @@ no bypass, including for repository admins — that's also why the tag appears r
 with it. Run `just release-ship` instead of pushing by hand; if the release commit and tag already
 exist locally, it picks them up as-is.
 
-## Why the tag is pushed after the merge
+## Why the tag names the release PR merge commit
 
-Tags aren't protected — only `main` is gated — so the tag goes last, once it names a commit
-already reachable from `main`. The ruleset permits only the `merge` method, so the release commit
-survives as a parent of the merge commit rather than being rewritten, and the tag stays valid. Full
-rationale: [`changelog/2026-08-10T11-14-38Z-pr-gated-release-flow.md`](https://github.com/PeterGrace/github_webhook_exporter/blob/main/changelog/2026-08-10T11-14-38Z-pr-gated-release-flow.md).
+Tags aren't protected — only `main` is gated — so the tag goes last. `cargo-release` initially
+creates it on the local version-bump commit, but that commit can become stale if another pull
+request lands while the release is being prepared. GitHub's merge commit combines the current base
+with the release commit, so `release-ship.sh` retargets the annotation to the exact merge commit
+reported for the release PR before pushing it. The published image and chart therefore come from
+the tree that actually landed on `main`, including changes merged before the release PR.
+
+The ruleset permits only the `merge` method, so the cargo-release commit remains an ancestor of the
+tagged merge commit. The script verifies that ancestry before publication.

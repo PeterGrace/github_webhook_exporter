@@ -323,6 +323,7 @@ expected_validate_steps = [
     },
     {"uses": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"},
     {"run": "just workflow-test"},
+    {"run": "just release-flow-test"},
     {"run": "mapfile -t shell_files < <(git ls-files -- '*.sh')\nshellcheck \"${shell_files[@]}\"\n"},
     {"run": "just helm-static"},
     {"uses": "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f"},
