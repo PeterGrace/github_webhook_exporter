@@ -67,9 +67,9 @@ every reported step as a span; over-limit jobs emit no partial trace and increme
 
 Each accepted projection creates an independent `github.workflow.job` root, with a trace identity
 unrelated to the live `http.request` trace. Every projected step is a direct `github.workflow.step`
-child; payload-provided names never become span names. The service creates no workflow-run root,
-persists no workflow data, and does not correlate jobs across deliveries or mutate merge-queue
-state for a `workflow_job` event.
+child; payload-provided names never become span names. The service creates no workflow-run root and does not mutate merge-queue state for a
+`workflow_job` event. It persists only bounded workflow-run correlation metadata keyed by
+repository, run ID, and run attempt; these records use the processed-delivery retention cutoff.
 
 **Timing.** A job uses its exact RFC 3339 `started_at`/`completed_at` only when both parse and
 start is not after completion (`timing_source=reported`); otherwise it's instantaneous at a valid
@@ -84,16 +84,29 @@ marked `fallback`.
 OpenTelemetry status OK; `failure` and `timed_out` set error status with a fixed description; all
 other conclusions leave status unset. Raw unknown conclusions are discarded.
 
-**Identifiers.** The workflow root carries only these validated span-only identifiers: canonical
-repository name, delivery UUID, workflow run ID, positive run attempt, workflow job ID, valid full
-head SHA, and at most the first 20 positive pull-request numbers. Run ID is exported as both
+**Identifiers and run context.** The workflow root carries only these validated span-only
+identifiers: canonical repository name, delivery UUID, workflow run ID, positive run attempt,
+workflow job ID, valid full head SHA, and at most the first 20 positive pull-request numbers. Run ID
+is exported as both
 `cicd.pipeline.run.id` and `github.workflow.run.id`. Job ID is exported as a decimal string under
 both `github.workflow.job.id` and the root's `cicd.pipeline.task.run.id`; each step's
 `cicd.pipeline.task.run.id` is `<job-id>:<positive-step-number>`. Workflow, job, and step display
 names are span-only, sanitized by removing all Unicode control characters and keeping at most the
 first 128 remaining Unicode scalar values; an empty result is omitted.
 
-Commands, output, logs, actors, raw or derived URLs, request bodies, arbitrary payload fragments,
+An earlier authenticated `workflow_run` delivery supplies the authoritative normalized
+`github.workflow.event` and sanitized `github.workflow.source_branch` and
+`github.workflow.target_branch`. Correlation uses repository, run ID, and run attempt. The event is
+`pull_request`, `merge_group`, `push`, or `other`; branches remove control characters and retain at
+most 255 Unicode scalar values. Missing or ambiguous branches are omitted. The same available
+context is attached to the job root and every step.
+
+The job root also carries `github.workflow.job.url`, derived only from the validated repository,
+run ID, and job ID. Each step carries `github.workflow.step.url`, which appends GitHub's
+`#step:<step-number>:1` log anchor. Payload-provided URLs remain ignored. Derived URLs are span-only
+and never enter logs or metrics.
+
+Commands, output, logs, actors, payload-provided URLs, request bodies, arbitrary payload fragments,
 secrets, signatures, authorization/other headers, unsupported actions, and raw unknown conclusions
 never enter workflow telemetry, in traces, logs, or metrics. The one exception is a parentless
 structured warning on a newly claimed `too_many_steps` rejection, which may contain only

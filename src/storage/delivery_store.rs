@@ -35,6 +35,10 @@ impl DeliveryStore {
         Self { pool }
     }
 
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     /// Atomically claims a delivery identifier without changing an existing receipt time.
     ///
     /// A committed claim is durable across restarts. A process crash after this method returns

@@ -15,7 +15,7 @@ use time::OffsetDateTime;
 use tracing::{debug, error, warn, Instrument};
 
 use crate::{
-    api::{merge_group::EventProjection, pull_request::QueueProcessor, workflow_job},
+    api::{merge_group::EventProjection, pull_request::QueueProcessor, workflow_job, workflow_run},
     app::{AppState, RequestRepositoryContext},
     domain::delivery::DeliveryId,
     error::AppError,
@@ -166,6 +166,21 @@ async fn webhook_handler(
                     action,
                     request.body.len(),
                 );
+                if event_type == EventType::WorkflowRun {
+                    if let Some(context) = workflow_run::project_context(request.body.as_ref()) {
+                        state
+                            .workflow_run_store()
+                            .upsert(repository_id, &context)
+                            .await
+                            .map_err(|_| {
+                                unavailable_error(
+                                    &state,
+                                    Some(&request.repository_name),
+                                    FailureStage::Database,
+                                )
+                            })?;
+                    }
+                }
                 if event_type == EventType::WorkflowJob && action == Action::Completed {
                     if let Some(admission) =
                         workflow_job::inspect_completed_job(request.body.as_ref())
@@ -183,13 +198,27 @@ async fn webhook_handler(
                                 &admission,
                                 step_limit,
                             );
-                        } else if let Some(workflow_trace) = workflow_job::project_completed_job(
-                            request.body.as_ref(),
-                            &request.repository_name,
-                            &request.delivery_id,
-                            received_at,
-                        ) {
-                            state.workflow_trace_emitter().emit(&workflow_trace);
+                        } else {
+                            let workflow_run_context = state
+                                .workflow_run_store()
+                                .get(repository_id, admission.run_id(), admission.run_attempt())
+                                .await
+                                .map_err(|_| {
+                                    unavailable_error(
+                                        &state,
+                                        Some(&request.repository_name),
+                                        FailureStage::Database,
+                                    )
+                                })?;
+                            if let Some(workflow_trace) = workflow_job::project_completed_job(
+                                request.body.as_ref(),
+                                &request.repository_name,
+                                &request.delivery_id,
+                                received_at,
+                                workflow_run_context,
+                            ) {
+                                state.workflow_trace_emitter().emit(&workflow_trace);
+                            }
                         }
                     }
                 }

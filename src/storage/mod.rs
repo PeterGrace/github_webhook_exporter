@@ -1,6 +1,7 @@
 mod delivery_store;
 mod merge_queue_store;
 mod repository_store;
+mod workflow_run_store;
 
 use std::{fs::OpenOptions, io, path::Path, time::Duration};
 
@@ -18,6 +19,7 @@ use sqlx::{
     SqlitePool,
 };
 use thiserror::Error;
+pub(crate) use workflow_run_store::{WorkflowRunStore, WorkflowRunStoreError};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 

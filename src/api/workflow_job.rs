@@ -19,8 +19,8 @@ use crate::{
         trace::CommitSha,
         workflow::{
             DisplayName, HistoricalTiming, WorkflowConclusion, WorkflowJobId, WorkflowJobTrace,
-            WorkflowJobTraceParts, WorkflowPullRequests, WorkflowRunAttempt, WorkflowRunId,
-            WorkflowStepTrace,
+            WorkflowJobTraceParts, WorkflowPullRequests, WorkflowRunAttempt, WorkflowRunContext,
+            WorkflowRunId, WorkflowStepTrace,
         },
     },
 };
@@ -214,6 +214,7 @@ pub(crate) fn project_completed_job(
     repository_name: &CanonicalRepositoryName,
     delivery_id: &DeliveryId,
     received_at: OffsetDateTime,
+    workflow_run_context: Option<WorkflowRunContext>,
 ) -> Option<WorkflowJobTrace> {
     let received_at = offset_datetime_to_system_time(received_at)?;
     let envelope: WorkflowJobEnvelope = serde_json::from_slice(body).ok()?;
@@ -234,6 +235,8 @@ pub(crate) fn project_completed_job(
     let run_id = WorkflowRunId::new(run_id).ok()?;
     let run_attempt = WorkflowRunAttempt::new(run_attempt).ok()?;
     let job_id = WorkflowJobId::new(id).ok()?;
+    let workflow_run_context = workflow_run_context
+        .filter(|context| context.run_id() == run_id && context.run_attempt() == run_attempt);
     let timing = select_job_timing(
         parse_timestamp(started_at.as_ref()),
         parse_timestamp(completed_at.as_ref()),
@@ -273,6 +276,7 @@ pub(crate) fn project_completed_job(
                 .filter_map(|value| PullRequestNumber::new(value.number).ok())
                 .take(20),
         ),
+        workflow_run_context,
         timing,
         steps: projected_steps,
     }))
@@ -360,7 +364,10 @@ mod tests {
     use crate::{
         domain::delivery::DeliveryId,
         security::CanonicalRepositoryName,
-        telemetry::workflow::{TimingSource, WorkflowConclusion},
+        telemetry::workflow::{
+            TimingSource, WorkflowBranch, WorkflowConclusion, WorkflowEvent, WorkflowRunAttempt,
+            WorkflowRunContext, WorkflowRunId,
+        },
     };
 
     fn repository_name() -> CanonicalRepositoryName {
@@ -376,7 +383,13 @@ mod tests {
         received_at: OffsetDateTime,
     ) -> Option<crate::telemetry::workflow::WorkflowJobTrace> {
         let bytes = serde_json::to_vec(&body).expect("fixture JSON serializes");
-        project_completed_job(&bytes, &repository_name(), &delivery_id(), received_at)
+        project_completed_job(
+            &bytes,
+            &repository_name(),
+            &delivery_id(),
+            received_at,
+            None,
+        )
     }
 
     fn project_fixture(body: Value) -> Option<crate::telemetry::workflow::WorkflowJobTrace> {
@@ -574,6 +587,47 @@ mod tests {
         assert_eq!(
             trace.steps()[0].name().map(|value| value.as_str()),
             Some("Checkout")
+        );
+    }
+
+    #[test]
+    fn completed_projection_retains_matching_workflow_run_context() {
+        let body = serde_json::to_vec(&json!({
+            "workflow_job": {
+                "id": 41,
+                "run_id": 31,
+                "run_attempt": 2,
+                "completed_at": "2026-08-06T10:05:00Z",
+                "steps": []
+            }
+        }))
+        .expect("fixture serializes");
+        let context = WorkflowRunContext::new(
+            WorkflowRunId::new(31).expect("run id is positive"),
+            WorkflowRunAttempt::new(2).expect("attempt is positive"),
+            WorkflowEvent::MergeGroup,
+            WorkflowBranch::sanitize("gh-readonly-queue/main/pr-7"),
+            WorkflowBranch::sanitize("main"),
+        );
+
+        let trace = project_completed_job(
+            &body,
+            &repository_name(),
+            &delivery_id(),
+            datetime!(2026-08-06 10:06:00 UTC),
+            Some(context),
+        )
+        .expect("valid completed job projects");
+
+        let retained = trace.workflow_run_context().expect("context is retained");
+        assert_eq!(retained.event(), WorkflowEvent::MergeGroup);
+        assert_eq!(
+            retained.source_branch().map(|branch| branch.as_str()),
+            Some("gh-readonly-queue/main/pr-7")
+        );
+        assert_eq!(
+            retained.target_branch().map(|branch| branch.as_str()),
+            Some("main")
         );
     }
 

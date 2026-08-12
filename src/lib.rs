@@ -16,11 +16,11 @@ pub mod health;
 pub mod lifecycle;
 /// Bounded Prometheus instruments and label normalization.
 pub mod metrics;
-/// Scheduled processed-delivery and completed merge-queue-attempt retention.
+/// Scheduled delivery, workflow-run context, and completed merge-queue-attempt retention.
 pub mod retention;
 /// Cryptographic and administrative-authentication security primitives.
 pub mod security;
-/// SQLite startup, migrations, probes, and durable repository, delivery, and queue persistence.
+/// SQLite startup, migrations, probes, and durable repository, delivery, workflow, and queue state.
 pub mod storage;
 /// Independent structured stderr logging and optional bounded OTLP trace/log export and shutdown.
 pub mod telemetry;

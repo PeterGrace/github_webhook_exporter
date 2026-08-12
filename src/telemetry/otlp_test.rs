@@ -161,6 +161,11 @@ const SPAN_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "github.workflow.run.id",
     "github.workflow.run.attempt",
     "github.workflow.job.id",
+    "github.workflow.event",
+    "github.workflow.source_branch",
+    "github.workflow.target_branch",
+    "github.workflow.job.url",
+    "github.workflow.step.url",
     "timing_source",
     "db.system.name",
     "db.operation.name",
@@ -2614,6 +2619,7 @@ async fn shutdown_exports_accepted_core_workflow_and_log_records() {
 async fn workflow_job_completed_exports_one_independent_historical_trace() {
     let fixture = WebhookTraceFixture::new().await;
     let delivery_id = "550e8400-e29b-41d4-a716-446655440207";
+    let workflow_run_delivery_id = "550e8400-e29b-41d4-a716-446655440208";
     let job_started_at = "2026-08-06T10:00:00.123456789Z";
     let first_step_started_at = "2026-08-06T10:00:01.000000001Z";
     let first_step_completed_at = "2026-08-06T10:00:02.000000002Z";
@@ -2623,6 +2629,32 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
     let pull_requests = (1..=25)
         .map(|number| serde_json::json!({"number": number}))
         .collect::<Vec<_>>();
+    let workflow_run_body = serde_json::to_vec(&serde_json::json!({
+        "action": "requested",
+        "workflow_run": {
+            "id": 31,
+            "run_attempt": 2,
+            "event": "merge_group",
+            "head_branch": "gh-readonly-queue/main/pr-7-deadbeef",
+            "pull_requests": [{
+                "head": {"ref": "feature/source"},
+                "base": {"ref": "main"}
+            }]
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("workflow-run payload serializes");
+    let workflow_run_response = fixture
+        .webhook(
+            &workflow_run_body,
+            "workflow_run",
+            workflow_run_delivery_id,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(workflow_run_response.status(), StatusCode::NO_CONTENT);
+    drop(workflow_run_response);
+
     let body = serde_json::to_vec(&serde_json::json!({
         "action": "completed",
         "workflow_job": {
@@ -2685,6 +2717,18 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
     assert_attribute(job, "github.workflow.run.id", "31");
     assert_attribute(job, "github.workflow.run.attempt", "2");
     assert_attribute(job, "github.workflow.job.id", "41");
+    assert_attribute(job, "github.workflow.event", "merge_group");
+    assert_attribute(
+        job,
+        "github.workflow.source_branch",
+        "gh-readonly-queue/main/pr-7-deadbeef",
+    );
+    assert_attribute(job, "github.workflow.target_branch", "main");
+    assert_attribute(
+        job,
+        "github.workflow.job.url",
+        &format!("https://github.com/{WEBHOOK_REPOSITORY}/actions/runs/31/job/41"),
+    );
     assert_attribute(job, "github.workflow.conclusion", "success");
     assert_attribute(job, "cicd.pipeline.result", "success");
     assert_attribute(job, "timing_source", "reported");
@@ -2714,6 +2758,18 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
     );
     assert_attribute(steps[0], "cicd.pipeline.task.name", "RunTests");
     assert_attribute(steps[0], "github.workflow.conclusion", "success");
+    assert_attribute(steps[0], "github.workflow.event", "merge_group");
+    assert_attribute(
+        steps[0],
+        "github.workflow.source_branch",
+        "gh-readonly-queue/main/pr-7-deadbeef",
+    );
+    assert_attribute(steps[0], "github.workflow.target_branch", "main");
+    assert_attribute(
+        steps[0],
+        "github.workflow.step.url",
+        &format!("https://github.com/{WEBHOOK_REPOSITORY}/actions/runs/31/job/41#step:2:1"),
+    );
     assert_attribute(steps[0], "cicd.pipeline.task.run.result", "success");
     assert_attribute(steps[0], "timing_source", "reported");
     assert_eq!(
@@ -2726,6 +2782,12 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
     );
     assert_attribute(steps[1], "cicd.pipeline.task.name", "Checkout");
     assert_attribute(steps[1], "github.workflow.conclusion", "success");
+    assert_attribute(steps[1], "github.workflow.event", "merge_group");
+    assert_attribute(
+        steps[1],
+        "github.workflow.step.url",
+        &format!("https://github.com/{WEBHOOK_REPOSITORY}/actions/runs/31/job/41#step:1:1"),
+    );
     assert_attribute(steps[1], "cicd.pipeline.task.run.result", "success");
     assert_attribute(steps[1], "timing_source", "reported");
     assert_eq!(
@@ -2738,6 +2800,79 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
     );
 
     captured.assert_approved_attribute_keys();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_request_workflow_context_enriches_job_and_step_spans() {
+    let fixture = WebhookTraceFixture::new().await;
+    let run_body = serde_json::to_vec(&serde_json::json!({
+        "action": "in_progress",
+        "workflow_run": {
+            "id": 73,
+            "run_attempt": 1,
+            "event": "pull_request",
+            "head_branch": "feature/otlp-context",
+            "pull_requests": [{
+                "head": {"ref": "feature/otlp-context"},
+                "base": {"ref": "main"}
+            }]
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("workflow-run payload serializes");
+    let run_response = fixture
+        .webhook(
+            &run_body,
+            "workflow_run",
+            "550e8400-e29b-41d4-a716-446655440209",
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(run_response.status(), StatusCode::NO_CONTENT);
+    drop(run_response);
+
+    let job_body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 7301,
+            "run_id": 73,
+            "run_attempt": 1,
+            "conclusion": "failure",
+            "steps": [{"number": 4, "conclusion": "failure"}]
+        }),
+    );
+    let job_delivery = "550e8400-e29b-41d4-a716-446655440210";
+    let job_response = fixture
+        .webhook(&job_body, "workflow_job", job_delivery, WEBHOOK_SECRET)
+        .await;
+    assert_eq!(job_response.status(), StatusCode::NO_CONTENT);
+    drop(job_response);
+
+    let captured = fixture.force_flush();
+    let job = captured.workflow_job_for_delivery(job_delivery);
+    let step = captured
+        .children(job)
+        .find(|span| span.name == "github.workflow.step")
+        .expect("step span is exported");
+    for span in [job, step] {
+        assert_attribute(span, "github.workflow.event", "pull_request");
+        assert_attribute(
+            span,
+            "github.workflow.source_branch",
+            "feature/otlp-context",
+        );
+        assert_attribute(span, "github.workflow.target_branch", "main");
+    }
+    assert_attribute(
+        job,
+        "github.workflow.job.url",
+        &format!("https://github.com/{WEBHOOK_REPOSITORY}/actions/runs/73/job/7301"),
+    );
+    assert_attribute(
+        step,
+        "github.workflow.step.url",
+        &format!("https://github.com/{WEBHOOK_REPOSITORY}/actions/runs/73/job/7301#step:4:1"),
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5051,6 +5186,7 @@ async fn integrated_core_trace_privacy() {
         [
             ("sqlite.query", Some("delivery.prune"), Some("success")),
             ("sqlite.query", Some("merge_queue.prune"), Some("success")),
+            ("sqlite.query", Some("workflow_run.prune"), Some("success")),
         ]
     );
 
