@@ -3683,9 +3683,7 @@ async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_conclusions_export_bounded_results_and_statuses() {
     type ExpectedExceptionEvent = (&'static str, &'static str, &'static str);
-
-    let fixture = WebhookTraceFixture::new().await;
-    let cases: [(
+    type WorkflowConclusionCase = (
         &'static str,
         &'static str,
         &'static str,
@@ -3698,7 +3696,10 @@ async fn workflow_conclusions_export_bounded_results_and_statuses() {
         &'static str,
         Option<ExpectedExceptionEvent>,
         Option<ExpectedExceptionEvent>,
-    ); 7] = [
+    );
+
+    let fixture = WebhookTraceFixture::new().await;
+    let cases: [WorkflowConclusionCase; 7] = [
         (
             "550e8400-e29b-41d4-a716-446655440300",
             "success",
