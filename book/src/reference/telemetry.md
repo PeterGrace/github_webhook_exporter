@@ -69,10 +69,15 @@ prevents a late shutdown worker from exporting a batch after its slots were alre
 dropped, and later records are rejected and counted the same way. Trace and log provider shutdown
 begin concurrently and share the single `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` deadline. A failed
 provider is counted with normalized reason `shutdown`; a provider unfinished at the deadline is
-counted with reason `timeout`. When configured, the Sentry error transport closes with the time
-remaining on that same deadline. Either condition uses the same direct, redacted stderr diagnostic
-path and never turns a successful HTTP drain into a process failure. See
-[Startup, retention, and shutdown](lifecycle.md) for the full shutdown sequence.
+counted with reason `timeout`. When configured, Sentry shutdown starts in a separate
+application-owned worker under that same receiver deadline. The caller stops waiting at the
+deadline and never joins a blocked Sentry transport; Sentry HTTP requests use the configured OTLP
+trace request timeout. A Sentry drain failure writes the fixed direct diagnostic
+`signal=sentry reason=shutdown`, while unfinished work writes `signal=sentry reason=timeout`.
+These Sentry diagnostics do not add a third value to the OTLP-only Prometheus `signal` label.
+Every condition uses the direct, redacted stderr path and never turns a successful HTTP drain into
+a process failure. See [Startup, retention, and shutdown](lifecycle.md) for the full shutdown
+sequence.
 
 ## Identifiers
 

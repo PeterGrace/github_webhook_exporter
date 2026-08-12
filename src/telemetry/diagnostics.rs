@@ -107,6 +107,21 @@ impl ExportFailureDetail {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SentryShutdownFailureReason {
+    Shutdown,
+    Timeout,
+}
+
+impl SentryShutdownFailureReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shutdown => "shutdown",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ExportFailureContext {
     status: Option<u16>,
@@ -158,6 +173,11 @@ impl DiagnosticsObserver {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn with_sink(metrics: Metrics, sink: Arc<dyn DiagnosticSink>) -> Self {
+        Self::with_dependencies(metrics, Arc::new(MonotonicClock::default()), sink)
+    }
+
     pub(super) fn export_failure(
         &self,
         signal: TelemetrySignal,
@@ -175,11 +195,16 @@ impl DiagnosticsObserver {
         self.inner
             .metrics
             .record_telemetry_export_failure(signal, reason);
-        let mut line = format!(
-            "telemetry pipeline diagnostic kind=failure signal={} reason={}",
-            signal.as_str(),
-            reason.as_str()
-        );
+        self.write_failure(signal.as_str(), reason.as_str(), context);
+    }
+
+    pub(super) fn sentry_shutdown_failure(&self, reason: SentryShutdownFailureReason) {
+        self.write_failure("sentry", reason.as_str(), ExportFailureContext::default());
+    }
+
+    fn write_failure(&self, signal: &str, reason: &str, context: ExportFailureContext) {
+        let mut line =
+            format!("telemetry pipeline diagnostic kind=failure signal={signal} reason={reason}");
         if let Some(status) = context.status {
             line.push_str(&format!(" status={status}"));
         }

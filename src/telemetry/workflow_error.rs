@@ -12,6 +12,7 @@ use sentry::{
 use super::workflow::{WorkflowConclusion, WorkflowJobTrace, WorkflowStepTrace};
 
 const UNKNOWN_WORKFLOW_NAME: &str = "workflow";
+const UNNAMED_JOB_GROUPING_NAME: &str = "unnamed-job";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WorkflowTaskKind {
@@ -99,6 +100,7 @@ struct WorkflowErrorParts {
     kind: WorkflowTaskKind,
     conclusion: WorkflowConclusion,
     task_name: String,
+    grouping_task_name: String,
     task_run_id: String,
     timestamp: SystemTime,
     trace_id: TraceId,
@@ -111,8 +113,9 @@ pub(super) struct SyntheticWorkflowError {
     description: String,
     repository_name: String,
     workflow_name: String,
-    job_name: String,
     task_name: String,
+    grouping_job_name: String,
+    grouping_task_name: String,
     task_run_id: String,
     conclusion: &'static str,
     timestamp: SystemTime,
@@ -132,12 +135,17 @@ impl SyntheticWorkflowError {
             || format!("task {task_run_id}"),
             |name| name.as_str().to_owned(),
         );
+        let grouping_task_name = step.name().map_or_else(
+            || format!("unnamed-step:{}", step.number()),
+            |name| name.as_str().to_owned(),
+        );
         Self::new(
             job,
             WorkflowErrorParts {
                 kind: WorkflowTaskKind::Step,
                 conclusion: step.conclusion(),
                 task_name,
+                grouping_task_name,
                 task_run_id,
                 timestamp: step.timing().end(),
                 trace_id,
@@ -152,12 +160,17 @@ impl SyntheticWorkflowError {
             || format!("task {task_run_id}"),
             |name| name.as_str().to_owned(),
         );
+        let grouping_task_name = job.job_name().map_or_else(
+            || UNNAMED_JOB_GROUPING_NAME.to_owned(),
+            |name| name.as_str().to_owned(),
+        );
         Self::new(
             job,
             WorkflowErrorParts {
                 kind: WorkflowTaskKind::Job,
                 conclusion: job.conclusion(),
                 task_name,
+                grouping_task_name,
                 task_run_id,
                 timestamp: job.timing().end(),
                 trace_id,
@@ -192,11 +205,12 @@ impl SyntheticWorkflowError {
                 .map_or(UNKNOWN_WORKFLOW_NAME.to_owned(), |name| {
                     name.as_str().to_owned()
                 }),
-            job_name: job.job_name().map_or_else(
-                || format!("task {}", job.job_id().get()),
+            task_name: parts.task_name,
+            grouping_job_name: job.job_name().map_or_else(
+                || UNNAMED_JOB_GROUPING_NAME.to_owned(),
                 |name| name.as_str().to_owned(),
             ),
-            task_name: parts.task_name,
+            grouping_task_name: parts.grouping_task_name,
             task_run_id: parts.task_run_id,
             conclusion: parts.conclusion.as_str(),
             timestamp: parts.timestamp,
@@ -256,19 +270,27 @@ impl SyntheticWorkflowError {
         self.span_id
     }
 
-    pub(super) fn fingerprint(&self) -> [&str; 6] {
+    pub(super) fn fingerprint(&self) -> [&str; 7] {
         [
             "github-actions-task",
+            self.kind.as_str(),
             &self.repository_name,
             &self.workflow_name,
-            &self.job_name,
-            &self.task_name,
+            &self.grouping_job_name,
+            &self.grouping_task_name,
             self.conclusion,
         ]
     }
 }
 
 impl WorkflowTaskKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Job => "job",
+            Self::Step => "step",
+        }
+    }
+
     const fn span_operation(self) -> &'static str {
         match self {
             Self::Job => "github.workflow.job",
@@ -315,6 +337,15 @@ mod tests {
         step_name: Option<&str>,
         conclusion: WorkflowConclusion,
     ) -> WorkflowJobTrace {
+        failure_job_with_id(41, job_name, step_name, conclusion)
+    }
+
+    fn failure_job_with_id(
+        job_id: i64,
+        job_name: Option<&str>,
+        step_name: Option<&str>,
+        conclusion: WorkflowConclusion,
+    ) -> WorkflowJobTrace {
         let timing = HistoricalTiming::fallback(SystemTime::UNIX_EPOCH + Duration::from_secs(20));
         let step = WorkflowStepTrace::new(
             2,
@@ -331,7 +362,7 @@ mod tests {
             workflow_name: DisplayName::sanitize("Build Workflow"),
             run_id: WorkflowRunId::new(31).expect("run id is valid"),
             run_attempt: WorkflowRunAttempt::new(2).expect("run attempt is valid"),
-            job_id: WorkflowJobId::new(41).expect("job id is valid"),
+            job_id: WorkflowJobId::new(job_id).expect("job id is valid"),
             job_name: job_name.and_then(DisplayName::sanitize),
             conclusion,
             head_sha: Some(
@@ -370,6 +401,7 @@ mod tests {
             error.fingerprint(),
             [
                 "github-actions-task",
+                "step",
                 "owner/repository",
                 "Build Workflow",
                 "Linux Job",
@@ -377,6 +409,112 @@ mod tests {
                 "failure",
             ]
         );
+    }
+
+    #[test]
+    fn unnamed_task_grouping_is_stable_across_job_ids() {
+        let first_job = failure_job_with_id(41, None, None, WorkflowConclusion::Failure);
+        let second_job = failure_job_with_id(99, None, None, WorkflowConclusion::Failure);
+        let first_step_error = SyntheticWorkflowError::for_step(
+            &first_job,
+            &first_job.steps()[0],
+            TraceId::from_bytes([1; 16]),
+            SpanId::from_bytes([2; 8]),
+        );
+        let second_step_error = SyntheticWorkflowError::for_step(
+            &second_job,
+            &second_job.steps()[0],
+            TraceId::from_bytes([3; 16]),
+            SpanId::from_bytes([4; 8]),
+        );
+        let first_job_error = SyntheticWorkflowError::for_job(
+            &first_job,
+            TraceId::from_bytes([1; 16]),
+            SpanId::from_bytes([5; 8]),
+        );
+        let second_job_error = SyntheticWorkflowError::for_job(
+            &second_job,
+            TraceId::from_bytes([3; 16]),
+            SpanId::from_bytes([6; 8]),
+        );
+
+        assert_ne!(first_step_error.task_name(), second_step_error.task_name());
+        assert_ne!(first_job_error.task_name(), second_job_error.task_name());
+        assert_eq!(
+            first_step_error.fingerprint(),
+            second_step_error.fingerprint()
+        );
+        assert_eq!(
+            first_step_error.fingerprint(),
+            [
+                "github-actions-task",
+                "step",
+                "owner/repository",
+                "Build Workflow",
+                "unnamed-job",
+                "unnamed-step:2",
+                "failure",
+            ]
+        );
+        assert_eq!(
+            first_job_error.fingerprint(),
+            second_job_error.fingerprint()
+        );
+        assert_eq!(
+            first_job_error.fingerprint(),
+            [
+                "github-actions-task",
+                "job",
+                "owner/repository",
+                "Build Workflow",
+                "unnamed-job",
+                "unnamed-job",
+                "failure",
+            ]
+        );
+
+        let first_named_step_job =
+            failure_job_with_id(41, None, Some("cargo test"), WorkflowConclusion::Failure);
+        let second_named_step_job =
+            failure_job_with_id(99, None, Some("cargo test"), WorkflowConclusion::Failure);
+        let first_named_step_error = SyntheticWorkflowError::for_step(
+            &first_named_step_job,
+            &first_named_step_job.steps()[0],
+            TraceId::from_bytes([7; 16]),
+            SpanId::from_bytes([8; 8]),
+        );
+        let second_named_step_error = SyntheticWorkflowError::for_step(
+            &second_named_step_job,
+            &second_named_step_job.steps()[0],
+            TraceId::from_bytes([9; 16]),
+            SpanId::from_bytes([10; 8]),
+        );
+        assert_eq!(
+            first_named_step_error.fingerprint(),
+            second_named_step_error.fingerprint()
+        );
+    }
+
+    #[test]
+    fn job_and_step_grouping_are_distinct_for_equal_names() {
+        let job = failure_job(
+            Some("shared task"),
+            Some("shared task"),
+            WorkflowConclusion::Failure,
+        );
+        let step_error = SyntheticWorkflowError::for_step(
+            &job,
+            &job.steps()[0],
+            TraceId::from_bytes([1; 16]),
+            SpanId::from_bytes([2; 8]),
+        );
+        let job_error = SyntheticWorkflowError::for_job(
+            &job,
+            TraceId::from_bytes([1; 16]),
+            SpanId::from_bytes([3; 8]),
+        );
+
+        assert_ne!(step_error.fingerprint(), job_error.fingerprint());
     }
 
     #[test]
@@ -411,6 +549,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "github-actions-task",
+                "step",
                 "owner/repository",
                 "Build Workflow",
                 "Linux Job",

@@ -12,4 +12,4 @@
 - Focused GREEN commands now pass for workflow emitter coverage, workflow error coverage, and OTLP serialization coverage.
 
 ## Notes
-- Repository-wide `cargo build`, `cargo clippy -- -D warnings`, and `cargo test` currently surface unrelated pre-existing failures outside this task (`src/telemetry.rs` Sentry client builder API usage and `retention::tests::prune_failure_is_redacted_and_carries_a_correlation_id`).
+- The repository-wide build, Clippy, and test failures observed during this intermediate task were transient. The task-3 validation pass resolved the Clippy/test issues, and the PR #80 final-review fix wave corrected the production Sentry client construction path.
