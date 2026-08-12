@@ -39,7 +39,7 @@ docker run --rm -d --name github-webhook-exporter -p 8080:8080 \
   -e GHE_DATABASE_PATH=/var/lib/github-webhook-exporter/github-webhook-exporter.db \
   -e GHE_MASTER_KEY="${GHE_MASTER_KEY}" \
   -e GHE_ADMIN_TOKEN="${GHE_ADMIN_TOKEN}" \
-  ghcr.io/petergrace/github-webhook-exporter:0.1.3
+  ghcr.io/petergrace/github-webhook-exporter:0.1.4
 ```
 
 Docker prints a long container ID and returns you to the prompt — the container is now running in
