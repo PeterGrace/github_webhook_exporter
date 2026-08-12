@@ -52,6 +52,9 @@ jobs:
       - name: Verify workflow contract
         run: just workflow-test
 
+      - name: Verify release flow contracts
+        run: just release-flow-test
+
       - name: ShellCheck tracked shell scripts
         run: |
           mapfile -t shell_files < <(git ls-files -- '*.sh')

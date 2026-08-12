@@ -49,6 +49,10 @@ helm-security-test:
 release-version-test:
     scripts/release-version-test.sh
 
+# Verify release preparation freshness and merge-commit tag publication.
+release-flow-test:
+    scripts/release-flow-test.sh
+
 # Verify immutable image and Helm chart publication transitions.
 release-publish-test:
     scripts/release-publish-test.sh
@@ -94,7 +98,7 @@ image-smoke-loaded:
 
 # Prepare the patch release commit and tag locally, without pushing.
 release-patch:
-    cargo release --no-publish --no-verify --no-push patch --execute
+    scripts/release-prepare.sh patch
 
 # Land the prepared release commit through a pull request, then publish its tag.
 release-ship:
