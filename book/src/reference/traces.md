@@ -87,6 +87,12 @@ marked `fallback`.
 OpenTelemetry status OK; `failure` and `timed_out` set error status with a fixed description; all
 other conclusions leave status unset. Raw unknown conclusions are discarded.
 
+Sentry SaaS verification on 2026-08-12 confirmed this canonical mapping is sufficient for waterfall
+rendering: successful job and step spans ingest as `sentry.status=ok`, while failed and timed-out
+spans ingest as `sentry.status=error` and display as red-hatched waterfall lines. All retain an
+absent `sentry.status_code`; the exporter deliberately emits no synthetic HTTP status for these
+non-HTTP CI tasks.
+
 Every failed or timed-out step emits one bounded OpenTelemetry `exception` span event. When
 `SENTRY_DSN` is configured, the same historical step also emits one synthetic Sentry error whose
 trace and span IDs match that step. A failed/timed-out job emits a job-level fallback only when no
