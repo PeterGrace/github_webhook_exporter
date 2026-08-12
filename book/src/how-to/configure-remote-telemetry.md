@@ -40,6 +40,11 @@ clear the inherited generic headers for that signal only.
 
 ## Link failed CI tasks to Sentry traces
 
+Canonical OTLP trace export already carries bounded `exception` span events for failed and
+timed-out workflow tasks; no Sentry configuration is required for that representation. `SENTRY_DSN`
+optionally adds a parallel Sentry envelope for native Issue grouping, does not disable the OTLP
+event, and there is no OTLP errors endpoint.
+
 Configure trace export to the Sentry OTLP trace endpoint, then provide the DSN for that same Sentry
 project:
 
@@ -59,9 +64,9 @@ and committed configuration.
 Add the header value as a key on the Secret you already created for `master-key` and
 `admin-token`, then reference it from `existingSecret.*` — see the
 [chart README](https://github.com/PeterGrace/github_webhook_exporter/blob/main/charts/github-webhook-exporter/README.md)
-for the exact key names the chart projects as `OTEL_EXPORTER_OTLP_*` variables. To enable linked
-CI-task errors, add the Sentry DSN to that Secret and set `existingSecret.keys.sentryDsn` to its key
-name.
+for the exact key names the chart projects as `OTEL_EXPORTER_OTLP_*` variables. To enable optional
+linked CI-task errors, add the Sentry DSN to that Secret and set `existingSecret.keys.sentryDsn`
+to its key name.
 
 ## Tune the export queue
 

@@ -11,9 +11,10 @@ created, and local logging remains fully functional. See
 version. Of the values in `OTEL_RESOURCE_ATTRIBUTES`, only `k8s.pod.name` and
 `k8s.namespace.name` are retained. `SENTRY_DSN` optionally enables a separate bounded,
 non-blocking Sentry error transport for failed workflow tasks and requires trace export to the same
-Sentry project. Invalid requested telemetry configuration fails startup with only the variable
-name. Collector latency or unavailability happens on dedicated exporter threads
-and never changes HTTP readiness or request results.
+Sentry project; the canonical OTLP `exception` span events do not require Sentry configuration.
+Invalid requested telemetry configuration fails startup with only the variable name. Collector
+latency or unavailability happens on dedicated exporter threads and never changes HTTP readiness
+or request results.
 
 ## Queue and batching
 
@@ -77,6 +78,7 @@ path and never turns a successful HTTP drain into a process failure. See
 
 Delivery, pull-request, commit, workflow, job, and step identifiers remain span-only except for the
 bounded task identity attached to an enabled synthetic Sentry workflow error — see
-[Traces](traces.md). Canonical repository names additionally appear on repository-scoped
-Prometheus series. None of these identifiers appears in local or OTLP application logs, except the
-one bounded workflow-rejection warning documented in [Traces](traces.md#completed-workflow-traces).
+[Traces](traces.md). Canonical OpenTelemetry `exception` span events do not require `SENTRY_DSN`.
+Canonical repository names additionally appear on repository-scoped Prometheus series. None of
+these identifiers appears in local or OTLP application logs, except the one bounded
+workflow-rejection warning documented in [Traces](traces.md#completed-workflow-traces).

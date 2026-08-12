@@ -1,9 +1,11 @@
 # Traces
 
 Exported over OTLP when [remote telemetry](telemetry.md) is enabled. Identifiers below are
-span-only unless stated otherwise. The exceptions are bounded synthetic Sentry workflow errors and
-the one bounded workflow-rejection warning noted below; neither permits raw payload data, logs,
-commands, output, or secrets.
+span-only unless stated otherwise. Workflow failures and timeouts export bounded OpenTelemetry
+`exception` span events as the canonical representation; `SENTRY_DSN` optionally promotes the same
+failures to synthetic Sentry workflow errors. There is no separate OTLP errors endpoint. The one
+bounded workflow-rejection warning noted below also remains; neither path permits raw payload data,
+logs, commands, output, or secrets.
 
 ## Core service operations
 
@@ -85,14 +87,15 @@ marked `fallback`.
 OpenTelemetry status OK; `failure` and `timed_out` set error status with a fixed description; all
 other conclusions leave status unset. Raw unknown conclusions are discarded.
 
-When `SENTRY_DSN` is configured, every failed or timed-out step also emits one synthetic Sentry
-error whose trace and span IDs match that historical step. A failed/timed-out job emits a job-level
-fallback only when no failed/timed-out child explains it. Exception types are fixed
-(`GitHubActionsTaskFailure` or `GitHubActionsTaskTimeout`); the description includes the sanitized
-task name, or the validated task-run ID when a name is absent. Fingerprints combine the bounded
-repository, workflow, job, task, and conclusion values so repeated failures group by CI task rather
-than workflow run. These events are synthetic and handled, contain no stack trace, logs, commands,
-or output, and use Sentry's bounded non-blocking transport.
+Every failed or timed-out step emits one bounded OpenTelemetry `exception` span event. When
+`SENTRY_DSN` is configured, the same historical step also emits one synthetic Sentry error whose
+trace and span IDs match that step. A failed/timed-out job emits a job-level fallback only when no
+failed/timed-out child explains it. Exception types are fixed (`GitHubActionsTaskFailure` or
+`GitHubActionsTaskTimeout`); the description includes the sanitized task name, or the validated
+task-run ID when a name is absent. Fingerprints combine the bounded repository, workflow, job,
+task, and conclusion values so repeated failures group by CI task rather than workflow run. These
+Sentry events are synthetic and handled, contain no stack trace, logs, commands, or output, and use
+Sentry's bounded non-blocking transport.
 
 **Identifiers and run context.** The workflow root carries only these validated span-only
 identifiers: canonical repository name, delivery UUID, workflow run ID, positive run attempt,
