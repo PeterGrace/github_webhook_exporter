@@ -332,7 +332,8 @@ assert_yq \
      ([.spec.template.spec.containers[0].env[] |
        select(.name == "OTEL_EXPORTER_OTLP_HEADERS" or
               .name == "OTEL_EXPORTER_OTLP_TRACES_HEADERS" or
-              .name == "OTEL_EXPORTER_OTLP_LOGS_HEADERS")] | length) == 0' \
+              .name == "OTEL_EXPORTER_OTLP_LOGS_HEADERS" or
+              .name == "SENTRY_DSN")] | length) == 0' \
     "${TEMPORARY_DIRECTORY}/default-statefulset.yaml" \
     'StatefulSet must project default ConfigMap, Secret, and downward API environment'
 
@@ -347,6 +348,7 @@ existingSecret:
     otlpHeaders: collector-headers
     otlpTracesHeaders: trace-headers
     otlpLogsHeaders: log-headers
+    sentryDsn: sentry-dsn
 telemetry:
   endpoint: https://collector.example.test:4318
   tracesEndpoint: https://traces.example.test/v1/traces
@@ -458,6 +460,11 @@ assert_yq \
         select(.name == "OTEL_EXPORTER_OTLP_LOGS_HEADERS")][0].valueFrom.secretKeyRef.key) ==
       "log-headers",
       ([.spec.template.spec.containers[0].env[] |
+        select(.name == "SENTRY_DSN")][0].valueFrom.secretKeyRef.name) ==
+      "exporter-credentials",
+      ([.spec.template.spec.containers[0].env[] |
+        select(.name == "SENTRY_DSN")][0].valueFrom.secretKeyRef.key) == "sentry-dsn",
+      ([.spec.template.spec.containers[0].env[] |
         select(.valueFrom.secretKeyRef.name == "exporter-credentials") |
         .valueFrom.secretKeyRef.optional] | all_c(. == false))] | all' \
     "${TEMPORARY_DIRECTORY}/override-statefulset.yaml" \
@@ -496,7 +503,7 @@ assert_contains \
     "${TEMPORARY_DIRECTORY}/notes.txt" \
     'notes must remind operators that one replica is mandatory'
 assert_not_contains \
-    'master-key|admin-token|OTEL_EXPORTER_OTLP(_[A-Z]+)?_HEADERS' \
+    'master-key|admin-token|sentry-dsn|SENTRY_DSN|OTEL_EXPORTER_OTLP(_[A-Z]+)?_HEADERS' \
     "${TEMPORARY_DIRECTORY}/notes.txt" \
     'notes must not print Secret key names or OTLP header variables'
 assert_no_sensitive_content "${TEMPORARY_DIRECTORY}/dry-run-install.txt"

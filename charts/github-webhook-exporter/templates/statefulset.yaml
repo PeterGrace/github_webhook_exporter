@@ -89,6 +89,14 @@ spec:
                   key: {{ .Values.existingSecret.keys.otlpLogsHeaders | quote }}
                   optional: false
             {{- end }}
+            {{- if .Values.existingSecret.keys.sentryDsn }}
+            - name: SENTRY_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret.name | quote }}
+                  key: {{ .Values.existingSecret.keys.sentryDsn | quote }}
+                  optional: false
+            {{- end }}
             - name: POD_NAME
               valueFrom:
                 fieldRef:

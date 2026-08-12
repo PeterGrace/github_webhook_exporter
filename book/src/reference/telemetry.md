@@ -9,8 +9,10 @@ created, and local logging remains fully functional. See
 
 `OTEL_SERVICE_NAME` defaults to `github-webhook-exporter`; every resource includes the package
 version. Of the values in `OTEL_RESOURCE_ATTRIBUTES`, only `k8s.pod.name` and
-`k8s.namespace.name` are retained. Invalid requested telemetry configuration fails startup with
-only the variable name. Collector latency or unavailability happens on dedicated exporter threads
+`k8s.namespace.name` are retained. `SENTRY_DSN` optionally enables a separate bounded,
+non-blocking Sentry error transport for failed workflow tasks and requires trace export to the same
+Sentry project. Invalid requested telemetry configuration fails startup with only the variable
+name. Collector latency or unavailability happens on dedicated exporter threads
 and never changes HTTP readiness or request results.
 
 ## Queue and batching
@@ -66,13 +68,15 @@ prevents a late shutdown worker from exporting a batch after its slots were alre
 dropped, and later records are rejected and counted the same way. Trace and log provider shutdown
 begin concurrently and share the single `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` deadline. A failed
 provider is counted with normalized reason `shutdown`; a provider unfinished at the deadline is
-counted with reason `timeout`. Either condition uses the same direct, redacted stderr diagnostic
+counted with reason `timeout`. When configured, the Sentry error transport closes with the time
+remaining on that same deadline. Either condition uses the same direct, redacted stderr diagnostic
 path and never turns a successful HTTP drain into a process failure. See
 [Startup, retention, and shutdown](lifecycle.md) for the full shutdown sequence.
 
 ## Identifiers
 
-Delivery, pull-request, commit, workflow, job, and step identifiers remain span-only — see
+Delivery, pull-request, commit, workflow, job, and step identifiers remain span-only except for the
+bounded task identity attached to an enabled synthetic Sentry workflow error — see
 [Traces](traces.md). Canonical repository names additionally appear on repository-scoped
 Prometheus series. None of these identifiers appears in local or OTLP application logs, except the
 one bounded workflow-rejection warning documented in [Traces](traces.md#completed-workflow-traces).

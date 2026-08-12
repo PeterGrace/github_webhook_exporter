@@ -162,7 +162,8 @@
             "adminToken",
             "otlpHeaders",
             "otlpTracesHeaders",
-            "otlpLogsHeaders"
+            "otlpLogsHeaders",
+            "sentryDsn"
           ],
           "properties": {
             "masterKey": {
@@ -180,6 +181,9 @@
               "type": "string"
             },
             "otlpLogsHeaders": {
+              "type": "string"
+            },
+            "sentryDsn": {
               "type": "string"
             }
           }

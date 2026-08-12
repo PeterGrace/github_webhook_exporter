@@ -1,5 +1,6 @@
 use std::{
-    io,
+    borrow::Cow,
+    fmt, io,
     sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
@@ -12,6 +13,7 @@ mod otlp_test;
 mod queue;
 pub(crate) mod trace;
 pub(crate) mod workflow;
+mod workflow_error;
 
 pub use workflow::WorkflowTraceEmitter;
 
@@ -26,6 +28,7 @@ use opentelemetry_sdk::{
     trace::{SdkTracer, SdkTracerProvider},
     Resource,
 };
+use sentry::{Client, ClientOptions};
 use thiserror::Error;
 use tracing::{Metadata, Subscriber};
 use tracing_subscriber::{
@@ -42,8 +45,18 @@ use crate::{
 use diagnostics::DiagnosticsObserver;
 use http_client::ObservingHttpClient;
 use queue::AdmissionBoundary;
+use workflow_error::SentryWorkflowErrorReporter;
 
 const INSTRUMENTATION_SCOPE: &str = "github_webhook_exporter";
+
+#[derive(Clone)]
+struct SentryErrorClient(Arc<Client>);
+
+impl fmt::Debug for SentryErrorClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SentryErrorClient([REDACTED])")
+    }
+}
 
 /// Tracing target for local diagnostics that must never enter the OTLP log pipeline.
 pub(crate) const LOCAL_ONLY_LOG_TARGET: &str = "github_webhook_exporter::local_only";
@@ -63,6 +76,7 @@ pub struct TelemetryRuntime {
     state: TelemetryState,
     tracer_provider: Option<SdkTracerProvider>,
     logger_provider: Option<SdkLoggerProvider>,
+    sentry_client: Option<SentryErrorClient>,
     workflow_trace_emitter: WorkflowTraceEmitter,
     trace_queue: Option<Arc<AdmissionBoundary>>,
     log_queue: Option<Arc<AdmissionBoundary>>,
@@ -160,8 +174,13 @@ impl TelemetryRuntime {
             .logger_provider
             .as_ref()
             .map(SdkLoggerProvider::force_flush);
+        let sentry_result = self
+            .sentry_client
+            .as_ref()
+            .is_none_or(|client| client.0.flush(None));
         if trace_result.is_some_and(|result| result.is_err())
             || log_result.is_some_and(|result| result.is_err())
+            || !sentry_result
         {
             return Err(TelemetryError::Flush);
         }
@@ -207,7 +226,20 @@ impl TelemetryRuntime {
             ));
         }
 
-        let outcome = run_shutdown_tasks(tasks, timeout, &self.diagnostics);
+        let shutdown_started = Instant::now();
+        let mut outcome = run_shutdown_tasks(tasks, timeout, &self.diagnostics);
+        if let Some(client) = self.sentry_client.take() {
+            let remaining = timeout.saturating_sub(shutdown_started.elapsed());
+            if !client.0.close(Some(remaining)) {
+                outcome = if remaining.is_zero() {
+                    TelemetryShutdownOutcome::TimedOut
+                } else if outcome == TelemetryShutdownOutcome::Completed {
+                    TelemetryShutdownOutcome::Failed
+                } else {
+                    outcome
+                };
+            }
+        }
         if let Some(queue) = &self.trace_queue {
             queue.drop_pending();
         }
@@ -317,6 +349,9 @@ pub enum TelemetryError {
     /// The OTLP log exporter could not be constructed.
     #[error("failed to construct the OTLP log exporter")]
     LogExporter,
+    /// The Sentry error client could not be constructed.
+    #[error("failed to construct the Sentry error client")]
+    SentryClient,
     /// Another global tracing subscriber has already been installed.
     #[error("the global tracing subscriber is already initialized")]
     AlreadyInitialized,
@@ -369,6 +404,14 @@ where
     let filter = EnvFilter::try_new(rust_log).map_err(|_| TelemetryError::InvalidFilter)?;
     let resource = telemetry_resource(config);
     let observer = DiagnosticsObserver::new(metrics);
+    let sentry_client = config
+        .sentry_dsn()
+        .map(|dsn| build_sentry_client(dsn, config.service_name()))
+        .transpose()?;
+    let sentry_error_reporter = sentry_client.as_ref().map(|client| {
+        Arc::new(SentryWorkflowErrorReporter::new(client.0.clone()))
+            as Arc<dyn workflow_error::WorkflowErrorReporter>
+    });
     let (tracer_provider, trace_tracer, workflow_trace_emitter, trace_queue) = config
         .trace_exporter
         .as_ref()
@@ -377,10 +420,16 @@ where
         .map_or(
             (None, None, WorkflowTraceEmitter::disabled(), None),
             |(provider, tracer, queue)| {
+                let workflow_trace_emitter = sentry_error_reporter.map_or_else(
+                    || WorkflowTraceEmitter::new(tracer.clone()),
+                    |reporter| {
+                        WorkflowTraceEmitter::new_with_error_reporter(tracer.clone(), reporter)
+                    },
+                );
                 (
                     Some(provider),
-                    Some(tracer.clone()),
-                    WorkflowTraceEmitter::new(tracer),
+                    Some(tracer),
+                    workflow_trace_emitter,
                     Some(queue),
                 )
             },
@@ -426,6 +475,7 @@ where
             state,
             tracer_provider,
             logger_provider,
+            sentry_client,
             workflow_trace_emitter,
             trace_queue,
             log_queue,
@@ -434,6 +484,20 @@ where
         },
         subscriber,
     ))
+}
+
+fn build_sentry_client(dsn: &str, service_name: &str) -> Result<SentryErrorClient, TelemetryError> {
+    let parsed_dsn = dsn
+        .parse::<sentry::types::Dsn>()
+        .map_err(|_| TelemetryError::SentryClient)?;
+    let options = ClientOptions::new()
+        .default_integrations(false)
+        .auto_session_tracking(false)
+        .send_default_pii(false)
+        .server_name(Cow::Owned(service_name.to_owned()))
+        .release(Cow::Borrowed(env!("CARGO_PKG_VERSION")));
+    let client = Client::from_config((parsed_dsn, options));
+    Ok(SentryErrorClient(Arc::new(client)))
 }
 
 fn build_trace_provider(
@@ -752,6 +816,33 @@ mod tests {
         assert!(metrics.encode().expect("metrics encode").contains(
             "github_telemetry_export_failures_total{signal=\"log\",reason=\"transport\"} 1"
         ));
+    }
+
+    #[test]
+    fn enabled_runtime_debug_redacts_the_sentry_client() {
+        let config = telemetry_config(&[
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "http://127.0.0.1:1/v1/traces",
+            ),
+            (
+                "SENTRY_DSN",
+                "https://public:secret@example.ingest.sentry.io/42",
+            ),
+        ]);
+        let (runtime, _subscriber) = build_runtime(
+            "github_webhook_exporter=info",
+            &config,
+            SharedWriter::default(),
+            Metrics::new(),
+        )
+        .expect("enabled runtime builds");
+
+        let rendered = format!("{runtime:?}");
+
+        assert!(!rendered.contains("example.ingest.sentry.io"));
+        assert!(!rendered.contains("public:secret"));
+        assert!(rendered.contains("[REDACTED]"));
     }
 
     #[test]
