@@ -170,7 +170,10 @@ const SPAN_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "db.system.name",
     "db.operation.name",
 ];
-const SPAN_EVENT_ALLOWLIST: &[(&str, &[&str])] = &[("operation.failure", &["ghe.failure.reason"])];
+const SPAN_EVENT_ALLOWLIST: &[(&str, &[&str])] = &[
+    ("operation.failure", &["ghe.failure.reason"]),
+    ("exception", &["exception.type", "exception.message"]),
+];
 const SPAN_ONLY_ATTRIBUTE_KEYS: &[&str] = &[
     "cicd.pipeline.name",
     "cicd.pipeline.run.id",
@@ -1510,6 +1513,49 @@ fn event_string_attribute<'event>(
         .attributes
         .iter()
         .find_map(|attribute| string_key_value(attribute, key))
+}
+
+fn assert_exception_event(
+    span: &Span,
+    expected_type: &str,
+    expected_message: &str,
+    expected_timestamp: u64,
+) {
+    let exception_events = span
+        .events
+        .iter()
+        .filter(|event| event.name == "exception")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        exception_events.len(),
+        1,
+        "exception event count for {}",
+        span.name
+    );
+    let event = exception_events[0];
+    assert_eq!(event.name, "exception");
+    assert_eq!(event.time_unix_nano, expected_timestamp);
+    assert_eq!(event.attributes.len(), 2);
+    assert_eq!(
+        event_string_attribute(event, "exception.type"),
+        Some(expected_type)
+    );
+    assert_eq!(
+        event_string_attribute(event, "exception.message"),
+        Some(expected_message)
+    );
+}
+
+fn assert_no_exception_events(span: &Span) {
+    assert_eq!(
+        span.events
+            .iter()
+            .filter(|event| event.name == "exception")
+            .count(),
+        0,
+        "unexpected exception events for {}",
+        span.name
+    );
 }
 
 fn string_key_value<'attribute>(
@@ -3636,77 +3682,205 @@ async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_conclusions_export_bounded_results_and_statuses() {
+    type ExpectedExceptionEvent = (&'static str, &'static str, &'static str);
+
     let fixture = WebhookTraceFixture::new().await;
-    let cases = [
+    let cases: [(
+        &'static str,
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        OtlpStatusCode,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        Option<ExpectedExceptionEvent>,
+        Option<ExpectedExceptionEvent>,
+    ); 7] = [
         (
+            "550e8400-e29b-41d4-a716-446655440300",
             "success",
             "success",
             Some("success"),
             OtlpStatusCode::Ok,
             "",
+            "Success Job",
+            "Success Step",
+            "2026-08-06T10:00:01.000000002Z",
+            "2026-08-06T10:00:00.900000004Z",
+            None,
+            None,
         ),
         (
+            "550e8400-e29b-41d4-a716-446655440301",
             "failure",
             "failure",
             Some("failure"),
             OtlpStatusCode::Error,
             "workflow_failed",
+            "Failure Job",
+            "Failure Step",
+            "2026-08-06T10:10:01.000000002Z",
+            "2026-08-06T10:10:00.900000004Z",
+            None,
+            Some((
+                "GitHubActionsTaskFailure",
+                "CI task failed: Failure Step",
+                "2026-08-06T10:10:00.900000004Z",
+            )),
         ),
         (
+            "550e8400-e29b-41d4-a716-446655440302",
             "cancelled",
             "cancelled",
             Some("cancellation"),
             OtlpStatusCode::Unset,
             "",
+            "Cancelled Job",
+            "Cancelled Step",
+            "2026-08-06T10:20:01.000000002Z",
+            "2026-08-06T10:20:00.900000004Z",
+            None,
+            None,
         ),
         (
+            "550e8400-e29b-41d4-a716-446655440303",
             "skipped",
             "skipped",
             Some("skip"),
             OtlpStatusCode::Unset,
             "",
+            "Skipped Job",
+            "Skipped Step",
+            "2026-08-06T10:30:01.000000002Z",
+            "2026-08-06T10:30:00.900000004Z",
+            None,
+            None,
         ),
         (
+            "550e8400-e29b-41d4-a716-446655440304",
             "timed_out",
             "timed_out",
             Some("timeout"),
             OtlpStatusCode::Error,
             "workflow_failed",
+            "Timed Out Job",
+            "Timed Out Step",
+            "2026-08-06T10:40:01.000000002Z",
+            "2026-08-06T10:40:00.900000004Z",
+            None,
+            Some((
+                "GitHubActionsTaskTimeout",
+                "CI task timed out: Timed Out Step",
+                "2026-08-06T10:40:00.900000004Z",
+            )),
         ),
-        ("neutral", "neutral", None, OtlpStatusCode::Unset, ""),
         (
+            "550e8400-e29b-41d4-a716-446655440305",
+            "neutral",
+            "neutral",
+            None,
+            OtlpStatusCode::Unset,
+            "",
+            "Neutral Job",
+            "Neutral Step",
+            "2026-08-06T10:50:01.000000002Z",
+            "2026-08-06T10:50:00.900000004Z",
+            None,
+            None,
+        ),
+        (
+            "550e8400-e29b-41d4-a716-446655440306",
             "fixture_private_unknown",
             "other",
             None,
             OtlpStatusCode::Unset,
             "",
+            "Other Job",
+            "Other Step",
+            "2026-08-06T11:00:01.000000002Z",
+            "2026-08-06T11:00:00.900000004Z",
+            None,
+            None,
         ),
     ];
+    let fallback_delivery_id = "550e8400-e29b-41d4-a716-446655440307";
+    let fallback_job_completed_at = "2026-08-06T11:10:01.000000002Z";
+    let fallback_step_completed_at = "2026-08-06T11:10:00.900000004Z";
 
-    for (index, (raw, _, _, _, _)) in cases.iter().enumerate() {
+    for (
+        index,
+        (
+            delivery_id,
+            raw,
+            _,
+            _,
+            _,
+            _,
+            job_name,
+            step_name,
+            job_completed_at,
+            step_completed_at,
+            _,
+            _,
+        ),
+    ) in cases.iter().enumerate()
+    {
         let body = workflow_job_body(
             Some("completed"),
             serde_json::json!({
                 "id": 100 + index,
                 "run_id": 200 + index,
                 "run_attempt": 1,
+                "name": job_name,
                 "conclusion": raw,
                 "started_at": "2026-08-06T10:00:00.000000001Z",
-                "completed_at": "2026-08-06T10:00:01.000000002Z",
+                "completed_at": job_completed_at,
                 "steps": [{
                     "number": 1,
+                    "name": step_name,
                     "conclusion": raw,
                     "started_at": "2026-08-06T10:00:00.100000003Z",
-                    "completed_at": "2026-08-06T10:00:00.900000004Z"
+                    "completed_at": step_completed_at
                 }]
             }),
         );
-        let delivery_id = format!("550e8400-e29b-41d4-a716-4466554403{index:02}");
         let response = fixture
-            .webhook(&body, "workflow_job", &delivery_id, WEBHOOK_SECRET)
+            .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
             .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
+
+    let fallback_body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 107,
+            "run_id": 207,
+            "run_attempt": 1,
+            "name": "Fallback Failure Job",
+            "conclusion": "failure",
+            "started_at": "2026-08-06T11:10:00.000000001Z",
+            "completed_at": fallback_job_completed_at,
+            "steps": [{
+                "number": 1,
+                "name": "Successful Child",
+                "conclusion": "success",
+                "started_at": "2026-08-06T11:10:00.100000003Z",
+                "completed_at": fallback_step_completed_at
+            }]
+        }),
+    );
+    let fallback_response = fixture
+        .webhook(
+            &fallback_body,
+            "workflow_job",
+            fallback_delivery_id,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(fallback_response.status(), StatusCode::NO_CONTENT);
 
     let captured = fixture.force_flush();
     assert_eq!(
@@ -3715,7 +3889,7 @@ async fn workflow_conclusions_export_bounded_results_and_statuses() {
             .iter()
             .filter(|span| span.name == "github.workflow.job")
             .count(),
-        cases.len()
+        cases.len() + 1
     );
     assert_eq!(
         captured
@@ -3723,12 +3897,25 @@ async fn workflow_conclusions_export_bounded_results_and_statuses() {
             .iter()
             .filter(|span| span.name == "github.workflow.step")
             .count(),
-        cases.len()
+        cases.len() + 1
     );
 
-    for (index, (_, normalized, semantic_result, status, description)) in cases.iter().enumerate() {
-        let delivery_id = format!("550e8400-e29b-41d4-a716-4466554403{index:02}");
-        let job = captured.workflow_job_for_delivery(&delivery_id);
+    for (
+        delivery_id,
+        _,
+        normalized,
+        semantic_result,
+        status,
+        description,
+        _,
+        _,
+        _,
+        _,
+        expected_job_event,
+        expected_step_event,
+    ) in &cases
+    {
+        let job = captured.workflow_job_for_delivery(delivery_id);
         let step = captured.child_named(job, "github.workflow.step");
 
         assert_attribute(job, "github.workflow.conclusion", normalized);
@@ -3745,7 +3932,47 @@ async fn workflow_conclusions_export_bounded_results_and_statuses() {
         // These protobuf assertions exercise WorkflowConclusion::status.
         assert_otlp_status(job, *status, description);
         assert_otlp_status(step, *status, description);
+        match expected_job_event {
+            Some((expected_type, expected_message, expected_timestamp)) => assert_exception_event(
+                job,
+                expected_type,
+                expected_message,
+                rfc3339_unix_nanos(expected_timestamp),
+            ),
+            None => assert_no_exception_events(job),
+        }
+        match expected_step_event {
+            Some((expected_type, expected_message, expected_timestamp)) => assert_exception_event(
+                step,
+                expected_type,
+                expected_message,
+                rfc3339_unix_nanos(expected_timestamp),
+            ),
+            None => assert_no_exception_events(step),
+        }
     }
+
+    let fallback_job = captured.workflow_job_for_delivery(fallback_delivery_id);
+    let fallback_step = captured.child_named(fallback_job, "github.workflow.step");
+    assert_attribute(fallback_job, "github.workflow.conclusion", "failure");
+    assert_attribute(fallback_step, "github.workflow.conclusion", "success");
+    assert_eq!(
+        string_attribute(fallback_job, "cicd.pipeline.result"),
+        Some("failure")
+    );
+    assert_eq!(
+        string_attribute(fallback_step, "cicd.pipeline.task.run.result"),
+        Some("success")
+    );
+    assert_otlp_status(fallback_job, OtlpStatusCode::Error, "workflow_failed");
+    assert_otlp_status(fallback_step, OtlpStatusCode::Ok, "");
+    assert_exception_event(
+        fallback_job,
+        "GitHubActionsTaskFailure",
+        "CI task failed: Fallback Failure Job",
+        rfc3339_unix_nanos(fallback_job_completed_at),
+    );
+    assert_no_exception_events(fallback_step);
     captured.assert_absent("fixture_private_unknown");
 }
 

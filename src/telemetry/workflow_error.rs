@@ -1,6 +1,9 @@
 use std::{borrow::Cow, fmt, sync::Arc, time::SystemTime};
 
-use opentelemetry::trace::{SpanId, TraceId};
+use opentelemetry::{
+    trace::{SpanId, TraceId},
+    KeyValue,
+};
 use sentry::{
     protocol::{Context, Event, Exception, Mechanism, SpanStatus, TraceContext},
     Client, Level,
@@ -232,6 +235,13 @@ impl SyntheticWorkflowError {
 
     pub(super) const fn conclusion(&self) -> &'static str {
         self.conclusion
+    }
+
+    pub(super) fn span_event_attributes(&self) -> [KeyValue; 2] {
+        [
+            KeyValue::new("exception.type", self.exception_type),
+            KeyValue::new("exception.message", self.description.clone()),
+        ]
     }
 
     pub(super) fn timestamp(&self) -> SystemTime {
