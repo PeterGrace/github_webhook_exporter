@@ -43,7 +43,9 @@ clear the inherited generic headers for that signal only.
 Canonical OTLP trace export already carries bounded `exception` span events for failed and
 timed-out workflow tasks; no Sentry configuration is required for that representation. `SENTRY_DSN`
 optionally adds a parallel Sentry envelope for native Issue grouping, does not disable the OTLP
-event, and there is no OTLP errors endpoint.
+event, and there is no OTLP errors endpoint. Treat the OTLP event as the observable source of
+record: the Sentry SDK does not report individual internal queue-overflow drops through its capture
+API.
 
 Configure trace export to the Sentry OTLP trace endpoint, then provide the DSN for that same Sentry
 project:

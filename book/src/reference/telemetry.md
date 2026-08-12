@@ -75,8 +75,11 @@ deadline and never joins a blocked Sentry transport; Sentry HTTP requests use th
 trace request timeout. A Sentry drain failure writes the fixed direct diagnostic
 `signal=sentry reason=shutdown`, while unfinished work writes `signal=sentry reason=timeout`.
 These Sentry diagnostics do not add a third value to the OTLP-only Prometheus `signal` label.
-Every condition uses the direct, redacted stderr path and never turns a successful HTTP drain into
-a process failure. See [Startup, retention, and shutdown](lifecycle.md) for the full shutdown
+The Sentry SDK does not expose per-event queue-overflow results through its capture API, so its
+internal transport drops are not included in `github_telemetry_dropped_records_total`; use the
+canonical OTLP exception events as the observable, vendor-neutral failure record. Every shutdown
+condition uses the direct, redacted stderr path and never turns a successful HTTP drain into a
+process failure. See [Startup, retention, and shutdown](lifecycle.md) for the full shutdown
 sequence.
 
 ## Identifiers
