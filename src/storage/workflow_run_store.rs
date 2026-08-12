@@ -176,14 +176,9 @@ impl StoredWorkflowRunContext {
 fn validated_stored_branch(
     value: Option<&str>,
 ) -> Result<Option<WorkflowBranch>, WorkflowRunStoreError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let branch = WorkflowBranch::sanitize(value).ok_or(WorkflowRunStoreError::Internal)?;
-    if branch.as_str() != value {
-        return Err(WorkflowRunStoreError::Internal);
-    }
-    Ok(Some(branch))
+    value
+        .map(|value| WorkflowBranch::sanitize(value).ok_or(WorkflowRunStoreError::Internal))
+        .transpose()
 }
 
 /// A stable, redacted workflow-run context persistence failure.
@@ -399,6 +394,44 @@ mod tests {
                 .await
                 .expect("second prune succeeds"),
             5
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_branch_is_resanitized_without_failing_the_job_lookup() {
+        let directory = tempfile::tempdir().expect("temporary directory exists");
+        let pool = open_database(&directory.path().join("exporter.sqlite3"))
+            .await
+            .expect("database opens");
+        let repository_id = insert_repository(&pool).await;
+        let store = WorkflowRunStore::new(pool.clone());
+        store
+            .upsert(repository_id, &context(1, "main"))
+            .await
+            .expect("context persists");
+        sqlx::query(
+            "UPDATE workflow_run_contexts SET source_branch = ? \
+             WHERE repository_id = ? AND workflow_run_id = 31 AND workflow_run_attempt = 1",
+        )
+        .bind("feature\nbranch")
+        .bind(repository_id.get())
+        .execute(&pool)
+        .await
+        .expect("legacy branch fixture updates");
+
+        let loaded = store
+            .get(
+                repository_id,
+                WorkflowRunId::new(31).expect("run id is positive"),
+                WorkflowRunAttempt::new(1).expect("attempt is positive"),
+            )
+            .await
+            .expect("lookup degrades safely")
+            .expect("context exists");
+
+        assert_eq!(
+            loaded.source_branch().map(WorkflowBranch::as_str),
+            Some("featurebranch")
         );
     }
 
