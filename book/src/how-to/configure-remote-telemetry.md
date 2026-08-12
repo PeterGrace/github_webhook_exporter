@@ -47,14 +47,19 @@ event, and there is no OTLP errors endpoint. Treat the OTLP event as the observa
 record: the Sentry SDK does not report individual internal queue-overflow drops through its capture
 API.
 
-Configure trace export to the Sentry OTLP trace endpoint, then provide the DSN for that same Sentry
-project:
+Configure trace export to the Sentry OTLP trace endpoint, authenticate OTLP with the public key
+from the DSN, then provide the DSN for that same Sentry project:
 
 ```bash
 : "${SENTRY_DSN:?set SENTRY_DSN in the operator shell}"
+: "${SENTRY_PUBLIC_KEY:?set SENTRY_PUBLIC_KEY from the DSN}"
 export SENTRY_DSN
-export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://example.ingest.sentry.io/api/42/integration/otlp/v1/traces
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://o123.ingest.sentry.io/api/42/integration/otlp/v1/traces
+export OTEL_EXPORTER_OTLP_TRACES_HEADERS="x-sentry-auth=sentry%20sentry_key=${SENTRY_PUBLIC_KEY}"
 ```
+
+`%20` is decoded to the required space in the `x-sentry-auth` value. Do not use an
+`Authorization: Bearer` header for direct Sentry OTLP ingestion.
 
 The DSN enables synthetic handled errors for failed and timed-out workflow tasks. Each error uses
 the historical task span's trace and span IDs, allowing Sentry to place it on that span in the
