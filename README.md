@@ -34,7 +34,7 @@ docker run --rm -p 8080:8080 \
   -e GHE_DATABASE_PATH=/var/lib/github-webhook-exporter/github-webhook-exporter.db \
   -e GHE_MASTER_KEY="$(openssl rand -base64 32)" \
   -e GHE_ADMIN_TOKEN="$(openssl rand -hex 32)" \
-  ghcr.io/petergrace/github-webhook-exporter:0.1.4
+  ghcr.io/petergrace/github-webhook-exporter:0.1.5
 ```
 
 Register a repository and its webhook secret through the admin API:
@@ -66,7 +66,7 @@ kubectl create secret generic github-webhook-exporter \
   --from-literal=admin-token="$(openssl rand -hex 32)"
 
 helm install github-webhook-exporter \
-  oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.4
+  oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.5
 ```
 
 The chart never creates a Secret; it only references one you supply.
