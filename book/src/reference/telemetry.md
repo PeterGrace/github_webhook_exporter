@@ -9,9 +9,12 @@ created, and local logging remains fully functional. See
 
 `OTEL_SERVICE_NAME` defaults to `github-webhook-exporter`; every resource includes the package
 version. Of the values in `OTEL_RESOURCE_ATTRIBUTES`, only `k8s.pod.name` and
-`k8s.namespace.name` are retained. Invalid requested telemetry configuration fails startup with
-only the variable name. Collector latency or unavailability happens on dedicated exporter threads
-and never changes HTTP readiness or request results.
+`k8s.namespace.name` are retained. `SENTRY_DSN` optionally enables a separate bounded,
+non-blocking Sentry error transport for failed workflow tasks and requires trace export to the same
+Sentry project; the canonical OTLP `exception` span events do not require Sentry configuration.
+Invalid requested telemetry configuration fails startup with only the variable name. Collector
+latency or unavailability happens on dedicated exporter threads and never changes HTTP readiness
+or request results.
 
 ## Queue and batching
 
@@ -66,13 +69,24 @@ prevents a late shutdown worker from exporting a batch after its slots were alre
 dropped, and later records are rejected and counted the same way. Trace and log provider shutdown
 begin concurrently and share the single `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` deadline. A failed
 provider is counted with normalized reason `shutdown`; a provider unfinished at the deadline is
-counted with reason `timeout`. Either condition uses the same direct, redacted stderr diagnostic
-path and never turns a successful HTTP drain into a process failure. See
-[Startup, retention, and shutdown](lifecycle.md) for the full shutdown sequence.
+counted with reason `timeout`. When configured, Sentry shutdown starts in a separate
+application-owned worker under that same receiver deadline. The caller stops waiting at the
+deadline and never joins a blocked Sentry transport; Sentry HTTP requests use the configured OTLP
+trace request timeout. A Sentry drain failure writes the fixed direct diagnostic
+`signal=sentry reason=shutdown`, while unfinished work writes `signal=sentry reason=timeout`.
+These Sentry diagnostics do not add a third value to the OTLP-only Prometheus `signal` label.
+The Sentry SDK does not expose per-event queue-overflow results through its capture API, so its
+internal transport drops are not included in `github_telemetry_dropped_records_total`; use the
+canonical OTLP exception events as the observable, vendor-neutral failure record. Every shutdown
+condition uses the direct, redacted stderr path and never turns a successful HTTP drain into a
+process failure. See [Startup, retention, and shutdown](lifecycle.md) for the full shutdown
+sequence.
 
 ## Identifiers
 
-Delivery, pull-request, commit, workflow, job, and step identifiers remain span-only — see
-[Traces](traces.md). Canonical repository names additionally appear on repository-scoped
-Prometheus series. None of these identifiers appears in local or OTLP application logs, except the
-one bounded workflow-rejection warning documented in [Traces](traces.md#completed-workflow-traces).
+Delivery, pull-request, commit, workflow, job, and step identifiers remain span-only except for the
+bounded task identity attached to an enabled synthetic Sentry workflow error — see
+[Traces](traces.md). Canonical OpenTelemetry `exception` span events do not require `SENTRY_DSN`.
+Canonical repository names additionally appear on repository-scoped Prometheus series. None of
+these identifiers appears in local or OTLP application logs, except the one bounded
+workflow-rejection warning documented in [Traces](traces.md#completed-workflow-traces).

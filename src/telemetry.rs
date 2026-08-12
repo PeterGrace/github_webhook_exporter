@@ -1,5 +1,6 @@
 use std::{
-    io,
+    borrow::Cow,
+    fmt, io,
     sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
@@ -12,6 +13,7 @@ mod otlp_test;
 mod queue;
 pub(crate) mod trace;
 pub(crate) mod workflow;
+mod workflow_error;
 
 pub use workflow::WorkflowTraceEmitter;
 
@@ -26,6 +28,7 @@ use opentelemetry_sdk::{
     trace::{SdkTracer, SdkTracerProvider},
     Resource,
 };
+use sentry::{Client, ClientOptions};
 use thiserror::Error;
 use tracing::{Metadata, Subscriber};
 use tracing_subscriber::{
@@ -39,11 +42,39 @@ use crate::{
     config::{ExporterSettings, TelemetryConfig},
     metrics::Metrics,
 };
-use diagnostics::DiagnosticsObserver;
+use diagnostics::{DiagnosticsObserver, SentryShutdownFailureReason};
 use http_client::ObservingHttpClient;
 use queue::AdmissionBoundary;
+use workflow_error::SentryWorkflowErrorReporter;
 
 const INSTRUMENTATION_SCOPE: &str = "github_webhook_exporter";
+
+#[derive(Clone)]
+struct SentryErrorClient(Arc<Client>);
+
+#[derive(Clone)]
+struct SentryReqwestTransportFactory {
+    client: reqwest::Client,
+}
+
+impl sentry::TransportFactory for SentryReqwestTransportFactory {
+    fn create_transport_with_options(
+        &self,
+        options: sentry::TransportOptions,
+    ) -> Arc<dyn sentry::Transport> {
+        Arc::new(
+            sentry::transports::ReqwestHttpTransportOptions::from(options)
+                .with_client(self.client.clone())
+                .build(),
+        )
+    }
+}
+
+impl fmt::Debug for SentryErrorClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SentryErrorClient([REDACTED])")
+    }
+}
 
 /// Tracing target for local diagnostics that must never enter the OTLP log pipeline.
 pub(crate) const LOCAL_ONLY_LOG_TARGET: &str = "github_webhook_exporter::local_only";
@@ -63,6 +94,7 @@ pub struct TelemetryRuntime {
     state: TelemetryState,
     tracer_provider: Option<SdkTracerProvider>,
     logger_provider: Option<SdkLoggerProvider>,
+    sentry_client: Option<SentryErrorClient>,
     workflow_trace_emitter: WorkflowTraceEmitter,
     trace_queue: Option<Arc<AdmissionBoundary>>,
     log_queue: Option<Arc<AdmissionBoundary>>,
@@ -81,8 +113,33 @@ pub enum TelemetryShutdownOutcome {
     TimedOut,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShutdownTaskKind {
+    Trace,
+    Log,
+    Sentry,
+}
+
+impl ShutdownTaskKind {
+    const fn slot(self) -> usize {
+        match self {
+            Self::Trace => 0,
+            Self::Log => 1,
+            Self::Sentry => 2,
+        }
+    }
+
+    const fn thread_name(self) -> &'static str {
+        match self {
+            Self::Trace => "otel-trace-shutdown",
+            Self::Log => "otel-log-shutdown",
+            Self::Sentry => "sentry-shutdown",
+        }
+    }
+}
+
 struct ShutdownTask {
-    signal: crate::metrics::TelemetrySignal,
+    kind: ShutdownTaskKind,
     operation: Box<dyn FnOnce(Duration) -> bool + Send + 'static>,
 }
 
@@ -91,8 +148,19 @@ impl ShutdownTask {
         signal: crate::metrics::TelemetrySignal,
         operation: impl FnOnce(Duration) -> bool + Send + 'static,
     ) -> Self {
+        let kind = match signal {
+            crate::metrics::TelemetrySignal::Trace => ShutdownTaskKind::Trace,
+            crate::metrics::TelemetrySignal::Log => ShutdownTaskKind::Log,
+        };
         Self {
-            signal,
+            kind,
+            operation: Box::new(operation),
+        }
+    }
+
+    fn sentry(operation: impl FnOnce(Duration) -> bool + Send + 'static) -> Self {
+        Self {
+            kind: ShutdownTaskKind::Sentry,
             operation: Box::new(operation),
         }
     }
@@ -160,8 +228,13 @@ impl TelemetryRuntime {
             .logger_provider
             .as_ref()
             .map(SdkLoggerProvider::force_flush);
+        let sentry_result = self
+            .sentry_client
+            .as_ref()
+            .is_none_or(|client| client.0.flush(None));
         if trace_result.is_some_and(|result| result.is_err())
             || log_result.is_some_and(|result| result.is_err())
+            || !sentry_result
         {
             return Err(TelemetryError::Flush);
         }
@@ -193,7 +266,7 @@ impl TelemetryRuntime {
             queue.close();
         }
 
-        let mut tasks = Vec::with_capacity(2);
+        let mut tasks = Vec::with_capacity(3);
         if let Some(provider) = self.tracer_provider.take() {
             tasks.push(ShutdownTask::new(
                 crate::metrics::TelemetrySignal::Trace,
@@ -205,6 +278,12 @@ impl TelemetryRuntime {
                 crate::metrics::TelemetrySignal::Log,
                 move |remaining| provider.shutdown_with_timeout(remaining).is_ok(),
             ));
+        }
+
+        if let Some(client) = self.sentry_client.take() {
+            tasks.push(ShutdownTask::sentry(move |remaining| {
+                client.0.close(Some(remaining))
+            }));
         }
 
         let outcome = run_shutdown_tasks(tasks, timeout, &self.diagnostics);
@@ -224,38 +303,32 @@ fn run_shutdown_tasks(
     timeout: Duration,
     diagnostics: &DiagnosticsObserver,
 ) -> TelemetryShutdownOutcome {
-    use crate::metrics::{TelemetryExportFailureReason, TelemetrySignal};
-
     let deadline = Instant::now()
         .checked_add(timeout)
         .unwrap_or_else(Instant::now);
     let (sender, receiver) = mpsc::channel();
-    let mut pending = [false; 2];
+    let mut pending = [false; 3];
     let mut remaining_tasks = 0_usize;
     let mut failed = false;
 
     for task in tasks {
-        let signal = task.signal;
-        let slot = match signal {
-            TelemetrySignal::Trace => 0,
-            TelemetrySignal::Log => 1,
-        };
+        let kind = task.kind;
         let sender = sender.clone();
         let remaining = deadline.saturating_duration_since(Instant::now());
         let spawn_result = thread::Builder::new()
-            .name(format!("otel-{}-shutdown", signal.as_str()))
+            .name(kind.thread_name().to_owned())
             .spawn(move || {
                 let succeeded = (task.operation)(remaining);
-                let _ignored = sender.send((signal, succeeded));
+                let _ignored = sender.send((kind, succeeded));
             });
         match spawn_result {
             Ok(_handle) => {
-                pending[slot] = true;
+                pending[kind.slot()] = true;
                 remaining_tasks += 1;
             }
             Err(_) => {
                 failed = true;
-                diagnostics.export_failure(signal, TelemetryExportFailureReason::Shutdown);
+                report_shutdown_issue(diagnostics, kind, SentryShutdownFailureReason::Shutdown);
             }
         }
     }
@@ -267,18 +340,14 @@ fn run_shutdown_tasks(
             break;
         }
         match receiver.recv_timeout(remaining) {
-            Ok((signal, succeeded)) => {
-                let slot = match signal {
-                    TelemetrySignal::Trace => 0,
-                    TelemetrySignal::Log => 1,
-                };
-                if pending[slot] {
-                    pending[slot] = false;
+            Ok((kind, succeeded)) => {
+                if pending[kind.slot()] {
+                    pending[kind.slot()] = false;
                     remaining_tasks -= 1;
                 }
                 if !succeeded {
                     failed = true;
-                    diagnostics.export_failure(signal, TelemetryExportFailureReason::Shutdown);
+                    report_shutdown_issue(diagnostics, kind, SentryShutdownFailureReason::Shutdown);
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
@@ -286,13 +355,17 @@ fn run_shutdown_tasks(
     }
 
     let mut timed_out = false;
-    for (signal, unfinished) in [TelemetrySignal::Trace, TelemetrySignal::Log]
-        .into_iter()
-        .zip(pending)
+    for (kind, unfinished) in [
+        ShutdownTaskKind::Trace,
+        ShutdownTaskKind::Log,
+        ShutdownTaskKind::Sentry,
+    ]
+    .into_iter()
+    .zip(pending)
     {
         if unfinished {
             timed_out = true;
-            diagnostics.export_failure(signal, TelemetryExportFailureReason::Timeout);
+            report_shutdown_issue(diagnostics, kind, SentryShutdownFailureReason::Timeout);
         }
     }
 
@@ -302,6 +375,28 @@ fn run_shutdown_tasks(
         TelemetryShutdownOutcome::Failed
     } else {
         TelemetryShutdownOutcome::Completed
+    }
+}
+
+fn report_shutdown_issue(
+    diagnostics: &DiagnosticsObserver,
+    kind: ShutdownTaskKind,
+    reason: SentryShutdownFailureReason,
+) {
+    use crate::metrics::{TelemetryExportFailureReason, TelemetrySignal};
+
+    let metric_reason = match reason {
+        SentryShutdownFailureReason::Shutdown => TelemetryExportFailureReason::Shutdown,
+        SentryShutdownFailureReason::Timeout => TelemetryExportFailureReason::Timeout,
+    };
+    match kind {
+        ShutdownTaskKind::Trace => {
+            diagnostics.export_failure(TelemetrySignal::Trace, metric_reason);
+        }
+        ShutdownTaskKind::Log => {
+            diagnostics.export_failure(TelemetrySignal::Log, metric_reason);
+        }
+        ShutdownTaskKind::Sentry => diagnostics.sentry_shutdown_failure(reason),
     }
 }
 
@@ -317,6 +412,9 @@ pub enum TelemetryError {
     /// The OTLP log exporter could not be constructed.
     #[error("failed to construct the OTLP log exporter")]
     LogExporter,
+    /// The Sentry error client could not be constructed.
+    #[error("failed to construct the Sentry error client")]
+    SentryClient,
     /// Another global tracing subscriber has already been installed.
     #[error("the global tracing subscriber is already initialized")]
     AlreadyInitialized,
@@ -366,9 +464,42 @@ fn build_runtime<W>(
 where
     W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
 {
+    build_runtime_with_sentry_transport(rust_log, config, writer, metrics, None)
+}
+
+fn build_runtime_with_sentry_transport<W>(
+    rust_log: &str,
+    config: &TelemetryConfig,
+    writer: W,
+    metrics: Metrics,
+    sentry_transport: Option<Arc<dyn sentry::TransportFactory>>,
+) -> Result<(TelemetryRuntime, impl Subscriber + Send + Sync), TelemetryError>
+where
+    W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+{
     let filter = EnvFilter::try_new(rust_log).map_err(|_| TelemetryError::InvalidFilter)?;
     let resource = telemetry_resource(config);
     let observer = DiagnosticsObserver::new(metrics);
+    let sentry_client = match config.sentry_dsn() {
+        Some(dsn) => {
+            let request_timeout = config
+                .trace_exporter
+                .as_ref()
+                .ok_or(TelemetryError::SentryClient)?
+                .timeout;
+            Some(match sentry_transport {
+                Some(transport) => {
+                    build_sentry_client_with_transport(dsn, config.service_name(), transport)?
+                }
+                None => build_sentry_client(dsn, config.service_name(), request_timeout)?,
+            })
+        }
+        None => None,
+    };
+    let sentry_error_reporter = sentry_client.as_ref().map(|client| {
+        Arc::new(SentryWorkflowErrorReporter::new(client.0.clone()))
+            as Arc<dyn workflow_error::WorkflowErrorReporter>
+    });
     let (tracer_provider, trace_tracer, workflow_trace_emitter, trace_queue) = config
         .trace_exporter
         .as_ref()
@@ -377,10 +508,16 @@ where
         .map_or(
             (None, None, WorkflowTraceEmitter::disabled(), None),
             |(provider, tracer, queue)| {
+                let workflow_trace_emitter = sentry_error_reporter.map_or_else(
+                    || WorkflowTraceEmitter::new(tracer.clone()),
+                    |reporter| {
+                        WorkflowTraceEmitter::new_with_error_reporter(tracer.clone(), reporter)
+                    },
+                );
                 (
                     Some(provider),
-                    Some(tracer.clone()),
-                    WorkflowTraceEmitter::new(tracer),
+                    Some(tracer),
+                    workflow_trace_emitter,
                     Some(queue),
                 )
             },
@@ -426,6 +563,7 @@ where
             state,
             tracer_provider,
             logger_provider,
+            sentry_client,
             workflow_trace_emitter,
             trace_queue,
             log_queue,
@@ -434,6 +572,46 @@ where
         },
         subscriber,
     ))
+}
+
+fn build_sentry_client(
+    dsn: &str,
+    service_name: &str,
+    request_timeout: Duration,
+) -> Result<SentryErrorClient, TelemetryError> {
+    let http_client = reqwest::Client::builder()
+        .timeout(request_timeout)
+        .build()
+        .map_err(|_| TelemetryError::SentryClient)?;
+    build_sentry_client_with_transport(
+        dsn,
+        service_name,
+        Arc::new(SentryReqwestTransportFactory {
+            client: http_client,
+        }),
+    )
+}
+
+fn build_sentry_client_with_transport(
+    dsn: &str,
+    service_name: &str,
+    transport: Arc<dyn sentry::TransportFactory>,
+) -> Result<SentryErrorClient, TelemetryError> {
+    let parsed_dsn = dsn
+        .parse::<sentry::types::Dsn>()
+        .map_err(|_| TelemetryError::SentryClient)?;
+    let mut options = ClientOptions::new()
+        .default_integrations(false)
+        .send_default_pii(false)
+        .server_name(Cow::Owned(service_name.to_owned()))
+        .release(Cow::Borrowed(env!("CARGO_PKG_VERSION")));
+    options.auto_session_tracking = false;
+    options.transport = Some(transport);
+    let client = Client::from_config((parsed_dsn, options));
+    if !client.is_enabled() {
+        return Err(TelemetryError::SentryClient);
+    }
+    Ok(SentryErrorClient(Arc::new(client)))
 }
 
 fn build_trace_provider(
@@ -591,19 +769,22 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use sentry::{Client, ClientOptions, Envelope, Transport};
+
     use crate::{
         config::TelemetryConfig,
         metrics::{Metrics, TelemetrySignal},
-        telemetry::diagnostics::DiagnosticsObserver,
+        telemetry::diagnostics::{DiagnosticSink, DiagnosticsObserver},
     };
 
     use super::{
-        build_blocking_http_client, build_runtime, build_subscriber, is_application_target,
-        is_remote_log_target, run_shutdown_tasks, ShutdownTask, TelemetryShutdownOutcome,
-        TelemetryState, LOCAL_ONLY_LOG_TARGET,
+        build_blocking_http_client, build_runtime, build_sentry_client, build_subscriber,
+        is_application_target, is_remote_log_target, run_shutdown_tasks, SentryErrorClient,
+        ShutdownTask, TelemetryRuntime, TelemetryShutdownOutcome, TelemetryState,
+        WorkflowTraceEmitter, LOCAL_ONLY_LOG_TARGET,
     };
 
-    #[derive(Clone, Default)]
+    #[derive(Clone, Debug, Default)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
 
     impl SharedWriter {
@@ -632,6 +813,60 @@ mod tests {
 
         fn make_writer(&'writer self) -> Self::Writer {
             self.clone()
+        }
+    }
+
+    impl DiagnosticSink for SharedWriter {
+        fn write(&self, line: &str) -> io::Result<()> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("capture lock is poisoned"))?
+                .extend_from_slice(line.as_bytes());
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct SleepingShutdownTransport;
+
+    impl Transport for SleepingShutdownTransport {
+        fn send_envelope(&self, _envelope: Envelope) {}
+
+        fn shutdown(&self, _timeout: Duration) -> bool {
+            thread::sleep(Duration::from_millis(250));
+            true
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingShutdownTransport;
+
+    impl Transport for FailingShutdownTransport {
+        fn send_envelope(&self, _envelope: Envelope) {}
+
+        fn shutdown(&self, _timeout: Duration) -> bool {
+            false
+        }
+    }
+
+    fn runtime_with_sentry_transport<T>(transport: Arc<T>, output: SharedWriter) -> TelemetryRuntime
+    where
+        T: Transport,
+    {
+        let options = ClientOptions::new()
+            .dsn("https://public@sentry.invalid/1")
+            .transport(transport);
+        let sentry_client = SentryErrorClient(Arc::new(Client::from_config(options)));
+        TelemetryRuntime {
+            state: TelemetryState::Enabled,
+            tracer_provider: None,
+            logger_provider: None,
+            sentry_client: Some(sentry_client),
+            workflow_trace_emitter: WorkflowTraceEmitter::disabled(),
+            trace_queue: None,
+            log_queue: None,
+            diagnostics: DiagnosticsObserver::with_sink(Metrics::new(), Arc::new(output)),
+            shutdown_outcome: None,
         }
     }
 
@@ -755,6 +990,48 @@ mod tests {
     }
 
     #[test]
+    fn configured_sentry_client_is_enabled() {
+        let client = build_sentry_client(
+            "https://public@sentry.invalid/1",
+            "github-webhook-exporter-test",
+            Duration::from_millis(100),
+        )
+        .expect("configured Sentry client builds");
+
+        assert!(client.0.is_enabled());
+        assert!(!client.0.options().default_integrations);
+        assert!(!client.0.options().auto_session_tracking);
+        assert!(!client.0.options().send_default_pii);
+    }
+
+    #[test]
+    fn enabled_runtime_debug_redacts_the_sentry_client() {
+        let config = telemetry_config(&[
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "http://127.0.0.1:1/v1/traces",
+            ),
+            (
+                "SENTRY_DSN",
+                "https://public:secret@example.ingest.sentry.io/42",
+            ),
+        ]);
+        let (runtime, _subscriber) = build_runtime(
+            "github_webhook_exporter=info",
+            &config,
+            SharedWriter::default(),
+            Metrics::new(),
+        )
+        .expect("enabled runtime builds");
+
+        let rendered = format!("{runtime:?}");
+
+        assert!(!rendered.contains("example.ingest.sentry.io"));
+        assert!(!rendered.contains("public:secret"));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
     fn remote_log_filter_rejects_only_the_local_only_application_target() {
         assert!(!is_remote_log_target(LOCAL_ONLY_LOG_TARGET));
         assert!(is_remote_log_target("github_webhook_exporter"));
@@ -769,6 +1046,38 @@ mod tests {
         assert!(!is_application_target("opentelemetry_sdk"));
         assert!(!is_application_target("opentelemetry_otlp"));
         assert!(!is_application_target("unrelated_dependency"));
+    }
+
+    #[test]
+    fn sentry_shutdown_obeys_shared_deadline() {
+        let output = SharedWriter::default();
+        let mut runtime =
+            runtime_with_sentry_transport(Arc::new(SleepingShutdownTransport), output.clone());
+        let started = Instant::now();
+
+        let outcome = runtime.shutdown(Duration::from_millis(25));
+
+        assert_eq!(outcome, TelemetryShutdownOutcome::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(
+            output.contents(),
+            "telemetry pipeline diagnostic kind=failure signal=sentry reason=timeout\n"
+        );
+    }
+
+    #[test]
+    fn sentry_shutdown_failure_is_reported() {
+        let output = SharedWriter::default();
+        let mut runtime =
+            runtime_with_sentry_transport(Arc::new(FailingShutdownTransport), output.clone());
+
+        let outcome = runtime.shutdown(Duration::from_secs(1));
+
+        assert_eq!(outcome, TelemetryShutdownOutcome::Failed);
+        assert_eq!(
+            output.contents(),
+            "telemetry pipeline diagnostic kind=failure signal=sentry reason=shutdown\n"
+        );
     }
 
     #[test]

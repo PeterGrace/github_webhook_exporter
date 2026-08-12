@@ -26,6 +26,11 @@ use opentelemetry_proto::tonic::{
     trace::v1::{status::StatusCode as OtlpStatusCode, Span},
 };
 use prost::Message;
+use sentry::{
+    protocol::{Context as SentryContext, SpanStatus as SentrySpanStatus},
+    test::TestTransport,
+    Level as SentryLevel, TransportFactory,
+};
 use serde_json::Value;
 use sha2::Sha256;
 use sqlx::SqlitePool;
@@ -63,7 +68,8 @@ use crate::{config::TelemetryConfig, metrics::Metrics};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use super::{
-    build_runtime, trace, TelemetryShutdownOutcome, TelemetryState, LOCAL_ONLY_LOG_TARGET,
+    build_runtime, build_runtime_with_sentry_transport, trace, TelemetryShutdownOutcome,
+    TelemetryState, LOCAL_ONLY_LOG_TARGET,
 };
 
 const QUEUE_CAPACITY: usize = 4;
@@ -170,7 +176,10 @@ const SPAN_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "db.system.name",
     "db.operation.name",
 ];
-const SPAN_EVENT_ALLOWLIST: &[(&str, &[&str])] = &[("operation.failure", &["ghe.failure.reason"])];
+const SPAN_EVENT_ALLOWLIST: &[(&str, &[&str])] = &[
+    ("operation.failure", &["ghe.failure.reason"]),
+    ("exception", &["exception.type", "exception.message"]),
+];
 const SPAN_ONLY_ATTRIBUTE_KEYS: &[&str] = &[
     "cicd.pipeline.name",
     "cicd.pipeline.run.id",
@@ -310,6 +319,21 @@ fn telemetry_config_with_queue_capacity_and_timeout(
     ]);
     TelemetryConfig::from_lookup(&mut |variable| values.get(variable).map(OsString::from))
         .expect("telemetry configuration is valid")
+}
+
+fn telemetry_config_with_sentry(endpoint: &str, timeout_millis: u64) -> TelemetryConfig {
+    let timeout_millis = timeout_millis.to_string();
+    let values = HashMap::from([
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint),
+        ("OTEL_EXPORTER_OTLP_HEADERS", "x-test-token=private-value"),
+        ("OTEL_EXPORTER_OTLP_TIMEOUT", timeout_millis.as_str()),
+        ("OTEL_SERVICE_NAME", "github-webhook-exporter-test"),
+        ("GHE_OTEL_QUEUE_CAPACITY", "128"),
+        ("GHE_OTEL_BATCH_SIZE", "1"),
+        ("SENTRY_DSN", "https://public@sentry.invalid/1"),
+    ]);
+    TelemetryConfig::from_lookup(&mut |variable| values.get(variable).map(OsString::from))
+        .expect("Sentry telemetry configuration is valid")
 }
 
 fn emit_records(dispatch: &Dispatch, range: std::ops::Range<usize>) {
@@ -727,8 +751,23 @@ impl WebhookTraceFixture {
             DEFAULT_WORKFLOW_JOB_MAX_STEPS,
             false,
             "github_webhook_exporter=info",
+            None,
         )
         .await
+    }
+
+    async fn new_with_sentry() -> (Self, Arc<TestTransport>) {
+        let transport = TestTransport::new();
+        let factory: Arc<dyn TransportFactory> = Arc::new(transport.clone());
+        let fixture = Self::new_with_exporter_timeout_and_step_limit(
+            2_000,
+            DEFAULT_WORKFLOW_JOB_MAX_STEPS,
+            false,
+            "github_webhook_exporter=info",
+            Some(factory),
+        )
+        .await;
+        (fixture, transport)
     }
 
     async fn new_with_debug_logging() -> Self {
@@ -737,6 +776,7 @@ impl WebhookTraceFixture {
             DEFAULT_WORKFLOW_JOB_MAX_STEPS,
             false,
             "github_webhook_exporter=debug",
+            None,
         )
         .await
     }
@@ -747,6 +787,7 @@ impl WebhookTraceFixture {
             workflow_job_max_steps,
             true,
             "github_webhook_exporter=info",
+            None,
         )
         .await
     }
@@ -757,6 +798,7 @@ impl WebhookTraceFixture {
             DEFAULT_WORKFLOW_JOB_MAX_STEPS,
             false,
             "github_webhook_exporter=info",
+            None,
         )
         .await
     }
@@ -766,19 +808,29 @@ impl WebhookTraceFixture {
         workflow_job_max_steps: usize,
         include_actionable_repository: bool,
         rust_log: &str,
+        sentry_transport: Option<Arc<dyn TransportFactory>>,
     ) -> Self {
         let otlp_guard = otlp_test_lock().lock_owned().await;
         let receiver = RunningReceiver::start_released().await;
-        let config = telemetry_config_with_queue_capacity_and_timeout(
-            &receiver.endpoint(),
-            128,
-            timeout_millis,
-        );
+        let config = if sentry_transport.is_some() {
+            telemetry_config_with_sentry(&receiver.endpoint(), timeout_millis)
+        } else {
+            telemetry_config_with_queue_capacity_and_timeout(
+                &receiver.endpoint(),
+                128,
+                timeout_millis,
+            )
+        };
         let output = CapturedOutput::default();
         let metrics = Metrics::new();
-        let (runtime, subscriber) =
-            build_runtime(rust_log, &config, output.clone(), metrics.clone())
-                .expect("telemetry runtime initializes");
+        let (runtime, subscriber) = build_runtime_with_sentry_transport(
+            rust_log,
+            &config,
+            output.clone(),
+            metrics.clone(),
+            sentry_transport,
+        )
+        .expect("telemetry runtime initializes");
         let span_lifecycles = CapturedSpanLifecycles::default();
         let dispatch = Dispatch::new(subscriber.with(span_lifecycles.clone()));
         let directory = tempfile::tempdir().expect("temporary directory is created");
@@ -1510,6 +1562,49 @@ fn event_string_attribute<'event>(
         .attributes
         .iter()
         .find_map(|attribute| string_key_value(attribute, key))
+}
+
+fn assert_exception_event(
+    span: &Span,
+    expected_type: &str,
+    expected_message: &str,
+    expected_timestamp: u64,
+) {
+    let exception_events = span
+        .events
+        .iter()
+        .filter(|event| event.name == "exception")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        exception_events.len(),
+        1,
+        "exception event count for {}",
+        span.name
+    );
+    let event = exception_events[0];
+    assert_eq!(event.name, "exception");
+    assert_eq!(event.time_unix_nano, expected_timestamp);
+    assert_eq!(event.attributes.len(), 2);
+    assert_eq!(
+        event_string_attribute(event, "exception.type"),
+        Some(expected_type)
+    );
+    assert_eq!(
+        event_string_attribute(event, "exception.message"),
+        Some(expected_message)
+    );
+}
+
+fn assert_no_exception_events(span: &Span) {
+    assert_eq!(
+        span.events
+            .iter()
+            .filter(|event| event.name == "exception")
+            .count(),
+        0,
+        "unexpected exception events for {}",
+        span.name
+    );
 }
 
 fn string_key_value<'attribute>(
@@ -3635,78 +3730,398 @@ async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hostile_failed_workflow_payload_is_private() {
+    let raw_step_name = format!("\n{}", "x".repeat(140));
+    let escaped_raw_step_name = format!("\\n{}", "x".repeat(140));
+    let sanitized_step_name = "x".repeat(128);
+    let expected_message = format!("CI task failed: {sanitized_step_name}");
+    let completed_at = "2026-08-06T13:02:00.222222222Z";
+    let (fixture, sentry_transport) = WebhookTraceFixture::new_with_sentry().await;
+    let body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": WORKFLOW_PRIVACY_JOB_ID,
+            "run_id": WORKFLOW_PRIVACY_RUN_ID,
+            "run_attempt": WORKFLOW_PRIVACY_RUN_ATTEMPT,
+            "workflow_name": WORKFLOW_RAW_NAME,
+            "name": WORKFLOW_RAW_JOB_NAME,
+            "conclusion": "failure",
+            "head_sha": WORKFLOW_PRIVACY_SHA,
+            "started_at": "2026-08-06T13:00:00.123456789Z",
+            "completed_at": "2026-08-06T13:05:00.987654321Z",
+            "command": WORKFLOW_FORBIDDEN_COMMAND,
+            "output": WORKFLOW_FORBIDDEN_OUTPUT,
+            "logs": WORKFLOW_FORBIDDEN_LOG,
+            "actor": {"login": WORKFLOW_FORBIDDEN_ACTOR},
+            "url": WORKFLOW_FORBIDDEN_URL,
+            "secret": WORKFLOW_FORBIDDEN_SECRET,
+            "signature": WORKFLOW_FORBIDDEN_SIGNATURE,
+            "headers": {"x-task6-private": WORKFLOW_FORBIDDEN_HEADER},
+            "raw_payload_fragment": WORKFLOW_FORBIDDEN_FRAGMENT,
+            "unknown_conclusion": WORKFLOW_UNKNOWN_CONCLUSION,
+            "steps": [{
+                "number": WORKFLOW_PRIVACY_STEP_NUMBER,
+                "name": raw_step_name.clone(),
+                "conclusion": "failure",
+                "started_at": "2026-08-06T13:01:00.111111111Z",
+                "completed_at": completed_at,
+                "command": WORKFLOW_FORBIDDEN_COMMAND,
+                "output": WORKFLOW_FORBIDDEN_OUTPUT,
+                "logs": WORKFLOW_FORBIDDEN_LOG,
+                "actor": WORKFLOW_FORBIDDEN_ACTOR,
+                "url": WORKFLOW_FORBIDDEN_URL,
+                "secret": WORKFLOW_FORBIDDEN_SECRET
+            }]
+        }),
+    );
+
+    let response = fixture
+        .webhook_with_authorization(
+            &body,
+            "workflow_job",
+            WORKFLOW_PRIVACY_DELIVERY,
+            WEBHOOK_SECRET,
+            Some(AUTHORIZATION),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let captured = fixture.force_flush();
+    let task_run_id = format!("{WORKFLOW_PRIVACY_JOB_ID}:{WORKFLOW_PRIVACY_STEP_NUMBER}");
+    let job = captured.workflow_job_for_delivery(WORKFLOW_PRIVACY_DELIVERY);
+    let step = captured.workflow_step_for_task_run_id(job, &task_run_id);
+    assert_no_exception_events(job);
+    assert_exception_event(
+        step,
+        "GitHubActionsTaskFailure",
+        &expected_message,
+        rfc3339_unix_nanos(completed_at),
+    );
+    assert_otlp_status(job, OtlpStatusCode::Error, "workflow_failed");
+    assert_otlp_status(step, OtlpStatusCode::Error, "workflow_failed");
+    assert_eq!(step.trace_id, job.trace_id);
+    assert_eq!(step.parent_span_id, job.span_id);
+
+    let events = sentry_transport.fetch_and_clear_events();
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event.level, SentryLevel::Error);
+    assert_eq!(
+        event
+            .fingerprint
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>(),
+        [
+            "github-actions-task",
+            "step",
+            WEBHOOK_REPOSITORY,
+            WORKFLOW_SANITIZED_NAME,
+            WORKFLOW_SANITIZED_JOB_NAME,
+            sanitized_step_name.as_str(),
+            "failure",
+        ]
+    );
+    assert_eq!(event.exception.values.len(), 1);
+    let exception = &event.exception.values[0];
+    assert_eq!(exception.ty, "GitHubActionsTaskFailure");
+    assert_eq!(exception.value.as_deref(), Some(expected_message.as_str()));
+    assert!(exception.module.is_none());
+    assert!(exception.stacktrace.is_none());
+    assert!(exception.raw_stacktrace.is_none());
+    assert!(exception.thread_id.is_none());
+    let mechanism = exception.mechanism.as_ref().expect("mechanism is present");
+    assert_eq!(mechanism.ty, "github_actions");
+    assert_eq!(mechanism.handled, Some(true));
+    assert_eq!(mechanism.synthetic, Some(true));
+    assert_eq!(event.contexts.len(), 1);
+    match event.contexts.get("trace") {
+        Some(SentryContext::Trace(trace)) => {
+            assert_eq!(trace.trace_id.to_string(), hex::encode(&step.trace_id));
+            assert_eq!(trace.span_id.to_string(), hex::encode(&step.span_id));
+            assert_eq!(trace.op.as_deref(), Some("github.workflow.step"));
+            assert_eq!(
+                trace.description.as_deref(),
+                Some(sanitized_step_name.as_str())
+            );
+            assert_eq!(trace.status, Some(SentrySpanStatus::InternalError));
+            assert_eq!(trace.origin.as_deref(), Some("manual.github.workflow"));
+        }
+        Some(other) => panic!("unexpected Sentry context: {other:?}"),
+        None => panic!("trace context is present"),
+    }
+    assert_eq!(event.tags.len(), 5);
+    for (key, expected) in [
+        ("github.repository.name", WEBHOOK_REPOSITORY),
+        ("cicd.pipeline.name", WORKFLOW_SANITIZED_NAME),
+        ("cicd.pipeline.task.name", sanitized_step_name.as_str()),
+        ("cicd.pipeline.task.run.id", task_run_id.as_str()),
+        ("github.workflow.conclusion", "failure"),
+    ] {
+        assert_eq!(event.tags.get(key).map(String::as_str), Some(expected));
+    }
+    assert_eq!(
+        event.server_name.as_deref(),
+        Some("github-webhook-exporter-test")
+    );
+    assert_eq!(event.release.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(event.platform.as_ref(), "native");
+    assert!(event.culprit.is_none());
+    assert!(event.transaction.is_none());
+    assert!(event.message.is_none());
+    assert!(event.logentry.is_none());
+    assert!(event.logger.is_none());
+    assert!(event.dist.is_none());
+    assert!(event.environment.is_none());
+    assert!(event.user.is_none());
+    assert!(event.request.is_none());
+    assert!(event.breadcrumbs.is_empty());
+    assert!(event.modules.is_empty());
+    assert!(event.extra.is_empty());
+    assert!(event.stacktrace.is_none());
+    assert!(event.threads.is_empty());
+    let sentry_timestamp = u64::try_from(
+        event
+            .timestamp
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("historical timestamp follows the Unix epoch")
+            .as_nanos(),
+    )
+    .expect("historical timestamp fits u64 nanoseconds");
+    assert_eq!(sentry_timestamp, rfc3339_unix_nanos(completed_at));
+
+    let serialized_sentry = serde_json::to_string(event).expect("Sentry event serializes");
+    for forbidden in [
+        WORKFLOW_RAW_NAME,
+        WORKFLOW_ESCAPED_RAW_NAME,
+        WORKFLOW_RAW_JOB_NAME,
+        WORKFLOW_ESCAPED_RAW_JOB_NAME,
+        raw_step_name.as_str(),
+        escaped_raw_step_name.as_str(),
+        WORKFLOW_FORBIDDEN_COMMAND,
+        WORKFLOW_FORBIDDEN_OUTPUT,
+        WORKFLOW_FORBIDDEN_LOG,
+        WORKFLOW_FORBIDDEN_ACTOR,
+        WORKFLOW_FORBIDDEN_URL,
+        WORKFLOW_FORBIDDEN_SECRET,
+        WORKFLOW_FORBIDDEN_SIGNATURE,
+        WORKFLOW_FORBIDDEN_HEADER,
+        WORKFLOW_FORBIDDEN_FRAGMENT,
+        WORKFLOW_UNKNOWN_CONCLUSION,
+        WEBHOOK_SECRET,
+        AUTHORIZATION,
+    ] {
+        captured.assert_absent(forbidden);
+        assert!(
+            !serialized_sentry.contains(forbidden),
+            "serialized Sentry event must not contain {forbidden:?}"
+        );
+    }
+    captured.assert_approved_attribute_keys();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_conclusions_export_bounded_results_and_statuses() {
+    type ExpectedExceptionEvent = (&'static str, &'static str, &'static str);
+    type WorkflowConclusionCase = (
+        &'static str,
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        OtlpStatusCode,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        Option<ExpectedExceptionEvent>,
+        Option<ExpectedExceptionEvent>,
+    );
+
     let fixture = WebhookTraceFixture::new().await;
-    let cases = [
+    let cases: [WorkflowConclusionCase; 7] = [
         (
+            "550e8400-e29b-41d4-a716-446655440300",
             "success",
             "success",
             Some("success"),
             OtlpStatusCode::Ok,
             "",
+            "Success Job",
+            "Success Step",
+            "2026-08-06T10:00:01.000000002Z",
+            "2026-08-06T10:00:00.900000004Z",
+            None,
+            None,
         ),
         (
+            "550e8400-e29b-41d4-a716-446655440301",
             "failure",
             "failure",
             Some("failure"),
             OtlpStatusCode::Error,
             "workflow_failed",
+            "Failure Job",
+            "Failure Step",
+            "2026-08-06T10:10:01.000000002Z",
+            "2026-08-06T10:10:00.900000004Z",
+            None,
+            Some((
+                "GitHubActionsTaskFailure",
+                "CI task failed: Failure Step",
+                "2026-08-06T10:10:00.900000004Z",
+            )),
         ),
         (
+            "550e8400-e29b-41d4-a716-446655440302",
             "cancelled",
             "cancelled",
             Some("cancellation"),
             OtlpStatusCode::Unset,
             "",
+            "Cancelled Job",
+            "Cancelled Step",
+            "2026-08-06T10:20:01.000000002Z",
+            "2026-08-06T10:20:00.900000004Z",
+            None,
+            None,
         ),
         (
+            "550e8400-e29b-41d4-a716-446655440303",
             "skipped",
             "skipped",
             Some("skip"),
             OtlpStatusCode::Unset,
             "",
+            "Skipped Job",
+            "Skipped Step",
+            "2026-08-06T10:30:01.000000002Z",
+            "2026-08-06T10:30:00.900000004Z",
+            None,
+            None,
         ),
         (
+            "550e8400-e29b-41d4-a716-446655440304",
             "timed_out",
             "timed_out",
             Some("timeout"),
             OtlpStatusCode::Error,
             "workflow_failed",
+            "Timed Out Job",
+            "Timed Out Step",
+            "2026-08-06T10:40:01.000000002Z",
+            "2026-08-06T10:40:00.900000004Z",
+            None,
+            Some((
+                "GitHubActionsTaskTimeout",
+                "CI task timed out: Timed Out Step",
+                "2026-08-06T10:40:00.900000004Z",
+            )),
         ),
-        ("neutral", "neutral", None, OtlpStatusCode::Unset, ""),
         (
+            "550e8400-e29b-41d4-a716-446655440305",
+            "neutral",
+            "neutral",
+            None,
+            OtlpStatusCode::Unset,
+            "",
+            "Neutral Job",
+            "Neutral Step",
+            "2026-08-06T10:50:01.000000002Z",
+            "2026-08-06T10:50:00.900000004Z",
+            None,
+            None,
+        ),
+        (
+            "550e8400-e29b-41d4-a716-446655440306",
             "fixture_private_unknown",
             "other",
             None,
             OtlpStatusCode::Unset,
             "",
+            "Other Job",
+            "Other Step",
+            "2026-08-06T11:00:01.000000002Z",
+            "2026-08-06T11:00:00.900000004Z",
+            None,
+            None,
         ),
     ];
+    let fallback_delivery_id = "550e8400-e29b-41d4-a716-446655440307";
+    let fallback_job_completed_at = "2026-08-06T11:10:01.000000002Z";
+    let fallback_step_completed_at = "2026-08-06T11:10:00.900000004Z";
 
-    for (index, (raw, _, _, _, _)) in cases.iter().enumerate() {
+    for (
+        index,
+        (
+            delivery_id,
+            raw,
+            _,
+            _,
+            _,
+            _,
+            job_name,
+            step_name,
+            job_completed_at,
+            step_completed_at,
+            _,
+            _,
+        ),
+    ) in cases.iter().enumerate()
+    {
         let body = workflow_job_body(
             Some("completed"),
             serde_json::json!({
                 "id": 100 + index,
                 "run_id": 200 + index,
                 "run_attempt": 1,
+                "name": job_name,
                 "conclusion": raw,
                 "started_at": "2026-08-06T10:00:00.000000001Z",
-                "completed_at": "2026-08-06T10:00:01.000000002Z",
+                "completed_at": job_completed_at,
                 "steps": [{
                     "number": 1,
+                    "name": step_name,
                     "conclusion": raw,
                     "started_at": "2026-08-06T10:00:00.100000003Z",
-                    "completed_at": "2026-08-06T10:00:00.900000004Z"
+                    "completed_at": step_completed_at
                 }]
             }),
         );
-        let delivery_id = format!("550e8400-e29b-41d4-a716-4466554403{index:02}");
         let response = fixture
-            .webhook(&body, "workflow_job", &delivery_id, WEBHOOK_SECRET)
+            .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
             .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
+
+    let fallback_body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 107,
+            "run_id": 207,
+            "run_attempt": 1,
+            "name": "Fallback Failure Job",
+            "conclusion": "failure",
+            "started_at": "2026-08-06T11:10:00.000000001Z",
+            "completed_at": fallback_job_completed_at,
+            "steps": [{
+                "number": 1,
+                "name": "Successful Child",
+                "conclusion": "success",
+                "started_at": "2026-08-06T11:10:00.100000003Z",
+                "completed_at": fallback_step_completed_at
+            }]
+        }),
+    );
+    let fallback_response = fixture
+        .webhook(
+            &fallback_body,
+            "workflow_job",
+            fallback_delivery_id,
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(fallback_response.status(), StatusCode::NO_CONTENT);
 
     let captured = fixture.force_flush();
     assert_eq!(
@@ -3715,7 +4130,7 @@ async fn workflow_conclusions_export_bounded_results_and_statuses() {
             .iter()
             .filter(|span| span.name == "github.workflow.job")
             .count(),
-        cases.len()
+        cases.len() + 1
     );
     assert_eq!(
         captured
@@ -3723,12 +4138,25 @@ async fn workflow_conclusions_export_bounded_results_and_statuses() {
             .iter()
             .filter(|span| span.name == "github.workflow.step")
             .count(),
-        cases.len()
+        cases.len() + 1
     );
 
-    for (index, (_, normalized, semantic_result, status, description)) in cases.iter().enumerate() {
-        let delivery_id = format!("550e8400-e29b-41d4-a716-4466554403{index:02}");
-        let job = captured.workflow_job_for_delivery(&delivery_id);
+    for (
+        delivery_id,
+        _,
+        normalized,
+        semantic_result,
+        status,
+        description,
+        _,
+        _,
+        _,
+        _,
+        expected_job_event,
+        expected_step_event,
+    ) in &cases
+    {
+        let job = captured.workflow_job_for_delivery(delivery_id);
         let step = captured.child_named(job, "github.workflow.step");
 
         assert_attribute(job, "github.workflow.conclusion", normalized);
@@ -3745,7 +4173,47 @@ async fn workflow_conclusions_export_bounded_results_and_statuses() {
         // These protobuf assertions exercise WorkflowConclusion::status.
         assert_otlp_status(job, *status, description);
         assert_otlp_status(step, *status, description);
+        match expected_job_event {
+            Some((expected_type, expected_message, expected_timestamp)) => assert_exception_event(
+                job,
+                expected_type,
+                expected_message,
+                rfc3339_unix_nanos(expected_timestamp),
+            ),
+            None => assert_no_exception_events(job),
+        }
+        match expected_step_event {
+            Some((expected_type, expected_message, expected_timestamp)) => assert_exception_event(
+                step,
+                expected_type,
+                expected_message,
+                rfc3339_unix_nanos(expected_timestamp),
+            ),
+            None => assert_no_exception_events(step),
+        }
     }
+
+    let fallback_job = captured.workflow_job_for_delivery(fallback_delivery_id);
+    let fallback_step = captured.child_named(fallback_job, "github.workflow.step");
+    assert_attribute(fallback_job, "github.workflow.conclusion", "failure");
+    assert_attribute(fallback_step, "github.workflow.conclusion", "success");
+    assert_eq!(
+        string_attribute(fallback_job, "cicd.pipeline.result"),
+        Some("failure")
+    );
+    assert_eq!(
+        string_attribute(fallback_step, "cicd.pipeline.task.run.result"),
+        Some("success")
+    );
+    assert_otlp_status(fallback_job, OtlpStatusCode::Error, "workflow_failed");
+    assert_otlp_status(fallback_step, OtlpStatusCode::Ok, "");
+    assert_exception_event(
+        fallback_job,
+        "GitHubActionsTaskFailure",
+        "CI task failed: Fallback Failure Job",
+        rfc3339_unix_nanos(fallback_job_completed_at),
+    );
+    assert_no_exception_events(fallback_step);
     captured.assert_absent("fixture_private_unknown");
 }
 

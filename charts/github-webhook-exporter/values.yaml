@@ -12,6 +12,7 @@ existingSecret:
     otlpHeaders: ""
     otlpTracesHeaders: ""
     otlpLogsHeaders: ""
+    sentryDsn: ""
 service:
   type: ClusterIP
   port: 8080

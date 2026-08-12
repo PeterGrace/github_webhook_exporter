@@ -47,6 +47,7 @@ pub struct TelemetryConfig {
     batch_size: usize,
     shutdown_timeout: Duration,
     service_name: String,
+    sentry_dsn: Option<Zeroizing<String>>,
     pub(crate) resource_attributes: Vec<(String, String)>,
 }
 
@@ -76,6 +77,11 @@ impl TelemetryConfig {
         &self.service_name
     }
 
+    /// Returns the optional Sentry DSN used for linked workflow-task errors.
+    pub(crate) fn sentry_dsn(&self) -> Option<&str> {
+        self.sentry_dsn.as_deref().map(String::as_str)
+    }
+
     /// Returns the approved Kubernetes pod resource attribute, when configured.
     pub fn pod_name(&self) -> Option<&str> {
         self.resource_attribute("k8s.pod.name")
@@ -103,6 +109,10 @@ impl fmt::Debug for TelemetryConfig {
             .field("batch_size", &self.batch_size)
             .field("shutdown_timeout", &self.shutdown_timeout)
             .field("service_name", &self.service_name)
+            .field(
+                "sentry_dsn",
+                &self.sentry_dsn.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("resource_attributes", &self.resource_attributes)
             .finish()
     }
@@ -411,6 +421,20 @@ impl TelemetryConfig {
                 variable: "OTEL_SERVICE_NAME",
             });
         }
+        let sentry_dsn = optional_string(lookup, "SENTRY_DSN")?
+            .map(|dsn| {
+                dsn.parse::<sentry::types::Dsn>()
+                    .map(|_| Zeroizing::new(dsn))
+                    .map_err(|_| ConfigError::Invalid {
+                        variable: "SENTRY_DSN",
+                    })
+            })
+            .transpose()?;
+        if sentry_dsn.is_some() && trace_endpoint.is_none() {
+            return Err(ConfigError::Invalid {
+                variable: "SENTRY_DSN",
+            });
+        }
         let resource_attributes = validated_resource_attributes(lookup)?;
 
         Ok(Self {
@@ -428,6 +452,7 @@ impl TelemetryConfig {
             batch_size,
             shutdown_timeout: Duration::from_secs(shutdown_timeout_seconds),
             service_name,
+            sentry_dsn,
             resource_attributes,
         })
     }
@@ -875,6 +900,7 @@ mod tests {
         assert_eq!(telemetry.batch_size(), DEFAULT_OTEL_BATCH_SIZE);
         assert_eq!(telemetry.shutdown_timeout(), Duration::from_secs(5));
         assert_eq!(telemetry.service_name(), "github-webhook-exporter");
+        assert_eq!(telemetry.sentry_dsn(), None);
         assert_eq!(telemetry.pod_name(), None);
         assert_eq!(telemetry.kubernetes_namespace(), None);
     }
@@ -899,6 +925,7 @@ mod tests {
             ("OTEL_EXPORTER_OTLP_TIMEOUT", "1200"),
             ("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT", "800"),
             ("OTEL_SERVICE_NAME", "custom-exporter"),
+            ("SENTRY_DSN", "https://public@example.ingest.sentry.io/42"),
             (
                 "OTEL_RESOURCE_ATTRIBUTES",
                 "k8s.pod.name=exporter-0,k8s.namespace.name=observability,forbidden=value",
@@ -918,6 +945,10 @@ mod tests {
         assert_eq!(telemetry.batch_size(), 4);
         assert_eq!(telemetry.shutdown_timeout(), Duration::from_secs(9));
         assert_eq!(telemetry.service_name(), "custom-exporter");
+        assert_eq!(
+            telemetry.sentry_dsn(),
+            Some("https://public@example.ingest.sentry.io/42")
+        );
         assert_eq!(telemetry.pod_name(), Some("exporter-0"));
         assert_eq!(telemetry.kubernetes_namespace(), Some("observability"));
         let trace_exporter = telemetry
@@ -976,6 +1007,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sentry_dsn_requires_a_valid_dsn_and_trace_export() {
+        for invalid_dsn in ["not-a-dsn", "ftp://public@example.test/42"] {
+            let mut variables = required_variables();
+            variables.insert(
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT".to_owned(),
+                OsString::from("https://traces.example/v1/traces"),
+            );
+            variables.insert("SENTRY_DSN".to_owned(), OsString::from(invalid_dsn));
+
+            assert_eq!(
+                RuntimeConfig::from_map(variables).expect_err("DSN must be rejected"),
+                ConfigError::Invalid {
+                    variable: "SENTRY_DSN"
+                }
+            );
+        }
+
+        let mut variables = required_variables();
+        variables.insert(
+            "SENTRY_DSN".to_owned(),
+            OsString::from("https://public@example.ingest.sentry.io/42"),
+        );
+        assert_eq!(
+            RuntimeConfig::from_map(variables).expect_err("linked errors require trace export"),
+            ConfigError::Invalid {
+                variable: "SENTRY_DSN"
+            }
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn telemetry_rejects_non_unicode_standard_settings() {
@@ -986,6 +1048,7 @@ mod tests {
             "OTEL_EXPORTER_OTLP_HEADERS",
             "OTEL_SERVICE_NAME",
             "OTEL_RESOURCE_ATTRIBUTES",
+            "SENTRY_DSN",
         ] {
             let mut variables = required_variables();
             variables.insert(variable.to_owned(), OsString::from_vec(vec![0xff]));
@@ -1008,12 +1071,18 @@ mod tests {
             "OTEL_EXPORTER_OTLP_HEADERS".to_owned(),
             OsString::from("authorization=secret-credential"),
         );
+        variables.insert(
+            "SENTRY_DSN".to_owned(),
+            OsString::from("https://public:secret@example.ingest.sentry.io/42"),
+        );
 
         let config = RuntimeConfig::from_map(variables).expect("configuration is valid");
         let rendered = format!("{config:?}");
 
         assert!(!rendered.contains("collector.example"));
         assert!(!rendered.contains("credential"));
+        assert!(!rendered.contains("example.ingest.sentry.io"));
+        assert!(!rendered.contains("public:secret"));
         assert!(rendered.contains("[REDACTED]"));
     }
 }

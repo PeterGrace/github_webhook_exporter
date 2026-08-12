@@ -1,6 +1,6 @@
 //! Bounded workflow telemetry values used to project authenticated GitHub Actions history.
 
-use std::{fmt, time::SystemTime};
+use std::{fmt, sync::Arc, time::SystemTime};
 
 use opentelemetry::{
     trace::{Span as _, Status, TraceContextExt, Tracer},
@@ -14,16 +14,19 @@ use crate::{
     security::CanonicalRepositoryName,
 };
 
-use super::trace::{
-    commit_sha_attribute, delivery_id_attribute, pull_request_numbers_attribute,
-    repository_name_attribute, timing_source_attribute, workflow_conclusion_attribute,
-    workflow_event_attribute, workflow_job_id_attribute, workflow_job_url_attribute,
-    workflow_name_attribute, workflow_pipeline_result_attribute,
-    workflow_pipeline_run_id_attribute, workflow_pipeline_step_task_run_id_attribute,
-    workflow_pipeline_task_run_id_attribute, workflow_pipeline_task_run_result_attribute,
-    workflow_run_attempt_attribute, workflow_run_id_attribute, workflow_source_branch_attribute,
-    workflow_step_url_attribute, workflow_target_branch_attribute, workflow_task_name_attribute,
-    CommitSha,
+use super::{
+    trace::{
+        commit_sha_attribute, delivery_id_attribute, pull_request_numbers_attribute,
+        repository_name_attribute, timing_source_attribute, workflow_conclusion_attribute,
+        workflow_event_attribute, workflow_job_id_attribute, workflow_job_url_attribute,
+        workflow_name_attribute, workflow_pipeline_result_attribute,
+        workflow_pipeline_run_id_attribute, workflow_pipeline_step_task_run_id_attribute,
+        workflow_pipeline_task_run_id_attribute, workflow_pipeline_task_run_result_attribute,
+        workflow_run_attempt_attribute, workflow_run_id_attribute,
+        workflow_source_branch_attribute, workflow_step_url_attribute,
+        workflow_target_branch_attribute, workflow_task_name_attribute, CommitSha,
+    },
+    workflow_error::{SyntheticWorkflowError, WorkflowErrorReporter},
 };
 
 const MAX_DISPLAY_NAME_LENGTH: usize = 128;
@@ -473,6 +476,7 @@ impl WorkflowRunContext {
 #[derive(Clone, Debug, Default)]
 pub struct WorkflowTraceEmitter {
     tracer: Option<SdkTracer>,
+    error_reporter: Option<Arc<dyn WorkflowErrorReporter>>,
 }
 
 impl WorkflowTraceEmitter {
@@ -489,6 +493,17 @@ impl WorkflowTraceEmitter {
     pub(crate) fn new(tracer: SdkTracer) -> Self {
         Self {
             tracer: Some(tracer),
+            error_reporter: None,
+        }
+    }
+
+    pub(super) fn new_with_error_reporter(
+        tracer: SdkTracer,
+        error_reporter: Arc<dyn WorkflowErrorReporter>,
+    ) -> Self {
+        Self {
+            tracer: Some(tracer),
+            error_reporter: Some(error_reporter),
         }
     }
 
@@ -510,7 +525,9 @@ impl WorkflowTraceEmitter {
             &Context::new(),
         );
         root.set_status(job.conclusion().status());
+        let root_span_context = root.span_context().clone();
         let parent_context = Context::current_with_span(root);
+        let mut child_error_emitted = false;
 
         for step in job.steps() {
             let mut span = tracer.build_with_context(
@@ -521,9 +538,45 @@ impl WorkflowTraceEmitter {
                 &parent_context,
             );
             span.set_status(step.conclusion().status());
+            if step.conclusion().emits_synthetic_error() {
+                child_error_emitted = true;
+                let span_context = span.span_context();
+                let error = SyntheticWorkflowError::for_step(
+                    job,
+                    step,
+                    span_context.trace_id(),
+                    span_context.span_id(),
+                );
+                span.add_event_with_timestamp(
+                    "exception",
+                    error.timestamp(),
+                    error.span_event_attributes().into(),
+                );
+                if let Some(reporter) = &self.error_reporter {
+                    reporter.report(error);
+                }
+            }
             span.end_with_timestamp(step.timing().end());
         }
 
+        if !child_error_emitted && job.conclusion().emits_synthetic_error() {
+            let error = SyntheticWorkflowError::for_job(
+                job,
+                root_span_context.trace_id(),
+                root_span_context.span_id(),
+            );
+            let root_span = parent_context.span();
+            root_span.add_event_with_timestamp(
+                "exception",
+                error.timestamp(),
+                error.span_event_attributes().into(),
+            );
+            if let Some(reporter) = &self.error_reporter {
+                reporter.report(error);
+            }
+            root_span.end_with_timestamp(job.timing().end());
+            return;
+        }
         parent_context.span().end_with_timestamp(job.timing().end());
     }
 }
@@ -690,6 +743,10 @@ impl WorkflowConclusion {
             Self::TimedOut => Some("timeout"),
             Self::Neutral | Self::Other => None,
         }
+    }
+
+    pub(crate) const fn emits_synthetic_error(self) -> bool {
+        matches!(self, Self::Failure | Self::TimedOut)
     }
 
     /// Returns the bounded OpenTelemetry status for this conclusion.
@@ -873,7 +930,13 @@ mod tests {
         WorkflowPullRequests, WorkflowRunAttempt, WorkflowRunContext, WorkflowRunId,
         WorkflowStepTrace, WorkflowTraceEmitter,
     };
-    use crate::{domain::merge_queue::PullRequestNumber, telemetry::trace::CommitSha};
+    use crate::{
+        domain::merge_queue::PullRequestNumber,
+        telemetry::{
+            trace::CommitSha,
+            workflow_error::{SyntheticWorkflowError, WorkflowErrorReporter, WorkflowTaskKind},
+        },
+    };
 
     #[test]
     fn positive_workflow_identifiers_reject_zero_and_negative_values() {
@@ -1139,6 +1202,24 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct CollectingErrorReporter(Mutex<Vec<SyntheticWorkflowError>>);
+
+    impl CollectingErrorReporter {
+        fn errors(&self) -> std::sync::MutexGuard<'_, Vec<SyntheticWorkflowError>> {
+            self.0.lock().expect("error capture lock is available")
+        }
+    }
+
+    impl WorkflowErrorReporter for CollectingErrorReporter {
+        fn report(&self, error: SyntheticWorkflowError) {
+            self.0
+                .lock()
+                .expect("error capture lock is available")
+                .push(error);
+        }
+    }
+
     #[test]
     fn workflow_step_trace_rejects_non_positive_numbers() {
         let timing = HistoricalTiming::reported(
@@ -1156,6 +1237,299 @@ mod tests {
         assert!(WorkflowStepTrace::new(-1, None, WorkflowConclusion::Success, timing).is_err());
     }
 
+    fn workflow_job_with_conclusions(
+        job_conclusion: WorkflowConclusion,
+        step_conclusions: &[WorkflowConclusion],
+    ) -> WorkflowJobTrace {
+        let timing = HistoricalTiming::fallback(SystemTime::UNIX_EPOCH + Duration::from_secs(20));
+        let steps = step_conclusions
+            .iter()
+            .enumerate()
+            .map(|(index, conclusion)| {
+                let number = i64::try_from(index + 1).expect("test step number fits i64");
+                WorkflowStepTrace::new(
+                    number,
+                    DisplayName::sanitize(&format!("Step {number}")),
+                    *conclusion,
+                    timing.clone(),
+                )
+                .expect("step is valid")
+            })
+            .collect();
+        WorkflowJobTrace::new(WorkflowJobTraceParts {
+            repository_name: crate::security::CanonicalRepositoryName::new("Owner/Repository")
+                .expect("repository name is valid"),
+            delivery_id: crate::domain::delivery::DeliveryId::parse(
+                "550e8400-e29b-41d4-a716-446655440000",
+            )
+            .expect("delivery id is valid"),
+            workflow_name: DisplayName::sanitize("Build Workflow"),
+            run_id: WorkflowRunId::new(31).expect("run id is valid"),
+            run_attempt: WorkflowRunAttempt::new(2).expect("run attempt is valid"),
+            job_id: WorkflowJobId::new(41).expect("job id is valid"),
+            job_name: DisplayName::sanitize("Linux Job"),
+            conclusion: job_conclusion,
+            head_sha: None,
+            pull_requests: WorkflowPullRequests::new([]),
+            workflow_run_context: None,
+            timing,
+            steps,
+        })
+    }
+
+    fn emitted_spans_and_errors(
+        job: &WorkflowJobTrace,
+    ) -> (Vec<SpanData>, Vec<SyntheticWorkflowError>) {
+        let exporter = CollectingSpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(SimpleSpanProcessor::new(exporter.clone()))
+            .build();
+        let reporter = Arc::new(CollectingErrorReporter::default());
+        let emitter = WorkflowTraceEmitter::new_with_error_reporter(
+            provider.tracer("github_webhook_exporter"),
+            reporter.clone(),
+        );
+
+        emitter.emit(job);
+        provider.force_flush().expect("spans flush");
+
+        let spans = exporter.finished_spans();
+        let errors = std::mem::take(&mut *reporter.errors());
+        (spans, errors)
+    }
+
+    fn emitted_errors(job: &WorkflowJobTrace) -> Vec<SyntheticWorkflowError> {
+        let (_, errors) = emitted_spans_and_errors(job);
+        errors
+    }
+
+    #[test]
+    fn emitter_reports_each_failing_step_without_a_duplicate_job_error() {
+        let job = workflow_job_with_conclusions(
+            WorkflowConclusion::Failure,
+            &[
+                WorkflowConclusion::Failure,
+                WorkflowConclusion::Success,
+                WorkflowConclusion::TimedOut,
+            ],
+        );
+
+        let errors = emitted_errors(&job);
+
+        assert_eq!(errors.len(), 2);
+        assert!(errors
+            .iter()
+            .all(|error| error.kind() == WorkflowTaskKind::Step));
+        assert_eq!(errors[0].task_name(), "Step 1");
+        assert_eq!(errors[1].task_name(), "Step 3");
+    }
+
+    #[test]
+    fn emitter_reports_the_job_only_when_no_failing_step_explains_it() {
+        let job = workflow_job_with_conclusions(
+            WorkflowConclusion::Failure,
+            &[WorkflowConclusion::Success, WorkflowConclusion::Skipped],
+        );
+
+        let errors = emitted_errors(&job);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind(), WorkflowTaskKind::Job);
+        assert_eq!(errors[0].task_name(), "Linux Job");
+    }
+
+    #[test]
+    fn emitter_exports_otlp_exception_events() {
+        let job_start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let first_step_start = job_start + Duration::from_secs(5);
+        let first_step_end = first_step_start + Duration::from_secs(10);
+        let second_step_start = first_step_end + Duration::from_secs(5);
+        let second_step_end = second_step_start + Duration::from_secs(10);
+        let third_step_start = second_step_end + Duration::from_secs(5);
+        let third_step_end = third_step_start + Duration::from_secs(10);
+        let job_end = third_step_end + Duration::from_secs(5);
+        let job_timing =
+            HistoricalTiming::reported(job_start, job_end).expect("job timing is ordered");
+        let first_step_timing =
+            HistoricalTiming::reported_within_parent(first_step_start, first_step_end, &job_timing)
+                .expect("first step timing fits inside job timing");
+        let second_step_timing = HistoricalTiming::reported_within_parent(
+            second_step_start,
+            second_step_end,
+            &job_timing,
+        )
+        .expect("second step timing fits inside job timing");
+        let third_step_timing =
+            HistoricalTiming::reported_within_parent(third_step_start, third_step_end, &job_timing)
+                .expect("third step timing fits inside job timing");
+        let job = WorkflowJobTrace::new(WorkflowJobTraceParts {
+            repository_name: crate::security::CanonicalRepositoryName::new("Owner/Repository")
+                .expect("repository name is valid"),
+            delivery_id: crate::domain::delivery::DeliveryId::parse(
+                "550e8400-e29b-41d4-a716-446655440000",
+            )
+            .expect("delivery id is valid"),
+            workflow_name: DisplayName::sanitize("Build Workflow"),
+            run_id: WorkflowRunId::new(31).expect("run id is valid"),
+            run_attempt: WorkflowRunAttempt::new(2).expect("run attempt is valid"),
+            job_id: WorkflowJobId::new(41).expect("job id is valid"),
+            job_name: DisplayName::sanitize("Linux Job"),
+            conclusion: WorkflowConclusion::Failure,
+            head_sha: None,
+            pull_requests: WorkflowPullRequests::new([]),
+            workflow_run_context: None,
+            timing: job_timing,
+            steps: vec![
+                WorkflowStepTrace::new(
+                    1,
+                    DisplayName::sanitize("Step 1"),
+                    WorkflowConclusion::Failure,
+                    first_step_timing.clone(),
+                )
+                .expect("first step is valid"),
+                WorkflowStepTrace::new(
+                    2,
+                    DisplayName::sanitize("Step 2"),
+                    WorkflowConclusion::Success,
+                    second_step_timing,
+                )
+                .expect("second step is valid"),
+                WorkflowStepTrace::new(
+                    3,
+                    DisplayName::sanitize("Step 3"),
+                    WorkflowConclusion::TimedOut,
+                    third_step_timing.clone(),
+                )
+                .expect("third step is valid"),
+            ],
+        });
+
+        let (spans, errors) = emitted_spans_and_errors(&job);
+
+        assert_eq!(errors.len(), 2);
+        let job_span = spans
+            .iter()
+            .find(|span| span.name == "github.workflow.job")
+            .expect("job span is exported");
+        let mut steps = spans
+            .iter()
+            .filter(|span| span.name == "github.workflow.step")
+            .collect::<Vec<_>>();
+        steps.sort_by_key(|span| span.start_time);
+
+        assert!(
+            job_span.events.is_empty(),
+            "job span must not duplicate child exceptions"
+        );
+        assert_exception_event(
+            steps[0],
+            "GitHubActionsTaskFailure",
+            "CI task failed: Step 1",
+            first_step_timing.end(),
+        );
+        assert!(
+            steps[1].events.is_empty(),
+            "successful step must not emit exceptions"
+        );
+        assert_exception_event(
+            steps[2],
+            "GitHubActionsTaskTimeout",
+            "CI task timed out: Step 3",
+            third_step_timing.end(),
+        );
+    }
+
+    #[test]
+    fn emitter_exports_job_exception_only_as_fallback() {
+        let job_start = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let first_step_start = job_start + Duration::from_secs(5);
+        let first_step_end = first_step_start + Duration::from_secs(10);
+        let second_step_start = first_step_end + Duration::from_secs(5);
+        let second_step_end = second_step_start + Duration::from_secs(10);
+        let job_end = second_step_end + Duration::from_secs(5);
+        let job_timing =
+            HistoricalTiming::reported(job_start, job_end).expect("job timing is ordered");
+        let first_step_timing =
+            HistoricalTiming::reported_within_parent(first_step_start, first_step_end, &job_timing)
+                .expect("first step timing fits inside job timing");
+        let second_step_timing = HistoricalTiming::reported_within_parent(
+            second_step_start,
+            second_step_end,
+            &job_timing,
+        )
+        .expect("second step timing fits inside job timing");
+        let job = WorkflowJobTrace::new(WorkflowJobTraceParts {
+            repository_name: crate::security::CanonicalRepositoryName::new("Owner/Repository")
+                .expect("repository name is valid"),
+            delivery_id: crate::domain::delivery::DeliveryId::parse(
+                "550e8400-e29b-41d4-a716-446655440001",
+            )
+            .expect("delivery id is valid"),
+            workflow_name: DisplayName::sanitize("Build Workflow"),
+            run_id: WorkflowRunId::new(32).expect("run id is valid"),
+            run_attempt: WorkflowRunAttempt::new(2).expect("run attempt is valid"),
+            job_id: WorkflowJobId::new(42).expect("job id is valid"),
+            job_name: DisplayName::sanitize("Linux Job"),
+            conclusion: WorkflowConclusion::Failure,
+            head_sha: None,
+            pull_requests: WorkflowPullRequests::new([]),
+            workflow_run_context: None,
+            timing: job_timing.clone(),
+            steps: vec![
+                WorkflowStepTrace::new(
+                    1,
+                    DisplayName::sanitize("Step 1"),
+                    WorkflowConclusion::Success,
+                    first_step_timing,
+                )
+                .expect("first step is valid"),
+                WorkflowStepTrace::new(
+                    2,
+                    DisplayName::sanitize("Step 2"),
+                    WorkflowConclusion::Skipped,
+                    second_step_timing,
+                )
+                .expect("second step is valid"),
+            ],
+        });
+
+        let (spans, errors) = emitted_spans_and_errors(&job);
+
+        assert_eq!(errors.len(), 1);
+        let job_span = spans
+            .iter()
+            .find(|span| span.name == "github.workflow.job")
+            .expect("job span is exported");
+        let steps = spans
+            .iter()
+            .filter(|span| span.name == "github.workflow.step")
+            .collect::<Vec<_>>();
+
+        assert_exception_event(
+            job_span,
+            "GitHubActionsTaskFailure",
+            "CI task failed: Linux Job",
+            job_timing.end(),
+        );
+        assert!(steps.iter().all(|span| span.events.is_empty()));
+    }
+
+    #[test]
+    fn emitter_does_not_report_non_failure_conclusions() {
+        for conclusion in [
+            WorkflowConclusion::Success,
+            WorkflowConclusion::Cancelled,
+            WorkflowConclusion::Skipped,
+            WorkflowConclusion::Neutral,
+            WorkflowConclusion::Other,
+        ] {
+            let job = workflow_job_with_conclusions(conclusion, &[conclusion]);
+            let (spans, errors) = emitted_spans_and_errors(&job);
+            assert!(errors.is_empty());
+            assert!(spans.iter().all(|span| span.events.is_empty()));
+        }
+    }
+
     #[test]
     fn emitter_exports_independent_historical_job_and_step_spans() {
         let exporter = CollectingSpanExporter::default();
@@ -1163,7 +1537,9 @@ mod tests {
             .with_span_processor(SimpleSpanProcessor::new(exporter.clone()))
             .build();
         let tracer = provider.tracer("github_webhook_exporter");
-        let emitter = WorkflowTraceEmitter::new(tracer.clone());
+        let error_reporter = Arc::new(CollectingErrorReporter::default());
+        let emitter =
+            WorkflowTraceEmitter::new_with_error_reporter(tracer.clone(), error_reporter.clone());
 
         let job_start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let first_step_start = job_start + Duration::from_secs(5);
@@ -1285,6 +1661,13 @@ mod tests {
         assert_eq!(job.status, WorkflowConclusion::Failure.status());
         assert_eq!(steps[0].status, WorkflowConclusion::Success.status());
         assert_eq!(steps[1].status, WorkflowConclusion::TimedOut.status());
+
+        let errors = error_reporter.errors();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind(), WorkflowTaskKind::Step);
+        assert_eq!(errors[0].task_name(), "Test");
+        assert_eq!(errors[0].trace_id(), steps[1].span_context.trace_id());
+        assert_eq!(errors[0].span_id(), steps[1].span_context.span_id());
 
         let expected_job_keys = BTreeSet::from([
             "cicd.pipeline.name",
@@ -1409,6 +1792,51 @@ mod tests {
             .iter()
             .find(|attribute| attribute.key.as_str() == key)
             .map(|attribute| &attribute.value)
+    }
+
+    fn event_attribute<'event>(
+        event: &'event opentelemetry::trace::Event,
+        key: &str,
+    ) -> Option<&'event Value> {
+        event
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == key)
+            .map(|attribute| &attribute.value)
+    }
+
+    fn assert_exception_event(
+        span: &SpanData,
+        expected_type: &str,
+        expected_message: &str,
+        expected_timestamp: SystemTime,
+    ) {
+        let exception_events = span
+            .events
+            .iter()
+            .filter(|event| event.name.as_ref() == "exception")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            exception_events.len(),
+            1,
+            "exception event count for {}",
+            span.name
+        );
+        let event = exception_events[0];
+        assert_eq!(event.timestamp, expected_timestamp);
+        assert_eq!(event.attributes.len(), 2);
+        assert_eq!(
+            event_attribute(event, "exception.type")
+                .map(Value::as_str)
+                .as_deref(),
+            Some(expected_type)
+        );
+        assert_eq!(
+            event_attribute(event, "exception.message")
+                .map(Value::as_str)
+                .as_deref(),
+            Some(expected_message)
+        );
     }
 
     fn attribute_keys(span: &SpanData) -> BTreeSet<&str> {

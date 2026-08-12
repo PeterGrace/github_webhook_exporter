@@ -87,8 +87,9 @@ helm upgrade --install github-webhook-exporter charts/github-webhook-exporter \
 
 Set `existingSecret.name` or its key-name values when the existing Secret uses different metadata.
 Setting an optional OTLP header key name projects that key from the same Secret; an empty key name
-omits the corresponding environment variable. The chart never reads or copies Secret data into its
-ConfigMap.
+omits the corresponding environment variable. Setting `existingSecret.keys.sentryDsn` projects a
+Sentry DSN for linked workflow-task errors; it must target the same Sentry project as trace export.
+The chart never reads or copies Secret data into its ConfigMap.
 
 ## Values
 
@@ -105,6 +106,7 @@ ConfigMap.
 | `existingSecret.keys.otlpHeaders` | `""` | Optional key projected as generic OTLP headers; empty omits it. |
 | `existingSecret.keys.otlpTracesHeaders` | `""` | Optional key projected as trace OTLP headers; empty omits it. |
 | `existingSecret.keys.otlpLogsHeaders` | `""` | Optional key projected as log OTLP headers; empty omits it. |
+| `existingSecret.keys.sentryDsn` | `""` | Optional key projected as `SENTRY_DSN`; empty disables synthetic workflow-task errors. |
 | `service.type` | `ClusterIP` | Fixed supported Service type. |
 | `service.port` | `8080` | Service, container, probe, and `[::]` application listener port. |
 | `application.shutdownTimeoutSeconds` | `30` | Drain deadline; range `1..=300` seconds. |
