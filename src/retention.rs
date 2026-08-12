@@ -7,13 +7,16 @@ use tracing::{info, warn, Instrument};
 
 use crate::{
     error::ErrorCorrelationId,
-    storage::{DeliveryStore, DeliveryStoreError, MergeQueueStore, MergeQueueStoreError},
+    storage::{
+        DeliveryStore, DeliveryStoreError, MergeQueueStore, MergeQueueStoreError, WorkflowRunStore,
+        WorkflowRunStoreError,
+    },
     telemetry::trace::{self, Operation, OperationOutcome},
 };
 
 const FULL_PRUNE_BATCH_SIZE: u64 = 1_000;
 
-/// Validated scheduling and age limits for delivery and merge-queue retention.
+/// Validated scheduling and age limits for delivery, workflow-run, and merge-queue retention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionConfig {
     interval: Duration,
@@ -65,17 +68,19 @@ fn validate_retention(retention: Duration) -> Result<time::Duration, RetentionEr
     time::Duration::try_from(retention).map_err(|_| RetentionError::InvalidRetention)
 }
 
-/// Runs scheduled bounded delivery and merge-queue pruning until cancellation is requested.
+/// Runs scheduled bounded delivery, workflow-run, and merge-queue pruning until cancellation.
 ///
 /// The first pass starts only after one full interval, and missed ticks are skipped. A shutdown
 /// received during an active SQLite batch allows that batch to finish, then prevents another batch
-/// from starting. Both workloads use cutoffs fixed at the beginning of each scheduled pass.
+/// from starting. All workloads use cutoffs fixed at the beginning of each scheduled pass;
+/// workflow-run context shares the processed-delivery cutoff.
 pub async fn run_retention(
     delivery_store: DeliveryStore,
     merge_queue_store: MergeQueueStore,
     config: RetentionConfig,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let workflow_run_store = WorkflowRunStore::new(delivery_store.pool().clone());
     let start = Instant::now() + config.interval;
     let mut ticker = tokio::time::interval_at(start, config.interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -88,6 +93,7 @@ pub async fn run_retention(
                 run_traced_retention_pass(
                     &delivery_store,
                     &merge_queue_store,
+                    &workflow_run_store,
                     config,
                     &shutdown,
                 )
@@ -100,13 +106,20 @@ pub async fn run_retention(
 async fn run_traced_retention_pass(
     delivery_store: &DeliveryStore,
     merge_queue_store: &MergeQueueStore,
+    workflow_run_store: &WorkflowRunStore,
     config: RetentionConfig,
     shutdown: &watch::Receiver<bool>,
 ) {
     let retention_span = trace::operation_span(Operation::RetentionRun);
-    let outcome = prune_retention_pass(delivery_store, merge_queue_store, config, shutdown)
-        .instrument(retention_span.clone())
-        .await;
+    let outcome = prune_retention_pass(
+        delivery_store,
+        merge_queue_store,
+        workflow_run_store,
+        config,
+        shutdown,
+    )
+    .instrument(retention_span.clone())
+    .await;
     trace::set_status(&retention_span, outcome.operation_outcome());
 }
 
@@ -118,12 +131,21 @@ pub(crate) async fn run_retention_once(
     config: RetentionConfig,
     shutdown: &watch::Receiver<bool>,
 ) {
-    run_traced_retention_pass(delivery_store, merge_queue_store, config, shutdown).await;
+    let workflow_run_store = WorkflowRunStore::new(delivery_store.pool().clone());
+    run_traced_retention_pass(
+        delivery_store,
+        merge_queue_store,
+        &workflow_run_store,
+        config,
+        shutdown,
+    )
+    .await;
 }
 
 async fn prune_retention_pass(
     delivery_store: &DeliveryStore,
     merge_queue_store: &MergeQueueStore,
+    workflow_run_store: &WorkflowRunStore,
     config: RetentionConfig,
     shutdown: &watch::Receiver<bool>,
 ) -> RetentionPassOutcome {
@@ -131,6 +153,7 @@ async fn prune_retention_pass(
     prune_retention_workloads(
         delivery_store,
         merge_queue_store,
+        workflow_run_store,
         pass_started_at.checked_sub(config.delivery_retention),
         pass_started_at.checked_sub(config.merge_queue_retention),
         shutdown,
@@ -138,9 +161,10 @@ async fn prune_retention_pass(
     .await
 }
 
-async fn prune_retention_workloads<D, M>(
+async fn prune_retention_workloads<D, M, W>(
     delivery_store: &D,
     merge_queue_store: &M,
+    workflow_run_store: &W,
     delivery_cutoff: Option<OffsetDateTime>,
     merge_queue_cutoff: Option<OffsetDateTime>,
     shutdown: &watch::Receiver<bool>,
@@ -148,6 +172,7 @@ async fn prune_retention_workloads<D, M>(
 where
     D: PrunableStore,
     M: PrunableStore,
+    W: PrunableStore,
 {
     let delivery_outcome = prune_store(delivery_store, delivery_cutoff, shutdown).await;
     if *shutdown.borrow() || delivery_outcome == StorePruneOutcome::Cancelled {
@@ -156,7 +181,14 @@ where
     }
 
     let merge_queue_outcome = prune_store(merge_queue_store, merge_queue_cutoff, shutdown).await;
-    RetentionPassOutcome::from_store_outcome(delivery_outcome).combine(merge_queue_outcome)
+    let outcome =
+        RetentionPassOutcome::from_store_outcome(delivery_outcome).combine(merge_queue_outcome);
+    if *shutdown.borrow() || merge_queue_outcome == StorePruneOutcome::Cancelled {
+        return outcome.combine(StorePruneOutcome::Cancelled);
+    }
+
+    let workflow_run_outcome = prune_store(workflow_run_store, delivery_cutoff, shutdown).await;
+    outcome.combine(workflow_run_outcome)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +262,16 @@ impl PrunableStore for MergeQueueStore {
 
     async fn prune_batch(&self, cutoff: OffsetDateTime) -> Result<u64, Self::Error> {
         self.prune_completed_batch(cutoff).await
+    }
+}
+
+impl PrunableStore for WorkflowRunStore {
+    type Error = WorkflowRunStoreError;
+
+    const WORKLOAD: &'static str = "workflow_run";
+
+    async fn prune_batch(&self, cutoff: OffsetDateTime) -> Result<u64, Self::Error> {
+        WorkflowRunStore::prune_batch(self, cutoff).await
     }
 }
 
@@ -695,6 +737,34 @@ mod tests {
         .await
         .expect("retained attempts are readable");
         assert_eq!(retained_numbers, vec![2001, 2002]);
+    }
+
+    #[tokio::test]
+    async fn retention_prunes_workflow_context_with_the_delivery_cutoff() {
+        let (_directory, pool, delivery_store, queue_store) = retention_stores().await;
+        sqlx::query(
+            "INSERT INTO workflow_run_contexts \
+             (repository_id, workflow_run_id, workflow_run_attempt, event, updated_at) \
+             VALUES (1, 31, 1, 'pull_request', '2020-01-01T00:00:00.000Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("expired workflow context inserts");
+        let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let config = RetentionConfig::new(
+            Duration::from_millis(10),
+            Duration::from_secs(86_400),
+            Duration::from_secs(90 * 86_400),
+        )
+        .expect("retention configuration is valid");
+
+        run_retention_once(&delivery_store, &queue_store, config, &shutdown_receiver).await;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_run_contexts")
+            .fetch_one(&pool)
+            .await
+            .expect("workflow contexts are countable");
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

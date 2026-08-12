@@ -214,6 +214,46 @@ async fn metrics(router: Router) -> String {
 }
 
 #[tokio::test]
+async fn workflow_run_context_is_persisted_once_per_new_delivery() {
+    let app = test_app(2_097_152, Some(true)).await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440073";
+    let original = br#"{"action":"requested","workflow_run":{"id":31,"run_attempt":2,"event":"merge_group","head_branch":"gh-readonly-queue/main/pr-7","pull_requests":[{"head":{"ref":"feature"},"base":{"ref":"main"}}]},"repository":{"full_name":"owner/repository"}}"#;
+    let duplicate = br#"{"action":"requested","workflow_run":{"id":31,"run_attempt":2,"event":"pull_request","head_branch":"feature","pull_requests":[{"head":{"ref":"feature"},"base":{"ref":"release"}}]},"repository":{"full_name":"owner/repository"}}"#;
+
+    for body in [original.as_slice(), duplicate.as_slice()] {
+        let response = app
+            .router
+            .clone()
+            .oneshot(webhook_request_for_event(
+                body,
+                SECRET,
+                delivery_id,
+                "workflow_run",
+            ))
+            .await
+            .expect("workflow-run webhook succeeds");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let row = sqlx::query(
+        "SELECT event, source_branch, target_branch FROM workflow_run_contexts \
+         WHERE workflow_run_id = 31 AND workflow_run_attempt = 2",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("workflow context is persisted");
+    assert_eq!(row.get::<String, _>("event"), "merge_group");
+    assert_eq!(
+        row.get::<Option<String>, _>("source_branch").as_deref(),
+        Some("gh-readonly-queue/main/pr-7")
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("target_branch").as_deref(),
+        Some("main")
+    );
+}
+
+#[tokio::test]
 async fn repository_scoped_metrics_distinguish_full_names() {
     const FIRST_SECRET: &str = "first-repository-secret";
     const SECOND_SECRET: &str = "second-repository-secret";

@@ -18,8 +18,8 @@ use crate::metrics::{
 };
 use crate::security::CanonicalRepositoryName;
 use crate::telemetry::workflow::{
-    DisplayName, TimingSource, WorkflowConclusion, WorkflowJobId, WorkflowRunAttempt,
-    WorkflowRunId, WorkflowStepTrace,
+    DisplayName, TimingSource, WorkflowBranch, WorkflowConclusion, WorkflowEvent, WorkflowJobId,
+    WorkflowRunAttempt, WorkflowRunId, WorkflowStepTrace,
 };
 
 const TELEMETRY_TARGET: &str = "github_webhook_exporter";
@@ -58,6 +58,11 @@ const GITHUB_WORKFLOW_CONCLUSION_KEY: &str = "github.workflow.conclusion";
 const GITHUB_WORKFLOW_RUN_ID_KEY: &str = "github.workflow.run.id";
 const GITHUB_WORKFLOW_RUN_ATTEMPT_KEY: &str = "github.workflow.run.attempt";
 const GITHUB_WORKFLOW_JOB_ID_KEY: &str = "github.workflow.job.id";
+const GITHUB_WORKFLOW_EVENT_KEY: &str = "github.workflow.event";
+const GITHUB_WORKFLOW_SOURCE_BRANCH_KEY: &str = "github.workflow.source_branch";
+const GITHUB_WORKFLOW_TARGET_BRANCH_KEY: &str = "github.workflow.target_branch";
+const GITHUB_WORKFLOW_JOB_URL_KEY: &str = "github.workflow.job.url";
+const GITHUB_WORKFLOW_STEP_URL_KEY: &str = "github.workflow.step.url";
 const TIMING_SOURCE_KEY: &str = "timing_source";
 
 fn string_key_value(key: &'static str, value: impl Into<String>) -> KeyValue {
@@ -135,6 +140,57 @@ pub(crate) fn workflow_run_attempt_attribute(run_attempt: WorkflowRunAttempt) ->
 /// Returns the workflow job identifier attribute.
 pub(crate) fn workflow_job_id_attribute(job_id: WorkflowJobId) -> KeyValue {
     decimal_string_key_value(GITHUB_WORKFLOW_JOB_ID_KEY, job_id.get())
+}
+
+/// Returns the normalized workflow trigger attribute.
+pub(crate) fn workflow_event_attribute(event: WorkflowEvent) -> KeyValue {
+    string_key_value(GITHUB_WORKFLOW_EVENT_KEY, event.as_str())
+}
+
+/// Returns a sanitized workflow source-branch attribute.
+pub(crate) fn workflow_source_branch_attribute(branch: &WorkflowBranch) -> KeyValue {
+    string_key_value(GITHUB_WORKFLOW_SOURCE_BRANCH_KEY, branch.as_str())
+}
+
+/// Returns a sanitized workflow target-branch attribute.
+pub(crate) fn workflow_target_branch_attribute(branch: &WorkflowBranch) -> KeyValue {
+    string_key_value(GITHUB_WORKFLOW_TARGET_BRANCH_KEY, branch.as_str())
+}
+
+/// Returns a derived GitHub Actions job URL from validated identifiers.
+pub(crate) fn workflow_job_url_attribute(
+    repository: &CanonicalRepositoryName,
+    run_id: WorkflowRunId,
+    job_id: WorkflowJobId,
+) -> KeyValue {
+    string_key_value(
+        GITHUB_WORKFLOW_JOB_URL_KEY,
+        format!(
+            "https://github.com/{}/actions/runs/{}/job/{}",
+            repository.as_str(),
+            run_id.get(),
+            job_id.get()
+        ),
+    )
+}
+
+/// Returns a derived GitHub Actions step-log URL from validated identifiers.
+pub(crate) fn workflow_step_url_attribute(
+    repository: &CanonicalRepositoryName,
+    run_id: WorkflowRunId,
+    job_id: WorkflowJobId,
+    step: &WorkflowStepTrace,
+) -> KeyValue {
+    string_key_value(
+        GITHUB_WORKFLOW_STEP_URL_KEY,
+        format!(
+            "https://github.com/{}/actions/runs/{}/job/{}#step:{}:1",
+            repository.as_str(),
+            run_id.get(),
+            job_id.get(),
+            step.number()
+        ),
+    )
 }
 
 /// Returns the semantic-convention task-run identifier for a workflow job root.
@@ -352,6 +408,12 @@ pub(crate) enum DatabaseOperation {
     MergeQueueComplete,
     /// Pruning merge-queue rows.
     MergeQueuePrune,
+    /// Upserting workflow-run context.
+    WorkflowRunUpsert,
+    /// Loading workflow-run context.
+    WorkflowRunGet,
+    /// Pruning workflow-run context.
+    WorkflowRunPrune,
 }
 
 /// Creates a bounded tracing span for a high-level operation.
@@ -752,6 +814,9 @@ impl DatabaseOperation {
             Self::MergeQueueEnqueue => "merge_queue.enqueue",
             Self::MergeQueueComplete => "merge_queue.complete",
             Self::MergeQueuePrune => "merge_queue.prune",
+            Self::WorkflowRunUpsert => "workflow_run.upsert",
+            Self::WorkflowRunGet => "workflow_run.get",
+            Self::WorkflowRunPrune => "workflow_run.prune",
         }
     }
 }
@@ -973,6 +1038,9 @@ mod tests {
                 "merge_queue.complete",
             ),
             (DatabaseOperation::MergeQueuePrune, "merge_queue.prune"),
+            (DatabaseOperation::WorkflowRunUpsert, "workflow_run.upsert"),
+            (DatabaseOperation::WorkflowRunGet, "workflow_run.get"),
+            (DatabaseOperation::WorkflowRunPrune, "workflow_run.prune"),
         ];
         for (operation, expected) in database_operations {
             assert_eq!(operation.as_str(), expected);

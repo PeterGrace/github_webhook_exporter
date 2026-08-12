@@ -17,14 +17,17 @@ use crate::{
 use super::trace::{
     commit_sha_attribute, delivery_id_attribute, pull_request_numbers_attribute,
     repository_name_attribute, timing_source_attribute, workflow_conclusion_attribute,
-    workflow_job_id_attribute, workflow_name_attribute, workflow_pipeline_result_attribute,
+    workflow_event_attribute, workflow_job_id_attribute, workflow_job_url_attribute,
+    workflow_name_attribute, workflow_pipeline_result_attribute,
     workflow_pipeline_run_id_attribute, workflow_pipeline_step_task_run_id_attribute,
     workflow_pipeline_task_run_id_attribute, workflow_pipeline_task_run_result_attribute,
-    workflow_run_attempt_attribute, workflow_run_id_attribute, workflow_task_name_attribute,
+    workflow_run_attempt_attribute, workflow_run_id_attribute, workflow_source_branch_attribute,
+    workflow_step_url_attribute, workflow_target_branch_attribute, workflow_task_name_attribute,
     CommitSha,
 };
 
 const MAX_DISPLAY_NAME_LENGTH: usize = 128;
+const MAX_BRANCH_NAME_LENGTH: usize = 255;
 const MAX_PULL_REQUEST_COUNT: usize = 20;
 const WORKFLOW_JOB_SPAN_NAME: &str = "github.workflow.job";
 const WORKFLOW_STEP_SPAN_NAME: &str = "github.workflow.step";
@@ -243,6 +246,7 @@ impl WorkflowJobTrace {
             conclusion: parts.conclusion,
             head_sha: parts.head_sha,
             pull_requests: parts.pull_requests,
+            workflow_run_context: parts.workflow_run_context,
             timing: parts.timing,
             steps: parts.steps,
         }
@@ -298,6 +302,11 @@ impl WorkflowJobTrace {
         self.pull_requests.as_slice()
     }
 
+    /// Returns optional correlated workflow-run context.
+    pub(crate) fn workflow_run_context(&self) -> Option<&WorkflowRunContext> {
+        self.workflow_run_context.as_ref()
+    }
+
     /// Returns the selected historical interval.
     pub(crate) fn timing(&self) -> &HistoricalTiming {
         &self.timing
@@ -334,6 +343,129 @@ impl WorkflowStepTrace {
 impl fmt::Debug for DisplayName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("DisplayName([REDACTED])")
+    }
+}
+
+/// A bounded GitHub Actions trigger event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkflowEvent {
+    /// A pull-request validation run.
+    PullRequest,
+    /// A merge-queue validation run.
+    MergeGroup,
+    /// A push-triggered run.
+    Push,
+    /// Any trigger outside the approved vocabulary.
+    Other,
+}
+
+impl WorkflowEvent {
+    /// Normalizes an optional raw trigger into the bounded workflow vocabulary.
+    pub(crate) fn normalize(value: Option<&str>) -> Self {
+        match value {
+            Some("pull_request") => Self::PullRequest,
+            Some("merge_group") => Self::MergeGroup,
+            Some("push") => Self::Push,
+            Some(_) | None => Self::Other,
+        }
+    }
+
+    /// Returns the normalized trigger value.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::PullRequest => "pull_request",
+            Self::MergeGroup => "merge_group",
+            Self::Push => "push",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// A sanitized, bounded Git branch name.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct WorkflowBranch(String);
+
+impl WorkflowBranch {
+    /// Removes Unicode control characters and retains at most 255 remaining characters.
+    pub(crate) fn sanitize(value: &str) -> Option<Self> {
+        let mut sanitized = String::with_capacity(value.len().min(MAX_BRANCH_NAME_LENGTH));
+        for character in value
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(MAX_BRANCH_NAME_LENGTH)
+        {
+            sanitized.push(character);
+        }
+        if sanitized.is_empty() {
+            None
+        } else {
+            Some(Self(sanitized))
+        }
+    }
+
+    /// Returns the sanitized branch name.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for WorkflowBranch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WorkflowBranch([REDACTED])")
+    }
+}
+
+/// Bounded workflow-run metadata used to enrich completed jobs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkflowRunContext {
+    run_id: WorkflowRunId,
+    run_attempt: WorkflowRunAttempt,
+    event: WorkflowEvent,
+    source_branch: Option<WorkflowBranch>,
+    target_branch: Option<WorkflowBranch>,
+}
+
+impl WorkflowRunContext {
+    /// Creates context from validated identifiers and bounded metadata.
+    pub(crate) fn new(
+        run_id: WorkflowRunId,
+        run_attempt: WorkflowRunAttempt,
+        event: WorkflowEvent,
+        source_branch: Option<WorkflowBranch>,
+        target_branch: Option<WorkflowBranch>,
+    ) -> Self {
+        Self {
+            run_id,
+            run_attempt,
+            event,
+            source_branch,
+            target_branch,
+        }
+    }
+
+    /// Returns the workflow run identifier.
+    pub(crate) fn run_id(&self) -> WorkflowRunId {
+        self.run_id
+    }
+
+    /// Returns the workflow run attempt.
+    pub(crate) fn run_attempt(&self) -> WorkflowRunAttempt {
+        self.run_attempt
+    }
+
+    /// Returns the normalized trigger event.
+    pub(crate) fn event(&self) -> WorkflowEvent {
+        self.event
+    }
+
+    /// Returns the optional source branch.
+    pub(crate) fn source_branch(&self) -> Option<&WorkflowBranch> {
+        self.source_branch.as_ref()
+    }
+
+    /// Returns the optional target branch.
+    pub(crate) fn target_branch(&self) -> Option<&WorkflowBranch> {
+        self.target_branch.as_ref()
     }
 }
 
@@ -385,7 +517,7 @@ impl WorkflowTraceEmitter {
                 tracer
                     .span_builder(WORKFLOW_STEP_SPAN_NAME)
                     .with_start_time(step.timing().start())
-                    .with_attributes(step_attributes(job.job_id(), step)),
+                    .with_attributes(step_attributes(job, step)),
                 &parent_context,
             );
             span.set_status(step.conclusion().status());
@@ -403,7 +535,12 @@ fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
             + usize::from(job.job_name().is_some())
             + usize::from(job.conclusion().semantic_result().is_some())
             + usize::from(job.head_sha().is_some())
-            + usize::from(!job.pull_requests().is_empty()),
+            + usize::from(!job.pull_requests().is_empty())
+            + 1
+            + job.workflow_run_context().map_or(0, |context| {
+                1 + usize::from(context.source_branch().is_some())
+                    + usize::from(context.target_branch().is_some())
+            }),
     );
     attributes.push(repository_name_attribute(job.repository_name()));
     attributes.push(delivery_id_attribute(&job.delivery_id()));
@@ -428,26 +565,63 @@ fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
     if let Some(pull_request_numbers) = pull_request_numbers_attribute(job.pull_requests()) {
         attributes.push(pull_request_numbers);
     }
+    append_workflow_run_context(&mut attributes, job.workflow_run_context());
+    attributes.push(workflow_job_url_attribute(
+        job.repository_name(),
+        job.run_id(),
+        job.job_id(),
+    ));
     attributes.push(timing_source_attribute(job.timing().source()));
     attributes
 }
 
-fn step_attributes(job_id: WorkflowJobId, step: &WorkflowStepTrace) -> Vec<KeyValue> {
+fn step_attributes(job: &WorkflowJobTrace, step: &WorkflowStepTrace) -> Vec<KeyValue> {
     let mut attributes = Vec::with_capacity(
         STEP_REQUIRED_ATTRIBUTE_COUNT
             + usize::from(step.name().is_some())
-            + usize::from(step.conclusion().semantic_result().is_some()),
+            + usize::from(step.conclusion().semantic_result().is_some())
+            + 1
+            + job.workflow_run_context().map_or(0, |context| {
+                1 + usize::from(context.source_branch().is_some())
+                    + usize::from(context.target_branch().is_some())
+            }),
     );
     if let Some(name) = step.name() {
         attributes.push(workflow_task_name_attribute(name));
     }
-    attributes.push(workflow_pipeline_step_task_run_id_attribute(job_id, step));
+    attributes.push(workflow_pipeline_step_task_run_id_attribute(
+        job.job_id(),
+        step,
+    ));
     attributes.push(workflow_conclusion_attribute(step.conclusion()));
     if let Some(result) = workflow_pipeline_task_run_result_attribute(step.conclusion()) {
         attributes.push(result);
     }
+    append_workflow_run_context(&mut attributes, job.workflow_run_context());
+    attributes.push(workflow_step_url_attribute(
+        job.repository_name(),
+        job.run_id(),
+        job.job_id(),
+        step,
+    ));
     attributes.push(timing_source_attribute(step.timing().source()));
     attributes
+}
+
+fn append_workflow_run_context(
+    attributes: &mut Vec<KeyValue>,
+    context: Option<&WorkflowRunContext>,
+) {
+    let Some(context) = context else {
+        return;
+    };
+    attributes.push(workflow_event_attribute(context.event()));
+    if let Some(source_branch) = context.source_branch() {
+        attributes.push(workflow_source_branch_attribute(source_branch));
+    }
+    if let Some(target_branch) = context.target_branch() {
+        attributes.push(workflow_target_branch_attribute(target_branch));
+    }
 }
 
 /// A bounded GitHub Actions conclusion.
@@ -608,6 +782,7 @@ pub(crate) struct WorkflowJobTraceParts {
     pub(crate) conclusion: WorkflowConclusion,
     pub(crate) head_sha: Option<CommitSha>,
     pub(crate) pull_requests: WorkflowPullRequests,
+    pub(crate) workflow_run_context: Option<WorkflowRunContext>,
     pub(crate) timing: HistoricalTiming,
     pub(crate) steps: Vec<WorkflowStepTrace>,
 }
@@ -625,6 +800,7 @@ pub(crate) struct WorkflowJobTrace {
     conclusion: WorkflowConclusion,
     head_sha: Option<CommitSha>,
     pull_requests: WorkflowPullRequests,
+    workflow_run_context: Option<WorkflowRunContext>,
     timing: HistoricalTiming,
     steps: Vec<WorkflowStepTrace>,
 }
@@ -692,9 +868,10 @@ mod tests {
     };
 
     use super::{
-        DisplayName, HistoricalTiming, TimingSource, WorkflowConclusion, WorkflowJobId,
-        WorkflowJobTrace, WorkflowJobTraceParts, WorkflowPullRequests, WorkflowRunAttempt,
-        WorkflowRunId, WorkflowStepTrace, WorkflowTraceEmitter,
+        DisplayName, HistoricalTiming, TimingSource, WorkflowBranch, WorkflowConclusion,
+        WorkflowEvent, WorkflowJobId, WorkflowJobTrace, WorkflowJobTraceParts,
+        WorkflowPullRequests, WorkflowRunAttempt, WorkflowRunContext, WorkflowRunId,
+        WorkflowStepTrace, WorkflowTraceEmitter,
     };
     use crate::{domain::merge_queue::PullRequestNumber, telemetry::trace::CommitSha};
 
@@ -920,6 +1097,7 @@ mod tests {
             conclusion: WorkflowConclusion::Success,
             head_sha: Some(head_sha.clone()),
             pull_requests,
+            workflow_run_context: None,
             timing: timing.clone(),
             steps: vec![step.clone()],
         });
@@ -1033,6 +1211,13 @@ mod tests {
                 first_pull_request_number,
                 second_pull_request_number,
             ]),
+            workflow_run_context: Some(WorkflowRunContext::new(
+                run_id,
+                run_attempt,
+                WorkflowEvent::MergeGroup,
+                WorkflowBranch::sanitize("gh-readonly-queue/main/pr-7"),
+                WorkflowBranch::sanitize("main"),
+            )),
             timing: job_timing.clone(),
             steps: vec![
                 WorkflowStepTrace::new(
@@ -1112,9 +1297,13 @@ mod tests {
             "github.pull_request.number",
             "github.repository.name",
             "github.workflow.conclusion",
+            "github.workflow.event",
             "github.workflow.job.id",
+            "github.workflow.job.url",
             "github.workflow.run.attempt",
             "github.workflow.run.id",
+            "github.workflow.source_branch",
+            "github.workflow.target_branch",
             "timing_source",
         ]);
         assert_eq!(attribute_keys(job), expected_job_keys);
@@ -1131,6 +1320,18 @@ mod tests {
         assert_string_attribute(job, "cicd.pipeline.task.name", "Linux Job");
         assert_string_attribute(job, "cicd.pipeline.task.run.id", "41");
         assert_string_attribute(job, "github.workflow.job.id", "41");
+        assert_string_attribute(job, "github.workflow.event", "merge_group");
+        assert_string_attribute(
+            job,
+            "github.workflow.source_branch",
+            "gh-readonly-queue/main/pr-7",
+        );
+        assert_string_attribute(job, "github.workflow.target_branch", "main");
+        assert_string_attribute(
+            job,
+            "github.workflow.job.url",
+            "https://github.com/owner/repository/actions/runs/31/job/41",
+        );
         assert_string_attribute(job, "github.workflow.conclusion", "failure");
         assert_string_attribute(job, "cicd.pipeline.result", "failure");
         assert_string_attribute(
@@ -1146,6 +1347,10 @@ mod tests {
             "cicd.pipeline.task.run.id",
             "cicd.pipeline.task.run.result",
             "github.workflow.conclusion",
+            "github.workflow.event",
+            "github.workflow.source_branch",
+            "github.workflow.step.url",
+            "github.workflow.target_branch",
             "timing_source",
         ]);
         assert_eq!(attribute_keys(steps[0]), expected_step_keys);
@@ -1153,11 +1358,29 @@ mod tests {
         assert_string_attribute(steps[0], "cicd.pipeline.task.name", "Checkout");
         assert_string_attribute(steps[0], "cicd.pipeline.task.run.id", "41:1");
         assert_string_attribute(steps[0], "github.workflow.conclusion", "success");
+        assert_string_attribute(steps[0], "github.workflow.event", "merge_group");
+        assert_string_attribute(
+            steps[0],
+            "github.workflow.source_branch",
+            "gh-readonly-queue/main/pr-7",
+        );
+        assert_string_attribute(steps[0], "github.workflow.target_branch", "main");
+        assert_string_attribute(
+            steps[0],
+            "github.workflow.step.url",
+            "https://github.com/owner/repository/actions/runs/31/job/41#step:1:1",
+        );
         assert_string_attribute(steps[0], "cicd.pipeline.task.run.result", "success");
         assert_string_attribute(steps[0], "timing_source", "reported");
         assert_string_attribute(steps[1], "cicd.pipeline.task.name", "Test");
         assert_string_attribute(steps[1], "cicd.pipeline.task.run.id", "41:2");
         assert_string_attribute(steps[1], "github.workflow.conclusion", "timed_out");
+        assert_string_attribute(steps[1], "github.workflow.event", "merge_group");
+        assert_string_attribute(
+            steps[1],
+            "github.workflow.step.url",
+            "https://github.com/owner/repository/actions/runs/31/job/41#step:2:1",
+        );
         assert_string_attribute(steps[1], "cicd.pipeline.task.run.result", "timeout");
         assert_string_attribute(steps[1], "timing_source", "reported");
 

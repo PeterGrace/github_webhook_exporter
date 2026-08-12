@@ -19,7 +19,7 @@ use crate::{
     metrics::{self, Metrics},
     retention::{run_retention, RetentionConfig},
     security::{AdminAuthenticator, CanonicalRepositoryName},
-    storage::{DeliveryStore, MergeQueueStore, RepositoryStore},
+    storage::{DeliveryStore, MergeQueueStore, RepositoryStore, WorkflowRunStore},
     telemetry::{
         trace::{self, Operation},
         WorkflowTraceEmitter,
@@ -51,6 +51,7 @@ pub struct AppState {
     database_pool: SqlitePool,
     delivery_store: DeliveryStore,
     merge_queue_store: MergeQueueStore,
+    workflow_run_store: WorkflowRunStore,
     metrics: Metrics,
     workflow_trace_emitter: WorkflowTraceEmitter,
     webhook_body_limit_bytes: usize,
@@ -68,12 +69,14 @@ impl AppState {
         let database_pool = repository_store.pool().clone();
         let delivery_store = DeliveryStore::new(database_pool.clone());
         let merge_queue_store = MergeQueueStore::new(database_pool.clone());
+        let workflow_run_store = WorkflowRunStore::new(database_pool.clone());
         Self {
             repository_store: Arc::new(repository_store),
             admin_authenticator: Arc::new(admin_authenticator),
             database_pool,
             delivery_store,
             merge_queue_store,
+            workflow_run_store,
             metrics: Metrics::new(),
             workflow_trace_emitter: WorkflowTraceEmitter::disabled(),
             webhook_body_limit_bytes,
@@ -130,6 +133,11 @@ impl AppState {
     /// Returns durable pull-request merge-queue attempt persistence.
     pub fn merge_queue_store(&self) -> &MergeQueueStore {
         &self.merge_queue_store
+    }
+
+    /// Returns durable bounded workflow-run correlation persistence.
+    pub(crate) fn workflow_run_store(&self) -> &WorkflowRunStore {
+        &self.workflow_run_store
     }
 
     /// Returns the shared bounded metrics component.
@@ -378,10 +386,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn application_state_exposes_workflow_job_step_limit() {
+    async fn application_state_exposes_workflow_job_step_limit_and_run_context_store() {
         let state = app_state().await;
 
         assert_eq!(state.workflow_job_max_steps(), 256);
+        let _workflow_run_store = state.workflow_run_store();
     }
 
     #[tokio::test]

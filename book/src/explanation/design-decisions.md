@@ -64,6 +64,21 @@ own terms: one root per completed job, timed by the job's own `started_at`/`comp
 independently in a trace backend by its `github.workflow.job.id` rather than by which webhook
 request happened to report it.
 
+## Why workflow context is correlated durably
+
+The completed `workflow_job` payload does not contain the authoritative Actions trigger event.
+Inferring merge-queue execution from a `gh-readonly-queue/...` branch would be convenient but
+heuristic. Instead, authenticated `workflow_run` deliveries contribute a bounded event and
+sanitized branch projection keyed by repository, run ID, and run attempt. Persisting that small
+projection allows later completed jobs to retain the correct context across webhook ordering,
+reruns, and process restarts without retaining full payloads. Missing or ambiguous metadata is
+omitted rather than guessed.
+
+Job and step links are derived from the already validated repository and positive run, job, and
+step identifiers. This avoids trusting payload-provided URLs while giving trace backends such as
+Sentry a direct link to the Actions job or step-log anchor. These URLs remain span-only so they do
+not create metric cardinality or disclose data through logs.
+
 ## Why the singleton model instead of horizontal scale
 
 Covered from the storage angle in [Architecture](architecture.md#why-sqlite-and-why-a-singleton):
