@@ -3,8 +3,8 @@
 Exported over OTLP when [remote telemetry](telemetry.md) is enabled. Identifiers below are
 span-only unless stated otherwise. Workflow failures and timeouts export bounded OpenTelemetry
 `exception` span events as the canonical representation; `SENTRY_DSN` optionally promotes the same
-failures to synthetic Sentry workflow errors. There is no separate OTLP errors endpoint. The one
-bounded workflow-rejection warning noted below also remains; neither path permits raw payload data,
+failures to application-generated Sentry workflow errors. There is no separate OTLP errors
+endpoint. The one bounded workflow-rejection warning noted below also remains; neither path permits raw payload data,
 logs, commands, output, or secrets.
 
 ## Core service operations
@@ -94,16 +94,19 @@ absent `sentry.status_code`; the exporter deliberately emits no synthetic HTTP s
 non-HTTP CI tasks.
 
 Every failed or timed-out step emits one bounded OpenTelemetry `exception` span event. When
-`SENTRY_DSN` is configured, the same historical step also emits one synthetic Sentry error whose
-trace and span IDs match that step. A failed/timed-out job emits a job-level fallback only when no
-failed/timed-out child explains it. Exception types are fixed (`GitHubActionsTaskFailure` or
+`SENTRY_DSN` is configured, the same historical step also emits one application-generated Sentry
+error whose trace and span IDs match that step. A failed/timed-out job emits a job-level fallback
+only when no failed/timed-out child explains it. Exception types are fixed (`GitHubActionsTaskFailure` or
 `GitHubActionsTaskTimeout`); the description includes the sanitized task name, or the validated
 task-run ID when a name is absent. Fingerprints combine task kind, bounded repository and workflow,
 stable job/task identities, and conclusion. Named identities use sanitized names; an unnamed job
 uses a fixed identity, and an unnamed step uses its positive ordinal. Per-run job IDs remain in the
 description/tag fallback but never enter grouping, so equivalent unnamed tasks group across runs
-and job fallbacks cannot merge with same-named steps. These Sentry events are synthetic and handled,
-contain no stack trace, logs, commands, or output, and use Sentry's bounded non-blocking transport.
+and job fallbacks cannot merge with same-named steps. These application-generated events use
+mechanism type `github_actions`, are handled, and omit Sentry's protocol-level
+`mechanism.synthetic` field so Sentry retains the exception type and derives a descriptive title.
+They contain no stack trace, logs, commands, or output, and use Sentry's bounded non-blocking
+transport.
 
 **Identifiers and run context.** The workflow root carries only these validated span-only
 identifiers: canonical repository name, delivery UUID, workflow run ID, positive run attempt,

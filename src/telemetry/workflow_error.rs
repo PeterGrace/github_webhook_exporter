@@ -70,7 +70,6 @@ impl WorkflowErrorReporter for SentryWorkflowErrorReporter {
             mechanism: Some(Mechanism {
                 ty: "github_actions".to_owned(),
                 handled: Some(true),
-                synthetic: Some(true),
                 ..Mechanism::default()
             }),
             ..Exception::default()
@@ -567,7 +566,7 @@ mod tests {
         let mechanism = exception.mechanism.as_ref().expect("mechanism is present");
         assert_eq!(mechanism.ty, "github_actions");
         assert_eq!(mechanism.handled, Some(true));
-        assert_eq!(mechanism.synthetic, Some(true));
+        assert_eq!(mechanism.synthetic, None);
         match event.contexts.get("trace") {
             Some(SentryContext::Trace(trace)) => {
                 assert_eq!(

@@ -61,10 +61,11 @@ export OTEL_EXPORTER_OTLP_TRACES_HEADERS="x-sentry-auth=sentry%20sentry_key=${SE
 `%20` is decoded to the required space in the `x-sentry-auth` value. Do not use an
 `Authorization: Bearer` header for direct Sentry OTLP ingestion.
 
-The DSN enables synthetic handled errors for failed and timed-out workflow tasks. Each error uses
-the historical task span's trace and span IDs, allowing Sentry to place it on that span in the
-waterfall. Startup rejects `SENTRY_DSN` unless trace export is enabled. Keep the DSN out of scripts
-and committed configuration.
+The DSN enables handled, application-generated errors for failed and timed-out workflow tasks. Each
+error uses the historical task span's trace and span IDs, allowing Sentry to place it on that span
+in the waterfall. The event omits Sentry's protocol-level `mechanism.synthetic` field so Sentry
+retains the bounded exception type and derives a descriptive title. Startup rejects `SENTRY_DSN`
+unless trace export is enabled. Keep the DSN out of scripts and committed configuration.
 
 ## Under Helm
 
