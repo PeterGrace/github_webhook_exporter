@@ -85,7 +85,7 @@ sequence.
 ## Identifiers
 
 Delivery, pull-request, commit, workflow, job, and step identifiers remain span-only except for the
-bounded task identity attached to an enabled synthetic Sentry workflow error — see
+bounded task identity attached to an enabled application-generated Sentry workflow error — see
 [Traces](traces.md). Canonical OpenTelemetry `exception` span events do not require `SENTRY_DSN`.
 Canonical repository names additionally appear on repository-scoped Prometheus series. None of
 these identifiers appears in local or OTLP application logs, except the one bounded

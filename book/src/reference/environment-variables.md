@@ -46,7 +46,7 @@ Export is entirely off unless at least one endpoint variable below is set. See
 | `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` | inherits generic | Log export timeout, milliseconds. |
 | `OTEL_SERVICE_NAME` | `github-webhook-exporter` | Reported service name. |
 | `OTEL_RESOURCE_ATTRIBUTES` | unset | Comma-separated `key=value`. Only `k8s.pod.name` and `k8s.namespace.name` are retained; other keys are dropped. Malformed entries are fatal at startup. |
-| `SENTRY_DSN` | unset | Enables linked synthetic errors for failed/timed-out workflow tasks. Requires trace export and must target the same Sentry project as the OTLP trace endpoint. |
+| `SENTRY_DSN` | unset | Enables linked application-generated errors for failed/timed-out workflow tasks. Their Sentry mechanism is handled and omits the protocol-level `synthetic` field. Requires trace export and must target the same Sentry project as the OTLP trace endpoint. |
 
 Structured logging to stderr is always on, independent of OTLP configuration.
 

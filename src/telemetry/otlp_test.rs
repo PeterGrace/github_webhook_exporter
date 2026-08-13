@@ -3833,7 +3833,7 @@ async fn hostile_failed_workflow_payload_is_private() {
     let mechanism = exception.mechanism.as_ref().expect("mechanism is present");
     assert_eq!(mechanism.ty, "github_actions");
     assert_eq!(mechanism.handled, Some(true));
-    assert_eq!(mechanism.synthetic, Some(true));
+    assert_eq!(mechanism.synthetic, None);
     assert_eq!(event.contexts.len(), 1);
     match event.contexts.get("trace") {
         Some(SentryContext::Trace(trace)) => {
