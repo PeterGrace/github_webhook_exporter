@@ -94,11 +94,12 @@ custom closed values. `failure` and `timed_out` also set `error.type` to
 with a fixed description; all other conclusions leave status unset. Raw unknown conclusions are
 discarded.
 
-Sentry SaaS verification on 2026-08-12 confirmed this canonical mapping is sufficient for waterfall
-rendering: successful job and step spans ingest as `sentry.status=ok`, while failed and timed-out
-spans ingest as `sentry.status=error` and display as red-hatched waterfall lines. All retain an
-absent `sentry.status_code`; the exporter deliberately emits no synthetic HTTP status for these
-non-HTTP CI tasks.
+Sentry SaaS verification on 2026-08-14 confirmed that waterfall rows use the descriptive job and
+step names and display `github.actions.job` and `github.actions.step` instead of `default`.
+Successful task spans ingest as `sentry.status=ok`; failed and timed-out task spans ingest as
+`sentry.status=error`. Linked errors use the exact failed or timed-out task span IDs in the same
+trace. All task spans retain an absent `sentry.status_code`; the exporter deliberately emits no
+synthetic HTTP status for these non-HTTP CI tasks.
 
 Every failed or timed-out step emits one bounded OpenTelemetry `exception` span event. When
 `SENTRY_DSN` is configured, the same historical step also emits one application-generated Sentry

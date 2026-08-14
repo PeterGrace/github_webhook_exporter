@@ -11,3 +11,7 @@
   description.
 - Updated workflow, OTLP, privacy, conclusion, hierarchy, and Sentry linkage tests and trace
   reference documentation.
+- Verified live Sentry ingestion with marker `issue-86-1786711273`: waterfall rows use the
+  descriptive job and step names, operations are `github.actions.job` and `github.actions.step`,
+  success is `ok`, failure and timeout are `error`, and both linked errors use the exact failed or
+  timed-out task span IDs in the same trace.
