@@ -18,7 +18,7 @@ use crate::metrics::{
 };
 use crate::security::CanonicalRepositoryName;
 use crate::telemetry::workflow::{
-    DisplayName, TimingSource, WorkflowBranch, WorkflowConclusion, WorkflowEvent, WorkflowJobId,
+    TimingSource, WorkflowBranch, WorkflowConclusion, WorkflowEvent, WorkflowJobId,
     WorkflowRunAttempt, WorkflowRunId, WorkflowStepTrace,
 };
 
@@ -50,20 +50,26 @@ const SHA_1_HEX_LENGTH: usize = 40;
 const SHA_256_HEX_LENGTH: usize = 64;
 const CICD_PIPELINE_NAME_KEY: &str = "cicd.pipeline.name";
 const CICD_PIPELINE_RUN_ID_KEY: &str = "cicd.pipeline.run.id";
+const CICD_PIPELINE_RUN_URL_KEY: &str = "cicd.pipeline.run.url.full";
 const CICD_PIPELINE_TASK_NAME_KEY: &str = "cicd.pipeline.task.name";
 const CICD_PIPELINE_TASK_RUN_ID_KEY: &str = "cicd.pipeline.task.run.id";
-const CICD_PIPELINE_RESULT_KEY: &str = "cicd.pipeline.result";
 const CICD_PIPELINE_TASK_RUN_RESULT_KEY: &str = "cicd.pipeline.task.run.result";
+const CICD_PIPELINE_TASK_RUN_URL_KEY: &str = "cicd.pipeline.task.run.url.full";
+const ERROR_TYPE_KEY: &str = "error.type";
+const SENTRY_DESCRIPTION_KEY: &str = "sentry.description";
+const SENTRY_OPERATION_KEY: &str = "sentry.op";
+const VCS_HEAD_REVISION_KEY: &str = "vcs.ref.head.revision";
+const VCS_REPOSITORY_NAME_KEY: &str = "vcs.repository.name";
+const VCS_REPOSITORY_URL_KEY: &str = "vcs.repository.url.full";
 const GITHUB_WORKFLOW_CONCLUSION_KEY: &str = "github.workflow.conclusion";
-const GITHUB_WORKFLOW_RUN_ID_KEY: &str = "github.workflow.run.id";
 const GITHUB_WORKFLOW_RUN_ATTEMPT_KEY: &str = "github.workflow.run.attempt";
-const GITHUB_WORKFLOW_JOB_ID_KEY: &str = "github.workflow.job.id";
 const GITHUB_WORKFLOW_EVENT_KEY: &str = "github.workflow.event";
 const GITHUB_WORKFLOW_SOURCE_BRANCH_KEY: &str = "github.workflow.source_branch";
 const GITHUB_WORKFLOW_TARGET_BRANCH_KEY: &str = "github.workflow.target_branch";
-const GITHUB_WORKFLOW_JOB_URL_KEY: &str = "github.workflow.job.url";
-const GITHUB_WORKFLOW_STEP_URL_KEY: &str = "github.workflow.step.url";
 const TIMING_SOURCE_KEY: &str = "timing_source";
+
+pub(super) const GITHUB_ACTIONS_JOB_OPERATION: &str = "github.actions.job";
+pub(super) const GITHUB_ACTIONS_STEP_OPERATION: &str = "github.actions.step";
 
 fn string_key_value(key: &'static str, value: impl Into<String>) -> KeyValue {
     KeyValue::new(key, value.into())
@@ -118,13 +124,8 @@ pub(crate) fn operation_outcome_attribute(outcome: OperationOutcome) -> KeyValue
 }
 
 /// Returns the workflow display-name attribute.
-pub(crate) fn workflow_name_attribute(name: &DisplayName) -> KeyValue {
-    string_key_value(CICD_PIPELINE_NAME_KEY, name.as_str())
-}
-
-/// Returns the workflow run identifier attribute.
-pub(crate) fn workflow_run_id_attribute(run_id: WorkflowRunId) -> KeyValue {
-    decimal_string_key_value(GITHUB_WORKFLOW_RUN_ID_KEY, run_id.get())
+pub(crate) fn workflow_name_attribute(name: &str) -> KeyValue {
+    string_key_value(CICD_PIPELINE_NAME_KEY, name)
 }
 
 /// Returns the semantic-convention workflow run identifier attribute.
@@ -135,11 +136,6 @@ pub(crate) fn workflow_pipeline_run_id_attribute(run_id: WorkflowRunId) -> KeyVa
 /// Returns the workflow run-attempt attribute.
 pub(crate) fn workflow_run_attempt_attribute(run_attempt: WorkflowRunAttempt) -> KeyValue {
     decimal_string_key_value(GITHUB_WORKFLOW_RUN_ATTEMPT_KEY, run_attempt.get())
-}
-
-/// Returns the workflow job identifier attribute.
-pub(crate) fn workflow_job_id_attribute(job_id: WorkflowJobId) -> KeyValue {
-    decimal_string_key_value(GITHUB_WORKFLOW_JOB_ID_KEY, job_id.get())
 }
 
 /// Returns the normalized workflow trigger attribute.
@@ -157,14 +153,29 @@ pub(crate) fn workflow_target_branch_attribute(branch: &WorkflowBranch) -> KeyVa
     string_key_value(GITHUB_WORKFLOW_TARGET_BRANCH_KEY, branch.as_str())
 }
 
-/// Returns a derived GitHub Actions job URL from validated identifiers.
-pub(crate) fn workflow_job_url_attribute(
+/// Returns the semantic-convention URL for a GitHub Actions workflow run.
+pub(crate) fn workflow_pipeline_run_url_attribute(
+    repository: &CanonicalRepositoryName,
+    run_id: WorkflowRunId,
+) -> KeyValue {
+    string_key_value(
+        CICD_PIPELINE_RUN_URL_KEY,
+        format!(
+            "https://github.com/{}/actions/runs/{}",
+            repository.as_str(),
+            run_id.get()
+        ),
+    )
+}
+
+/// Returns the semantic-convention URL for a GitHub Actions job task run.
+pub(crate) fn workflow_task_run_url_attribute(
     repository: &CanonicalRepositoryName,
     run_id: WorkflowRunId,
     job_id: WorkflowJobId,
 ) -> KeyValue {
     string_key_value(
-        GITHUB_WORKFLOW_JOB_URL_KEY,
+        CICD_PIPELINE_TASK_RUN_URL_KEY,
         format!(
             "https://github.com/{}/actions/runs/{}/job/{}",
             repository.as_str(),
@@ -174,15 +185,15 @@ pub(crate) fn workflow_job_url_attribute(
     )
 }
 
-/// Returns a derived GitHub Actions step-log URL from validated identifiers.
-pub(crate) fn workflow_step_url_attribute(
+/// Returns the semantic-convention URL for a GitHub Actions step task run.
+pub(crate) fn workflow_step_task_run_url_attribute(
     repository: &CanonicalRepositoryName,
     run_id: WorkflowRunId,
     job_id: WorkflowJobId,
     step: &WorkflowStepTrace,
 ) -> KeyValue {
     string_key_value(
-        GITHUB_WORKFLOW_STEP_URL_KEY,
+        CICD_PIPELINE_TASK_RUN_URL_KEY,
         format!(
             "https://github.com/{}/actions/runs/{}/job/{}#step:{}:1",
             repository.as_str(),
@@ -191,6 +202,29 @@ pub(crate) fn workflow_step_url_attribute(
             step.number()
         ),
     )
+}
+
+/// Returns the semantic-convention repository URL for a workflow task.
+pub(crate) fn workflow_repository_url_attribute(repository: &CanonicalRepositoryName) -> KeyValue {
+    string_key_value(
+        VCS_REPOSITORY_URL_KEY,
+        format!("https://github.com/{}", repository.as_str()),
+    )
+}
+
+/// Returns the semantic-convention repository name for a workflow task.
+pub(crate) fn workflow_repository_name_attribute(repository: &CanonicalRepositoryName) -> KeyValue {
+    // The fallback is defensive because CanonicalRepositoryName currently guarantees owner/name.
+    let repository_name = repository
+        .as_str()
+        .rsplit_once('/')
+        .map_or(repository.as_str(), |(_, name)| name);
+    string_key_value(VCS_REPOSITORY_NAME_KEY, repository_name)
+}
+
+/// Returns the semantic-convention head revision for a workflow task.
+pub(crate) fn workflow_head_revision_attribute(sha: &CommitSha) -> KeyValue {
+    string_key_value(VCS_HEAD_REVISION_KEY, sha.as_str())
 }
 
 /// Returns the semantic-convention task-run identifier for a workflow job root.
@@ -210,8 +244,8 @@ pub(crate) fn workflow_pipeline_step_task_run_id_attribute(
 }
 
 /// Returns the workflow job or step display-name attribute.
-pub(crate) fn workflow_task_name_attribute(name: &DisplayName) -> KeyValue {
-    string_key_value(CICD_PIPELINE_TASK_NAME_KEY, name.as_str())
+pub(crate) fn workflow_task_name_attribute(name: &str) -> KeyValue {
+    string_key_value(CICD_PIPELINE_TASK_NAME_KEY, name)
 }
 
 /// Returns the workflow conclusion attribute.
@@ -219,22 +253,31 @@ pub(crate) fn workflow_conclusion_attribute(conclusion: WorkflowConclusion) -> K
     string_key_value(GITHUB_WORKFLOW_CONCLUSION_KEY, conclusion.as_str())
 }
 
-/// Returns the semantic-convention pipeline result attribute when one exists.
-pub(crate) fn workflow_pipeline_result_attribute(
-    conclusion: WorkflowConclusion,
-) -> Option<KeyValue> {
-    conclusion
-        .semantic_result()
-        .map(|result| string_key_value(CICD_PIPELINE_RESULT_KEY, result))
-}
-
-/// Returns the semantic-convention task-run result attribute when one exists.
+/// Returns the bounded semantic-convention task-run result attribute.
 pub(crate) fn workflow_pipeline_task_run_result_attribute(
     conclusion: WorkflowConclusion,
-) -> Option<KeyValue> {
+) -> KeyValue {
+    string_key_value(
+        CICD_PIPELINE_TASK_RUN_RESULT_KEY,
+        conclusion.semantic_result(),
+    )
+}
+
+/// Returns the bounded error type for a failed or timed-out task.
+pub(crate) fn workflow_error_type_attribute(conclusion: WorkflowConclusion) -> Option<KeyValue> {
     conclusion
-        .semantic_result()
-        .map(|result| string_key_value(CICD_PIPELINE_TASK_RUN_RESULT_KEY, result))
+        .error_type()
+        .map(|error_type| string_key_value(ERROR_TYPE_KEY, error_type))
+}
+
+/// Returns an explicit Sentry operation for a workflow task span.
+pub(crate) fn sentry_operation_attribute(operation: &'static str) -> KeyValue {
+    string_key_value(SENTRY_OPERATION_KEY, operation)
+}
+
+/// Returns a bounded Sentry description for a workflow task span.
+pub(crate) fn sentry_description_attribute(description: String) -> KeyValue {
+    string_key_value(SENTRY_DESCRIPTION_KEY, description)
 }
 
 /// Returns the timing-source attribute.
@@ -849,21 +892,23 @@ mod tests {
         set_config_operation, set_delivery_id, set_http_method, set_http_response, set_http_route,
         set_pull_request_number, set_repository_id, set_repository_name, set_result_status,
         set_status, timing_source_attribute, workflow_conclusion_attribute,
-        workflow_job_id_attribute, workflow_name_attribute, workflow_pipeline_result_attribute,
-        workflow_pipeline_run_id_attribute, workflow_pipeline_step_task_run_id_attribute,
-        workflow_pipeline_task_run_id_attribute, workflow_pipeline_task_run_result_attribute,
-        workflow_run_attempt_attribute, workflow_run_id_attribute, workflow_task_name_attribute,
-        CommitSha, ConfigOperation, DatabaseOperation, HttpMethod, HttpResult, Operation,
-        OperationFailureReason, OperationOutcome, QueueEntity, TimingSource, WorkflowConclusion,
-        WorkflowJobId, WorkflowRunAttempt, WorkflowRunId, CICD_PIPELINE_NAME_KEY,
-        CICD_PIPELINE_RESULT_KEY, CICD_PIPELINE_RUN_ID_KEY, CICD_PIPELINE_TASK_NAME_KEY,
-        CICD_PIPELINE_TASK_RUN_ID_KEY, CICD_PIPELINE_TASK_RUN_RESULT_KEY, COMMIT_SHA_KEY,
+        workflow_error_type_attribute, workflow_head_revision_attribute, workflow_name_attribute,
+        workflow_pipeline_run_id_attribute, workflow_pipeline_run_url_attribute,
+        workflow_pipeline_step_task_run_id_attribute, workflow_pipeline_task_run_id_attribute,
+        workflow_pipeline_task_run_result_attribute, workflow_repository_name_attribute,
+        workflow_repository_url_attribute, workflow_run_attempt_attribute,
+        workflow_task_name_attribute, workflow_task_run_url_attribute, CommitSha, ConfigOperation,
+        DatabaseOperation, HttpMethod, HttpResult, Operation, OperationFailureReason,
+        OperationOutcome, QueueEntity, TimingSource, WorkflowConclusion, WorkflowJobId,
+        WorkflowRunAttempt, WorkflowRunId, CICD_PIPELINE_NAME_KEY, CICD_PIPELINE_RUN_ID_KEY,
+        CICD_PIPELINE_RUN_URL_KEY, CICD_PIPELINE_TASK_NAME_KEY, CICD_PIPELINE_TASK_RUN_ID_KEY,
+        CICD_PIPELINE_TASK_RUN_RESULT_KEY, CICD_PIPELINE_TASK_RUN_URL_KEY, COMMIT_SHA_KEY,
         CONFIG_OPERATION_KEY, DB_OPERATION_NAME_KEY, DB_SYSTEM_NAME_KEY, DELIVERY_ID_KEY,
-        FAILURE_REASON_KEY, GITHUB_WORKFLOW_CONCLUSION_KEY, GITHUB_WORKFLOW_JOB_ID_KEY,
-        GITHUB_WORKFLOW_RUN_ATTEMPT_KEY, GITHUB_WORKFLOW_RUN_ID_KEY, HTTP_REQUEST_METHOD_KEY,
-        HTTP_RESPONSE_STATUS_CODE_KEY, HTTP_RESULT_KEY, HTTP_ROUTE_KEY, OPERATION_FAILURE_EVENT,
-        OPERATION_OUTCOME_KEY, PULL_REQUEST_NUMBER_KEY, REPOSITORY_ID_KEY, REPOSITORY_NAME_KEY,
-        SQLITE_SYSTEM_NAME, TIMING_SOURCE_KEY,
+        ERROR_TYPE_KEY, FAILURE_REASON_KEY, GITHUB_WORKFLOW_CONCLUSION_KEY,
+        GITHUB_WORKFLOW_RUN_ATTEMPT_KEY, HTTP_REQUEST_METHOD_KEY, HTTP_RESPONSE_STATUS_CODE_KEY,
+        HTTP_RESULT_KEY, HTTP_ROUTE_KEY, OPERATION_FAILURE_EVENT, OPERATION_OUTCOME_KEY,
+        PULL_REQUEST_NUMBER_KEY, REPOSITORY_ID_KEY, REPOSITORY_NAME_KEY, SQLITE_SYSTEM_NAME,
+        TIMING_SOURCE_KEY, VCS_HEAD_REVISION_KEY, VCS_REPOSITORY_NAME_KEY, VCS_REPOSITORY_URL_KEY,
     };
 
     const TEST_DELIVERY_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -1292,20 +1337,16 @@ mod tests {
         let pull_request_number =
             PullRequestNumber::new(17).expect("test pull request number is positive");
 
-        let workflow_name_kv = workflow_name_attribute(&workflow_name);
+        let workflow_name_kv = workflow_name_attribute(workflow_name.as_str());
         assert_eq!(workflow_name_kv.key.as_str(), CICD_PIPELINE_NAME_KEY);
         assert_eq!(workflow_name_kv.value.as_str().as_ref(), "BuildWorkflow");
 
-        let workflow_task_name_kv = workflow_task_name_attribute(&job_name);
+        let workflow_task_name_kv = workflow_task_name_attribute(job_name.as_str());
         assert_eq!(
             workflow_task_name_kv.key.as_str(),
             CICD_PIPELINE_TASK_NAME_KEY
         );
         assert_eq!(workflow_task_name_kv.value.as_str().as_ref(), "LinuxJob");
-
-        let run_id_kv = workflow_run_id_attribute(run_id);
-        assert_eq!(run_id_kv.key.as_str(), GITHUB_WORKFLOW_RUN_ID_KEY);
-        assert_eq!(run_id_kv.value.as_str().as_ref(), "31");
 
         let pipeline_run_id_kv = workflow_pipeline_run_id_attribute(run_id);
         assert_eq!(pipeline_run_id_kv.key.as_str(), CICD_PIPELINE_RUN_ID_KEY);
@@ -1314,10 +1355,6 @@ mod tests {
         let attempt_kv = workflow_run_attempt_attribute(run_attempt);
         assert_eq!(attempt_kv.key.as_str(), GITHUB_WORKFLOW_RUN_ATTEMPT_KEY);
         assert_eq!(attempt_kv.value.as_str().as_ref(), "2");
-
-        let job_id_kv = workflow_job_id_attribute(job_id);
-        assert_eq!(job_id_kv.key.as_str(), GITHUB_WORKFLOW_JOB_ID_KEY);
-        assert_eq!(job_id_kv.value.as_str().as_ref(), "41");
 
         let job_task_run_id_kv = workflow_pipeline_task_run_id_attribute(job_id);
         assert_eq!(
@@ -1346,21 +1383,64 @@ mod tests {
         assert_eq!(conclusion_kv.key.as_str(), GITHUB_WORKFLOW_CONCLUSION_KEY);
         assert_eq!(conclusion_kv.value.as_str().as_ref(), "cancelled");
 
-        let result_kv = workflow_pipeline_result_attribute(WorkflowConclusion::Cancelled)
-            .expect("cancelled has a semantic result");
-        assert_eq!(result_kv.key.as_str(), CICD_PIPELINE_RESULT_KEY);
-        assert_eq!(result_kv.value.as_str().as_ref(), "cancellation");
-
         let task_result_kv =
-            workflow_pipeline_task_run_result_attribute(WorkflowConclusion::TimedOut)
-                .expect("timed out has a semantic result");
+            workflow_pipeline_task_run_result_attribute(WorkflowConclusion::TimedOut);
         assert_eq!(
             task_result_kv.key.as_str(),
             CICD_PIPELINE_TASK_RUN_RESULT_KEY
         );
         assert_eq!(task_result_kv.value.as_str().as_ref(), "timeout");
-        assert!(workflow_pipeline_result_attribute(WorkflowConclusion::Neutral).is_none());
-        assert!(workflow_pipeline_task_run_result_attribute(WorkflowConclusion::Other).is_none());
+        assert_eq!(
+            workflow_pipeline_task_run_result_attribute(WorkflowConclusion::Neutral)
+                .value
+                .as_str()
+                .as_ref(),
+            "neutral"
+        );
+        assert_eq!(
+            workflow_pipeline_task_run_result_attribute(WorkflowConclusion::Other)
+                .value
+                .as_str()
+                .as_ref(),
+            "other"
+        );
+
+        let run_url = workflow_pipeline_run_url_attribute(&repository_name, run_id);
+        assert_eq!(run_url.key.as_str(), CICD_PIPELINE_RUN_URL_KEY);
+        assert_eq!(
+            run_url.value.as_str().as_ref(),
+            "https://github.com/owner/private-repository/actions/runs/31"
+        );
+        let task_url = workflow_task_run_url_attribute(&repository_name, run_id, job_id);
+        assert_eq!(task_url.key.as_str(), CICD_PIPELINE_TASK_RUN_URL_KEY);
+        assert_eq!(
+            task_url.value.as_str().as_ref(),
+            "https://github.com/owner/private-repository/actions/runs/31/job/41"
+        );
+        assert_eq!(
+            workflow_repository_url_attribute(&repository_name)
+                .key
+                .as_str(),
+            VCS_REPOSITORY_URL_KEY
+        );
+        let vcs_repository_name = workflow_repository_name_attribute(&repository_name);
+        assert_eq!(vcs_repository_name.key.as_str(), VCS_REPOSITORY_NAME_KEY);
+        assert_eq!(
+            vcs_repository_name.value.as_str().as_ref(),
+            "private-repository"
+        );
+        assert_eq!(
+            workflow_head_revision_attribute(&commit_sha).key.as_str(),
+            VCS_HEAD_REVISION_KEY
+        );
+        assert_eq!(
+            workflow_error_type_attribute(WorkflowConclusion::Failure)
+                .expect("failure has an error type")
+                .key
+                .as_str(),
+            ERROR_TYPE_KEY
+        );
+        assert!(workflow_error_type_attribute(WorkflowConclusion::Success).is_none());
 
         let timing_source_kv = timing_source_attribute(TimingSource::Fallback);
         assert_eq!(timing_source_kv.key.as_str(), TIMING_SOURCE_KEY);

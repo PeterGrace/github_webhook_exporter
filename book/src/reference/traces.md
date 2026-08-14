@@ -68,9 +68,13 @@ are `0`, `5`, `10`, `20`, `40`, `64`, `128`, `256`, `512`, `1024`, plus `+Inf`. 
 every reported step as a span; over-limit jobs emit no partial trace and increment
 `github_workflow_job_trace_rejections_total{reason="too_many_steps"}` once.
 
-Each accepted projection creates an independent `github.workflow.job` root, with a trace identity
-unrelated to the live `http.request` trace. Every projected step is a direct `github.workflow.step`
-child; payload-provided names never become span names. The service creates no workflow-run root and does not mutate merge-queue state for a
+Each accepted projection creates an independent task-run root with a trace identity unrelated to
+the live `http.request` trace. Its span name and `sentry.description` are
+`<workflow-name> / <job-name>`, and its `sentry.op` is `github.actions.job`. Every projected step is
+a direct task-run child named `<step-name>`; its `sentry.description` is
+`<workflow-name> / <job-name> / <step-name>`, and its `sentry.op` is `github.actions.step`. Missing
+workflow, job, and step names use the fixed values `workflow`, `job`, and `step`. Both span kinds are
+`INTERNAL`. The service creates no workflow-run root and does not mutate merge-queue state for a
 `workflow_job` event. It persists only bounded workflow-run correlation metadata keyed by
 repository, run ID, and run attempt; these records use the processed-delivery retention cutoff.
 
@@ -82,16 +86,20 @@ and lie inside the selected job interval; every other step is instantaneous at t
 marked `fallback`.
 
 **Conclusions.** Normalized to `success`, `failure`, `cancelled`, `skipped`, `timed_out`,
-`neutral`, or `other`. The CI/CD result is respectively `success`, `failure`, `cancellation`,
-`skip`, or `timeout` where that semantic exists, omitted for `neutral`/`other`. `success` sets
-OpenTelemetry status OK; `failure` and `timed_out` set error status with a fixed description; all
-other conclusions leave status unset. Raw unknown conclusions are discarded.
+`neutral`, or `other`. `cicd.pipeline.task.run.result` is always present and is respectively
+`success`, `failure`, `cancellation`, `skip`, `timeout`, `neutral`, or `other`. The last two are
+custom closed values. `failure` and `timed_out` also set `error.type` to
+`GitHubActionsTaskFailure` and `GitHubActionsTaskTimeout`, respectively. Other conclusions omit
+`error.type`. `success` sets OpenTelemetry status OK; `failure` and `timed_out` set error status
+with a fixed description; all other conclusions leave status unset. Raw unknown conclusions are
+discarded.
 
-Sentry SaaS verification on 2026-08-12 confirmed this canonical mapping is sufficient for waterfall
-rendering: successful job and step spans ingest as `sentry.status=ok`, while failed and timed-out
-spans ingest as `sentry.status=error` and display as red-hatched waterfall lines. All retain an
-absent `sentry.status_code`; the exporter deliberately emits no synthetic HTTP status for these
-non-HTTP CI tasks.
+Sentry SaaS verification on 2026-08-14 confirmed that waterfall rows use the descriptive job and
+step names and display `github.actions.job` and `github.actions.step` instead of `default`.
+Successful task spans ingest as `sentry.status=ok`; failed and timed-out task spans ingest as
+`sentry.status=error`. Linked errors use the exact failed or timed-out task span IDs in the same
+trace. All task spans retain an absent `sentry.status_code`; the exporter deliberately emits no
+synthetic HTTP status for these non-HTTP CI tasks.
 
 Every failed or timed-out step emits one bounded OpenTelemetry `exception` span event. When
 `SENTRY_DSN` is configured, the same historical step also emits one application-generated Sentry
@@ -105,18 +113,28 @@ description/tag fallback but never enter grouping, so equivalent unnamed tasks g
 and job fallbacks cannot merge with same-named steps. These application-generated events use
 mechanism type `github_actions`, are handled, and omit Sentry's protocol-level
 `mechanism.synthetic` field so Sentry retains the exception type and derives a descriptive title.
-They contain no stack trace, logs, commands, or output, and use Sentry's bounded non-blocking
-transport.
+Their trace contexts use the same `github.actions.job` or `github.actions.step` operation and the
+same bounded descriptions as the linked task spans. They contain no stack trace, logs, commands,
+or output, and use Sentry's bounded non-blocking transport.
 
-**Identifiers and run context.** The workflow root carries only these validated span-only
-identifiers: canonical repository name, delivery UUID, workflow run ID, positive run attempt,
-workflow job ID, valid full head SHA, and at most the first 20 positive pull-request numbers. Run ID
-is exported as both
-`cicd.pipeline.run.id` and `github.workflow.run.id`. Job ID is exported as a decimal string under
-both `github.workflow.job.id` and the root's `cicd.pipeline.task.run.id`; each step's
-`cicd.pipeline.task.run.id` is `<job-id>:<positive-step-number>`. Workflow, job, and step display
-names are span-only, sanitized by removing all Unicode control characters and keeping at most the
-first 128 remaining Unicode scalar values; an empty result is omitted.
+**Identifiers and run context.** Every job and step task span carries available pipeline and
+repository context: `cicd.pipeline.name`, `cicd.pipeline.run.id`,
+`cicd.pipeline.run.url.full`, `vcs.repository.url.full`, `vcs.repository.name`, and
+`vcs.ref.head.revision`. The revision is omitted when no valid full head SHA is available. Pipeline
+and repository URLs are derived only from validated identifiers.
+
+Every task span carries `cicd.pipeline.task.name`, `cicd.pipeline.task.run.id`,
+`cicd.pipeline.task.run.result`, and `cicd.pipeline.task.run.url.full`. The job task-run ID is the
+decimal job ID. Each step task-run ID is `<job-id>:<positive-step-number>`, and its URL includes
+GitHub's `#step:<step-number>:1` log anchor. The root additionally carries the delivery UUID,
+positive run attempt, and at most the first 20 positive pull-request numbers. Workflow, job, and
+step display names are span-only, sanitized by removing all Unicode control characters and keeping
+at most the first 128 remaining Unicode scalar values; an empty result selects the fixed fallback.
+
+Workflow spans do not emit the replaced fields `github.repository.name`, `github.commit.sha`,
+`github.workflow.run.id`, `github.workflow.job.id`, `github.workflow.job.url`, or
+`github.workflow.step.url`. They also do not emit `cicd.pipeline.result` or
+`cicd.pipeline.action.name`.
 
 An earlier authenticated `workflow_run` delivery supplies the authoritative normalized
 `github.workflow.event` and sanitized `github.workflow.source_branch` and
@@ -125,10 +143,8 @@ An earlier authenticated `workflow_run` delivery supplies the authoritative norm
 most 255 Unicode scalar values. Missing or ambiguous branches are omitted. The same available
 context is attached to the job root and every step.
 
-The job root also carries `github.workflow.job.url`, derived only from the validated repository,
-run ID, and job ID. Each step carries `github.workflow.step.url`, which appends GitHub's
-`#step:<step-number>:1` log anchor. Payload-provided URLs remain ignored. Derived URLs are span-only
-and never enter logs or metrics.
+Payload-provided URLs remain ignored. Derived CI/CD and VCS URLs are span-only and never enter logs
+or metrics.
 
 Commands, output, logs, actors, payload-provided URLs, request bodies, arbitrary payload fragments,
 secrets, signatures, authorization/other headers, unsupported actions, and raw unknown conclusions
