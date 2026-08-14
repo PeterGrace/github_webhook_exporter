@@ -214,6 +214,7 @@ pub(crate) fn workflow_repository_url_attribute(repository: &CanonicalRepository
 
 /// Returns the semantic-convention repository name for a workflow task.
 pub(crate) fn workflow_repository_name_attribute(repository: &CanonicalRepositoryName) -> KeyValue {
+    // The fallback is defensive because CanonicalRepositoryName currently guarantees owner/name.
     let repository_name = repository
         .as_str()
         .rsplit_once('/')
