@@ -9,9 +9,14 @@ use sentry::{
     Client, Level,
 };
 
-use super::workflow::{WorkflowConclusion, WorkflowJobTrace, WorkflowStepTrace};
+use super::{
+    trace::{GITHUB_ACTIONS_JOB_OPERATION, GITHUB_ACTIONS_STEP_OPERATION},
+    workflow::{
+        job_span_name, step_description, workflow_name, WorkflowConclusion, WorkflowJobTrace,
+        WorkflowStepTrace,
+    },
+};
 
-const UNKNOWN_WORKFLOW_NAME: &str = "workflow";
 const UNNAMED_JOB_GROUPING_NAME: &str = "unnamed-job";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,7 +48,7 @@ impl WorkflowErrorReporter for SentryWorkflowErrorReporter {
                 span_id: error.span_id().to_bytes().into(),
                 trace_id: error.trace_id().to_bytes().into(),
                 op: Some(error.kind().span_operation().to_owned()),
-                description: Some(error.task_name().to_owned()),
+                description: Some(error.trace_description().to_owned()),
                 status: Some(SpanStatus::InternalError),
                 origin: Some("manual.github.workflow".to_owned()),
                 ..TraceContext::default()
@@ -101,6 +106,7 @@ struct WorkflowErrorParts {
     task_name: String,
     grouping_task_name: String,
     task_run_id: String,
+    trace_description: String,
     timestamp: SystemTime,
     trace_id: TraceId,
     span_id: SpanId,
@@ -116,6 +122,7 @@ pub(super) struct SyntheticWorkflowError {
     grouping_job_name: String,
     grouping_task_name: String,
     task_run_id: String,
+    trace_description: String,
     conclusion: &'static str,
     timestamp: SystemTime,
     trace_id: TraceId,
@@ -138,6 +145,7 @@ impl SyntheticWorkflowError {
             || format!("unnamed-step:{}", step.number()),
             |name| name.as_str().to_owned(),
         );
+        let trace_description = step_description(job, step);
         Self::new(
             job,
             WorkflowErrorParts {
@@ -146,6 +154,7 @@ impl SyntheticWorkflowError {
                 task_name,
                 grouping_task_name,
                 task_run_id,
+                trace_description,
                 timestamp: step.timing().end(),
                 trace_id,
                 span_id,
@@ -163,6 +172,7 @@ impl SyntheticWorkflowError {
             || UNNAMED_JOB_GROUPING_NAME.to_owned(),
             |name| name.as_str().to_owned(),
         );
+        let trace_description = job_span_name(job);
         Self::new(
             job,
             WorkflowErrorParts {
@@ -171,6 +181,7 @@ impl SyntheticWorkflowError {
                 task_name,
                 grouping_task_name,
                 task_run_id,
+                trace_description,
                 timestamp: job.timing().end(),
                 trace_id,
                 span_id,
@@ -199,11 +210,7 @@ impl SyntheticWorkflowError {
             exception_type,
             description,
             repository_name: job.repository_name().as_str().to_owned(),
-            workflow_name: job
-                .workflow_name()
-                .map_or(UNKNOWN_WORKFLOW_NAME.to_owned(), |name| {
-                    name.as_str().to_owned()
-                }),
+            workflow_name: workflow_name(job).to_owned(),
             task_name: parts.task_name,
             grouping_job_name: job.job_name().map_or_else(
                 || UNNAMED_JOB_GROUPING_NAME.to_owned(),
@@ -211,6 +218,7 @@ impl SyntheticWorkflowError {
             ),
             grouping_task_name: parts.grouping_task_name,
             task_run_id: parts.task_run_id,
+            trace_description: parts.trace_description,
             conclusion: parts.conclusion.as_str(),
             timestamp: parts.timestamp,
             trace_id: parts.trace_id,
@@ -244,6 +252,10 @@ impl SyntheticWorkflowError {
 
     pub(super) fn task_run_id(&self) -> &str {
         &self.task_run_id
+    }
+
+    pub(super) fn trace_description(&self) -> &str {
+        &self.trace_description
     }
 
     pub(super) const fn conclusion(&self) -> &'static str {
@@ -292,8 +304,8 @@ impl WorkflowTaskKind {
 
     const fn span_operation(self) -> &'static str {
         match self {
-            Self::Job => "github.workflow.job",
-            Self::Step => "github.workflow.step",
+            Self::Job => GITHUB_ACTIONS_JOB_OPERATION,
+            Self::Step => GITHUB_ACTIONS_STEP_OPERATION,
         }
     }
 }
@@ -495,6 +507,15 @@ mod tests {
     }
 
     #[test]
+    fn workflow_task_kinds_use_matching_sentry_operations() {
+        assert_eq!(WorkflowTaskKind::Job.span_operation(), "github.actions.job");
+        assert_eq!(
+            WorkflowTaskKind::Step.span_operation(),
+            "github.actions.step"
+        );
+    }
+
+    #[test]
     fn job_and_step_grouping_are_distinct_for_equal_names() {
         let job = failure_job(
             Some("shared task"),
@@ -577,6 +598,11 @@ mod tests {
                     trace.span_id.to_string(),
                     SpanId::from_bytes([2; 8]).to_string()
                 );
+                assert_eq!(trace.op.as_deref(), Some("github.actions.step"));
+                assert_eq!(
+                    trace.description.as_deref(),
+                    Some("Build Workflow / Linux Job / cargo test")
+                );
             }
             _ => panic!("trace context is present"),
         }
@@ -618,8 +644,13 @@ mod tests {
         assert_eq!(step_error.exception_type(), "GitHubActionsTaskTimeout");
         assert_eq!(step_error.description(), "CI task timed out: task 41:2");
         assert_eq!(step_error.task_name(), "task 41:2");
+        assert_eq!(
+            step_error.trace_description(),
+            "Build Workflow / job / step"
+        );
         assert_eq!(job_error.kind(), WorkflowTaskKind::Job);
         assert_eq!(job_error.description(), "CI task timed out: task 41");
         assert_eq!(job_error.task_name(), "task 41");
+        assert_eq!(job_error.trace_description(), "Build Workflow / job");
     }
 }

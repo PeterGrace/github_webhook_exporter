@@ -23,7 +23,7 @@ use opentelemetry_proto::tonic::{
         any_value::Value as AttributeValue, AnyValue, ArrayValue, KeyValue, KeyValueList,
     },
     logs::v1::LogRecord,
-    trace::v1::{status::StatusCode as OtlpStatusCode, Span},
+    trace::v1::{span::SpanKind as OtlpSpanKind, status::StatusCode as OtlpStatusCode, Span},
 };
 use prost::Message;
 use sentry::{
@@ -159,19 +159,22 @@ const SPAN_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "github.commit.sha",
     "cicd.pipeline.name",
     "cicd.pipeline.run.id",
+    "cicd.pipeline.run.url.full",
     "cicd.pipeline.task.name",
     "cicd.pipeline.task.run.id",
-    "cicd.pipeline.result",
     "cicd.pipeline.task.run.result",
+    "cicd.pipeline.task.run.url.full",
+    "error.type",
+    "sentry.description",
+    "sentry.op",
+    "vcs.ref.head.revision",
+    "vcs.repository.name",
+    "vcs.repository.url.full",
     "github.workflow.conclusion",
-    "github.workflow.run.id",
     "github.workflow.run.attempt",
-    "github.workflow.job.id",
     "github.workflow.event",
     "github.workflow.source_branch",
     "github.workflow.target_branch",
-    "github.workflow.job.url",
-    "github.workflow.step.url",
     "timing_source",
     "db.system.name",
     "db.operation.name",
@@ -183,16 +186,20 @@ const SPAN_EVENT_ALLOWLIST: &[(&str, &[&str])] = &[
 const SPAN_ONLY_ATTRIBUTE_KEYS: &[&str] = &[
     "cicd.pipeline.name",
     "cicd.pipeline.run.id",
+    "cicd.pipeline.run.url.full",
     "cicd.pipeline.task.name",
     "cicd.pipeline.task.run.id",
+    "cicd.pipeline.task.run.url.full",
+    "sentry.description",
+    "vcs.ref.head.revision",
+    "vcs.repository.name",
+    "vcs.repository.url.full",
     "github.repository.name",
     "github.repository.id",
     "github.delivery.id",
     "github.pull_request.number",
     "github.commit.sha",
-    "github.workflow.run.id",
     "github.workflow.run.attempt",
-    "github.workflow.job.id",
 ];
 
 #[derive(Default)]
@@ -1383,7 +1390,7 @@ impl CapturedSpans {
             .spans
             .iter()
             .filter(|span| {
-                span.name == "github.workflow.job"
+                string_attribute(span, "sentry.op") == Some("github.actions.job")
                     && string_attribute(span, "github.delivery.id") == Some(delivery_id)
             })
             .collect::<Vec<_>>();
@@ -1395,6 +1402,15 @@ impl CapturedSpans {
         matches[0]
     }
 
+    fn workflow_step<'spans>(&'spans self, job: &'spans Span) -> &'spans Span {
+        let matches = self
+            .children(job)
+            .filter(|span| string_attribute(span, "sentry.op") == Some("github.actions.step"))
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "workflow step count");
+        matches[0]
+    }
+
     fn workflow_step_for_task_run_id<'spans>(
         &'spans self,
         job: &'spans Span,
@@ -1403,7 +1419,7 @@ impl CapturedSpans {
         let matches = self
             .children(job)
             .filter(|span| {
-                span.name == "github.workflow.step"
+                string_attribute(span, "sentry.op") == Some("github.actions.step")
                     && string_attribute(span, "cicd.pipeline.task.run.id") == Some(task_run_id)
             })
             .collect::<Vec<_>>();
@@ -1546,6 +1562,13 @@ impl CapturedSpans {
             }
         }
     }
+}
+
+fn is_workflow_task_span(span: &Span) -> bool {
+    matches!(
+        string_attribute(span, "sentry.op"),
+        Some("github.actions.job" | "github.actions.step")
+    )
 }
 
 fn string_attribute<'span>(span: &'span Span, key: &str) -> Option<&'span str> {
@@ -2704,8 +2727,8 @@ async fn shutdown_exports_accepted_core_workflow_and_log_records() {
         .webhook_request_for_delivery(delivery_id)
         .parent_span_id
         .is_empty());
-    let job = captured.one_named("github.workflow.job");
-    assert_eq!(captured.child_count(job, "github.workflow.step"), 1);
+    let job = captured.one_named("workflow / job");
+    assert_eq!(captured.child_count(job, "shutdown step"), 1);
     assert!(captured.has_log_body("shutdown export sentinel"));
     assert!(stderr.contains("shutdown export sentinel"));
 }
@@ -2794,24 +2817,33 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
 
     let captured = fixture.force_flush();
     let request = captured.webhook_request_for_delivery(delivery_id);
-    let job = captured.one_named("github.workflow.job");
+    let job = captured.one_named("BuildWorkflow / LinuxJob");
     assert!(job.parent_span_id.is_empty());
-    assert_eq!(captured.child_count(job, "github.workflow.step"), 2);
+    assert_eq!(captured.children(job).count(), 2);
     assert_ne!(job.trace_id, request.trace_id);
-    assert_attribute(job, "github.repository.name", WEBHOOK_REPOSITORY);
+    assert_eq!(job.kind, OtlpSpanKind::Internal as i32);
     assert_attribute(job, "github.delivery.id", delivery_id);
-    assert_attribute(
-        job,
-        "github.commit.sha",
-        &WEBHOOK_SHA_40.to_ascii_lowercase(),
-    );
     assert_attribute(job, "cicd.pipeline.name", "BuildWorkflow");
     assert_attribute(job, "cicd.pipeline.task.name", "LinuxJob");
     assert_attribute(job, "cicd.pipeline.task.run.id", "41");
     assert_attribute(job, "cicd.pipeline.run.id", "31");
-    assert_attribute(job, "github.workflow.run.id", "31");
+    assert_attribute(
+        job,
+        "cicd.pipeline.run.url.full",
+        &format!("https://github.com/{WEBHOOK_REPOSITORY}/actions/runs/31"),
+    );
     assert_attribute(job, "github.workflow.run.attempt", "2");
-    assert_attribute(job, "github.workflow.job.id", "41");
+    assert_attribute(job, "vcs.repository.name", "webhook-private-repository");
+    assert_attribute(
+        job,
+        "vcs.repository.url.full",
+        &format!("https://github.com/{WEBHOOK_REPOSITORY}"),
+    );
+    assert_attribute(
+        job,
+        "vcs.ref.head.revision",
+        &WEBHOOK_SHA_40.to_ascii_lowercase(),
+    );
     assert_attribute(job, "github.workflow.event", "merge_group");
     assert_attribute(
         job,
@@ -2821,11 +2853,13 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
     assert_attribute(job, "github.workflow.target_branch", "main");
     assert_attribute(
         job,
-        "github.workflow.job.url",
+        "cicd.pipeline.task.run.url.full",
         &format!("https://github.com/{WEBHOOK_REPOSITORY}/actions/runs/31/job/41"),
     );
     assert_attribute(job, "github.workflow.conclusion", "success");
-    assert_attribute(job, "cicd.pipeline.result", "success");
+    assert_attribute(job, "cicd.pipeline.task.run.result", "success");
+    assert_attribute(job, "sentry.op", "github.actions.job");
+    assert_attribute(job, "sentry.description", "BuildWorkflow / LinuxJob");
     assert_attribute(job, "timing_source", "reported");
     assert_i64_array_attribute(
         job,
@@ -2837,11 +2871,14 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
 
     let steps = captured
         .children(job)
-        .filter(|span| span.name == "github.workflow.step")
+        .filter(|span| string_attribute(span, "sentry.op") == Some("github.actions.step"))
         .collect::<Vec<_>>();
     assert_eq!(steps.len(), 2);
     assert_eq!(steps[0].parent_span_id, job.span_id);
     assert_eq!(steps[1].parent_span_id, job.span_id);
+    assert!(steps
+        .iter()
+        .all(|step| step.kind == OtlpSpanKind::Internal as i32));
     assert_eq!(steps[0].trace_id, job.trace_id);
     assert_eq!(steps[1].trace_id, job.trace_id);
     assert_eq!(
@@ -2862,10 +2899,23 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
     assert_attribute(steps[0], "github.workflow.target_branch", "main");
     assert_attribute(
         steps[0],
-        "github.workflow.step.url",
+        "cicd.pipeline.task.run.url.full",
         &format!("https://github.com/{WEBHOOK_REPOSITORY}/actions/runs/31/job/41#step:2:1"),
     );
     assert_attribute(steps[0], "cicd.pipeline.task.run.result", "success");
+    assert_attribute(steps[0], "cicd.pipeline.name", "BuildWorkflow");
+    assert_attribute(steps[0], "cicd.pipeline.run.id", "31");
+    assert_attribute(
+        steps[0],
+        "vcs.repository.name",
+        "webhook-private-repository",
+    );
+    assert_attribute(steps[0], "sentry.op", "github.actions.step");
+    assert_attribute(
+        steps[0],
+        "sentry.description",
+        "BuildWorkflow / LinuxJob / RunTests",
+    );
     assert_attribute(steps[0], "timing_source", "reported");
     assert_eq!(
         steps[0].start_time_unix_nano,
@@ -2880,10 +2930,23 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
     assert_attribute(steps[1], "github.workflow.event", "merge_group");
     assert_attribute(
         steps[1],
-        "github.workflow.step.url",
+        "cicd.pipeline.task.run.url.full",
         &format!("https://github.com/{WEBHOOK_REPOSITORY}/actions/runs/31/job/41#step:1:1"),
     );
     assert_attribute(steps[1], "cicd.pipeline.task.run.result", "success");
+    assert_attribute(steps[1], "cicd.pipeline.name", "BuildWorkflow");
+    assert_attribute(steps[1], "cicd.pipeline.run.id", "31");
+    assert_attribute(
+        steps[1],
+        "vcs.repository.name",
+        "webhook-private-repository",
+    );
+    assert_attribute(steps[1], "sentry.op", "github.actions.step");
+    assert_attribute(
+        steps[1],
+        "sentry.description",
+        "BuildWorkflow / LinuxJob / Checkout",
+    );
     assert_attribute(steps[1], "timing_source", "reported");
     assert_eq!(
         steps[1].start_time_unix_nano,
@@ -2945,10 +3008,7 @@ async fn pull_request_workflow_context_enriches_job_and_step_spans() {
 
     let captured = fixture.force_flush();
     let job = captured.workflow_job_for_delivery(job_delivery);
-    let step = captured
-        .children(job)
-        .find(|span| span.name == "github.workflow.step")
-        .expect("step span is exported");
+    let step = captured.workflow_step(job);
     for span in [job, step] {
         assert_attribute(span, "github.workflow.event", "pull_request");
         assert_attribute(
@@ -2960,12 +3020,12 @@ async fn pull_request_workflow_context_enriches_job_and_step_spans() {
     }
     assert_attribute(
         job,
-        "github.workflow.job.url",
+        "cicd.pipeline.task.run.url.full",
         &format!("https://github.com/{WEBHOOK_REPOSITORY}/actions/runs/73/job/7301"),
     );
     assert_attribute(
         step,
-        "github.workflow.step.url",
+        "cicd.pipeline.task.run.url.full",
         &format!("https://github.com/{WEBHOOK_REPOSITORY}/actions/runs/73/job/7301#step:4:1"),
     );
 }
@@ -2997,7 +3057,13 @@ async fn workflow_job_at_configured_step_limit_exports_complete_trace() {
     let exposition = fixture.metrics_text().await;
     let captured = fixture.force_flush();
     let job = captured.workflow_job_for_delivery(delivery_id);
-    assert_eq!(captured.child_count(job, "github.workflow.step"), 2);
+    assert_eq!(
+        captured
+            .children(job)
+            .filter(|span| string_attribute(span, "sentry.op") == Some("github.actions.step"))
+            .count(),
+        2
+    );
     assert_metric_line(
         &exposition,
         "github_workflow_job_steps_count{repository=\"owner/webhook-private-repository\"} 1",
@@ -3102,7 +3168,7 @@ async fn workflow_job_over_step_limit_emits_actionable_rejection_without_trace()
             .spans
             .iter()
             .filter(|span| {
-                (span.name == "github.workflow.job" || span.name == "github.workflow.step")
+                is_workflow_task_span(span)
                     && string_attribute(span, "github.delivery.id") == Some(DELIVERY_ID)
             })
             .count(),
@@ -3346,7 +3412,7 @@ async fn unauthorized_and_non_completed_over_limit_jobs_skip_specialized_process
                 .spans
                 .iter()
                 .filter(|span| {
-                    (span.name == "github.workflow.job" || span.name == "github.workflow.step")
+                    is_workflow_task_span(span)
                         && string_attribute(span, "github.delivery.id") == Some(delivery_id)
                 })
                 .count(),
@@ -3410,7 +3476,7 @@ async fn malformed_workflow_admission_after_authentication_has_no_specialized_ef
             .spans
             .iter()
             .filter(|span| {
-                (span.name == "github.workflow.job" || span.name == "github.workflow.step")
+                is_workflow_task_span(span)
                     && string_attribute(span, "github.delivery.id") == Some(delivery_id)
             })
             .count(),
@@ -3478,7 +3544,7 @@ async fn malformed_detailed_workflow_projection_observes_admission_once_without_
             .spans
             .iter()
             .filter(|span| {
-                (span.name == "github.workflow.job" || span.name == "github.workflow.step")
+                is_workflow_task_span(span)
                     && string_attribute(span, "github.delivery.id") == Some(delivery_id)
             })
             .count(),
@@ -3494,11 +3560,15 @@ async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent
     let required_workflow_span_only_keys = [
         "cicd.pipeline.name",
         "cicd.pipeline.run.id",
+        "cicd.pipeline.run.url.full",
         "cicd.pipeline.task.name",
         "cicd.pipeline.task.run.id",
-        "github.workflow.run.id",
+        "cicd.pipeline.task.run.url.full",
+        "sentry.description",
+        "vcs.ref.head.revision",
+        "vcs.repository.name",
+        "vcs.repository.url.full",
         "github.workflow.run.attempt",
-        "github.workflow.job.id",
     ];
     for key in required_workflow_span_only_keys {
         assert!(
@@ -3570,9 +3640,9 @@ async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent
     let step = captured.workflow_step_for_task_run_id(job, &task_run_id);
 
     assert!(job.parent_span_id.is_empty());
-    assert_attribute(job, "github.repository.name", WEBHOOK_REPOSITORY);
     assert_attribute(job, "github.delivery.id", WORKFLOW_PRIVACY_DELIVERY);
-    assert_attribute(job, "github.commit.sha", WORKFLOW_PRIVACY_SHA);
+    assert_attribute(job, "vcs.repository.name", "webhook-private-repository");
+    assert_attribute(job, "vcs.ref.head.revision", WORKFLOW_PRIVACY_SHA);
     assert_attribute(job, "cicd.pipeline.name", WORKFLOW_SANITIZED_NAME);
     assert_attribute(job, "cicd.pipeline.task.name", WORKFLOW_SANITIZED_JOB_NAME);
     assert_attribute(
@@ -3582,18 +3652,8 @@ async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent
     );
     assert_attribute(
         job,
-        "github.workflow.run.id",
-        &WORKFLOW_PRIVACY_RUN_ID.to_string(),
-    );
-    assert_attribute(
-        job,
         "github.workflow.run.attempt",
         &WORKFLOW_PRIVACY_RUN_ATTEMPT.to_string(),
-    );
-    assert_attribute(
-        job,
-        "github.workflow.job.id",
-        &WORKFLOW_PRIVACY_JOB_ID.to_string(),
     );
     assert_attribute(
         job,
@@ -3606,7 +3666,8 @@ async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent
         WORKFLOW_PRIVACY_PR_NUMBERS,
     );
     assert_attribute(job, "github.workflow.conclusion", "other");
-    assert_eq!(string_attribute(job, "cicd.pipeline.result"), None);
+    assert_attribute(job, "cicd.pipeline.task.run.result", "other");
+    assert_eq!(string_attribute(job, "error.type"), None);
     assert_historical_interval(
         job,
         rfc3339_unix_nanos("2026-08-06T13:00:00.123456789Z"),
@@ -3620,10 +3681,8 @@ async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent
     );
     assert_attribute(step, "cicd.pipeline.task.run.id", &task_run_id);
     assert_attribute(step, "github.workflow.conclusion", "other");
-    assert_eq!(
-        string_attribute(step, "cicd.pipeline.task.run.result"),
-        None
-    );
+    assert_attribute(step, "cicd.pipeline.task.run.result", "other");
+    assert_eq!(string_attribute(step, "error.type"), None);
     assert_historical_interval(
         step,
         rfc3339_unix_nanos("2026-08-06T13:01:00.111111111Z"),
@@ -3632,11 +3691,13 @@ async fn workflow_identifiers_and_names_are_span_only_and_payload_data_is_absent
     );
 
     captured.assert_approved_attribute_keys();
-    for key in SPAN_ONLY_ATTRIBUTE_KEYS {
+    for key in required_workflow_span_only_keys {
         assert!(
             captured.has_trace_attribute_key(key),
-            "span-only attribute key {key:?} is present in traces"
+            "workflow span-only attribute key {key:?} is present in traces"
         );
+    }
+    for key in SPAN_ONLY_ATTRIBUTE_KEYS {
         assert!(
             !captured.has_log_attribute_key(key),
             "OTLP logs must not contain span-only attribute key {key:?}"
@@ -3839,10 +3900,15 @@ async fn hostile_failed_workflow_payload_is_private() {
         Some(SentryContext::Trace(trace)) => {
             assert_eq!(trace.trace_id.to_string(), hex::encode(&step.trace_id));
             assert_eq!(trace.span_id.to_string(), hex::encode(&step.span_id));
-            assert_eq!(trace.op.as_deref(), Some("github.workflow.step"));
+            assert_eq!(trace.op.as_deref(), Some("github.actions.step"));
             assert_eq!(
                 trace.description.as_deref(),
-                Some(sanitized_step_name.as_str())
+                Some(
+                    format!(
+                        "{WORKFLOW_SANITIZED_NAME} / {WORKFLOW_SANITIZED_JOB_NAME} / {sanitized_step_name}"
+                    )
+                    .as_str()
+                )
             );
             assert_eq!(trace.status, Some(SentrySpanStatus::InternalError));
             assert_eq!(trace.origin.as_deref(), Some("manual.github.workflow"));
@@ -4022,7 +4088,7 @@ async fn workflow_conclusions_export_bounded_results_and_statuses() {
             "550e8400-e29b-41d4-a716-446655440305",
             "neutral",
             "neutral",
-            None,
+            Some("neutral"),
             OtlpStatusCode::Unset,
             "",
             "Neutral Job",
@@ -4036,7 +4102,7 @@ async fn workflow_conclusions_export_bounded_results_and_statuses() {
             "550e8400-e29b-41d4-a716-446655440306",
             "fixture_private_unknown",
             "other",
-            None,
+            Some("other"),
             OtlpStatusCode::Unset,
             "",
             "Other Job",
@@ -4128,7 +4194,7 @@ async fn workflow_conclusions_export_bounded_results_and_statuses() {
         captured
             .spans
             .iter()
-            .filter(|span| span.name == "github.workflow.job")
+            .filter(|span| string_attribute(span, "sentry.op") == Some("github.actions.job"))
             .count(),
         cases.len() + 1
     );
@@ -4136,7 +4202,7 @@ async fn workflow_conclusions_export_bounded_results_and_statuses() {
         captured
             .spans
             .iter()
-            .filter(|span| span.name == "github.workflow.step")
+            .filter(|span| string_attribute(span, "sentry.op") == Some("github.actions.step"))
             .count(),
         cases.len() + 1
     );
@@ -4157,19 +4223,26 @@ async fn workflow_conclusions_export_bounded_results_and_statuses() {
     ) in &cases
     {
         let job = captured.workflow_job_for_delivery(delivery_id);
-        let step = captured.child_named(job, "github.workflow.step");
+        let step = captured.workflow_step(job);
 
         assert_attribute(job, "github.workflow.conclusion", normalized);
         assert_attribute(step, "github.workflow.conclusion", normalized);
-        // These exact presence/absence assertions exercise WorkflowConclusion::semantic_result.
         assert_eq!(
-            string_attribute(job, "cicd.pipeline.result"),
+            string_attribute(job, "cicd.pipeline.task.run.result"),
             *semantic_result
         );
         assert_eq!(
             string_attribute(step, "cicd.pipeline.task.run.result"),
             *semantic_result
         );
+        let expected_error_type = match *normalized {
+            "failure" => Some("GitHubActionsTaskFailure"),
+            "timed_out" => Some("GitHubActionsTaskTimeout"),
+            "success" | "cancelled" | "skipped" | "neutral" | "other" => None,
+            unexpected => panic!("unexpected normalized conclusion {unexpected}"),
+        };
+        assert_eq!(string_attribute(job, "error.type"), expected_error_type);
+        assert_eq!(string_attribute(step, "error.type"), expected_error_type);
         // These protobuf assertions exercise WorkflowConclusion::status.
         assert_otlp_status(job, *status, description);
         assert_otlp_status(step, *status, description);
@@ -4194,11 +4267,11 @@ async fn workflow_conclusions_export_bounded_results_and_statuses() {
     }
 
     let fallback_job = captured.workflow_job_for_delivery(fallback_delivery_id);
-    let fallback_step = captured.child_named(fallback_job, "github.workflow.step");
+    let fallback_step = captured.workflow_step(fallback_job);
     assert_attribute(fallback_job, "github.workflow.conclusion", "failure");
     assert_attribute(fallback_step, "github.workflow.conclusion", "success");
     assert_eq!(
-        string_attribute(fallback_job, "cicd.pipeline.result"),
+        string_attribute(fallback_job, "cicd.pipeline.task.run.result"),
         Some("failure")
     );
     assert_eq!(
@@ -4371,7 +4444,7 @@ async fn workflow_timing_uses_reported_and_bounded_fallback_intervals() {
     );
     let steps = captured
         .children(reported_job)
-        .filter(|span| span.name == "github.workflow.step")
+        .filter(|span| string_attribute(span, "sentry.op") == Some("github.actions.step"))
         .collect::<Vec<_>>();
     assert_eq!(steps.len(), 5);
     let step_by_number = |number: i64| {
@@ -4608,9 +4681,7 @@ async fn unsupported_workflow_actions_and_projections_emit_no_historical_trace()
             captured
                 .spans
                 .iter()
-                .filter(|span| {
-                    span.name == "github.workflow.job" || span.name == "github.workflow.step"
-                })
+                .filter(|span| is_workflow_task_span(span))
                 .count(),
             0,
             "request {delivery_id} emits no historical workflow span"
@@ -4670,7 +4741,13 @@ async fn duplicate_workflow_delivery_emits_one_historical_trace() {
     let captured = fixture.force_flush();
 
     let job = captured.workflow_job_for_delivery(delivery_id);
-    assert_eq!(captured.child_count(job, "github.workflow.step"), 2);
+    assert_eq!(
+        captured
+            .children(job)
+            .filter(|span| string_attribute(span, "sentry.op") == Some("github.actions.step"))
+            .count(),
+        2
+    );
     let first_step = captured.workflow_step_for_task_run_id(job, "701:1");
     let second_step = captured.workflow_step_for_task_run_id(job, "701:2");
     assert_attribute(first_step, "github.workflow.conclusion", "success");
@@ -4766,7 +4843,7 @@ async fn duplicate_over_limit_workflow_job_records_one_rejection() {
         captured
             .spans
             .iter()
-            .filter(|span| span.name == "github.workflow.job" || span.name == "github.workflow.step")
+            .filter(|span| is_workflow_task_span(span))
             .count(),
         0,
         "over-limit duplicate delivery emits no historical workflow spans"

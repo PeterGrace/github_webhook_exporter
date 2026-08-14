@@ -3,7 +3,7 @@
 use std::{fmt, sync::Arc, time::SystemTime};
 
 use opentelemetry::{
-    trace::{Span as _, Status, TraceContextExt, Tracer},
+    trace::{Span as _, SpanKind, Status, TraceContextExt, Tracer},
     Context, KeyValue,
 };
 use opentelemetry_sdk::trace::SdkTracer;
@@ -16,15 +16,17 @@ use crate::{
 
 use super::{
     trace::{
-        commit_sha_attribute, delivery_id_attribute, pull_request_numbers_attribute,
-        repository_name_attribute, timing_source_attribute, workflow_conclusion_attribute,
-        workflow_event_attribute, workflow_job_id_attribute, workflow_job_url_attribute,
-        workflow_name_attribute, workflow_pipeline_result_attribute,
-        workflow_pipeline_run_id_attribute, workflow_pipeline_step_task_run_id_attribute,
+        delivery_id_attribute, pull_request_numbers_attribute, sentry_description_attribute,
+        sentry_operation_attribute, timing_source_attribute, workflow_conclusion_attribute,
+        workflow_error_type_attribute, workflow_event_attribute, workflow_head_revision_attribute,
+        workflow_name_attribute, workflow_pipeline_run_id_attribute,
+        workflow_pipeline_run_url_attribute, workflow_pipeline_step_task_run_id_attribute,
         workflow_pipeline_task_run_id_attribute, workflow_pipeline_task_run_result_attribute,
-        workflow_run_attempt_attribute, workflow_run_id_attribute,
-        workflow_source_branch_attribute, workflow_step_url_attribute,
-        workflow_target_branch_attribute, workflow_task_name_attribute, CommitSha,
+        workflow_repository_name_attribute, workflow_repository_url_attribute,
+        workflow_run_attempt_attribute, workflow_source_branch_attribute,
+        workflow_step_task_run_url_attribute, workflow_target_branch_attribute,
+        workflow_task_name_attribute, workflow_task_run_url_attribute, CommitSha,
+        GITHUB_ACTIONS_JOB_OPERATION, GITHUB_ACTIONS_STEP_OPERATION,
     },
     workflow_error::{SyntheticWorkflowError, WorkflowErrorReporter},
 };
@@ -32,10 +34,11 @@ use super::{
 const MAX_DISPLAY_NAME_LENGTH: usize = 128;
 const MAX_BRANCH_NAME_LENGTH: usize = 255;
 const MAX_PULL_REQUEST_COUNT: usize = 20;
-const WORKFLOW_JOB_SPAN_NAME: &str = "github.workflow.job";
-const WORKFLOW_STEP_SPAN_NAME: &str = "github.workflow.step";
-const JOB_REQUIRED_ATTRIBUTE_COUNT: usize = 9;
-const STEP_REQUIRED_ATTRIBUTE_COUNT: usize = 3;
+const UNKNOWN_WORKFLOW_NAME: &str = "workflow";
+const UNNAMED_JOB_NAME: &str = "job";
+const UNNAMED_STEP_NAME: &str = "step";
+const JOB_REQUIRED_ATTRIBUTE_COUNT: usize = 15;
+const STEP_REQUIRED_ATTRIBUTE_COUNT: usize = 13;
 
 /// A malformed workflow telemetry value.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -519,7 +522,8 @@ impl WorkflowTraceEmitter {
 
         let mut root = tracer.build_with_context(
             tracer
-                .span_builder(WORKFLOW_JOB_SPAN_NAME)
+                .span_builder(job_span_name(job))
+                .with_kind(SpanKind::Internal)
                 .with_start_time(job.timing().start())
                 .with_attributes(job_attributes(job)),
             &Context::new(),
@@ -532,7 +536,8 @@ impl WorkflowTraceEmitter {
         for step in job.steps() {
             let mut span = tracer.build_with_context(
                 tracer
-                    .span_builder(WORKFLOW_STEP_SPAN_NAME)
+                    .span_builder(step_span_name(step))
+                    .with_kind(SpanKind::Internal)
                     .with_start_time(step.timing().start())
                     .with_attributes(step_attributes(job, step)),
                 &parent_context,
@@ -584,46 +589,37 @@ impl WorkflowTraceEmitter {
 fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
     let mut attributes = Vec::with_capacity(
         JOB_REQUIRED_ATTRIBUTE_COUNT
-            + usize::from(job.workflow_name().is_some())
-            + usize::from(job.job_name().is_some())
-            + usize::from(job.conclusion().semantic_result().is_some())
             + usize::from(job.head_sha().is_some())
             + usize::from(!job.pull_requests().is_empty())
-            + 1
+            + usize::from(job.conclusion().error_type().is_some())
             + job.workflow_run_context().map_or(0, |context| {
                 1 + usize::from(context.source_branch().is_some())
                     + usize::from(context.target_branch().is_some())
             }),
     );
-    attributes.push(repository_name_attribute(job.repository_name()));
+    append_pipeline_and_repository_context(&mut attributes, job);
     attributes.push(delivery_id_attribute(&job.delivery_id()));
-    if let Some(workflow_name) = job.workflow_name() {
-        attributes.push(workflow_name_attribute(workflow_name));
-    }
-    attributes.push(workflow_pipeline_run_id_attribute(job.run_id()));
-    attributes.push(workflow_run_id_attribute(job.run_id()));
     attributes.push(workflow_run_attempt_attribute(job.run_attempt()));
-    if let Some(job_name) = job.job_name() {
-        attributes.push(workflow_task_name_attribute(job_name));
-    }
+    attributes.push(workflow_task_name_attribute(job_name(job)));
     attributes.push(workflow_pipeline_task_run_id_attribute(job.job_id()));
-    attributes.push(workflow_job_id_attribute(job.job_id()));
     attributes.push(workflow_conclusion_attribute(job.conclusion()));
-    if let Some(result) = workflow_pipeline_result_attribute(job.conclusion()) {
-        attributes.push(result);
-    }
-    if let Some(head_sha) = job.head_sha() {
-        attributes.push(commit_sha_attribute(head_sha));
+    attributes.push(workflow_pipeline_task_run_result_attribute(
+        job.conclusion(),
+    ));
+    if let Some(error_type) = workflow_error_type_attribute(job.conclusion()) {
+        attributes.push(error_type);
     }
     if let Some(pull_request_numbers) = pull_request_numbers_attribute(job.pull_requests()) {
         attributes.push(pull_request_numbers);
     }
     append_workflow_run_context(&mut attributes, job.workflow_run_context());
-    attributes.push(workflow_job_url_attribute(
+    attributes.push(workflow_task_run_url_attribute(
         job.repository_name(),
         job.run_id(),
         job.job_id(),
     ));
+    attributes.push(sentry_operation_attribute(GITHUB_ACTIONS_JOB_OPERATION));
+    attributes.push(sentry_description_attribute(job_span_name(job)));
     attributes.push(timing_source_attribute(job.timing().source()));
     attributes
 }
@@ -631,34 +627,81 @@ fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
 fn step_attributes(job: &WorkflowJobTrace, step: &WorkflowStepTrace) -> Vec<KeyValue> {
     let mut attributes = Vec::with_capacity(
         STEP_REQUIRED_ATTRIBUTE_COUNT
-            + usize::from(step.name().is_some())
-            + usize::from(step.conclusion().semantic_result().is_some())
-            + 1
+            + usize::from(job.head_sha().is_some())
+            + usize::from(step.conclusion().error_type().is_some())
             + job.workflow_run_context().map_or(0, |context| {
                 1 + usize::from(context.source_branch().is_some())
                     + usize::from(context.target_branch().is_some())
             }),
     );
-    if let Some(name) = step.name() {
-        attributes.push(workflow_task_name_attribute(name));
-    }
+    append_pipeline_and_repository_context(&mut attributes, job);
+    attributes.push(workflow_task_name_attribute(step_name(step)));
     attributes.push(workflow_pipeline_step_task_run_id_attribute(
         job.job_id(),
         step,
     ));
     attributes.push(workflow_conclusion_attribute(step.conclusion()));
-    if let Some(result) = workflow_pipeline_task_run_result_attribute(step.conclusion()) {
-        attributes.push(result);
+    attributes.push(workflow_pipeline_task_run_result_attribute(
+        step.conclusion(),
+    ));
+    if let Some(error_type) = workflow_error_type_attribute(step.conclusion()) {
+        attributes.push(error_type);
     }
     append_workflow_run_context(&mut attributes, job.workflow_run_context());
-    attributes.push(workflow_step_url_attribute(
+    attributes.push(workflow_step_task_run_url_attribute(
         job.repository_name(),
         job.run_id(),
         job.job_id(),
         step,
     ));
+    attributes.push(sentry_operation_attribute(GITHUB_ACTIONS_STEP_OPERATION));
+    attributes.push(sentry_description_attribute(step_description(job, step)));
     attributes.push(timing_source_attribute(step.timing().source()));
     attributes
+}
+
+fn append_pipeline_and_repository_context(attributes: &mut Vec<KeyValue>, job: &WorkflowJobTrace) {
+    attributes.push(workflow_name_attribute(workflow_name(job)));
+    attributes.push(workflow_pipeline_run_id_attribute(job.run_id()));
+    attributes.push(workflow_pipeline_run_url_attribute(
+        job.repository_name(),
+        job.run_id(),
+    ));
+    attributes.push(workflow_repository_url_attribute(job.repository_name()));
+    attributes.push(workflow_repository_name_attribute(job.repository_name()));
+    if let Some(head_sha) = job.head_sha() {
+        attributes.push(workflow_head_revision_attribute(head_sha));
+    }
+}
+
+pub(super) fn workflow_name(job: &WorkflowJobTrace) -> &str {
+    job.workflow_name()
+        .map_or(UNKNOWN_WORKFLOW_NAME, DisplayName::as_str)
+}
+
+fn job_name(job: &WorkflowJobTrace) -> &str {
+    job.job_name().map_or(UNNAMED_JOB_NAME, DisplayName::as_str)
+}
+
+fn step_name(step: &WorkflowStepTrace) -> &str {
+    step.name().map_or(UNNAMED_STEP_NAME, DisplayName::as_str)
+}
+
+pub(super) fn job_span_name(job: &WorkflowJobTrace) -> String {
+    format!("{} / {}", workflow_name(job), job_name(job))
+}
+
+fn step_span_name(step: &WorkflowStepTrace) -> String {
+    step_name(step).to_owned()
+}
+
+pub(super) fn step_description(job: &WorkflowJobTrace, step: &WorkflowStepTrace) -> String {
+    format!(
+        "{} / {} / {}",
+        workflow_name(job),
+        job_name(job),
+        step_name(step)
+    )
 }
 
 fn append_workflow_run_context(
@@ -731,17 +774,25 @@ impl WorkflowConclusion {
         }
     }
 
-    /// Returns the semantic-convention result when one exists.
-    ///
-    /// The result is omitted for neutral and unsupported conclusions.
-    pub(crate) const fn semantic_result(self) -> Option<&'static str> {
+    /// Returns the bounded semantic-convention task-run result.
+    pub(crate) const fn semantic_result(self) -> &'static str {
         match self {
-            Self::Success => Some("success"),
-            Self::Failure => Some("failure"),
-            Self::Cancelled => Some("cancellation"),
-            Self::Skipped => Some("skip"),
-            Self::TimedOut => Some("timeout"),
-            Self::Neutral | Self::Other => None,
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Cancelled => "cancellation",
+            Self::Skipped => "skip",
+            Self::TimedOut => "timeout",
+            Self::Neutral => "neutral",
+            Self::Other => "other",
+        }
+    }
+
+    /// Returns the bounded error type for failures and timeouts.
+    pub(crate) const fn error_type(self) -> Option<&'static str> {
+        match self {
+            Self::Failure => Some("GitHubActionsTaskFailure"),
+            Self::TimedOut => Some("GitHubActionsTaskTimeout"),
+            Self::Success | Self::Cancelled | Self::Skipped | Self::Neutral | Self::Other => None,
         }
     }
 
@@ -916,7 +967,7 @@ mod tests {
     };
 
     use opentelemetry::{
-        trace::{SpanId, Status, TraceContextExt, Tracer, TracerProvider as _},
+        trace::{SpanId, SpanKind, Status, TraceContextExt, Tracer, TracerProvider as _},
         Array, Context, Value,
     };
     use opentelemetry_sdk::{
@@ -960,30 +1011,18 @@ mod tests {
     #[test]
     fn conclusions_have_a_closed_normalized_vocabulary() {
         let cases = [
-            (
-                Some("success"),
-                WorkflowConclusion::Success,
-                Some("success"),
-            ),
-            (
-                Some("failure"),
-                WorkflowConclusion::Failure,
-                Some("failure"),
-            ),
+            (Some("success"), WorkflowConclusion::Success, "success"),
+            (Some("failure"), WorkflowConclusion::Failure, "failure"),
             (
                 Some("cancelled"),
                 WorkflowConclusion::Cancelled,
-                Some("cancellation"),
+                "cancellation",
             ),
-            (Some("skipped"), WorkflowConclusion::Skipped, Some("skip")),
-            (
-                Some("timed_out"),
-                WorkflowConclusion::TimedOut,
-                Some("timeout"),
-            ),
-            (Some("neutral"), WorkflowConclusion::Neutral, None),
-            (Some("private-unknown"), WorkflowConclusion::Other, None),
-            (None, WorkflowConclusion::Other, None),
+            (Some("skipped"), WorkflowConclusion::Skipped, "skip"),
+            (Some("timed_out"), WorkflowConclusion::TimedOut, "timeout"),
+            (Some("neutral"), WorkflowConclusion::Neutral, "neutral"),
+            (Some("private-unknown"), WorkflowConclusion::Other, "other"),
+            (None, WorkflowConclusion::Other, "other"),
         ];
         for (raw, expected, semantic_result) in cases {
             let conclusion = WorkflowConclusion::normalize(raw);
@@ -998,43 +1037,43 @@ mod tests {
             (
                 WorkflowConclusion::Success,
                 "success",
-                Some("success"),
+                "success",
                 Some(Status::Ok),
             ),
             (
                 WorkflowConclusion::Failure,
                 "failure",
-                Some("failure"),
+                "failure",
                 Some(Status::error("workflow_failed")),
             ),
             (
                 WorkflowConclusion::Cancelled,
                 "cancelled",
-                Some("cancellation"),
+                "cancellation",
                 Some(Status::Unset),
             ),
             (
                 WorkflowConclusion::Skipped,
                 "skipped",
-                Some("skip"),
+                "skip",
                 Some(Status::Unset),
             ),
             (
                 WorkflowConclusion::TimedOut,
                 "timed_out",
-                Some("timeout"),
+                "timeout",
                 Some(Status::error("workflow_failed")),
             ),
             (
                 WorkflowConclusion::Neutral,
                 "neutral",
-                None,
+                "neutral",
                 Some(Status::Unset),
             ),
             (
                 WorkflowConclusion::Other,
                 "other",
-                None,
+                "other",
                 Some(Status::Unset),
             ),
         ];
@@ -1304,6 +1343,111 @@ mod tests {
     }
 
     #[test]
+    fn emitter_exports_descriptive_internal_task_spans_with_standard_context() {
+        let job = workflow_job_with_conclusions(
+            WorkflowConclusion::Failure,
+            &[WorkflowConclusion::Success, WorkflowConclusion::TimedOut],
+        );
+
+        let (spans, _) = emitted_spans_and_errors(&job);
+        let job_span = spans
+            .iter()
+            .find(|span| span.name == "Build Workflow / Linux Job")
+            .expect("descriptive job span is exported");
+        let successful_step = spans
+            .iter()
+            .find(|span| span.name == "Step 1")
+            .expect("descriptive successful step span is exported");
+        let timed_out_step = spans
+            .iter()
+            .find(|span| span.name == "Step 2")
+            .expect("descriptive timed-out step span is exported");
+
+        assert_eq!(job_span.span_kind, SpanKind::Internal);
+        assert_eq!(successful_step.span_kind, SpanKind::Internal);
+        assert_eq!(timed_out_step.span_kind, SpanKind::Internal);
+        assert_string_attribute(job_span, "sentry.op", "github.actions.job");
+        assert_string_attribute(job_span, "sentry.description", "Build Workflow / Linux Job");
+        assert_string_attribute(successful_step, "sentry.op", "github.actions.step");
+        assert_string_attribute(
+            successful_step,
+            "sentry.description",
+            "Build Workflow / Linux Job / Step 1",
+        );
+        assert_string_attribute(job_span, "cicd.pipeline.run.id", "31");
+        assert_string_attribute(
+            job_span,
+            "cicd.pipeline.run.url.full",
+            "https://github.com/owner/repository/actions/runs/31",
+        );
+        assert_string_attribute(
+            job_span,
+            "cicd.pipeline.task.run.url.full",
+            "https://github.com/owner/repository/actions/runs/31/job/41",
+        );
+        assert_string_attribute(
+            successful_step,
+            "cicd.pipeline.task.run.url.full",
+            "https://github.com/owner/repository/actions/runs/31/job/41#step:1:1",
+        );
+        for span in [&job_span, &successful_step, &timed_out_step] {
+            assert_string_attribute(span, "cicd.pipeline.name", "Build Workflow");
+            assert_string_attribute(
+                span,
+                "vcs.repository.url.full",
+                "https://github.com/owner/repository",
+            );
+            assert_string_attribute(span, "vcs.repository.name", "repository");
+        }
+        assert_string_attribute(job_span, "cicd.pipeline.task.run.result", "failure");
+        assert_string_attribute(job_span, "error.type", "GitHubActionsTaskFailure");
+        assert_string_attribute(successful_step, "cicd.pipeline.task.run.result", "success");
+        assert!(attribute(successful_step, "error.type").is_none());
+        assert_string_attribute(timed_out_step, "cicd.pipeline.task.run.result", "timeout");
+        assert_string_attribute(timed_out_step, "error.type", "GitHubActionsTaskTimeout");
+        for removed_key in [
+            "github.repository.name",
+            "github.commit.sha",
+            "github.workflow.run.id",
+            "github.workflow.job.id",
+            "github.workflow.job.url",
+            "github.workflow.step.url",
+            "cicd.pipeline.result",
+        ] {
+            assert!(attribute(job_span, removed_key).is_none());
+            assert!(attribute(successful_step, removed_key).is_none());
+        }
+    }
+
+    #[test]
+    fn emitter_uses_fixed_fallbacks_for_missing_display_names() {
+        let mut job = workflow_job_with_conclusions(
+            WorkflowConclusion::Neutral,
+            &[WorkflowConclusion::Other],
+        );
+        job.workflow_name = None;
+        job.job_name = None;
+        job.steps[0].name = None;
+
+        let (spans, _) = emitted_spans_and_errors(&job);
+        let job_span = spans
+            .iter()
+            .find(|span| span.name == "workflow / job")
+            .expect("fallback job span is exported");
+        let step_span = spans
+            .iter()
+            .find(|span| span.name == "step")
+            .expect("fallback step span is exported");
+
+        assert_string_attribute(job_span, "cicd.pipeline.task.run.result", "neutral");
+        assert_string_attribute(step_span, "cicd.pipeline.task.run.result", "other");
+        assert_string_attribute(job_span, "sentry.description", "workflow / job");
+        assert_string_attribute(step_span, "sentry.description", "workflow / job / step");
+        assert_string_attribute(job_span, "cicd.pipeline.task.name", "job");
+        assert_string_attribute(step_span, "cicd.pipeline.task.name", "step");
+    }
+
+    #[test]
     fn emitter_reports_each_failing_step_without_a_duplicate_job_error() {
         let job = workflow_job_with_conclusions(
             WorkflowConclusion::Failure,
@@ -1409,11 +1553,11 @@ mod tests {
         assert_eq!(errors.len(), 2);
         let job_span = spans
             .iter()
-            .find(|span| span.name == "github.workflow.job")
+            .find(|span| span.name == "Build Workflow / Linux Job")
             .expect("job span is exported");
         let mut steps = spans
             .iter()
-            .filter(|span| span.name == "github.workflow.step")
+            .filter(|span| span.name.starts_with("Step "))
             .collect::<Vec<_>>();
         steps.sort_by_key(|span| span.start_time);
 
@@ -1498,11 +1642,11 @@ mod tests {
         assert_eq!(errors.len(), 1);
         let job_span = spans
             .iter()
-            .find(|span| span.name == "github.workflow.job")
+            .find(|span| span.name == "Build Workflow / Linux Job")
             .expect("job span is exported");
         let steps = spans
             .iter()
-            .filter(|span| span.name == "github.workflow.step")
+            .filter(|span| span.name.starts_with("Step "))
             .collect::<Vec<_>>();
 
         assert_exception_event(
@@ -1626,25 +1770,25 @@ mod tests {
         assert_eq!(
             spans
                 .iter()
-                .filter(|span| span.name == "github.workflow.job")
+                .filter(|span| span.name == "Build Workflow / Linux Job")
                 .count(),
             1
         );
         assert_eq!(
             spans
                 .iter()
-                .filter(|span| span.name == "github.workflow.step")
+                .filter(|span| matches!(span.name.as_ref(), "Checkout" | "Test"))
                 .count(),
             2
         );
 
         let job = spans
             .iter()
-            .find(|span| span.name == "github.workflow.job")
+            .find(|span| span.name == "Build Workflow / Linux Job")
             .expect("job span is exported");
         let mut steps = spans
             .iter()
-            .filter(|span| span.name == "github.workflow.step")
+            .filter(|span| matches!(span.name.as_ref(), "Checkout" | "Test"))
             .collect::<Vec<_>>();
         steps.sort_by_key(|span| span.start_time);
 
@@ -1671,26 +1815,28 @@ mod tests {
 
         let expected_job_keys = BTreeSet::from([
             "cicd.pipeline.name",
-            "cicd.pipeline.result",
             "cicd.pipeline.run.id",
+            "cicd.pipeline.run.url.full",
             "cicd.pipeline.task.name",
             "cicd.pipeline.task.run.id",
-            "github.commit.sha",
+            "cicd.pipeline.task.run.result",
+            "cicd.pipeline.task.run.url.full",
+            "error.type",
             "github.delivery.id",
             "github.pull_request.number",
-            "github.repository.name",
             "github.workflow.conclusion",
             "github.workflow.event",
-            "github.workflow.job.id",
-            "github.workflow.job.url",
             "github.workflow.run.attempt",
-            "github.workflow.run.id",
             "github.workflow.source_branch",
             "github.workflow.target_branch",
+            "sentry.description",
+            "sentry.op",
             "timing_source",
+            "vcs.ref.head.revision",
+            "vcs.repository.name",
+            "vcs.repository.url.full",
         ]);
         assert_eq!(attribute_keys(job), expected_job_keys);
-        assert_string_attribute(job, "github.repository.name", "owner/repository");
         assert_string_attribute(
             job,
             "github.delivery.id",
@@ -1698,11 +1844,14 @@ mod tests {
         );
         assert_string_attribute(job, "cicd.pipeline.name", "Build Workflow");
         assert_string_attribute(job, "cicd.pipeline.run.id", "31");
-        assert_string_attribute(job, "github.workflow.run.id", "31");
+        assert_string_attribute(
+            job,
+            "cicd.pipeline.run.url.full",
+            "https://github.com/owner/repository/actions/runs/31",
+        );
         assert_string_attribute(job, "github.workflow.run.attempt", "2");
         assert_string_attribute(job, "cicd.pipeline.task.name", "Linux Job");
         assert_string_attribute(job, "cicd.pipeline.task.run.id", "41");
-        assert_string_attribute(job, "github.workflow.job.id", "41");
         assert_string_attribute(job, "github.workflow.event", "merge_group");
         assert_string_attribute(
             job,
@@ -1712,32 +1861,51 @@ mod tests {
         assert_string_attribute(job, "github.workflow.target_branch", "main");
         assert_string_attribute(
             job,
-            "github.workflow.job.url",
+            "cicd.pipeline.task.run.url.full",
             "https://github.com/owner/repository/actions/runs/31/job/41",
         );
         assert_string_attribute(job, "github.workflow.conclusion", "failure");
-        assert_string_attribute(job, "cicd.pipeline.result", "failure");
+        assert_string_attribute(job, "cicd.pipeline.task.run.result", "failure");
+        assert_string_attribute(job, "error.type", "GitHubActionsTaskFailure");
         assert_string_attribute(
             job,
-            "github.commit.sha",
+            "vcs.ref.head.revision",
             "0123456789abcdef0123456789abcdef01234567",
         );
+        assert_string_attribute(job, "vcs.repository.name", "repository");
+        assert_string_attribute(
+            job,
+            "vcs.repository.url.full",
+            "https://github.com/owner/repository",
+        );
+        assert_string_attribute(job, "sentry.op", "github.actions.job");
+        assert_string_attribute(job, "sentry.description", "Build Workflow / Linux Job");
         assert_i64_array_attribute(job, "github.pull_request.number", &[7, 11]);
         assert_string_attribute(job, "timing_source", "reported");
 
-        let expected_step_keys = BTreeSet::from([
+        let expected_successful_step_keys = BTreeSet::from([
+            "cicd.pipeline.name",
+            "cicd.pipeline.run.id",
+            "cicd.pipeline.run.url.full",
             "cicd.pipeline.task.name",
             "cicd.pipeline.task.run.id",
             "cicd.pipeline.task.run.result",
+            "cicd.pipeline.task.run.url.full",
             "github.workflow.conclusion",
             "github.workflow.event",
             "github.workflow.source_branch",
-            "github.workflow.step.url",
             "github.workflow.target_branch",
+            "sentry.description",
+            "sentry.op",
             "timing_source",
+            "vcs.ref.head.revision",
+            "vcs.repository.name",
+            "vcs.repository.url.full",
         ]);
-        assert_eq!(attribute_keys(steps[0]), expected_step_keys);
-        assert_eq!(attribute_keys(steps[1]), expected_step_keys);
+        let mut expected_failed_step_keys = expected_successful_step_keys.clone();
+        expected_failed_step_keys.insert("error.type");
+        assert_eq!(attribute_keys(steps[0]), expected_successful_step_keys);
+        assert_eq!(attribute_keys(steps[1]), expected_failed_step_keys);
         assert_string_attribute(steps[0], "cicd.pipeline.task.name", "Checkout");
         assert_string_attribute(steps[0], "cicd.pipeline.task.run.id", "41:1");
         assert_string_attribute(steps[0], "github.workflow.conclusion", "success");
@@ -1750,10 +1918,16 @@ mod tests {
         assert_string_attribute(steps[0], "github.workflow.target_branch", "main");
         assert_string_attribute(
             steps[0],
-            "github.workflow.step.url",
+            "cicd.pipeline.task.run.url.full",
             "https://github.com/owner/repository/actions/runs/31/job/41#step:1:1",
         );
         assert_string_attribute(steps[0], "cicd.pipeline.task.run.result", "success");
+        assert_string_attribute(steps[0], "sentry.op", "github.actions.step");
+        assert_string_attribute(
+            steps[0],
+            "sentry.description",
+            "Build Workflow / Linux Job / Checkout",
+        );
         assert_string_attribute(steps[0], "timing_source", "reported");
         assert_string_attribute(steps[1], "cicd.pipeline.task.name", "Test");
         assert_string_attribute(steps[1], "cicd.pipeline.task.run.id", "41:2");
@@ -1761,27 +1935,38 @@ mod tests {
         assert_string_attribute(steps[1], "github.workflow.event", "merge_group");
         assert_string_attribute(
             steps[1],
-            "github.workflow.step.url",
+            "cicd.pipeline.task.run.url.full",
             "https://github.com/owner/repository/actions/runs/31/job/41#step:2:1",
         );
         assert_string_attribute(steps[1], "cicd.pipeline.task.run.result", "timeout");
+        assert_string_attribute(steps[1], "error.type", "GitHubActionsTaskTimeout");
         assert_string_attribute(steps[1], "timing_source", "reported");
 
         for step in steps {
-            for duplicated_identifier in [
+            for shared_attribute in [
                 "cicd.pipeline.name",
                 "cicd.pipeline.run.id",
-                "github.commit.sha",
-                "github.delivery.id",
-                "github.pull_request.number",
-                "github.repository.name",
-                "github.workflow.job.id",
-                "github.workflow.run.attempt",
-                "github.workflow.run.id",
+                "cicd.pipeline.run.url.full",
+                "vcs.ref.head.revision",
+                "vcs.repository.name",
+                "vcs.repository.url.full",
             ] {
                 assert!(
-                    attribute(step, duplicated_identifier).is_none(),
-                    "child span duplicated identifier attribute {duplicated_identifier}"
+                    attribute(step, shared_attribute).is_some(),
+                    "child span is missing shared attribute {shared_attribute}"
+                );
+            }
+            for removed_identifier in [
+                "github.commit.sha",
+                "github.repository.name",
+                "github.workflow.job.id",
+                "github.workflow.job.url",
+                "github.workflow.run.id",
+                "github.workflow.step.url",
+            ] {
+                assert!(
+                    attribute(step, removed_identifier).is_none(),
+                    "child span retained replaced attribute {removed_identifier}"
                 );
             }
         }
