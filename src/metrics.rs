@@ -278,6 +278,8 @@ pub enum FailureStage {
     Database,
     /// Durable merge-queue state transition failure.
     QueueState,
+    /// Durable workflow-job trace link persistence or lookup failure.
+    WorkflowLink,
 }
 
 /// A bounded merge-group webhook action.
@@ -600,6 +602,7 @@ impl FailureStage {
             Self::Metrics => "metrics",
             Self::Database => "database",
             Self::QueueState => "queue_state",
+            Self::WorkflowLink => "workflow_link",
         }
     }
 }
@@ -796,6 +799,7 @@ impl Metrics {
             FailureStage::Metrics,
             FailureStage::Database,
             FailureStage::QueueState,
+            FailureStage::WorkflowLink,
         ] {
             let _ = processing_failures.get_or_create(&FailureLabels {
                 repository: RepositoryLabel::Unknown,

@@ -72,6 +72,12 @@ duration metrics update only after SQLite commits a pending-to-completed transit
 over-365-day durations are omitted and increment only the bounded `invalid_duration` transition
 failure.
 
+`github_webhook_processing_failures_total` uses the closed `stage` vocabulary `authentication`,
+`delivery_claim`, `metrics`, `database`, `queue_state`, and `workflow_link`. The last two mark
+enrichment-only paths that keep the authenticated `204 No Content` response: `queue_state` for
+merge-queue persistence and `workflow_link` for pipeline-run link persistence, lookup, and export.
+Every stage is published zero-valued at startup.
+
 `github_workflow_job_trace_rejections_total` uses the closed `reason` vocabulary `too_many_steps`
 and `too_many_jobs`: a completed job over `GHE_WORKFLOW_JOB_MAX_STEPS` emits no job trace, and a
 run attempt over the fixed 256-job pipeline limit emits no pipeline-run summary trace. Both series

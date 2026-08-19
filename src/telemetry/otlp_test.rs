@@ -6577,3 +6577,74 @@ async fn a_run_without_emitted_job_traces_exports_no_pipeline_trace() {
         "a run with nothing to summarize emits no pipeline trace"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn link_persistence_failure_keeps_the_job_trace_and_reports_its_own_stage() {
+    let fixture = WebhookTraceFixture::new().await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440420";
+    sqlx::query(
+        "CREATE TRIGGER reject_workflow_job_links BEFORE INSERT ON workflow_job_links \
+         BEGIN SELECT RAISE(ABORT, 'sensitive-link-failure-must-not-appear'); END",
+    )
+    .execute(&fixture.pool)
+    .await
+    .expect("link failure trigger is installed");
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "action": "completed",
+        "workflow_job": {
+            "id": 41,
+            "run_id": 31,
+            "run_attempt": 1,
+            "workflow_name": "Build Workflow",
+            "name": "Linux Job",
+            "conclusion": "success",
+            "started_at": "2026-08-06T10:00:00.000000001Z",
+            "completed_at": "2026-08-06T10:05:00.000000002Z",
+            "steps": [{
+                "number": 1,
+                "name": "Only Step",
+                "conclusion": "success",
+                "started_at": "2026-08-06T10:00:00.000000001Z",
+                "completed_at": "2026-08-06T10:05:00.000000002Z"
+            }]
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("workflow-job payload serializes");
+
+    let response = fixture
+        .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "enrichment-only link persistence never changes the authenticated response"
+    );
+    drop(response);
+
+    let captured = fixture.force_flush();
+    let job = captured.one_named("Build Workflow / Linux Job");
+    assert_eq!(
+        captured.children(job).count(),
+        1,
+        "the job trace is exported in full even though its link could not be persisted"
+    );
+
+    let exposition = fixture.metrics_text().await;
+    assert_metric_line(
+        &exposition,
+        "github_webhook_processing_failures_total{repository=\"owner/webhook-private-repository\",stage=\"workflow_link\"} 1",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_webhook_processing_failures_total{repository=\"unknown\",stage=\"database\"} 0",
+    );
+    for forbidden in [
+        "sensitive-link-failure-must-not-appear",
+        "workflow_job_links",
+    ] {
+        captured.assert_absent(forbidden);
+        assert!(!exposition.contains(forbidden));
+    }
+}

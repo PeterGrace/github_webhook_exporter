@@ -392,17 +392,27 @@ fn record_pipeline_trace_rejection(
     );
 }
 
+/// Records one bounded pipeline-link failure without changing the authenticated response.
+///
+/// This uses its own [`FailureStage::WorkflowLink`] rather than the generic database stage so
+/// operators can alert on the health of the enrichment-only pipeline-link path directly, without
+/// reading logs to separate it from the failures that do change a response.
+///
+/// # Parameters
+///
+/// * `state` - The shared application state.
+/// * `repository_name` - The canonical authenticated repository name.
 fn record_workflow_link_failure(state: &AppState, repository_name: &CanonicalRepositoryName) {
     state
         .metrics()
-        .record_failure(Some(repository_name), FailureStage::Database);
+        .record_failure(Some(repository_name), FailureStage::WorkflowLink);
     let error = AppError::webhook_unavailable();
     let error_correlation_id = error
         .correlation_id()
         .expect("webhook dependency failures carry a correlation ID");
     error!(
         parent: None,
-        stage = FailureStage::Database.as_str(),
+        stage = FailureStage::WorkflowLink.as_str(),
         result = WebhookResult::Unavailable.as_str(),
         %error_correlation_id,
         "workflow-job link persistence failed"

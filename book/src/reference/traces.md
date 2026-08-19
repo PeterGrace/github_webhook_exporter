@@ -224,6 +224,8 @@ parentless warning containing only `repository_name`, `delivery_id`, `workflow_r
 there is never a partial pipeline trace.
 
 Pipeline-run emission is telemetry enrichment layered on already exported job traces, so every
-failure along this path — link persistence, lookup, or export — degrades to a bounded failure
-metric and leaves the authenticated `204 No Content` response, readiness, and merge-queue state
-untouched.
+failure along this path — link persistence, lookup, or export — degrades to
+`github_webhook_processing_failures_total{stage="workflow_link"}` plus one redacted correlated
+error log, and leaves the authenticated `204 No Content` response, readiness, and merge-queue
+state untouched. That stage is distinct from the generic `database` stage so operators can alert
+on link health without reading logs.
