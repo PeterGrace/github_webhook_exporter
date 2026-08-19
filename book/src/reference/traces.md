@@ -184,8 +184,33 @@ successful one. `github.workflow.conclusion` reports that derived value, and the
 status follows the same mapping used for jobs: `success` sets OK, `failure` and `timed_out` set
 error with the fixed description (ingesting as `sentry.status=error`) and also set `error.type`,
 and every other conclusion leaves status unset. Each child span reports its own job's conclusion
-and status the same way. The pipeline trace raises no `exception` span events and no Sentry
-errors; failed jobs and steps are already reported once on their own traces.
+and status the same way.
+
+**Failure reporting.** Every failed or timed-out job summary emits one bounded OpenTelemetry
+`exception` span event and, when `SENTRY_DSN` is configured, one run-scoped Sentry error whose
+trace and span IDs are exactly those of that summary span. The root raises nothing of its own: its
+conclusion is the most severe job conclusion, so a failing root always has a failing child that
+already explains it. Successful, cancelled, skipped, neutral, and other summaries raise nothing.
+
+Sentry SaaS verification on 2026-08-19 established that the OpenTelemetry error status alone is
+not enough: a `github.actions.pipeline.task` span whose only failure marker is `Status::error`
+ingests as `span.status=error` but carries no linked issue and is not rendered as an errored span.
+An `exception` span event alone changes nothing either — Sentry's OTLP endpoint does not convert
+span events into errors. Only an application-generated Sentry error referencing the span's own
+trace and span IDs attaches an issue to it. The exporter therefore raises one, in addition to the
+span event that keeps the failure legible to any other OTLP backend.
+
+That run-scoped error deliberately duplicates the failure the job trace already reported, so it
+groups separately and can never merge with the job- and step-scoped issues. Its exception type
+matches the span's own `error.type` (`GitHubActionsTaskFailure` or `GitHubActionsTaskTimeout`); its
+description is `CI run job failed: <task>` or `CI run job timed out: <task>`, against the job
+trace's `CI task failed: <task>`; and its fingerprint uses the task kind `pipeline-task` rather
+than `job` or `step`. The task name is the sanitized job name, or the validated job ID when the
+payload carried none, and grouping uses the fixed unnamed-job identity so equivalent unnamed jobs
+group across runs. Its trace context uses the `github.actions.pipeline.task` operation and the
+`<workflow-name> / <job-name>` description of the linked span. Like the job- and step-scoped
+errors, it uses mechanism type `github_actions`, is handled, and contains no stack trace, logs,
+commands, or output.
 
 **Timing.** The root spans from the earliest summarized job start to the latest job end, using
 each job's own selected interval. `timing_source` is `reported` only when every summarized job

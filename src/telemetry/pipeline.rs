@@ -29,6 +29,7 @@ use super::{
         HistoricalTiming, TimingSource, WorkflowConclusion, WorkflowJobId, WorkflowPullRequests,
         WorkflowRunContext, WorkflowTraceEmitter,
     },
+    workflow_error::{PipelineTaskErrorParts, SyntheticWorkflowError},
 };
 
 /// The greatest number of job summaries one pipeline-run trace may contain.
@@ -228,8 +229,14 @@ impl PipelineRunTrace {
 impl WorkflowTraceEmitter {
     /// Emits one independent pipeline-run summary span and its per-job child spans.
     ///
-    /// Each child links to the root span of the job trace exported for that job. No synthetic
-    /// workflow errors are raised here; the job traces already own that reporting.
+    /// Each child links to the root span of the job trace exported for that job. Every failing
+    /// child additionally carries one bounded `exception` span event and one run-scoped synthetic
+    /// error, because Sentry renders a span as errored only when an error event references it;
+    /// the OpenTelemetry status alone leaves the span uncolored and unlinked. Those run-scoped
+    /// errors group separately from the job- and step-scoped errors raised on the job traces.
+    ///
+    /// The root itself raises nothing: its conclusion is the most severe job conclusion, so a
+    /// failing root always has a failing child that already explains it.
     ///
     /// # Parameters
     ///
@@ -251,9 +258,10 @@ impl WorkflowTraceEmitter {
         let parent_context = Context::current_with_span(root);
 
         for job in pipeline.jobs() {
+            let span_name = pipeline_task_span_name(pipeline, job);
             let mut span = tracer.build_with_context(
                 tracer
-                    .span_builder(pipeline_task_span_name(pipeline, job))
+                    .span_builder(span_name.clone())
                     .with_kind(SpanKind::Internal)
                     .with_start_time(job.timing().start())
                     .with_links(vec![Link::with_context(job.identity.link_span_context())])
@@ -261,6 +269,28 @@ impl WorkflowTraceEmitter {
                 &parent_context,
             );
             span.set_status(job.conclusion().status());
+            if job.conclusion().emits_synthetic_error() {
+                let span_context = span.span_context();
+                let error = SyntheticWorkflowError::for_pipeline_task(PipelineTaskErrorParts {
+                    repository_name: pipeline.repository_name.as_str(),
+                    workflow_name: pipeline.workflow_name(),
+                    job_name: job.job_name.as_ref().map(DisplayName::as_str),
+                    job_id: job.job_id,
+                    conclusion: job.conclusion,
+                    span_description: span_name,
+                    timestamp: job.timing().end(),
+                    trace_id: span_context.trace_id(),
+                    span_id: span_context.span_id(),
+                });
+                span.add_event_with_timestamp(
+                    "exception",
+                    error.timestamp(),
+                    error.span_event_attributes().into(),
+                );
+                if let Some(reporter) = self.error_reporter() {
+                    reporter.report(error);
+                }
+            }
             span.end_with_timestamp(job.timing().end());
         }
 
@@ -417,8 +447,8 @@ mod tests {
     };
 
     use super::{
-        PipelineJobSummary, PipelineRunTrace, PipelineRunTraceParts, WorkflowJobTraceIdentity,
-        MAX_PIPELINE_JOB_SPANS,
+        PipelineJobSummary, PipelineRunTrace, PipelineRunTraceParts, SyntheticWorkflowError,
+        WorkflowJobTraceIdentity, MAX_PIPELINE_JOB_SPANS,
     };
     use crate::{
         domain::{delivery::DeliveryId, merge_queue::PullRequestNumber},
@@ -430,6 +460,7 @@ mod tests {
                 WorkflowEvent, WorkflowJobId, WorkflowPullRequests, WorkflowRunAttempt,
                 WorkflowRunContext, WorkflowRunId, WorkflowTraceEmitter,
             },
+            workflow_error::WorkflowErrorReporter,
         },
     };
 
@@ -524,16 +555,78 @@ mod tests {
         }
     }
 
+    /// One synthetic error captured from a pipeline-run emission.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ReportedError {
+        exception_type: String,
+        description: String,
+        fingerprint: [String; 7],
+    }
+
+    /// Captures every synthetic error a pipeline-run emission reports.
+    #[derive(Clone, Default, Debug)]
+    struct CollectingErrorReporter(Arc<Mutex<Vec<ReportedError>>>);
+
+    impl CollectingErrorReporter {
+        fn reported(&self) -> Vec<ReportedError> {
+            self.0
+                .lock()
+                .expect("error capture lock is available")
+                .clone()
+        }
+    }
+
+    impl WorkflowErrorReporter for CollectingErrorReporter {
+        fn report(&self, error: SyntheticWorkflowError) {
+            self.0
+                .lock()
+                .expect("error capture lock is available")
+                .push(ReportedError {
+                    exception_type: error.exception_type().to_owned(),
+                    description: error.description().to_owned(),
+                    fingerprint: error.fingerprint().map(ToOwned::to_owned),
+                });
+        }
+    }
+
     fn emitted_spans(pipeline: &PipelineRunTrace) -> Vec<SpanData> {
+        emitted_spans_and_errors(pipeline).0
+    }
+
+    fn emitted_spans_and_errors(
+        pipeline: &PipelineRunTrace,
+    ) -> (Vec<SpanData>, Vec<ReportedError>) {
         let exporter = CollectingSpanExporter::default();
+        let reporter = CollectingErrorReporter::default();
         let provider = SdkTracerProvider::builder()
             .with_span_processor(SimpleSpanProcessor::new(exporter.clone()))
             .build();
-        let emitter = WorkflowTraceEmitter::new(provider.tracer("github_webhook_exporter"));
+        let emitter = WorkflowTraceEmitter::new_with_error_reporter(
+            provider.tracer("github_webhook_exporter"),
+            Arc::new(reporter.clone()),
+        );
 
         emitter.emit_pipeline(pipeline);
         provider.force_flush().expect("spans flush");
-        exporter.finished_spans()
+        (exporter.finished_spans(), reporter.reported())
+    }
+
+    fn exception_events(span: &SpanData) -> Vec<(String, String)> {
+        span.events
+            .iter()
+            .filter(|event| event.name == "exception")
+            .map(|event| {
+                let value = |key: &str| {
+                    event
+                        .attributes
+                        .iter()
+                        .find(|attribute| attribute.key.as_str() == key)
+                        .map(|attribute| attribute.value.as_str().into_owned())
+                        .unwrap_or_default()
+                };
+                (value("exception.type"), value("exception.message"))
+            })
+            .collect()
     }
 
     fn attribute<'span>(span: &'span SpanData, key: &str) -> Option<&'span Value> {
@@ -787,6 +880,132 @@ mod tests {
             let expected = identity(job_id);
             assert_eq!(link, (expected.trace_id(), expected.span_id()));
         }
+    }
+
+    #[test]
+    fn failing_summaries_carry_one_bounded_exception_event_and_one_run_scoped_error() {
+        let pipeline = PipelineRunTrace::new(parts(vec![
+            job(41, Some("Linux Job"), WorkflowConclusion::Success, 100, 300),
+            job(42, None, WorkflowConclusion::Failure, 200, 400),
+            job(43, Some("Slow Job"), WorkflowConclusion::TimedOut, 150, 350),
+            job(
+                44,
+                Some("Skipped Job"),
+                WorkflowConclusion::Cancelled,
+                120,
+                320,
+            ),
+        ]))
+        .expect("a summarized run builds a trace");
+
+        let (spans, reported) = emitted_spans_and_errors(&pipeline);
+        let root = spans
+            .iter()
+            .find(|span| span.parent_span_id == SpanId::INVALID)
+            .expect("one independent pipeline root is exported");
+        // The root conclusion is the most severe child conclusion, so a failing child always
+        // explains it and the root never raises its own error.
+        assert_eq!(root.status, Status::error("workflow_failed"));
+        assert!(exception_events(root).is_empty());
+
+        let child = |name: &str| {
+            spans
+                .iter()
+                .find(|span| span.name == name)
+                .expect("the summarized job is exported")
+        };
+        assert!(exception_events(child("Build Workflow / Linux Job")).is_empty());
+        assert!(exception_events(child("Build Workflow / Skipped Job")).is_empty());
+        assert_eq!(
+            exception_events(child("Build Workflow / job")),
+            vec![(
+                "GitHubActionsTaskFailure".to_owned(),
+                "CI run job failed: task 42".to_owned()
+            )]
+        );
+        assert_eq!(
+            exception_events(child("Build Workflow / Slow Job")),
+            vec![(
+                "GitHubActionsTaskTimeout".to_owned(),
+                "CI run job timed out: Slow Job".to_owned()
+            )]
+        );
+
+        assert_eq!(
+            reported,
+            vec![
+                ReportedError {
+                    exception_type: "GitHubActionsTaskFailure".to_owned(),
+                    description: "CI run job failed: task 42".to_owned(),
+                    fingerprint: [
+                        "github-actions-task",
+                        "pipeline-task",
+                        REPOSITORY,
+                        "Build Workflow",
+                        "unnamed-job",
+                        "unnamed-job",
+                        "failure",
+                    ]
+                    .map(ToOwned::to_owned),
+                },
+                ReportedError {
+                    exception_type: "GitHubActionsTaskTimeout".to_owned(),
+                    description: "CI run job timed out: Slow Job".to_owned(),
+                    fingerprint: [
+                        "github-actions-task",
+                        "pipeline-task",
+                        REPOSITORY,
+                        "Build Workflow",
+                        "Slow Job",
+                        "Slow Job",
+                        "timed_out",
+                    ]
+                    .map(ToOwned::to_owned),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_successful_run_reports_no_errors_and_an_emitter_without_a_reporter_still_marks_spans() {
+        let successful = PipelineRunTrace::new(parts(vec![job(
+            41,
+            Some("Linux Job"),
+            WorkflowConclusion::Success,
+            100,
+            300,
+        )]))
+        .expect("a summarized run builds a trace");
+        assert!(emitted_spans_and_errors(&successful).1.is_empty());
+
+        // Without a Sentry client the span event is still the only failure marker on the span.
+        let exporter = CollectingSpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(SimpleSpanProcessor::new(exporter.clone()))
+            .build();
+        let failed = PipelineRunTrace::new(parts(vec![job(
+            42,
+            Some("Linux Job"),
+            WorkflowConclusion::Failure,
+            100,
+            300,
+        )]))
+        .expect("a summarized run builds a trace");
+        WorkflowTraceEmitter::new(provider.tracer("github_webhook_exporter"))
+            .emit_pipeline(&failed);
+        provider.force_flush().expect("spans flush");
+        let spans = exporter.finished_spans();
+        let child = spans
+            .iter()
+            .find(|span| span.name == "Build Workflow / Linux Job")
+            .expect("the summarized job is exported");
+        assert_eq!(
+            exception_events(child),
+            vec![(
+                "GitHubActionsTaskFailure".to_owned(),
+                "CI run job failed: Linux Job".to_owned()
+            )]
+        );
     }
 
     #[test]

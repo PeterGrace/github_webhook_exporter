@@ -6530,9 +6530,14 @@ async fn terminal_workflow_run_exports_a_pipeline_trace_linking_every_job_trace(
     assert_attribute(summaries[1], "cicd.pipeline.task.run.result", "failure");
     assert_attribute(summaries[1], "error.type", "GitHubActionsTaskFailure");
     assert_otlp_status(summaries[1], OtlpStatusCode::Error, "workflow_failed");
-    assert!(
-        summaries.iter().all(|span| span.events.is_empty()),
-        "synthetic workflow errors stay on the job traces"
+    assert_no_exception_events(summaries[0]);
+    // Sentry colors a span only when an error references it, so the failing summary carries its
+    // own bounded exception event even though the job trace already reported the same failure.
+    assert_exception_event(
+        summaries[1],
+        "GitHubActionsTaskFailure",
+        "CI run job failed: task 42",
+        rfc3339_unix_nanos(failed_completed_at),
     );
 
     let exposition = fixture.metrics_text().await;
@@ -6540,6 +6545,150 @@ async fn terminal_workflow_run_exports_a_pipeline_trace_linking_every_job_trace(
         &exposition,
         "github_workflow_job_trace_rejections_total{repository=\"unknown\",reason=\"too_many_jobs\"} 0",
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_pipeline_summary_links_a_run_scoped_sentry_error_to_its_own_span() {
+    let (fixture, sentry_transport) = WebhookTraceFixture::new_with_sentry().await;
+    let requested_delivery_id = "550e8400-e29b-41d4-a716-446655440420";
+    let job_delivery_id = "550e8400-e29b-41d4-a716-446655440421";
+    let completed_delivery_id = "550e8400-e29b-41d4-a716-446655440422";
+    let started_at = "2026-08-06T10:00:00.000000001Z";
+    let completed_at = "2026-08-06T10:05:00.000000002Z";
+
+    let workflow_run_body = |action: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "action": action,
+            "workflow_run": {
+                "id": 31,
+                "run_attempt": 1,
+                "name": "Build Workflow",
+                "event": "push",
+                "head_branch": "main",
+                "pull_requests": []
+            },
+            "repository": {"full_name": WEBHOOK_REPOSITORY}
+        }))
+        .expect("workflow-run payload serializes")
+    };
+    let workflow_job_body = serde_json::to_vec(&serde_json::json!({
+        "action": "completed",
+        "workflow_job": {
+            "id": 41,
+            "run_id": 31,
+            "run_attempt": 1,
+            "workflow_name": "Build Workflow",
+            "name": "Linux Job",
+            "conclusion": "failure",
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "steps": [{
+                "number": 1,
+                "name": "Only Step",
+                "conclusion": "failure",
+                "started_at": started_at,
+                "completed_at": completed_at
+            }]
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("workflow-job payload serializes");
+
+    for (body, event, delivery_id) in [
+        (
+            workflow_run_body("requested"),
+            "workflow_run",
+            requested_delivery_id,
+        ),
+        (workflow_job_body, "workflow_job", job_delivery_id),
+        (
+            workflow_run_body("completed"),
+            "workflow_run",
+            completed_delivery_id,
+        ),
+    ] {
+        let response = fixture
+            .webhook(&body, event, delivery_id, WEBHOOK_SECRET)
+            .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        drop(response);
+    }
+
+    let captured = fixture.force_flush();
+    let pipeline = captured.one_named("Build Workflow");
+    let summary = captured
+        .children(pipeline)
+        .find(|span| string_attribute(span, "sentry.op") == Some("github.actions.pipeline.task"))
+        .expect("the failed job summary is exported");
+    assert_exception_event(
+        summary,
+        "GitHubActionsTaskFailure",
+        "CI run job failed: Linux Job",
+        rfc3339_unix_nanos(completed_at),
+    );
+
+    let events = sentry_transport.fetch_and_clear_events();
+    let run_scoped = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.contexts.get("trace"),
+                Some(SentryContext::Trace(trace))
+                    if trace.op.as_deref() == Some("github.actions.pipeline.task")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(run_scoped.len(), 1, "one run-scoped error per failed job");
+    let event = run_scoped[0];
+    assert_eq!(event.level, SentryLevel::Error);
+    assert_eq!(
+        event
+            .fingerprint
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>(),
+        [
+            "github-actions-task",
+            "pipeline-task",
+            WEBHOOK_REPOSITORY,
+            "Build Workflow",
+            "Linux Job",
+            "Linux Job",
+            "failure",
+        ]
+    );
+    assert_eq!(event.exception.values.len(), 1);
+    assert_eq!(event.exception.values[0].ty, "GitHubActionsTaskFailure");
+    assert_eq!(
+        event.exception.values[0].value.as_deref(),
+        Some("CI run job failed: Linux Job")
+    );
+    match event.contexts.get("trace") {
+        // Sentry renders the span as an error only when the error carries exactly these IDs.
+        Some(SentryContext::Trace(trace)) => {
+            assert_eq!(trace.trace_id.to_string(), hex::encode(&summary.trace_id));
+            assert_eq!(trace.span_id.to_string(), hex::encode(&summary.span_id));
+            assert_eq!(
+                trace.description.as_deref(),
+                Some("Build Workflow / Linux Job")
+            );
+        }
+        _ => panic!("the run-scoped error carries a trace context"),
+    }
+
+    // The job trace keeps reporting the same failure once, under its own grouping.
+    let job_scoped = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.contexts.get("trace"),
+                Some(SentryContext::Trace(trace))
+                    if trace.op.as_deref() == Some("github.actions.step")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(job_scoped.len(), 1, "one step-scoped error per failed step");
+    assert_ne!(job_scoped[0].fingerprint, event.fingerprint);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
