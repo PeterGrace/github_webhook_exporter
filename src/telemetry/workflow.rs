@@ -15,6 +15,7 @@ use crate::{
 };
 
 use super::{
+    pipeline::WorkflowJobTraceIdentity,
     trace::{
         delivery_id_attribute, pull_request_numbers_attribute, sentry_description_attribute,
         sentry_operation_attribute, timing_source_attribute, workflow_conclusion_attribute,
@@ -172,6 +173,33 @@ impl HistoricalTiming {
                 end,
                 source: TimingSource::Reported,
             })
+        } else {
+            Err(WorkflowTimingError)
+        }
+    }
+
+    /// Creates a derived historical interval whose source the caller already decided.
+    ///
+    /// # Parameters
+    ///
+    /// * `start` - The derived start time.
+    /// * `end` - The derived end time.
+    /// * `source` - The timing source that produced the bounds.
+    ///
+    /// # Returns
+    ///
+    /// A derived historical interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkflowTimingError`] when `start` is after `end`.
+    pub(crate) fn derived(
+        start: SystemTime,
+        end: SystemTime,
+        source: TimingSource,
+    ) -> Result<Self, WorkflowTimingError> {
+        if start <= end {
+            Ok(Self { start, end, source })
         } else {
             Err(WorkflowTimingError)
         }
@@ -510,15 +538,30 @@ impl WorkflowTraceEmitter {
         }
     }
 
+    /// Returns the configured SDK tracer when remote telemetry is enabled.
+    pub(super) fn tracer(&self) -> Option<&SdkTracer> {
+        self.tracer.as_ref()
+    }
+
+    /// Returns whether this emitter exports anything at all.
+    ///
+    /// Callers use this to skip the durable work that only feeds disabled telemetry.
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.tracer.is_some()
+    }
+
     /// Emits one independent historical workflow job span and its child step spans.
     ///
     /// # Parameters
     ///
     /// * `job` - The bounded historical workflow job trace to export.
-    pub(crate) fn emit(&self, job: &WorkflowJobTrace) {
-        let Some(tracer) = &self.tracer else {
-            return;
-        };
+    ///
+    /// # Returns
+    ///
+    /// The exported identity of the emitted job root span, so a later pipeline-run summary can
+    /// link to it. Returns `None` when remote telemetry is disabled and nothing was exported.
+    pub(crate) fn emit(&self, job: &WorkflowJobTrace) -> Option<WorkflowJobTraceIdentity> {
+        let tracer = self.tracer.as_ref()?;
 
         let mut root = tracer.build_with_context(
             tracer
@@ -530,6 +573,10 @@ impl WorkflowTraceEmitter {
         );
         root.set_status(job.conclusion().status());
         let root_span_context = root.span_context().clone();
+        let identity = WorkflowJobTraceIdentity::new(
+            root_span_context.trace_id(),
+            root_span_context.span_id(),
+        );
         let parent_context = Context::current_with_span(root);
         let mut child_error_emitted = false;
 
@@ -580,9 +627,10 @@ impl WorkflowTraceEmitter {
                 reporter.report(error);
             }
             root_span.end_with_timestamp(job.timing().end());
-            return;
+            return Some(identity);
         }
         parent_context.span().end_with_timestamp(job.timing().end());
+        Some(identity)
     }
 }
 
@@ -597,7 +645,7 @@ fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
                     + usize::from(context.target_branch().is_some())
             }),
     );
-    append_pipeline_and_repository_context(&mut attributes, job);
+    append_job_pipeline_and_repository_context(&mut attributes, job);
     attributes.push(delivery_id_attribute(&job.delivery_id()));
     attributes.push(workflow_run_attempt_attribute(job.run_attempt()));
     attributes.push(workflow_task_name_attribute(job_name(job)));
@@ -634,7 +682,7 @@ fn step_attributes(job: &WorkflowJobTrace, step: &WorkflowStepTrace) -> Vec<KeyV
                     + usize::from(context.target_branch().is_some())
             }),
     );
-    append_pipeline_and_repository_context(&mut attributes, job);
+    append_job_pipeline_and_repository_context(&mut attributes, job);
     attributes.push(workflow_task_name_attribute(step_name(step)));
     attributes.push(workflow_pipeline_step_task_run_id_attribute(
         job.job_id(),
@@ -660,18 +708,43 @@ fn step_attributes(job: &WorkflowJobTrace, step: &WorkflowStepTrace) -> Vec<KeyV
     attributes
 }
 
-fn append_pipeline_and_repository_context(attributes: &mut Vec<KeyValue>, job: &WorkflowJobTrace) {
-    attributes.push(workflow_name_attribute(workflow_name(job)));
-    attributes.push(workflow_pipeline_run_id_attribute(job.run_id()));
-    attributes.push(workflow_pipeline_run_url_attribute(
-        job.repository_name(),
-        job.run_id(),
-    ));
-    attributes.push(workflow_repository_url_attribute(job.repository_name()));
-    attributes.push(workflow_repository_name_attribute(job.repository_name()));
-    if let Some(head_sha) = job.head_sha() {
+/// Appends the shared pipeline and repository context carried by every workflow task span.
+///
+/// # Parameters
+///
+/// * `attributes` - The attribute buffer to extend.
+/// * `workflow_name` - The sanitized workflow name, or the fixed fallback.
+/// * `repository_name` - The canonical authenticated repository name.
+/// * `run_id` - The validated workflow run identifier.
+/// * `head_sha` - The validated head revision, when one is available.
+pub(super) fn append_pipeline_and_repository_context(
+    attributes: &mut Vec<KeyValue>,
+    workflow_name: &str,
+    repository_name: &CanonicalRepositoryName,
+    run_id: WorkflowRunId,
+    head_sha: Option<&CommitSha>,
+) {
+    attributes.push(workflow_name_attribute(workflow_name));
+    attributes.push(workflow_pipeline_run_id_attribute(run_id));
+    attributes.push(workflow_pipeline_run_url_attribute(repository_name, run_id));
+    attributes.push(workflow_repository_url_attribute(repository_name));
+    attributes.push(workflow_repository_name_attribute(repository_name));
+    if let Some(head_sha) = head_sha {
         attributes.push(workflow_head_revision_attribute(head_sha));
     }
+}
+
+fn append_job_pipeline_and_repository_context(
+    attributes: &mut Vec<KeyValue>,
+    job: &WorkflowJobTrace,
+) {
+    append_pipeline_and_repository_context(
+        attributes,
+        workflow_name(job),
+        job.repository_name(),
+        job.run_id(),
+        job.head_sha(),
+    );
 }
 
 pub(super) fn workflow_name(job: &WorkflowJobTrace) -> &str {
@@ -704,7 +777,13 @@ pub(super) fn step_description(job: &WorkflowJobTrace, step: &WorkflowStepTrace)
     )
 }
 
-fn append_workflow_run_context(
+/// Appends the optional correlated workflow-run trigger and branch context.
+///
+/// # Parameters
+///
+/// * `attributes` - The attribute buffer to extend.
+/// * `context` - The correlated workflow-run context, when one was persisted.
+pub(super) fn append_workflow_run_context(
     attributes: &mut Vec<KeyValue>,
     context: Option<&WorkflowRunContext>,
 ) {

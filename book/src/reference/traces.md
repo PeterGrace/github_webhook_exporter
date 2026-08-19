@@ -18,7 +18,8 @@ Six stable operations:
 - `github.webhook.process` — payload projection, durable delivery claim, and bounded event
   processing, under an authenticated request.
 - `config.repository.write` — create, update, or delete persistence, under an admin API request.
-- `sqlite.query` — one child per logical repository, delivery, or merge-queue store operation.
+- `sqlite.query` — one child per logical repository, delivery, merge-queue, or workflow store
+  operation.
 - `merge_queue.update` — one specialized merge-group or pull-request transition, under webhook
   processing.
 
@@ -158,3 +159,71 @@ structured warning on a newly claimed `too_many_steps` rejection, which may cont
 Historical spans use the same bounded non-blocking trace queue as everything else — the request
 path never waits for export, and collector failures never change the authenticated
 `204 No Content` response, readiness, generic webhook metrics, or merge-queue state.
+
+## Pipeline-run summary traces
+
+A `workflow_run` webhook whose normalized action is `completed` emits one additional independent
+root trace summarizing the whole run attempt. It is a second, separate trace: it never shares a
+trace ID with the live `http.request` trace or with any `github.actions.job` trace, and it never
+changes the structure or attributes of those job traces.
+
+The root's span name and `sentry.description` are the sanitized workflow name (fixed fallback
+`workflow`), and its `sentry.op` is `github.actions.pipeline`. It carries one direct child per job
+of that run attempt, named `<workflow-name> / <job-name>` with `sentry.op`
+`github.actions.pipeline.task`. Both span kinds are `INTERNAL`. Step spans stay on the job traces
+and are never repeated here.
+
+Every child carries exactly one OpenTelemetry span link whose trace and span IDs are those of the
+`github.actions.job` root span exported when that job completed, so a pipeline waterfall row leads
+directly to the full job-and-step trace. The root itself carries no links.
+
+**Conclusion and status.** The run conclusion is derived from the summarized jobs, not from the
+payload. Severity descends `failure`, `timed_out`, `cancelled`, `other`, `neutral`, `success`,
+`skipped`, so any failed or timed-out job decides the run and skipped jobs never mask an otherwise
+successful one. `github.workflow.conclusion` reports that derived value, and the OpenTelemetry
+status follows the same mapping used for jobs: `success` sets OK, `failure` and `timed_out` set
+error with the fixed description (ingesting as `sentry.status=error`) and also set `error.type`,
+and every other conclusion leaves status unset. Each child span reports its own job's conclusion
+and status the same way. The pipeline trace raises no `exception` span events and no Sentry
+errors; failed jobs and steps are already reported once on their own traces.
+
+**Timing.** The root spans from the earliest summarized job start to the latest job end, using
+each job's own selected interval. `timing_source` is `reported` only when every summarized job
+used reported timing; a single fallback job marks the derived run boundary `fallback`.
+
+**Identifiers.** The root and every child carry the same shared context as job spans:
+`cicd.pipeline.name`, `cicd.pipeline.run.id`, `cicd.pipeline.run.url.full`,
+`vcs.repository.url.full`, `vcs.repository.name`, `vcs.ref.head.revision` when available, and the
+correlated `github.workflow.event`, `github.workflow.source_branch`, and
+`github.workflow.target_branch`. The root additionally carries the `workflow_run` delivery UUID,
+the positive run attempt, and at most the first 20 positive pull-request numbers reported by the
+run. Each child additionally carries `cicd.pipeline.task.name`, the decimal
+`cicd.pipeline.task.run.id`, `cicd.pipeline.task.run.result`, and `cicd.pipeline.task.run.url.full`.
+
+**Persistence.** Linking requires the job trace identities to outlive the delivery that produced
+them, so each emitted job trace durably records its trace ID, span ID, sanitized job name, bounded
+conclusion, and selected interval, keyed by repository, run ID, run attempt, and job ID. Nothing
+else is retained: no payload data, logs, commands, output, secrets, actors, or raw URLs. These
+records use the processed-delivery retention cutoff and are pruned in the same scheduled pass as
+workflow-run context. Identities are recorded only when remote telemetry is enabled, since a
+disabled emitter exports no job trace to link to.
+
+**Omissions and limits.** A run attempt with no recorded job traces emits no pipeline trace at
+all — this covers runs whose jobs were all rejected by `GHE_WORKFLOW_JOB_MAX_STEPS`, and runs
+whose jobs completed before this feature or while telemetry was disabled. A run whose jobs were
+partially recorded emits a pipeline trace summarizing only the recorded jobs — GitHub normally
+delivers `workflow_run` `completed` after every `workflow_job` `completed`, but delivery order is
+not guaranteed, and a job whose delivery has not yet been processed is simply absent from the
+summary. Each run attempt is keyed separately, so a re-run summarizes only its own jobs, and a
+redelivered `workflow_run` `completed` is stopped by the durable delivery claim rather than
+emitting a second pipeline trace. A run attempt with
+more than 256 recorded job traces emits no pipeline trace at all, increments
+`github_workflow_job_trace_rejections_total{reason="too_many_jobs"}` once, and emits one bounded
+parentless warning containing only `repository_name`, `delivery_id`, `workflow_run_id`,
+`workflow_run_attempt`, `job_count`, and `job_limit`. The limit is fixed and not configurable;
+there is never a partial pipeline trace.
+
+Pipeline-run emission is telemetry enrichment layered on already exported job traces, so every
+failure along this path — link persistence, lookup, or export — degrades to a bounded failure
+metric and leaves the authenticated `204 No Content` response, readiness, and merge-queue state
+untouched.
