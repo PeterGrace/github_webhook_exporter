@@ -54,6 +54,7 @@ use crate::{
     storage::{
         open_database, DeliveryStore, MergeQueueStore, RepositoryStore, RepositoryStoreError,
     },
+    telemetry::pipeline::MAX_PIPELINE_JOB_SPANS,
 };
 use tokio::{
     net::TcpListener,
@@ -1318,15 +1319,16 @@ impl CapturedSpans {
     }
 
     fn workflow_rejection_log(&self) -> &LogRecord {
+        self.one_log_with_body("completed workflow-job trace rejected")
+    }
+
+    fn one_log_with_body(&self, body: &str) -> &LogRecord {
         let matches = self
             .log_records
             .iter()
-            .filter(|record| {
-                record.body.as_ref().and_then(string_any_value)
-                    == Some("completed workflow-job trace rejected")
-            })
+            .filter(|record| record.body.as_ref().and_then(string_any_value) == Some(body))
             .collect::<Vec<_>>();
-        assert_eq!(matches.len(), 1, "workflow rejection warning count");
+        assert_eq!(matches.len(), 1, "log record count for {body:?}");
         matches[0]
     }
 
@@ -6647,4 +6649,119 @@ async fn link_persistence_failure_keeps_the_job_trace_and_reports_its_own_stage(
         captured.assert_absent(forbidden);
         assert!(!exposition.contains(forbidden));
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_over_the_job_limit_emits_an_actionable_rejection_without_a_pipeline_trace() {
+    let fixture = WebhookTraceFixture::new().await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440430";
+    let job_limit = i64::try_from(MAX_PIPELINE_JOB_SPANS).expect("job limit fits an identifier");
+    let repository_id: i64 = sqlx::query_scalar("SELECT id FROM repositories WHERE full_name = ?")
+        .bind(WEBHOOK_REPOSITORY)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("the authenticated repository row exists");
+
+    // Seeding links directly is the whole point: driving 257 job deliveries through the router
+    // would test the job path, not the over-limit branch this test is about.
+    sqlx::query(
+        "WITH RECURSIVE sequence(value) AS (\
+             VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < ?\
+         ) INSERT INTO workflow_job_links \
+         (repository_id, workflow_run_id, workflow_run_attempt, workflow_job_id, job_name, \
+          conclusion, trace_id, span_id, started_at_nanos, completed_at_nanos, timing_source, \
+          updated_at) \
+         SELECT ?, 31, 1, value, 'seeded job', 'success', \
+         printf('%032x', value), printf('%016x', value), value, value + 1, 'reported', \
+         '2026-08-19T10:00:00.000Z' FROM sequence",
+    )
+    .bind(job_limit + 1)
+    .bind(repository_id)
+    .execute(&fixture.pool)
+    .await
+    .expect("over-limit job links seed");
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "action": "completed",
+        "workflow_run": {
+            "id": 31,
+            "run_attempt": 1,
+            "name": "Build Workflow",
+            "event": "push",
+            "head_branch": "main",
+            "pull_requests": []
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("workflow-run payload serializes");
+
+    let response = fixture
+        .webhook(&body, "workflow_run", delivery_id, WEBHOOK_SECRET)
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "an over-limit run still returns the authenticated response"
+    );
+    drop(response);
+
+    let captured = fixture.force_flush();
+    assert!(
+        !captured.spans.iter().any(|span| matches!(
+            string_attribute(span, "sentry.op"),
+            Some("github.actions.pipeline" | "github.actions.pipeline.task")
+        )),
+        "an over-limit run emits no partial pipeline trace"
+    );
+
+    let rejection_log = captured.one_log_with_body("pipeline-run summary trace rejected");
+    assert!(
+        rejection_log.trace_id.is_empty() || rejection_log.trace_id.iter().all(|byte| *byte == 0),
+        "rejection warning trace ID must be absent or zero: {:?}",
+        rejection_log.trace_id
+    );
+    let mut rejection_attribute_keys = rejection_log
+        .attributes
+        .iter()
+        .map(|attribute| attribute.key.as_str())
+        .collect::<Vec<_>>();
+    rejection_attribute_keys.sort_unstable();
+    assert_eq!(
+        rejection_attribute_keys,
+        vec![
+            "delivery_id",
+            "job_count",
+            "job_limit",
+            "reason",
+            "repository_name",
+            "workflow_run_attempt",
+            "workflow_run_id",
+        ],
+        "rejection warning custom OTLP attributes"
+    );
+    assert!(captured.has_log_string_attribute("reason", "too_many_jobs"));
+    assert!(captured.has_log_string_attribute("repository_name", WEBHOOK_REPOSITORY));
+    assert!(captured.has_log_string_attribute("delivery_id", delivery_id));
+    for (key, value) in [
+        ("workflow_run_id", 31),
+        ("workflow_run_attempt", 1),
+        ("job_count", job_limit + 1),
+        ("job_limit", job_limit),
+    ] {
+        assert!(
+            captured.has_log_i64_attribute(key, value),
+            "OTLP logs contain approved field {key:?}"
+        );
+    }
+
+    let exposition = fixture.metrics_text().await;
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{repository=\"owner/webhook-private-repository\",reason=\"too_many_jobs\"} 1",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_webhook_processing_failures_total{repository=\"unknown\",stage=\"workflow_link\"} 0",
+    );
+    captured.assert_absent("seeded job");
 }
