@@ -278,6 +278,8 @@ pub enum FailureStage {
     Database,
     /// Durable merge-queue state transition failure.
     QueueState,
+    /// Durable workflow-job trace link persistence or lookup failure.
+    WorkflowLink,
 }
 
 /// A bounded merge-group webhook action.
@@ -434,13 +436,19 @@ pub enum QueueTransitionFailureReason {
 pub(crate) enum WorkflowTraceRejectionReason {
     /// The trace reported more steps than the configured maximum.
     TooManySteps,
+    /// The pipeline-run summary covered more jobs than the fixed maximum.
+    TooManyJobs,
 }
 
 impl WorkflowTraceRejectionReason {
+    /// Every bounded rejection reason, used to publish zero-valued series at startup.
+    pub(crate) const ALL: [Self; 2] = [Self::TooManySteps, Self::TooManyJobs];
+
     /// Returns the fixed metric/log vocabulary value for this rejection reason.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::TooManySteps => "too_many_steps",
+            Self::TooManyJobs => "too_many_jobs",
         }
     }
 }
@@ -594,6 +602,7 @@ impl FailureStage {
             Self::Metrics => "metrics",
             Self::Database => "database",
             Self::QueueState => "queue_state",
+            Self::WorkflowLink => "workflow_link",
         }
     }
 }
@@ -790,6 +799,7 @@ impl Metrics {
             FailureStage::Metrics,
             FailureStage::Database,
             FailureStage::QueueState,
+            FailureStage::WorkflowLink,
         ] {
             let _ = processing_failures.get_or_create(&FailureLabels {
                 repository: RepositoryLabel::Unknown,
@@ -842,10 +852,12 @@ impl Metrics {
                 reason,
             });
         }
-        let _ = workflow_trace_rejections.get_or_create(&WorkflowTraceRejectionLabels {
-            repository: RepositoryLabel::Unknown,
-            reason: WorkflowTraceRejectionReason::TooManySteps,
-        });
+        for reason in WorkflowTraceRejectionReason::ALL {
+            let _ = workflow_trace_rejections.get_or_create(&WorkflowTraceRejectionLabels {
+                repository: RepositoryLabel::Unknown,
+                reason,
+            });
+        }
         for signal in TelemetrySignal::ALL {
             for reason in TelemetryExportFailureReason::ALL {
                 let _ = telemetry_export_failures

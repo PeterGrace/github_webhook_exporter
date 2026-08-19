@@ -17,7 +17,7 @@ use tracing::{debug, error, warn, Instrument};
 use crate::{
     api::{merge_group::EventProjection, pull_request::QueueProcessor, workflow_job, workflow_run},
     app::{AppState, RequestRepositoryContext},
-    domain::delivery::DeliveryId,
+    domain::{delivery::DeliveryId, repository::RepositoryId},
     error::AppError,
     metrics::{
         normalize_action, normalize_event_type, Action, EventType, FailureStage, Metrics,
@@ -28,7 +28,9 @@ use crate::{
     },
     storage::DeliveryClaim,
     telemetry::{
+        pipeline::{PipelineRunTrace, PipelineRunTraceParts, MAX_PIPELINE_JOB_SPANS},
         trace::{self, Operation, OperationOutcome, QueueEntity},
+        workflow::WorkflowRunContext,
         LOCAL_ONLY_LOG_TARGET,
     },
 };
@@ -179,6 +181,9 @@ async fn webhook_handler(
                                     FailureStage::Database,
                                 )
                             })?;
+                        if action == Action::Completed {
+                            emit_pipeline_trace(&state, repository_id, &request, &context).await;
+                        }
                     }
                 }
                 if event_type == EventType::WorkflowJob && action == Action::Completed {
@@ -217,7 +222,21 @@ async fn webhook_handler(
                                 received_at,
                                 workflow_run_context,
                             ) {
-                                state.workflow_trace_emitter().emit(&workflow_trace);
+                                if let Some(identity) =
+                                    state.workflow_trace_emitter().emit(&workflow_trace)
+                                {
+                                    if state
+                                        .workflow_job_link_store()
+                                        .record(repository_id, &workflow_trace, identity)
+                                        .await
+                                        .is_err()
+                                    {
+                                        record_workflow_link_failure(
+                                            &state,
+                                            &request.repository_name,
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -283,6 +302,121 @@ async fn webhook_handler(
             Err(error)
         }
     }
+}
+
+/// Emits the pipeline-run summary trace for one terminal `workflow_run` delivery.
+///
+/// Pipeline traces are pure telemetry enrichment layered on top of already exported job traces, so
+/// every failure here degrades to a bounded failure metric and leaves the authenticated
+/// `204 No Content` response, readiness, and merge-queue state untouched.
+///
+/// # Parameters
+///
+/// * `state` - The shared application state.
+/// * `repository_id` - The authenticated repository row identifier.
+/// * `request` - The authenticated webhook request.
+/// * `context` - The bounded workflow-run context projected from this delivery.
+async fn emit_pipeline_trace(
+    state: &AppState,
+    repository_id: RepositoryId,
+    request: &WebhookRequest,
+    context: &WorkflowRunContext,
+) {
+    if !state.workflow_trace_emitter().is_enabled() {
+        return;
+    }
+    // One extra row distinguishes an accepted run from an over-limit one without a second query.
+    let jobs = match state
+        .workflow_job_link_store()
+        .list(
+            repository_id,
+            context.run_id(),
+            context.run_attempt(),
+            MAX_PIPELINE_JOB_SPANS + 1,
+        )
+        .await
+    {
+        Ok(jobs) => jobs,
+        Err(_) => {
+            record_workflow_link_failure(state, &request.repository_name);
+            return;
+        }
+    };
+    if jobs.is_empty() {
+        return;
+    }
+    if jobs.len() > MAX_PIPELINE_JOB_SPANS {
+        record_pipeline_trace_rejection(state, request, context, jobs.len());
+        return;
+    }
+
+    let Some(summary) = workflow_run::project_run_summary(request.body.as_ref()) else {
+        return;
+    };
+    let Some(pipeline) = PipelineRunTrace::new(PipelineRunTraceParts {
+        repository_name: request.repository_name.clone(),
+        delivery_id: request.delivery_id,
+        workflow_name: summary.workflow_name,
+        head_sha: summary.head_sha,
+        pull_requests: summary.pull_requests,
+        run_context: context.clone(),
+        jobs,
+    }) else {
+        return;
+    };
+    state.workflow_trace_emitter().emit_pipeline(&pipeline);
+}
+
+fn record_pipeline_trace_rejection(
+    state: &AppState,
+    request: &WebhookRequest,
+    context: &WorkflowRunContext,
+    job_count: usize,
+) {
+    state.metrics().record_workflow_trace_rejection(
+        &request.repository_name,
+        WorkflowTraceRejectionReason::TooManyJobs,
+    );
+    let _parentless_context = Context::new().attach();
+    let mut delivery_buffer = uuid::Uuid::encode_buffer();
+    warn!(
+        parent: None,
+        reason = WorkflowTraceRejectionReason::TooManyJobs.as_str(),
+        repository_name = request.repository_name.as_str(),
+        workflow_run_id = context.run_id().get(),
+        workflow_run_attempt = context.run_attempt().get(),
+        delivery_id = request.delivery_id.encode_lower(&mut delivery_buffer),
+        job_count,
+        job_limit = MAX_PIPELINE_JOB_SPANS,
+        "pipeline-run summary trace rejected"
+    );
+}
+
+/// Records one bounded pipeline-link failure without changing the authenticated response.
+///
+/// This uses its own [`FailureStage::WorkflowLink`] rather than the generic database stage so
+/// operators can alert on the health of the enrichment-only pipeline-link path directly, without
+/// reading logs to separate it from the failures that do change a response.
+///
+/// # Parameters
+///
+/// * `state` - The shared application state.
+/// * `repository_name` - The canonical authenticated repository name.
+fn record_workflow_link_failure(state: &AppState, repository_name: &CanonicalRepositoryName) {
+    state
+        .metrics()
+        .record_failure(Some(repository_name), FailureStage::WorkflowLink);
+    let error = AppError::webhook_unavailable();
+    let error_correlation_id = error
+        .correlation_id()
+        .expect("webhook dependency failures carry a correlation ID");
+    error!(
+        parent: None,
+        stage = FailureStage::WorkflowLink.as_str(),
+        result = WebhookResult::Unavailable.as_str(),
+        %error_correlation_id,
+        "workflow-job link persistence failed"
+    );
 }
 
 fn record_workflow_trace_rejection(

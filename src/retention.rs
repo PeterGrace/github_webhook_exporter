@@ -8,8 +8,8 @@ use tracing::{info, warn, Instrument};
 use crate::{
     error::ErrorCorrelationId,
     storage::{
-        DeliveryStore, DeliveryStoreError, MergeQueueStore, MergeQueueStoreError, WorkflowRunStore,
-        WorkflowRunStoreError,
+        DeliveryStore, DeliveryStoreError, MergeQueueStore, MergeQueueStoreError,
+        WorkflowJobLinkStore, WorkflowJobLinkStoreError, WorkflowRunStore, WorkflowRunStoreError,
     },
     telemetry::trace::{self, Operation, OperationOutcome},
 };
@@ -81,6 +81,7 @@ pub async fn run_retention(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let workflow_run_store = WorkflowRunStore::new(delivery_store.pool().clone());
+    let workflow_job_link_store = WorkflowJobLinkStore::new(delivery_store.pool().clone());
     let start = Instant::now() + config.interval;
     let mut ticker = tokio::time::interval_at(start, config.interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -94,6 +95,7 @@ pub async fn run_retention(
                     &delivery_store,
                     &merge_queue_store,
                     &workflow_run_store,
+                    &workflow_job_link_store,
                     config,
                     &shutdown,
                 )
@@ -107,6 +109,7 @@ async fn run_traced_retention_pass(
     delivery_store: &DeliveryStore,
     merge_queue_store: &MergeQueueStore,
     workflow_run_store: &WorkflowRunStore,
+    workflow_job_link_store: &WorkflowJobLinkStore,
     config: RetentionConfig,
     shutdown: &watch::Receiver<bool>,
 ) {
@@ -115,6 +118,7 @@ async fn run_traced_retention_pass(
         delivery_store,
         merge_queue_store,
         workflow_run_store,
+        workflow_job_link_store,
         config,
         shutdown,
     )
@@ -132,10 +136,12 @@ pub(crate) async fn run_retention_once(
     shutdown: &watch::Receiver<bool>,
 ) {
     let workflow_run_store = WorkflowRunStore::new(delivery_store.pool().clone());
+    let workflow_job_link_store = WorkflowJobLinkStore::new(delivery_store.pool().clone());
     run_traced_retention_pass(
         delivery_store,
         merge_queue_store,
         &workflow_run_store,
+        &workflow_job_link_store,
         config,
         shutdown,
     )
@@ -146,6 +152,7 @@ async fn prune_retention_pass(
     delivery_store: &DeliveryStore,
     merge_queue_store: &MergeQueueStore,
     workflow_run_store: &WorkflowRunStore,
+    workflow_job_link_store: &WorkflowJobLinkStore,
     config: RetentionConfig,
     shutdown: &watch::Receiver<bool>,
 ) -> RetentionPassOutcome {
@@ -154,6 +161,7 @@ async fn prune_retention_pass(
         delivery_store,
         merge_queue_store,
         workflow_run_store,
+        workflow_job_link_store,
         pass_started_at.checked_sub(config.delivery_retention),
         pass_started_at.checked_sub(config.merge_queue_retention),
         shutdown,
@@ -161,10 +169,11 @@ async fn prune_retention_pass(
     .await
 }
 
-async fn prune_retention_workloads<D, M, W>(
+async fn prune_retention_workloads<D, M, W, L>(
     delivery_store: &D,
     merge_queue_store: &M,
     workflow_run_store: &W,
+    workflow_job_link_store: &L,
     delivery_cutoff: Option<OffsetDateTime>,
     merge_queue_cutoff: Option<OffsetDateTime>,
     shutdown: &watch::Receiver<bool>,
@@ -173,6 +182,7 @@ where
     D: PrunableStore,
     M: PrunableStore,
     W: PrunableStore,
+    L: PrunableStore,
 {
     let delivery_outcome = prune_store(delivery_store, delivery_cutoff, shutdown).await;
     if *shutdown.borrow() || delivery_outcome == StorePruneOutcome::Cancelled {
@@ -188,7 +198,14 @@ where
     }
 
     let workflow_run_outcome = prune_store(workflow_run_store, delivery_cutoff, shutdown).await;
-    outcome.combine(workflow_run_outcome)
+    let outcome = outcome.combine(workflow_run_outcome);
+    if *shutdown.borrow() || workflow_run_outcome == StorePruneOutcome::Cancelled {
+        return outcome.combine(StorePruneOutcome::Cancelled);
+    }
+
+    let workflow_job_link_outcome =
+        prune_store(workflow_job_link_store, delivery_cutoff, shutdown).await;
+    outcome.combine(workflow_job_link_outcome)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,6 +289,16 @@ impl PrunableStore for WorkflowRunStore {
 
     async fn prune_batch(&self, cutoff: OffsetDateTime) -> Result<u64, Self::Error> {
         WorkflowRunStore::prune_batch(self, cutoff).await
+    }
+}
+
+impl PrunableStore for WorkflowJobLinkStore {
+    type Error = WorkflowJobLinkStoreError;
+
+    const WORKLOAD: &'static str = "workflow_job_link";
+
+    async fn prune_batch(&self, cutoff: OffsetDateTime) -> Result<u64, Self::Error> {
+        WorkflowJobLinkStore::prune_batch(self, cutoff).await
     }
 }
 

@@ -19,7 +19,9 @@ use crate::{
     metrics::{self, Metrics},
     retention::{run_retention, RetentionConfig},
     security::{AdminAuthenticator, CanonicalRepositoryName},
-    storage::{DeliveryStore, MergeQueueStore, RepositoryStore, WorkflowRunStore},
+    storage::{
+        DeliveryStore, MergeQueueStore, RepositoryStore, WorkflowJobLinkStore, WorkflowRunStore,
+    },
     telemetry::{
         trace::{self, Operation},
         WorkflowTraceEmitter,
@@ -52,6 +54,7 @@ pub struct AppState {
     delivery_store: DeliveryStore,
     merge_queue_store: MergeQueueStore,
     workflow_run_store: WorkflowRunStore,
+    workflow_job_link_store: WorkflowJobLinkStore,
     metrics: Metrics,
     workflow_trace_emitter: WorkflowTraceEmitter,
     webhook_body_limit_bytes: usize,
@@ -70,6 +73,7 @@ impl AppState {
         let delivery_store = DeliveryStore::new(database_pool.clone());
         let merge_queue_store = MergeQueueStore::new(database_pool.clone());
         let workflow_run_store = WorkflowRunStore::new(database_pool.clone());
+        let workflow_job_link_store = WorkflowJobLinkStore::new(database_pool.clone());
         Self {
             repository_store: Arc::new(repository_store),
             admin_authenticator: Arc::new(admin_authenticator),
@@ -77,6 +81,7 @@ impl AppState {
             delivery_store,
             merge_queue_store,
             workflow_run_store,
+            workflow_job_link_store,
             metrics: Metrics::new(),
             workflow_trace_emitter: WorkflowTraceEmitter::disabled(),
             webhook_body_limit_bytes,
@@ -138,6 +143,11 @@ impl AppState {
     /// Returns durable bounded workflow-run correlation persistence.
     pub(crate) fn workflow_run_store(&self) -> &WorkflowRunStore {
         &self.workflow_run_store
+    }
+
+    /// Returns durable emitted workflow-job trace identity persistence.
+    pub(crate) fn workflow_job_link_store(&self) -> &WorkflowJobLinkStore {
+        &self.workflow_job_link_store
     }
 
     /// Returns the shared bounded metrics component.

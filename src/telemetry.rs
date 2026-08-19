@@ -10,6 +10,7 @@ mod diagnostics;
 mod http_client;
 #[cfg(test)]
 mod otlp_test;
+pub(crate) mod pipeline;
 mod queue;
 pub(crate) mod trace;
 pub(crate) mod workflow;

@@ -68,6 +68,8 @@ const GITHUB_WORKFLOW_SOURCE_BRANCH_KEY: &str = "github.workflow.source_branch";
 const GITHUB_WORKFLOW_TARGET_BRANCH_KEY: &str = "github.workflow.target_branch";
 const TIMING_SOURCE_KEY: &str = "timing_source";
 
+pub(super) const GITHUB_ACTIONS_PIPELINE_OPERATION: &str = "github.actions.pipeline";
+pub(super) const GITHUB_ACTIONS_PIPELINE_TASK_OPERATION: &str = "github.actions.pipeline.task";
 pub(super) const GITHUB_ACTIONS_JOB_OPERATION: &str = "github.actions.job";
 pub(super) const GITHUB_ACTIONS_STEP_OPERATION: &str = "github.actions.step";
 
@@ -457,6 +459,12 @@ pub(crate) enum DatabaseOperation {
     WorkflowRunGet,
     /// Pruning workflow-run context.
     WorkflowRunPrune,
+    /// Recording one emitted workflow-job trace identity.
+    WorkflowJobLinkRecord,
+    /// Listing the emitted workflow-job trace identities of one run attempt.
+    WorkflowJobLinkList,
+    /// Pruning emitted workflow-job trace identities.
+    WorkflowJobLinkPrune,
 }
 
 /// Creates a bounded tracing span for a high-level operation.
@@ -860,6 +868,9 @@ impl DatabaseOperation {
             Self::WorkflowRunUpsert => "workflow_run.upsert",
             Self::WorkflowRunGet => "workflow_run.get",
             Self::WorkflowRunPrune => "workflow_run.prune",
+            Self::WorkflowJobLinkRecord => "workflow_job_link.record",
+            Self::WorkflowJobLinkList => "workflow_job_link.list",
+            Self::WorkflowJobLinkPrune => "workflow_job_link.prune",
         }
     }
 }
@@ -1086,6 +1097,18 @@ mod tests {
             (DatabaseOperation::WorkflowRunUpsert, "workflow_run.upsert"),
             (DatabaseOperation::WorkflowRunGet, "workflow_run.get"),
             (DatabaseOperation::WorkflowRunPrune, "workflow_run.prune"),
+            (
+                DatabaseOperation::WorkflowJobLinkRecord,
+                "workflow_job_link.record",
+            ),
+            (
+                DatabaseOperation::WorkflowJobLinkList,
+                "workflow_job_link.list",
+            ),
+            (
+                DatabaseOperation::WorkflowJobLinkPrune,
+                "workflow_job_link.prune",
+            ),
         ];
         for (operation, expected) in database_operations {
             assert_eq!(operation.as_str(), expected);

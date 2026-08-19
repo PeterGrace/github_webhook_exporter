@@ -54,6 +54,7 @@ use crate::{
     storage::{
         open_database, DeliveryStore, MergeQueueStore, RepositoryStore, RepositoryStoreError,
     },
+    telemetry::pipeline::MAX_PIPELINE_JOB_SPANS,
 };
 use tokio::{
     net::TcpListener,
@@ -1318,15 +1319,16 @@ impl CapturedSpans {
     }
 
     fn workflow_rejection_log(&self) -> &LogRecord {
+        self.one_log_with_body("completed workflow-job trace rejected")
+    }
+
+    fn one_log_with_body(&self, body: &str) -> &LogRecord {
         let matches = self
             .log_records
             .iter()
-            .filter(|record| {
-                record.body.as_ref().and_then(string_any_value)
-                    == Some("completed workflow-job trace rejected")
-            })
+            .filter(|record| record.body.as_ref().and_then(string_any_value) == Some(body))
             .collect::<Vec<_>>();
-        assert_eq!(matches.len(), 1, "workflow rejection warning count");
+        assert_eq!(matches.len(), 1, "log record count for {body:?}");
         matches[0]
     }
 
@@ -5731,6 +5733,11 @@ async fn integrated_core_trace_privacy() {
         [
             ("sqlite.query", Some("delivery.prune"), Some("success")),
             ("sqlite.query", Some("merge_queue.prune"), Some("success")),
+            (
+                "sqlite.query",
+                Some("workflow_job_link.prune"),
+                Some("success")
+            ),
             ("sqlite.query", Some("workflow_run.prune"), Some("success")),
         ]
     );
@@ -6319,4 +6326,442 @@ async fn blocked_exporters_preserve_exact_bounds_and_export_otlp_protobuf() {
     );
 
     receiver.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_workflow_run_exports_a_pipeline_trace_linking_every_job_trace() {
+    let fixture = WebhookTraceFixture::new().await;
+    let requested_delivery_id = "550e8400-e29b-41d4-a716-446655440400";
+    let success_job_delivery_id = "550e8400-e29b-41d4-a716-446655440401";
+    let failed_job_delivery_id = "550e8400-e29b-41d4-a716-446655440402";
+    let completed_delivery_id = "550e8400-e29b-41d4-a716-446655440403";
+    let success_started_at = "2026-08-06T10:00:00.000000001Z";
+    let success_completed_at = "2026-08-06T10:05:00.000000002Z";
+    let failed_started_at = "2026-08-06T10:04:00.000000003Z";
+    let failed_completed_at = "2026-08-06T10:09:00.000000004Z";
+
+    let workflow_run_body = |action: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "action": action,
+            "workflow_run": {
+                "id": 31,
+                "run_attempt": 2,
+                "name": "Build\nWorkflow",
+                "event": "merge_group",
+                "head_branch": "gh-readonly-queue/main/pr-7-deadbeef",
+                "head_sha": WEBHOOK_SHA_40,
+                "pull_requests": [{
+                    "number": 7,
+                    "head": {"ref": "feature/source"},
+                    "base": {"ref": "main"}
+                }]
+            },
+            "repository": {"full_name": WEBHOOK_REPOSITORY}
+        }))
+        .expect("workflow-run payload serializes")
+    };
+    let workflow_job_body =
+        |job_id: i64, name: &str, conclusion: &str, started_at: &str, completed_at: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "action": "completed",
+                "workflow_job": {
+                    "id": job_id,
+                    "run_id": 31,
+                    "run_attempt": 2,
+                    "workflow_name": "Build\nWorkflow",
+                    "name": name,
+                    "conclusion": conclusion,
+                    "head_sha": WEBHOOK_SHA_40,
+                    "started_at": started_at,
+                    "completed_at": completed_at,
+                    "steps": [{
+                        "number": 1,
+                        "name": "Only Step",
+                        "conclusion": conclusion,
+                        "started_at": started_at,
+                        "completed_at": completed_at
+                    }]
+                },
+                "repository": {"full_name": WEBHOOK_REPOSITORY}
+            }))
+            .expect("workflow-job payload serializes")
+        };
+
+    for (body, event, delivery_id) in [
+        (
+            workflow_run_body("requested"),
+            "workflow_run",
+            requested_delivery_id,
+        ),
+        (
+            workflow_job_body(
+                41,
+                "Linux\tJob",
+                "success",
+                success_started_at,
+                success_completed_at,
+            ),
+            "workflow_job",
+            success_job_delivery_id,
+        ),
+        (
+            workflow_job_body(42, "\n", "failure", failed_started_at, failed_completed_at),
+            "workflow_job",
+            failed_job_delivery_id,
+        ),
+        (
+            workflow_run_body("completed"),
+            "workflow_run",
+            completed_delivery_id,
+        ),
+    ] {
+        let response = fixture
+            .webhook(&body, event, delivery_id, WEBHOOK_SECRET)
+            .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        drop(response);
+    }
+
+    let captured = fixture.force_flush();
+    let request = captured.webhook_request_for_delivery(completed_delivery_id);
+    let pipeline = captured.one_named("BuildWorkflow");
+    assert!(
+        pipeline.parent_span_id.is_empty(),
+        "the pipeline summary is an independent root"
+    );
+    assert_ne!(pipeline.trace_id, request.trace_id);
+    assert_eq!(pipeline.kind, OtlpSpanKind::Internal as i32);
+    assert_otlp_status(pipeline, OtlpStatusCode::Error, "workflow_failed");
+    assert_attribute(pipeline, "sentry.op", "github.actions.pipeline");
+    assert_attribute(pipeline, "sentry.description", "BuildWorkflow");
+    assert_attribute(pipeline, "cicd.pipeline.name", "BuildWorkflow");
+    assert_attribute(pipeline, "cicd.pipeline.run.id", "31");
+    assert_attribute(
+        pipeline,
+        "cicd.pipeline.run.url.full",
+        &format!("https://github.com/{WEBHOOK_REPOSITORY}/actions/runs/31"),
+    );
+    assert_attribute(pipeline, "github.workflow.run.attempt", "2");
+    assert_attribute(pipeline, "github.workflow.conclusion", "failure");
+    assert_attribute(pipeline, "error.type", "GitHubActionsTaskFailure");
+    assert_attribute(pipeline, "github.workflow.event", "merge_group");
+    assert_attribute(
+        pipeline,
+        "github.workflow.source_branch",
+        "gh-readonly-queue/main/pr-7-deadbeef",
+    );
+    assert_attribute(pipeline, "github.workflow.target_branch", "main");
+    assert_attribute(pipeline, "github.delivery.id", completed_delivery_id);
+    assert_attribute(
+        pipeline,
+        "vcs.repository.name",
+        "webhook-private-repository",
+    );
+    assert_attribute(
+        pipeline,
+        "vcs.ref.head.revision",
+        &WEBHOOK_SHA_40.to_ascii_lowercase(),
+    );
+    assert_attribute(pipeline, "timing_source", "reported");
+    assert_i64_array_attribute(pipeline, "github.pull_request.number", &[7]);
+    assert_eq!(
+        pipeline.start_time_unix_nano,
+        rfc3339_unix_nanos(success_started_at)
+    );
+    assert_eq!(
+        pipeline.end_time_unix_nano,
+        rfc3339_unix_nanos(failed_completed_at)
+    );
+    assert!(pipeline.links.is_empty());
+
+    let mut summaries = captured.children(pipeline).collect::<Vec<_>>();
+    summaries.sort_unstable_by_key(|span| span.start_time_unix_nano);
+    assert_eq!(summaries.len(), 2);
+    assert!(summaries
+        .iter()
+        .all(|span| span.trace_id == pipeline.trace_id
+            && span.kind == OtlpSpanKind::Internal as i32
+            && string_attribute(span, "sentry.op") == Some("github.actions.pipeline.task")));
+
+    // Summary children deliberately reuse the job waterfall label, so job roots are selected by
+    // their distinct operation rather than by name.
+    let job_roots = ["BuildWorkflow / LinuxJob", "BuildWorkflow / job"].map(|name| {
+        let matches = captured
+            .spans
+            .iter()
+            .filter(|span| {
+                span.name == name
+                    && string_attribute(span, "sentry.op") == Some("github.actions.job")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "one job root for {name}");
+        matches[0]
+    });
+    for (summary, job_root) in summaries.iter().zip(job_roots) {
+        assert_ne!(
+            summary.trace_id, job_root.trace_id,
+            "job traces stay independent of the pipeline trace"
+        );
+        assert_eq!(summary.links.len(), 1, "one link per summarized job");
+        let link = &summary.links[0];
+        assert_eq!(link.trace_id, job_root.trace_id);
+        assert_eq!(link.span_id, job_root.span_id);
+        assert_eq!(summary.name, job_root.name);
+        assert_eq!(summary.start_time_unix_nano, job_root.start_time_unix_nano);
+        assert_eq!(summary.end_time_unix_nano, job_root.end_time_unix_nano);
+        assert_eq!(
+            captured.children(summary).count(),
+            0,
+            "steps stay on the job trace"
+        );
+    }
+
+    assert_attribute(summaries[0], "cicd.pipeline.task.name", "LinuxJob");
+    assert_attribute(summaries[0], "cicd.pipeline.task.run.id", "41");
+    assert_attribute(summaries[0], "cicd.pipeline.task.run.result", "success");
+    assert_attribute(
+        summaries[0],
+        "cicd.pipeline.task.run.url.full",
+        &format!("https://github.com/{WEBHOOK_REPOSITORY}/actions/runs/31/job/41"),
+    );
+    assert_otlp_status(summaries[0], OtlpStatusCode::Ok, "");
+    assert_attribute(summaries[1], "cicd.pipeline.task.name", "job");
+    assert_attribute(summaries[1], "cicd.pipeline.task.run.id", "42");
+    assert_attribute(summaries[1], "cicd.pipeline.task.run.result", "failure");
+    assert_attribute(summaries[1], "error.type", "GitHubActionsTaskFailure");
+    assert_otlp_status(summaries[1], OtlpStatusCode::Error, "workflow_failed");
+    assert!(
+        summaries.iter().all(|span| span.events.is_empty()),
+        "synthetic workflow errors stay on the job traces"
+    );
+
+    let exposition = fixture.metrics_text().await;
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{repository=\"unknown\",reason=\"too_many_jobs\"} 0",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_without_emitted_job_traces_exports_no_pipeline_trace() {
+    let fixture = WebhookTraceFixture::new().await;
+    let body = serde_json::to_vec(&serde_json::json!({
+        "action": "completed",
+        "workflow_run": {
+            "id": 31,
+            "run_attempt": 1,
+            "name": "Build Workflow",
+            "event": "push",
+            "head_branch": "main",
+            "pull_requests": []
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("workflow-run payload serializes");
+
+    let response = fixture
+        .webhook(
+            &body,
+            "workflow_run",
+            "550e8400-e29b-41d4-a716-446655440410",
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    let captured = fixture.force_flush();
+    assert!(
+        !captured
+            .spans
+            .iter()
+            .any(|span| string_attribute(span, "sentry.op") == Some("github.actions.pipeline")),
+        "a run with nothing to summarize emits no pipeline trace"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn link_persistence_failure_keeps_the_job_trace_and_reports_its_own_stage() {
+    let fixture = WebhookTraceFixture::new().await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440420";
+    sqlx::query(
+        "CREATE TRIGGER reject_workflow_job_links BEFORE INSERT ON workflow_job_links \
+         BEGIN SELECT RAISE(ABORT, 'sensitive-link-failure-must-not-appear'); END",
+    )
+    .execute(&fixture.pool)
+    .await
+    .expect("link failure trigger is installed");
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "action": "completed",
+        "workflow_job": {
+            "id": 41,
+            "run_id": 31,
+            "run_attempt": 1,
+            "workflow_name": "Build Workflow",
+            "name": "Linux Job",
+            "conclusion": "success",
+            "started_at": "2026-08-06T10:00:00.000000001Z",
+            "completed_at": "2026-08-06T10:05:00.000000002Z",
+            "steps": [{
+                "number": 1,
+                "name": "Only Step",
+                "conclusion": "success",
+                "started_at": "2026-08-06T10:00:00.000000001Z",
+                "completed_at": "2026-08-06T10:05:00.000000002Z"
+            }]
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("workflow-job payload serializes");
+
+    let response = fixture
+        .webhook(&body, "workflow_job", delivery_id, WEBHOOK_SECRET)
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "enrichment-only link persistence never changes the authenticated response"
+    );
+    drop(response);
+
+    let captured = fixture.force_flush();
+    let job = captured.one_named("Build Workflow / Linux Job");
+    assert_eq!(
+        captured.children(job).count(),
+        1,
+        "the job trace is exported in full even though its link could not be persisted"
+    );
+
+    let exposition = fixture.metrics_text().await;
+    assert_metric_line(
+        &exposition,
+        "github_webhook_processing_failures_total{repository=\"owner/webhook-private-repository\",stage=\"workflow_link\"} 1",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_webhook_processing_failures_total{repository=\"unknown\",stage=\"database\"} 0",
+    );
+    for forbidden in [
+        "sensitive-link-failure-must-not-appear",
+        "workflow_job_links",
+    ] {
+        captured.assert_absent(forbidden);
+        assert!(!exposition.contains(forbidden));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_over_the_job_limit_emits_an_actionable_rejection_without_a_pipeline_trace() {
+    let fixture = WebhookTraceFixture::new().await;
+    let delivery_id = "550e8400-e29b-41d4-a716-446655440430";
+    let job_limit = i64::try_from(MAX_PIPELINE_JOB_SPANS).expect("job limit fits an identifier");
+    let repository_id: i64 = sqlx::query_scalar("SELECT id FROM repositories WHERE full_name = ?")
+        .bind(WEBHOOK_REPOSITORY)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("the authenticated repository row exists");
+
+    // Seeding links directly is the whole point: driving 257 job deliveries through the router
+    // would test the job path, not the over-limit branch this test is about.
+    sqlx::query(
+        "WITH RECURSIVE sequence(value) AS (\
+             VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < ?\
+         ) INSERT INTO workflow_job_links \
+         (repository_id, workflow_run_id, workflow_run_attempt, workflow_job_id, job_name, \
+          conclusion, trace_id, span_id, started_at_nanos, completed_at_nanos, timing_source, \
+          updated_at) \
+         SELECT ?, 31, 1, value, 'seeded job', 'success', \
+         printf('%032x', value), printf('%016x', value), value, value + 1, 'reported', \
+         '2026-08-19T10:00:00.000Z' FROM sequence",
+    )
+    .bind(job_limit + 1)
+    .bind(repository_id)
+    .execute(&fixture.pool)
+    .await
+    .expect("over-limit job links seed");
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "action": "completed",
+        "workflow_run": {
+            "id": 31,
+            "run_attempt": 1,
+            "name": "Build Workflow",
+            "event": "push",
+            "head_branch": "main",
+            "pull_requests": []
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("workflow-run payload serializes");
+
+    let response = fixture
+        .webhook(&body, "workflow_run", delivery_id, WEBHOOK_SECRET)
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "an over-limit run still returns the authenticated response"
+    );
+    drop(response);
+
+    let captured = fixture.force_flush();
+    assert!(
+        !captured.spans.iter().any(|span| matches!(
+            string_attribute(span, "sentry.op"),
+            Some("github.actions.pipeline" | "github.actions.pipeline.task")
+        )),
+        "an over-limit run emits no partial pipeline trace"
+    );
+
+    let rejection_log = captured.one_log_with_body("pipeline-run summary trace rejected");
+    assert!(
+        rejection_log.trace_id.is_empty() || rejection_log.trace_id.iter().all(|byte| *byte == 0),
+        "rejection warning trace ID must be absent or zero: {:?}",
+        rejection_log.trace_id
+    );
+    let mut rejection_attribute_keys = rejection_log
+        .attributes
+        .iter()
+        .map(|attribute| attribute.key.as_str())
+        .collect::<Vec<_>>();
+    rejection_attribute_keys.sort_unstable();
+    assert_eq!(
+        rejection_attribute_keys,
+        vec![
+            "delivery_id",
+            "job_count",
+            "job_limit",
+            "reason",
+            "repository_name",
+            "workflow_run_attempt",
+            "workflow_run_id",
+        ],
+        "rejection warning custom OTLP attributes"
+    );
+    assert!(captured.has_log_string_attribute("reason", "too_many_jobs"));
+    assert!(captured.has_log_string_attribute("repository_name", WEBHOOK_REPOSITORY));
+    assert!(captured.has_log_string_attribute("delivery_id", delivery_id));
+    for (key, value) in [
+        ("workflow_run_id", 31),
+        ("workflow_run_attempt", 1),
+        ("job_count", job_limit + 1),
+        ("job_limit", job_limit),
+    ] {
+        assert!(
+            captured.has_log_i64_attribute(key, value),
+            "OTLP logs contain approved field {key:?}"
+        );
+    }
+
+    let exposition = fixture.metrics_text().await;
+    assert_metric_line(
+        &exposition,
+        "github_workflow_job_trace_rejections_total{repository=\"owner/webhook-private-repository\",reason=\"too_many_jobs\"} 1",
+    );
+    assert_metric_line(
+        &exposition,
+        "github_webhook_processing_failures_total{repository=\"unknown\",stage=\"workflow_link\"} 0",
+    );
+    captured.assert_absent("seeded job");
 }
