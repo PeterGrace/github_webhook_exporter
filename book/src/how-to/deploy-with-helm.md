@@ -24,7 +24,7 @@ If you also want OTLP export, add its header value as an additional key on the s
 
 ```bash
 helm install github-webhook-exporter \
-  oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.9
+  oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.10
 ```
 
 An empty `image.tag` resolves to the chart's `appVersion`, which matches the published image for
@@ -42,7 +42,7 @@ Pass overrides the way you normally would, for example to size storage and set a
 
 ```bash
 helm install github-webhook-exporter \
-  oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.9 \
+  oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.10 \
   --set persistence.size=5Gi \
   --set webhookIngress.enabled=true \
   --set webhookIngress.host=webhooks.example.com
