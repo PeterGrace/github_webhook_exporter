@@ -543,6 +543,11 @@ impl WorkflowTraceEmitter {
         self.tracer.as_ref()
     }
 
+    /// Returns the configured synthetic workflow error reporter, when one is installed.
+    pub(super) fn error_reporter(&self) -> Option<&Arc<dyn WorkflowErrorReporter>> {
+        self.error_reporter.as_ref()
+    }
+
     /// Returns whether this emitter exports anything at all.
     ///
     /// Callers use this to skip the durable work that only feeds disabled telemetry.

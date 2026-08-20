@@ -10,10 +10,13 @@ use sentry::{
 };
 
 use super::{
-    trace::{GITHUB_ACTIONS_JOB_OPERATION, GITHUB_ACTIONS_STEP_OPERATION},
+    trace::{
+        GITHUB_ACTIONS_JOB_OPERATION, GITHUB_ACTIONS_PIPELINE_TASK_OPERATION,
+        GITHUB_ACTIONS_STEP_OPERATION,
+    },
     workflow::{
-        job_span_name, step_description, workflow_name, WorkflowConclusion, WorkflowJobTrace,
-        WorkflowStepTrace,
+        job_span_name, step_description, workflow_name, WorkflowConclusion, WorkflowJobId,
+        WorkflowJobTrace, WorkflowStepTrace,
     },
 };
 
@@ -23,6 +26,8 @@ const UNNAMED_JOB_GROUPING_NAME: &str = "unnamed-job";
 pub(super) enum WorkflowTaskKind {
     Job,
     Step,
+    /// One job summary carried by a pipeline-run trace, reported at run scope.
+    PipelineTask,
 }
 
 pub(super) trait WorkflowErrorReporter: fmt::Debug + Send + Sync {
@@ -100,6 +105,35 @@ impl fmt::Debug for SentryWorkflowErrorReporter {
     }
 }
 
+/// The bounded grouping identity shared by every synthetic workflow error.
+struct WorkflowErrorOrigin {
+    repository_name: String,
+    workflow_name: String,
+    grouping_job_name: String,
+}
+
+/// The already sanitized components of one failing pipeline-run job summary.
+pub(super) struct PipelineTaskErrorParts<'a> {
+    /// The canonical `owner/repository` name of the summarized run.
+    pub(super) repository_name: &'a str,
+    /// The sanitized workflow name, or its fixed fallback.
+    pub(super) workflow_name: &'a str,
+    /// The sanitized job name, absent when the payload carried none.
+    pub(super) job_name: Option<&'a str>,
+    /// The validated job identifier.
+    pub(super) job_id: WorkflowJobId,
+    /// The failing job conclusion.
+    pub(super) conclusion: WorkflowConclusion,
+    /// The `<workflow> / <job>` span name shared with the linked span.
+    pub(super) span_description: String,
+    /// The end of the summarized job interval.
+    pub(super) timestamp: SystemTime,
+    /// The pipeline-run trace identifier.
+    pub(super) trace_id: TraceId,
+    /// The identifier of the linked pipeline-run task span.
+    pub(super) span_id: SpanId,
+}
+
 struct WorkflowErrorParts {
     kind: WorkflowTaskKind,
     conclusion: WorkflowConclusion,
@@ -147,7 +181,7 @@ impl SyntheticWorkflowError {
         );
         let trace_description = step_description(job, step);
         Self::new(
-            job,
+            job_origin(job),
             WorkflowErrorParts {
                 kind: WorkflowTaskKind::Step,
                 conclusion: step.conclusion(),
@@ -174,7 +208,7 @@ impl SyntheticWorkflowError {
         );
         let trace_description = job_span_name(job);
         Self::new(
-            job,
+            job_origin(job),
             WorkflowErrorParts {
                 kind: WorkflowTaskKind::Job,
                 conclusion: job.conclusion(),
@@ -189,17 +223,71 @@ impl SyntheticWorkflowError {
         )
     }
 
-    fn new(job: &WorkflowJobTrace, parts: WorkflowErrorParts) -> Self {
-        let (exception_type, description_prefix) = match parts.conclusion {
-            WorkflowConclusion::Failure => ("GitHubActionsTaskFailure", "CI task failed: "),
-            WorkflowConclusion::TimedOut => ("GitHubActionsTaskTimeout", "CI task timed out: "),
-            WorkflowConclusion::Success
-            | WorkflowConclusion::Cancelled
-            | WorkflowConclusion::Skipped
-            | WorkflowConclusion::Neutral
-            | WorkflowConclusion::Other => {
-                unreachable!("synthetic errors require a failing workflow conclusion")
+    /// Creates the synthetic error for one failing job summary on a pipeline-run trace.
+    ///
+    /// # Parameters
+    ///
+    /// * `task` - The bounded pipeline-run task components, already sanitized by the caller.
+    pub(super) fn for_pipeline_task(task: PipelineTaskErrorParts<'_>) -> Self {
+        let task_run_id = task.job_id.get().to_string();
+        // An unnamed job keeps its per-run identifier in the description only; grouping uses the
+        // fixed identity so equivalent unnamed jobs group across runs.
+        let task_name = task
+            .job_name
+            .map_or_else(|| format!("task {task_run_id}"), ToOwned::to_owned);
+        let grouping_task_name = task
+            .job_name
+            .map_or_else(|| UNNAMED_JOB_GROUPING_NAME.to_owned(), ToOwned::to_owned);
+        Self::new(
+            WorkflowErrorOrigin {
+                repository_name: task.repository_name.to_owned(),
+                workflow_name: task.workflow_name.to_owned(),
+                grouping_job_name: grouping_task_name.clone(),
+            },
+            WorkflowErrorParts {
+                kind: WorkflowTaskKind::PipelineTask,
+                conclusion: task.conclusion,
+                task_name,
+                grouping_task_name,
+                task_run_id,
+                trace_description: task.span_description,
+                timestamp: task.timestamp,
+                trace_id: task.trace_id,
+                span_id: task.span_id,
+            },
+        )
+    }
+
+    /// Creates one synthetic workflow error from an already validated grouping identity.
+    ///
+    /// # Parameters
+    ///
+    /// * `origin` - The bounded repository, workflow, and job grouping identity.
+    /// * `parts` - The task-scoped components of this error.
+    fn new(origin: WorkflowErrorOrigin, parts: WorkflowErrorParts) -> Self {
+        // The exception type mirrors the span's own `error.type`, so a pipeline-run task reuses
+        // the task types and separates only its human-readable prefix and its fingerprint.
+        let (exception_type, description_prefix) = match (parts.kind, parts.conclusion) {
+            (WorkflowTaskKind::Job | WorkflowTaskKind::Step, WorkflowConclusion::Failure) => {
+                ("GitHubActionsTaskFailure", "CI task failed: ")
             }
+            (WorkflowTaskKind::Job | WorkflowTaskKind::Step, WorkflowConclusion::TimedOut) => {
+                ("GitHubActionsTaskTimeout", "CI task timed out: ")
+            }
+            (WorkflowTaskKind::PipelineTask, WorkflowConclusion::Failure) => {
+                ("GitHubActionsTaskFailure", "CI run job failed: ")
+            }
+            (WorkflowTaskKind::PipelineTask, WorkflowConclusion::TimedOut) => {
+                ("GitHubActionsTaskTimeout", "CI run job timed out: ")
+            }
+            (
+                _,
+                WorkflowConclusion::Success
+                | WorkflowConclusion::Cancelled
+                | WorkflowConclusion::Skipped
+                | WorkflowConclusion::Neutral
+                | WorkflowConclusion::Other,
+            ) => unreachable!("synthetic errors require a failing workflow conclusion"),
         };
         let mut description =
             String::with_capacity(description_prefix.len() + parts.task_name.len());
@@ -209,13 +297,10 @@ impl SyntheticWorkflowError {
             kind: parts.kind,
             exception_type,
             description,
-            repository_name: job.repository_name().as_str().to_owned(),
-            workflow_name: workflow_name(job).to_owned(),
+            repository_name: origin.repository_name,
+            workflow_name: origin.workflow_name,
             task_name: parts.task_name,
-            grouping_job_name: job.job_name().map_or_else(
-                || UNNAMED_JOB_GROUPING_NAME.to_owned(),
-                |name| name.as_str().to_owned(),
-            ),
+            grouping_job_name: origin.grouping_job_name,
             grouping_task_name: parts.grouping_task_name,
             task_run_id: parts.task_run_id,
             trace_description: parts.trace_description,
@@ -294,11 +379,23 @@ impl SyntheticWorkflowError {
     }
 }
 
+fn job_origin(job: &WorkflowJobTrace) -> WorkflowErrorOrigin {
+    WorkflowErrorOrigin {
+        repository_name: job.repository_name().as_str().to_owned(),
+        workflow_name: workflow_name(job).to_owned(),
+        grouping_job_name: job.job_name().map_or_else(
+            || UNNAMED_JOB_GROUPING_NAME.to_owned(),
+            |name| name.as_str().to_owned(),
+        ),
+    }
+}
+
 impl WorkflowTaskKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Job => "job",
             Self::Step => "step",
+            Self::PipelineTask => "pipeline-task",
         }
     }
 
@@ -306,6 +403,7 @@ impl WorkflowTaskKind {
         match self {
             Self::Job => GITHUB_ACTIONS_JOB_OPERATION,
             Self::Step => GITHUB_ACTIONS_STEP_OPERATION,
+            Self::PipelineTask => GITHUB_ACTIONS_PIPELINE_TASK_OPERATION,
         }
     }
 }
@@ -327,8 +425,8 @@ mod tests {
     use sentry::{protocol::Context as SentryContext, test::TestTransport, Client, ClientOptions};
 
     use super::{
-        SentryWorkflowErrorReporter, SyntheticWorkflowError, WorkflowErrorReporter,
-        WorkflowTaskKind,
+        PipelineTaskErrorParts, SentryWorkflowErrorReporter, SyntheticWorkflowError,
+        WorkflowErrorReporter, WorkflowTaskKind,
     };
     use crate::{
         domain::{delivery::DeliveryId, merge_queue::PullRequestNumber},
@@ -342,6 +440,23 @@ mod tests {
             },
         },
     };
+
+    fn pipeline_task_error(
+        job_name: Option<&str>,
+        conclusion: WorkflowConclusion,
+    ) -> SyntheticWorkflowError {
+        SyntheticWorkflowError::for_pipeline_task(PipelineTaskErrorParts {
+            repository_name: "Owner/Repository",
+            workflow_name: "Build Workflow",
+            job_name,
+            job_id: WorkflowJobId::new(41).expect("job id is valid"),
+            conclusion,
+            span_description: format!("Build Workflow / {}", job_name.unwrap_or("job")),
+            timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+            trace_id: TraceId::from_bytes([4; 16]),
+            span_id: SpanId::from_bytes([5; 8]),
+        })
+    }
 
     fn failure_job(
         job_name: Option<&str>,
@@ -513,6 +628,64 @@ mod tests {
             WorkflowTaskKind::Step.span_operation(),
             "github.actions.step"
         );
+        assert_eq!(
+            WorkflowTaskKind::PipelineTask.span_operation(),
+            "github.actions.pipeline.task"
+        );
+    }
+
+    #[test]
+    fn pipeline_task_errors_group_apart_from_the_job_and_step_errors_they_summarize() {
+        let job = failure_job(
+            Some("shared task"),
+            Some("shared task"),
+            WorkflowConclusion::Failure,
+        );
+        let job_error = SyntheticWorkflowError::for_job(
+            &job,
+            TraceId::from_bytes([1; 16]),
+            SpanId::from_bytes([2; 8]),
+        );
+        let pipeline_error = pipeline_task_error(Some("shared task"), WorkflowConclusion::Failure);
+
+        assert_eq!(
+            pipeline_error.fingerprint(),
+            [
+                "github-actions-task",
+                "pipeline-task",
+                "Owner/Repository",
+                "Build Workflow",
+                "shared task",
+                "shared task",
+                "failure",
+            ]
+        );
+        assert_ne!(pipeline_error.fingerprint(), job_error.fingerprint());
+        // The exception type matches the span's own `error.type`; only the description and the
+        // fingerprint separate the run-scoped report from the job-scoped one.
+        assert_eq!(pipeline_error.exception_type(), job_error.exception_type());
+        assert_ne!(pipeline_error.description(), job_error.description());
+        assert_eq!(
+            pipeline_error.description(),
+            "CI run job failed: shared task"
+        );
+        assert_eq!(
+            pipeline_error.trace_description(),
+            "Build Workflow / shared task"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_pipeline_task_reports_a_timeout_and_unnamed_jobs_group_across_runs() {
+        let timed_out = pipeline_task_error(Some("Linux Job"), WorkflowConclusion::TimedOut);
+        assert_eq!(timed_out.exception_type(), "GitHubActionsTaskTimeout");
+        assert_eq!(timed_out.description(), "CI run job timed out: Linux Job");
+
+        let unnamed = pipeline_task_error(None, WorkflowConclusion::Failure);
+        // The per-run job identifier stays in the description and tags but never in grouping.
+        assert_eq!(unnamed.description(), "CI run job failed: task 41");
+        assert_eq!(unnamed.task_run_id(), "41");
+        assert_eq!(unnamed.fingerprint()[4..6], ["unnamed-job", "unnamed-job"]);
     }
 
     #[test]

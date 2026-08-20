@@ -28,6 +28,10 @@ failing job; per-job traces are unchanged.
   `reported` only when every summarized job used reported timing.
 - No `exception` span events and no Sentry errors are raised on the pipeline trace — the job
   traces already report those exactly once.
+  **Superseded (issue #92).** Live Sentry verification showed the OpenTelemetry error status alone
+  never renders a pipeline span as errored. Failing job summaries now emit one bounded `exception`
+  span event and one run-scoped Sentry error under the `pipeline-task` fingerprint kind. See
+  `changelog/2026-08-19T22-00-00Z-pipeline-span-error-rendering.md`.
 
 ### New bounded persistence
 
@@ -89,3 +93,6 @@ projection, and two end-to-end OTLP tests driving real webhook deliveries throug
 Not run: live Sentry SaaS verification of how the new `github.actions.pipeline` operation and the
 span links render in a Sentry waterfall. The prior `github.actions.job` verification (2026-08-14)
 does not cover span links.
+
+**Closed by issue #92** on 2026-08-19: the live verification was run and found this gap real. See
+`changelog/2026-08-19T22-00-00Z-pipeline-span-error-rendering.md`.
