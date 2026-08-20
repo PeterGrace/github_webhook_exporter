@@ -16,12 +16,12 @@ Helm OCI chart only after full validation passes. The release workflow requires 
 before it authenticates. See [How to release a new version](../how-to/release-a-new-version.md)
 for the procedure that keeps all four version fields aligned.
 
-For example, after all four version fields are `0.1.9`, consume the published image and chart:
+For example, after all four version fields are `0.1.10`, consume the published image and chart:
 
 ```bash
-docker pull ghcr.io/petergrace/github-webhook-exporter:0.1.9
-helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.9
-helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.9
+docker pull ghcr.io/petergrace/github-webhook-exporter:0.1.10
+helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.10
+helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.10
 ```
 
 Published version tags are immutable. Existing image tags are never overwritten. An exact matching
@@ -65,7 +65,7 @@ KIND_ARTIFACT_DIRECTORY=dist/kind-lifecycle just helm-kind-lifecycle
 archive contracts across the supported Kubernetes range 1.31.0 through 1.35.0
 (`>=1.31.0-0 <1.36.0-0`). `just image-smoke` builds and exercises the production image locally.
 `just workflow-test` checks the GitHub Actions contract, including the exact archive path
-`dist/github-webhook-exporter-0.1.9.tgz`. `just helm-kind-acceptance` confirms API acceptance for
+`dist/github-webhook-exporter-0.1.10.tgz`. `just helm-kind-acceptance` confirms API acceptance for
 the rendered StatefulSet, Service, ConfigMap, and PVC; it does not start the exporter.
 
 `just helm-kind-lifecycle` builds and loads the `linux/amd64` production image into a uniquely
@@ -89,9 +89,9 @@ pins the Kind Kubernetes 1.35.0 node image by digest. CI uploads the diagnostics
 For local archive inspection, use the fixed package name directly:
 
 ```bash
-helm show chart dist/github-webhook-exporter-0.1.9.tgz
-helm show values dist/github-webhook-exporter-0.1.9.tgz
-helm template archive dist/github-webhook-exporter-0.1.9.tgz --kube-version 1.35.0 >/dev/null
+helm show chart dist/github-webhook-exporter-0.1.10.tgz
+helm show values dist/github-webhook-exporter-0.1.10.tgz
+helm template archive dist/github-webhook-exporter-0.1.10.tgz --kube-version 1.35.0 >/dev/null
 ```
 
 If `just helm-policy` fails, run `just helm-render` first, then inspect the rendered manifests
