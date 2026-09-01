@@ -55,6 +55,9 @@ jobs:
       - name: Verify release flow contracts
         run: just release-flow-test
 
+      - name: Verify release notes contracts
+        run: just release-notes-test
+
       - name: ShellCheck tracked shell scripts
         run: |
           mapfile -t shell_files < <(git ls-files -- '*.sh')
@@ -125,11 +128,13 @@ jobs:
     needs: validate
     runs-on: ubuntu-24.04
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
 
       - name: Validate release version alignment
         id: version
@@ -232,3 +237,10 @@ jobs:
         run: |
           scripts/release-publish.sh "${{ steps.version.outputs.version }}" \
               "$RELEASE_IMAGE" "${{ steps.chart.outputs.archive }}"
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          scripts/release-announce.sh "${{ steps.version.outputs.version }}" \
+              "${{ steps.chart.outputs.archive }}"

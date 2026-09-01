@@ -55,7 +55,7 @@ exist remotely. It validates the tag against the Cargo and chart versions via
 `scripts/release-version.sh` before changing any remote refs.
 
 Pushing the tag triggers the tag job in `.github/workflows/helm-package-ci.yml`, which packages
-and publishes the image and chart — see
+and publishes the image and chart, then mints the GitHub release for the tag — see
 [Release and packaging](../reference/release-and-packaging.md) for exactly what that job will and
 won't overwrite.
 
@@ -63,7 +63,20 @@ won't overwrite.
 
 ```bash
 gh run list --workflow helm-package-ci.yml --limit 3
+gh release view vX.Y.Z
 ```
+
+The release page carries the packaged chart archive and notes grouping every non-merge commit
+landed since the previous stable tag. To preview those notes before shipping, run the generator
+against a local tag:
+
+```bash
+scripts/release-changelog.sh X.Y.Z
+```
+
+If the workflow published the image and chart but failed before the release page existed, rerun the
+failed attempt without moving the tag: `scripts/release-announce.sh` skips an existing release page
+and creates a missing one, so the rerun is safe.
 
 ## If you need to abandon a prepared release
 

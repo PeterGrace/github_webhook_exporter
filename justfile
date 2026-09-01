@@ -57,6 +57,11 @@ release-flow-test:
 release-publish-test:
     scripts/release-publish-test.sh
 
+# Verify release changelog grouping and idempotent GitHub release publication.
+release-notes-test:
+    scripts/release-changelog-test.sh
+    scripts/release-announce-test.sh
+
 # Verify the GitHub Actions workflow contract.
 workflow-test:
     scripts/github-actions-test.sh .github/workflows/helm-package-ci.yml
