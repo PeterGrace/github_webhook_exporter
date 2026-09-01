@@ -776,8 +776,10 @@ fn register_fixture_dispatch(
     dispatch: &Dispatch,
 ) -> FixtureDispatchRegistration {
     FIXTURE_SPAN_CLOSER_INSTALLED.get_or_init(|| {
-        tracing::dispatcher::set_global_default(Dispatch::new(FixtureSpanCloser))
-            .expect("the test binary installs no other global tracing dispatcher");
+        tracing::dispatcher::set_global_default(Dispatch::new(FixtureSpanCloser)).expect(
+            "FixtureSpanCloser claims the lib test binary's global dispatcher, so no lib test may \
+             call telemetry::init or install a global default of its own",
+        );
     });
     let previous = active_fixture_dispatch()
         .write()
