@@ -1,6 +1,6 @@
 //! Bounded workflow telemetry values used to project authenticated GitHub Actions history.
 
-use std::{fmt, sync::Arc, time::SystemTime};
+use std::{borrow::Borrow, collections::BTreeSet, fmt, sync::Arc, time::SystemTime};
 
 use opentelemetry::{
     trace::{Span as _, SpanKind, Status, TraceContextExt, Tracer},
@@ -24,10 +24,11 @@ use super::{
         workflow_pipeline_run_url_attribute, workflow_pipeline_step_task_run_id_attribute,
         workflow_pipeline_task_run_id_attribute, workflow_pipeline_task_run_result_attribute,
         workflow_repository_name_attribute, workflow_repository_url_attribute,
-        workflow_run_attempt_attribute, workflow_source_branch_attribute,
-        workflow_step_task_run_url_attribute, workflow_target_branch_attribute,
-        workflow_task_name_attribute, workflow_task_run_url_attribute, CommitSha,
-        GITHUB_ACTIONS_JOB_OPERATION, GITHUB_ACTIONS_STEP_OPERATION,
+        workflow_required_attribute, workflow_run_attempt_attribute,
+        workflow_source_branch_attribute, workflow_step_task_run_url_attribute,
+        workflow_target_branch_attribute, workflow_task_name_attribute,
+        workflow_task_run_url_attribute, CommitSha, GITHUB_ACTIONS_JOB_OPERATION,
+        GITHUB_ACTIONS_STEP_OPERATION,
     },
     workflow_error::{SyntheticWorkflowError, WorkflowErrorReporter},
 };
@@ -35,6 +36,8 @@ use super::{
 const MAX_DISPLAY_NAME_LENGTH: usize = 128;
 const MAX_BRANCH_NAME_LENGTH: usize = 255;
 const MAX_PULL_REQUEST_COUNT: usize = 20;
+/// Maximum branch-protection required-check names retained for one repository branch.
+pub(crate) const MAX_REQUIRED_CHECK_COUNT: usize = 100;
 const UNKNOWN_WORKFLOW_NAME: &str = "workflow";
 const UNNAMED_JOB_NAME: &str = "job";
 const UNNAMED_STEP_NAME: &str = "step";
@@ -107,7 +110,7 @@ positive_i64_newtype!(
 );
 
 /// A sanitized GitHub Actions display name.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct DisplayName(String);
 
 impl DisplayName {
@@ -281,6 +284,7 @@ impl WorkflowJobTrace {
             head_sha: parts.head_sha,
             pull_requests: parts.pull_requests,
             workflow_run_context: parts.workflow_run_context,
+            required: parts.required,
             timing: parts.timing,
             steps: parts.steps,
         }
@@ -341,6 +345,40 @@ impl WorkflowJobTrace {
         self.workflow_run_context.as_ref()
     }
 
+    /// Returns whether this job is a branch-protection required status check.
+    ///
+    /// `None` means the required-check cache had no confident answer for this repository branch —
+    /// it was never fetched, or the cached entry aged past its TTL. Unknown is deliberately
+    /// distinct from `Some(false)`; consumers must treat it as its own bucket.
+    pub(crate) fn required(&self) -> Option<bool> {
+        self.required
+    }
+
+    /// Returns whether a confident "not required" answer suppresses parent-failure reporting.
+    ///
+    /// Only `Some(false)` suppresses. `Some(true)` and `None` both preserve the historical
+    /// behavior, so a cold cache can never silently stop flagging a genuine failure.
+    fn suppresses_failure(&self) -> bool {
+        self.required == Some(false)
+    }
+
+    /// Returns the bounded status recorded on the job root span.
+    ///
+    /// A failed or timed-out job that is confidently not required is left unset instead of being
+    /// recorded as an error; its step spans still carry their own conclusions unchanged.
+    pub(crate) fn root_status(&self) -> Status {
+        if self.suppresses_failure() {
+            Status::Unset
+        } else {
+            self.conclusion.status()
+        }
+    }
+
+    /// Returns whether the job root span emits a synthetic workflow error.
+    pub(crate) fn emits_root_synthetic_error(&self) -> bool {
+        !self.suppresses_failure() && self.conclusion.emits_synthetic_error()
+    }
+
     /// Returns the selected historical interval.
     pub(crate) fn timing(&self) -> &HistoricalTiming {
         &self.timing
@@ -371,6 +409,17 @@ impl WorkflowStepTrace {
     /// Returns the selected historical interval.
     pub(crate) fn timing(&self) -> &HistoricalTiming {
         &self.timing
+    }
+}
+
+/// Borrows the sanitized text so a [`BTreeSet<DisplayName>`] can be probed with a plain `&str`.
+///
+/// [`Ord`] for `DisplayName` delegates to the wrapped `String`, which orders identically to `str`,
+/// so the ordering the set was built with and the ordering a lookup uses agree — the invariant
+/// `Borrow` requires.
+impl Borrow<str> for DisplayName {
+    fn borrow(&self) -> &str {
+        &self.0
     }
 }
 
@@ -446,6 +495,59 @@ impl WorkflowBranch {
 impl fmt::Debug for WorkflowBranch {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("WorkflowBranch([REDACTED])")
+    }
+}
+
+/// The bounded branch-protection required status-check names of one repository branch.
+///
+/// GitHub models "required" as a branch-protection property keyed by check *name*, which for
+/// GitHub Actions is the job name. Names are stored as [`DisplayName`] values so a cached name and
+/// a job name projected from a webhook are sanitized identically and therefore directly
+/// comparable. An empty set is a valid, confident answer: it means the branch is protected by
+/// nothing, so no job on it is required.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RequiredChecks(BTreeSet<DisplayName>);
+
+impl RequiredChecks {
+    /// Creates a bounded required-check set, discarding duplicates.
+    ///
+    /// # Parameters
+    ///
+    /// * `names` - The candidate sanitized check names.
+    ///
+    /// # Returns
+    ///
+    /// A set holding at most [`MAX_REQUIRED_CHECK_COUNT`] distinct names. Names beyond the cap are
+    /// dropped, so an over-long upstream response is bounded rather than rejected.
+    pub(crate) fn new<I>(names: I) -> Self
+    where
+        I: IntoIterator<Item = DisplayName>,
+    {
+        // `BTreeSet` deduplicates as it inserts, so the cap is applied to the retained set rather
+        // than to the raw input: a response repeating one name cannot crowd out the others.
+        let mut retained = BTreeSet::new();
+        for name in names {
+            if retained.len() == MAX_REQUIRED_CHECK_COUNT {
+                break;
+            }
+            retained.insert(name);
+        }
+        Self(retained)
+    }
+
+    /// Returns whether `name` is a required status check for this branch.
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.0.contains(name)
+    }
+
+    /// Returns the retained check names in a stable order.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(DisplayName::as_str)
+    }
+
+    /// Returns the number of retained check names.
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -576,7 +678,7 @@ impl WorkflowTraceEmitter {
                 .with_attributes(job_attributes(job)),
             &Context::new(),
         );
-        root.set_status(job.conclusion().status());
+        root.set_status(job.root_status());
         let root_span_context = root.span_context().clone();
         let identity = WorkflowJobTraceIdentity::new(
             root_span_context.trace_id(),
@@ -616,7 +718,7 @@ impl WorkflowTraceEmitter {
             span.end_with_timestamp(step.timing().end());
         }
 
-        if !child_error_emitted && job.conclusion().emits_synthetic_error() {
+        if !child_error_emitted && job.emits_root_synthetic_error() {
             let error = SyntheticWorkflowError::for_job(
                 job,
                 root_span_context.trace_id(),
@@ -645,6 +747,7 @@ fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
             + usize::from(job.head_sha().is_some())
             + usize::from(!job.pull_requests().is_empty())
             + usize::from(job.conclusion().error_type().is_some())
+            + usize::from(job.required().is_some())
             + job.workflow_run_context().map_or(0, |context| {
                 1 + usize::from(context.source_branch().is_some())
                     + usize::from(context.target_branch().is_some())
@@ -661,6 +764,9 @@ fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
     ));
     if let Some(error_type) = workflow_error_type_attribute(job.conclusion()) {
         attributes.push(error_type);
+    }
+    if let Some(required) = workflow_required_attribute(job.required()) {
+        attributes.push(required);
     }
     if let Some(pull_request_numbers) = pull_request_numbers_attribute(job.pull_requests()) {
         attributes.push(pull_request_numbers);
@@ -682,6 +788,7 @@ fn step_attributes(job: &WorkflowJobTrace, step: &WorkflowStepTrace) -> Vec<KeyV
         STEP_REQUIRED_ATTRIBUTE_COUNT
             + usize::from(job.head_sha().is_some())
             + usize::from(step.conclusion().error_type().is_some())
+            + usize::from(job.required().is_some())
             + job.workflow_run_context().map_or(0, |context| {
                 1 + usize::from(context.source_branch().is_some())
                     + usize::from(context.target_branch().is_some())
@@ -699,6 +806,10 @@ fn step_attributes(job: &WorkflowJobTrace, step: &WorkflowStepTrace) -> Vec<KeyV
     ));
     if let Some(error_type) = workflow_error_type_attribute(step.conclusion()) {
         attributes.push(error_type);
+    }
+    // No per-step source of "required" exists in GitHub's model, so a step inherits its job's flag.
+    if let Some(required) = workflow_required_attribute(job.required()) {
+        attributes.push(required);
     }
     append_workflow_run_context(&mut attributes, job.workflow_run_context());
     attributes.push(workflow_step_task_run_url_attribute(
@@ -975,6 +1086,7 @@ pub(crate) struct WorkflowJobTraceParts {
     pub(crate) head_sha: Option<CommitSha>,
     pub(crate) pull_requests: WorkflowPullRequests,
     pub(crate) workflow_run_context: Option<WorkflowRunContext>,
+    pub(crate) required: Option<bool>,
     pub(crate) timing: HistoricalTiming,
     pub(crate) steps: Vec<WorkflowStepTrace>,
 }
@@ -993,6 +1105,7 @@ pub(crate) struct WorkflowJobTrace {
     head_sha: Option<CommitSha>,
     pull_requests: WorkflowPullRequests,
     workflow_run_context: Option<WorkflowRunContext>,
+    required: Option<bool>,
     timing: HistoricalTiming,
     steps: Vec<WorkflowStepTrace>,
 }
@@ -1060,10 +1173,10 @@ mod tests {
     };
 
     use super::{
-        DisplayName, HistoricalTiming, TimingSource, WorkflowBranch, WorkflowConclusion,
-        WorkflowEvent, WorkflowJobId, WorkflowJobTrace, WorkflowJobTraceParts,
+        DisplayName, HistoricalTiming, RequiredChecks, TimingSource, WorkflowBranch,
+        WorkflowConclusion, WorkflowEvent, WorkflowJobId, WorkflowJobTrace, WorkflowJobTraceParts,
         WorkflowPullRequests, WorkflowRunAttempt, WorkflowRunContext, WorkflowRunId,
-        WorkflowStepTrace, WorkflowTraceEmitter,
+        WorkflowStepTrace, WorkflowTraceEmitter, MAX_REQUIRED_CHECK_COUNT,
     };
     use crate::{
         domain::merge_queue::PullRequestNumber,
@@ -1284,6 +1397,7 @@ mod tests {
             head_sha: Some(head_sha.clone()),
             pull_requests,
             workflow_run_context: None,
+            required: None,
             timing: timing.clone(),
             steps: vec![step.clone()],
         });
@@ -1364,6 +1478,14 @@ mod tests {
         job_conclusion: WorkflowConclusion,
         step_conclusions: &[WorkflowConclusion],
     ) -> WorkflowJobTrace {
+        workflow_job_with_required(job_conclusion, step_conclusions, None)
+    }
+
+    fn workflow_job_with_required(
+        job_conclusion: WorkflowConclusion,
+        step_conclusions: &[WorkflowConclusion],
+        required: Option<bool>,
+    ) -> WorkflowJobTrace {
         let timing = HistoricalTiming::fallback(SystemTime::UNIX_EPOCH + Duration::from_secs(20));
         let steps = step_conclusions
             .iter()
@@ -1395,6 +1517,7 @@ mod tests {
             head_sha: None,
             pull_requests: WorkflowPullRequests::new([]),
             workflow_run_context: None,
+            required,
             timing,
             steps,
         })
@@ -1606,6 +1729,7 @@ mod tests {
             head_sha: None,
             pull_requests: WorkflowPullRequests::new([]),
             workflow_run_context: None,
+            required: None,
             timing: job_timing,
             steps: vec![
                 WorkflowStepTrace::new(
@@ -1702,6 +1826,7 @@ mod tests {
             head_sha: None,
             pull_requests: WorkflowPullRequests::new([]),
             workflow_run_context: None,
+            required: None,
             timing: job_timing.clone(),
             steps: vec![
                 WorkflowStepTrace::new(
@@ -1822,6 +1947,7 @@ mod tests {
                 WorkflowBranch::sanitize("gh-readonly-queue/main/pr-7"),
                 WorkflowBranch::sanitize("main"),
             )),
+            required: None,
             timing: job_timing.clone(),
             steps: vec![
                 WorkflowStepTrace::new(
@@ -2054,6 +2180,142 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn required_check_sets_deduplicate_and_cap_at_one_hundred_names() {
+        let checks = RequiredChecks::new(
+            std::iter::repeat_with(|| DisplayName::sanitize("build"))
+                .take(5)
+                .chain((0..150).map(|index| DisplayName::sanitize(&format!("check-{index:03}"))))
+                .flatten(),
+        );
+
+        assert_eq!(checks.len(), MAX_REQUIRED_CHECK_COUNT);
+        assert!(checks.contains("build"));
+        assert!(!checks.contains("absent"));
+        // `BTreeSet` ordering makes the retained window deterministic rather than input-order.
+        assert_eq!(
+            checks.names().take(2).collect::<Vec<_>>(),
+            ["build", "check-000"]
+        );
+    }
+
+    #[test]
+    fn an_empty_required_check_set_matches_nothing() {
+        let checks = RequiredChecks::default();
+
+        assert_eq!(checks.len(), 0);
+        assert!(!checks.contains("build"));
+        assert_eq!(checks.names().count(), 0);
+    }
+
+    #[test]
+    fn a_known_required_status_is_emitted_on_the_job_and_inherited_by_every_step() {
+        for required in [true, false] {
+            let job = workflow_job_with_required(
+                WorkflowConclusion::Success,
+                &[WorkflowConclusion::Success],
+                Some(required),
+            );
+
+            let (spans, _) = emitted_spans_and_errors(&job);
+
+            for span in &spans {
+                assert_eq!(
+                    attribute(span, "github.workflow.required"),
+                    Some(&Value::Bool(required)),
+                    "span {} is missing the required attribute",
+                    span.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_required_status_omits_the_attribute_entirely() {
+        let job = workflow_job_with_required(
+            WorkflowConclusion::Success,
+            &[WorkflowConclusion::Success],
+            None,
+        );
+
+        let (spans, _) = emitted_spans_and_errors(&job);
+
+        assert!(!spans.is_empty());
+        for span in &spans {
+            assert!(
+                !attribute_keys(span).contains("github.workflow.required"),
+                "span {} must omit the required attribute when the answer is unknown",
+                span.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_confidently_optional_failed_job_does_not_report_its_root_span_as_an_error() {
+        let job = workflow_job_with_required(
+            WorkflowConclusion::Failure,
+            &[WorkflowConclusion::Success],
+            Some(false),
+        );
+
+        let (spans, errors) = emitted_spans_and_errors(&job);
+        let job_span = spans
+            .iter()
+            .find(|span| span.name == "Build Workflow / Linux Job")
+            .expect("job span is exported");
+
+        assert_eq!(job_span.status, Status::Unset);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn a_required_or_unknown_failed_job_still_reports_its_root_span_as_an_error() {
+        for required in [Some(true), None] {
+            let job = workflow_job_with_required(
+                WorkflowConclusion::Failure,
+                &[WorkflowConclusion::Success],
+                required,
+            );
+
+            let (spans, errors) = emitted_spans_and_errors(&job);
+            let job_span = spans
+                .iter()
+                .find(|span| span.name == "Build Workflow / Linux Job")
+                .expect("job span is exported");
+
+            assert_eq!(
+                job_span.status,
+                Status::error("workflow_failed"),
+                "required={required:?} must preserve failure reporting"
+            );
+            assert_eq!(errors.len(), 1, "required={required:?}");
+        }
+    }
+
+    #[test]
+    fn suppressing_a_parent_failure_leaves_step_conclusions_untouched() {
+        let job = workflow_job_with_required(
+            WorkflowConclusion::Failure,
+            &[WorkflowConclusion::Failure],
+            Some(false),
+        );
+
+        let (spans, errors) = emitted_spans_and_errors(&job);
+        let job_span = spans
+            .iter()
+            .find(|span| span.name == "Build Workflow / Linux Job")
+            .expect("job span is exported");
+        let step_span = spans
+            .iter()
+            .find(|span| span.name == "Step 1")
+            .expect("step span is exported");
+
+        assert_eq!(job_span.status, Status::Unset);
+        // The step is the factual record of what failed; only the parent's verdict is suppressed.
+        assert_eq!(step_span.status, Status::error("workflow_failed"));
+        assert_eq!(errors.len(), 1);
     }
 
     fn attribute<'span>(span: &'span SpanData, key: &str) -> Option<&'span Value> {

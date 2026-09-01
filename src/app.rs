@@ -15,12 +15,18 @@ use tokio::{net::TcpListener, sync::watch};
 use tracing::Instrument;
 
 use crate::{
-    api, health,
+    api,
+    config::{GitHubAppConfig, DEFAULT_REQUIRED_CHECK_TTL_SECONDS},
+    github::{
+        GitHubAppClient, GitHubClientError, RequiredCheckRefreshHandle, RequiredCheckRefresher,
+    },
+    health, lifecycle,
     metrics::{self, Metrics},
     retention::{run_retention, RetentionConfig},
     security::{AdminAuthenticator, CanonicalRepositoryName},
     storage::{
-        DeliveryStore, MergeQueueStore, RepositoryStore, WorkflowJobLinkStore, WorkflowRunStore,
+        DeliveryStore, MergeQueueStore, RepositoryStore, RequiredCheckStore, WorkflowJobLinkStore,
+        WorkflowRunStore,
     },
     telemetry::{
         trace::{self, Operation},
@@ -55,6 +61,8 @@ pub struct AppState {
     merge_queue_store: MergeQueueStore,
     workflow_run_store: WorkflowRunStore,
     workflow_job_link_store: WorkflowJobLinkStore,
+    required_check_store: RequiredCheckStore,
+    required_check_refresher: Option<RequiredCheckRefreshHandle>,
     metrics: Metrics,
     workflow_trace_emitter: WorkflowTraceEmitter,
     webhook_body_limit_bytes: usize,
@@ -74,6 +82,10 @@ impl AppState {
         let merge_queue_store = MergeQueueStore::new(database_pool.clone());
         let workflow_run_store = WorkflowRunStore::new(database_pool.clone());
         let workflow_job_link_store = WorkflowJobLinkStore::new(database_pool.clone());
+        let required_check_store = RequiredCheckStore::new(
+            database_pool.clone(),
+            Duration::from_secs(DEFAULT_REQUIRED_CHECK_TTL_SECONDS),
+        );
         Self {
             repository_store: Arc::new(repository_store),
             admin_authenticator: Arc::new(admin_authenticator),
@@ -82,6 +94,8 @@ impl AppState {
             merge_queue_store,
             workflow_run_store,
             workflow_job_link_store,
+            required_check_store,
+            required_check_refresher: None,
             metrics: Metrics::new(),
             workflow_trace_emitter: WorkflowTraceEmitter::disabled(),
             webhook_body_limit_bytes,
@@ -93,6 +107,42 @@ impl AppState {
     pub fn with_metrics(mut self, metrics: Metrics) -> Self {
         self.metrics = metrics;
         self
+    }
+
+    /// Returns application state whose required-check cache honors `time_to_live`.
+    ///
+    /// # Parameters
+    ///
+    /// * `time_to_live` - How long a cached branch-protection answer stays confident.
+    pub fn with_required_check_ttl(mut self, time_to_live: Duration) -> Self {
+        self.required_check_store =
+            RequiredCheckStore::new(self.database_pool.clone(), time_to_live);
+        self
+    }
+
+    /// Enables out-of-band branch-protection required-check lookups for this state.
+    ///
+    /// The returned refresher must be handed to [`BackgroundServices`] and driven alongside the
+    /// server; until it runs, the cache stays empty and every job reports "required" as unknown.
+    /// Leaving this unconfigured is a supported deployment, not a degraded one.
+    ///
+    /// # Parameters
+    ///
+    /// * `github_app` - The validated GitHub App credentials that authorize the lookups.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GitHubClientError`] when the configured private key is unusable or the outbound
+    /// HTTP client cannot be built.
+    pub fn enable_required_check_refresh(
+        &mut self,
+        github_app: &GitHubAppConfig,
+    ) -> Result<RequiredCheckRefresher, GitHubClientError> {
+        let client = GitHubAppClient::new(github_app)?;
+        let (handle, refresher) =
+            RequiredCheckRefresher::new(client, self.required_check_store.clone());
+        self.required_check_refresher = Some(handle);
+        Ok(refresher)
     }
 
     /// Returns application state updated with the configured workflow trace emitter.
@@ -150,6 +200,16 @@ impl AppState {
         &self.workflow_job_link_store
     }
 
+    /// Returns the branch-protection required-check cache read by the webhook path.
+    pub(crate) fn required_check_store(&self) -> &RequiredCheckStore {
+        &self.required_check_store
+    }
+
+    /// Returns the out-of-band required-check refresher handle, when a GitHub App is configured.
+    pub(crate) fn required_check_refresher(&self) -> Option<&RequiredCheckRefreshHandle> {
+        self.required_check_refresher.as_ref()
+    }
+
     /// Returns the shared bounded metrics component.
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
@@ -196,6 +256,43 @@ async fn observe_http_request(mut request: Request, next: Next) -> Response {
     response
 }
 
+/// The background workloads served alongside HTTP requests.
+///
+/// Grouping them keeps [`serve_with_shutdown`] within the project's parameter budget and makes the
+/// optional workload explicit at every call site.
+#[derive(Debug)]
+pub struct BackgroundServices {
+    retention: RetentionConfig,
+    required_check_refresher: Option<RequiredCheckRefresher>,
+}
+
+impl BackgroundServices {
+    /// Creates the background workload set from validated retention configuration.
+    ///
+    /// # Parameters
+    ///
+    /// * `retention` - The validated retention schedule and age limits.
+    pub fn new(retention: RetentionConfig) -> Self {
+        Self {
+            retention,
+            required_check_refresher: None,
+        }
+    }
+
+    /// Returns the workload set extended with the out-of-band required-check refresher.
+    ///
+    /// # Parameters
+    ///
+    /// * `required_check_refresher` - The refresher that fills the required-check cache.
+    pub fn with_required_check_refresher(
+        mut self,
+        required_check_refresher: RequiredCheckRefresher,
+    ) -> Self {
+        self.required_check_refresher = Some(required_check_refresher);
+        self
+    }
+}
+
 /// The normalized result of serving after a graceful-shutdown request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownOutcome {
@@ -219,25 +316,39 @@ pub async fn serve_with_shutdown<S>(
     state: AppState,
     shutdown: S,
     shutdown_timeout: Duration,
-    retention_config: RetentionConfig,
+    background: BackgroundServices,
 ) -> std::io::Result<ShutdownOutcome>
 where
     S: Future<Output = ()>,
 {
     let delivery_store = state.delivery_store.clone();
     let merge_queue_store = state.merge_queue_store.clone();
+    let BackgroundServices {
+        retention,
+        required_check_refresher,
+    } = background;
     serve_router_with_background_shutdown(
         listener,
         build_router(state),
         shutdown,
         shutdown_timeout,
-        move |cancellation| {
-            run_retention(
-                delivery_store,
-                merge_queue_store,
-                retention_config,
-                cancellation,
-            )
+        move |cancellation| async move {
+            let refresh = async {
+                if let Some(refresher) = required_check_refresher {
+                    refresher.run(cancellation.clone()).await;
+                }
+            };
+            // Both background workloads observe the same cancellation channel, so joining them
+            // keeps a single background task handle while letting either stop independently.
+            tokio::join!(
+                run_retention(
+                    delivery_store,
+                    merge_queue_store,
+                    retention,
+                    cancellation.clone(),
+                ),
+                refresh,
+            );
         },
     )
     .await
@@ -259,11 +370,7 @@ where
         shutdown,
         shutdown_timeout,
         |mut cancellation| async move {
-            while !*cancellation.borrow() {
-                if cancellation.changed().await.is_err() {
-                    return;
-                }
-            }
+            lifecycle::wait_for_cancellation(&mut cancellation).await;
         },
     )
     .await
@@ -285,11 +392,7 @@ where
     let mut server_cancellation = cancellation_receiver.clone();
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            while !*server_cancellation.borrow() {
-                if server_cancellation.changed().await.is_err() {
-                    return;
-                }
-            }
+            lifecycle::wait_for_cancellation(&mut server_cancellation).await;
         })
         .into_future();
     let mut background = tokio::spawn(background(cancellation_receiver));

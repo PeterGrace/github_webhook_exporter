@@ -1,6 +1,7 @@
 mod delivery_store;
 mod merge_queue_store;
 mod repository_store;
+mod required_check_store;
 mod workflow_job_link_store;
 mod workflow_run_store;
 
@@ -14,6 +15,7 @@ pub use merge_queue_store::{
     CompletionTransition, EnqueueTransition, MergeQueueStore, MergeQueueStoreError,
 };
 pub use repository_store::{RepositoryStore, RepositoryStoreError};
+pub(crate) use required_check_store::{RequiredCheckStore, RequiredCheckStoreError};
 use sqlx::{
     migrate::MigrateError,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},

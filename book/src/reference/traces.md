@@ -144,6 +144,41 @@ An earlier authenticated `workflow_run` delivery supplies the authoritative norm
 most 255 Unicode scalar values. Missing or ambiguous branches are omitted. The same available
 context is attached to the job root and every step.
 
+### Branch-protection required checks
+
+`github.workflow.required` is a boolean reporting whether a job is a **branch-protection required
+status check** on the workflow run's target branch. GitHub models "required" at the granularity of
+a check *name*, which for GitHub Actions is the job name; there is no per-step notion of required
+in GitHub's data model, and the `workflow_job` payload carries no such field. The job's flag is
+therefore attached to the job root and inherited unchanged by every step span.
+
+The attribute is tri-state, and the third state is **absence**. It is emitted only when the local
+cache holds a confident answer for the target branch. An unknown answer omits the attribute
+entirely rather than defaulting to `true` or `false`, so consumers must treat "attribute missing" as
+its own bucket and never as "not required". The answer is unknown when no GitHub App is configured,
+when the run has no known target branch, when the branch has not been looked up yet, or when the
+cached entry has aged past `GHE_REQUIRED_CHECK_TTL_SECONDS`.
+
+**The webhook path never calls GitHub.** It reads the local cache and nothing else. A miss or a
+stale entry emits "unknown", queues an out-of-band refresh, and returns the authenticated
+`204 No Content` immediately. A slow, rate-limited, or unavailable GitHub API therefore cannot delay
+a webhook acknowledgement, and cannot cause a redelivery. Refreshes run in a background task that
+mints one short-lived GitHub App installation token and reuses it across branches; a refresh request
+that arrives while the queue is full is dropped, leaving the branch unknown until the next delivery
+asks again. A branch with no protection at all answers with a confident empty set, so its jobs are
+reported as `github.workflow.required=false` rather than unknown.
+
+Cached entries hold only the repository, the sanitized target branch, the sanitized required-check
+names, and a timestamp. They are pruned on the processed-delivery retention cutoff alongside the
+other correlation caches.
+
+**Failure reporting.** A failed or timed-out job whose required status is a confident `false` leaves
+its root span status unset and emits no job-level `exception` event or Sentry error — an optional
+gate failing is not a run failure. Only `Some(false)` suppresses: `true` and unknown both preserve
+the normal behavior, so a cold cache can never silently stop flagging a genuine failure. Step spans
+are never suppressed; they always record what actually happened, so a suppressed job can still have
+a child step marked as an error.
+
 Payload-provided URLs remain ignored. Derived CI/CD and VCS URLs are span-only and never enter logs
 or metrics.
 

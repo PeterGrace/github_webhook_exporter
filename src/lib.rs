@@ -10,6 +10,8 @@ pub mod config;
 pub mod domain;
 /// Safe HTTP-facing application errors.
 pub mod error;
+/// Outbound GitHub App access that fills the branch-protection required-check cache.
+pub mod github;
 /// Unauthenticated process liveness and SQLite readiness endpoints.
 pub mod health;
 /// Operating-system signal normalization for graceful process shutdown.

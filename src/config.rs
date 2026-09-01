@@ -36,6 +36,10 @@ const DEFAULT_OTEL_EXPORT_TIMEOUT_MILLISECONDS: u64 = 10_000;
 pub(crate) const DEFAULT_OTEL_QUEUE_CAPACITY: usize = 2_048;
 pub(crate) const DEFAULT_OTEL_BATCH_SIZE: usize = 512;
 const DEFAULT_OTEL_SHUTDOWN_TIMEOUT_SECONDS: u64 = 5;
+const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
+/// Default lifetime of a cached branch-protection required-check answer.
+pub(crate) const DEFAULT_REQUIRED_CHECK_TTL_SECONDS: u64 = 300;
+const MAX_REQUIRED_CHECK_TTL_SECONDS: u64 = 86_400;
 
 type SensitiveHeaders = Vec<(String, Zeroizing<String>)>;
 
@@ -143,6 +147,90 @@ impl fmt::Debug for ExporterSettings {
     }
 }
 
+/// Validated, redacted GitHub App credentials used to read branch-protection required checks.
+///
+/// This is the service's only outbound GitHub credential. It is optional: without it the
+/// required-check cache is simply never filled and every workflow job reports "required" as
+/// unknown.
+pub struct GitHubAppConfig {
+    app_id: u64,
+    installation_id: u64,
+    private_key_pem: Zeroizing<Vec<u8>>,
+    api_base_url: String,
+}
+
+impl GitHubAppConfig {
+    /// Returns the numeric GitHub App identifier used as the JWT issuer.
+    pub fn app_id(&self) -> u64 {
+        self.app_id
+    }
+
+    /// Returns the installation whose token authorizes branch-protection reads.
+    pub fn installation_id(&self) -> u64 {
+        self.installation_id
+    }
+
+    /// Returns the PEM-encoded RSA private key that signs the App JWT.
+    pub(crate) fn private_key_pem(&self) -> &[u8] {
+        &self.private_key_pem
+    }
+
+    /// Returns the GitHub REST API base URL, without a trailing slash.
+    pub fn api_base_url(&self) -> &str {
+        &self.api_base_url
+    }
+
+    /// Loads the optional GitHub App credentials.
+    ///
+    /// The feature is enabled only when the App identifier, the installation identifier, and
+    /// exactly one form of private key are all supplied. Supplying some but not all of them is an
+    /// error rather than a silent fallback to "disabled", because a half-configured deployment
+    /// would otherwise report every job's required status as unknown with no signal why.
+    fn from_lookup(
+        lookup: &mut impl FnMut(&str) -> Option<OsString>,
+    ) -> Result<Option<Self>, ConfigError> {
+        let app_id = optional_positive_u64_variable(lookup, "GHE_GITHUB_APP_ID")?;
+        let installation_id =
+            optional_positive_u64_variable(lookup, "GHE_GITHUB_APP_INSTALLATION_ID")?;
+        let private_key_pem = optional_private_key(lookup)?;
+
+        match (app_id, installation_id, private_key_pem) {
+            (None, None, None) => Ok(None),
+            (Some(app_id), Some(installation_id), Some(private_key_pem)) => {
+                let api_base_url = validated_endpoint(lookup, "GHE_GITHUB_API_BASE_URL")?
+                    .unwrap_or_else(|| DEFAULT_GITHUB_API_BASE_URL.to_owned());
+                Ok(Some(Self {
+                    app_id,
+                    installation_id,
+                    private_key_pem,
+                    api_base_url: api_base_url.trim_end_matches('/').to_owned(),
+                }))
+            }
+            (None, _, _) => Err(ConfigError::Missing {
+                variable: "GHE_GITHUB_APP_ID",
+            }),
+            (_, None, _) => Err(ConfigError::Missing {
+                variable: "GHE_GITHUB_APP_INSTALLATION_ID",
+            }),
+            (_, _, None) => Err(ConfigError::Missing {
+                variable: "GHE_GITHUB_APP_PRIVATE_KEY_PATH",
+            }),
+        }
+    }
+}
+
+impl fmt::Debug for GitHubAppConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitHubAppConfig")
+            .field("app_id", &self.app_id)
+            .field("installation_id", &self.installation_id)
+            .field("private_key_pem", &"[REDACTED]")
+            .field("api_base_url", &self.api_base_url)
+            .finish()
+    }
+}
+
 /// Fully validated process configuration loaded from environment variables.
 pub struct RuntimeConfig {
     database_path: PathBuf,
@@ -155,6 +243,8 @@ pub struct RuntimeConfig {
     delivery_retention: Duration,
     merge_queue_retention: Duration,
     delivery_prune_interval: Duration,
+    required_check_ttl: Duration,
+    github_app: Option<GitHubAppConfig>,
     rust_log: String,
     telemetry: TelemetryConfig,
 }
@@ -218,6 +308,16 @@ impl RuntimeConfig {
     /// Returns the interval between retention pruning passes.
     pub fn delivery_prune_interval(&self) -> Duration {
         self.delivery_prune_interval
+    }
+
+    /// Returns how long a cached branch-protection required-check answer stays confident.
+    pub fn required_check_ttl(&self) -> Duration {
+        self.required_check_ttl
+    }
+
+    /// Returns the optional GitHub App credentials that fill the required-check cache.
+    pub fn github_app(&self) -> Option<&GitHubAppConfig> {
+        self.github_app.as_ref()
     }
 
     /// Returns the validated tracing filter directive.
@@ -338,6 +438,18 @@ impl RuntimeConfig {
             DEFAULT_DELIVERY_PRUNE_INTERVAL_SECONDS,
         )?;
 
+        let required_check_ttl_seconds = optional_positive_u64(
+            &mut lookup,
+            "GHE_REQUIRED_CHECK_TTL_SECONDS",
+            DEFAULT_REQUIRED_CHECK_TTL_SECONDS,
+        )?;
+        if required_check_ttl_seconds > MAX_REQUIRED_CHECK_TTL_SECONDS {
+            return Err(ConfigError::Invalid {
+                variable: "GHE_REQUIRED_CHECK_TTL_SECONDS",
+            });
+        }
+        let github_app = GitHubAppConfig::from_lookup(&mut lookup)?;
+
         let rust_log = optional_string(&mut lookup, "RUST_LOG")?
             .unwrap_or_else(|| DEFAULT_RUST_LOG.to_owned());
         EnvFilter::try_new(&rust_log).map_err(|_| ConfigError::Invalid {
@@ -357,6 +469,8 @@ impl RuntimeConfig {
             delivery_retention: Duration::from_secs(delivery_retention_seconds),
             merge_queue_retention: Duration::from_secs(merge_queue_retention_seconds),
             delivery_prune_interval: Duration::from_secs(delivery_prune_interval_seconds),
+            required_check_ttl: Duration::from_secs(required_check_ttl_seconds),
+            github_app,
             rust_log,
             telemetry,
         })
@@ -472,6 +586,8 @@ impl fmt::Debug for RuntimeConfig {
             .field("delivery_retention", &self.delivery_retention)
             .field("merge_queue_retention", &self.merge_queue_retention)
             .field("delivery_prune_interval", &self.delivery_prune_interval)
+            .field("required_check_ttl", &self.required_check_ttl)
+            .field("github_app", &self.github_app)
             .field("rust_log", &self.rust_log)
             .field("telemetry", &self.telemetry)
             .finish()
@@ -556,6 +672,69 @@ fn optional_positive_u64(
     }
 
     Ok(value)
+}
+
+/// Reads an optional positive `u64` variable, treating absence as `None` rather than a default.
+fn optional_positive_u64_variable(
+    lookup: &mut impl FnMut(&str) -> Option<OsString>,
+    variable: &'static str,
+) -> Result<Option<u64>, ConfigError> {
+    optional_string(lookup, variable)?
+        .map(|value| {
+            let parsed = value
+                .parse::<u64>()
+                .map_err(|_| ConfigError::Invalid { variable })?;
+            if parsed == 0 {
+                return Err(ConfigError::Invalid { variable });
+            }
+            Ok(parsed)
+        })
+        .transpose()
+}
+
+/// Reads the GitHub App private key from a mounted file, or from a base64 environment variable.
+///
+/// `GHE_GITHUB_APP_PRIVATE_KEY_PATH` wins when both are set, so an operator who mounts a Kubernetes
+/// secret is never silently served a stale value left behind in the environment. The file form is
+/// read verbatim, since a mounted PEM is already the raw key.
+fn optional_private_key(
+    lookup: &mut impl FnMut(&str) -> Option<OsString>,
+) -> Result<Option<Zeroizing<Vec<u8>>>, ConfigError> {
+    if let Some(path) = optional_string(lookup, "GHE_GITHUB_APP_PRIVATE_KEY_PATH")? {
+        if path.is_empty() {
+            return Err(ConfigError::Invalid {
+                variable: "GHE_GITHUB_APP_PRIVATE_KEY_PATH",
+            });
+        }
+        let contents = Zeroizing::new(std::fs::read(&path).map_err(|_| ConfigError::Invalid {
+            variable: "GHE_GITHUB_APP_PRIVATE_KEY_PATH",
+        })?);
+        if contents.is_empty() {
+            return Err(ConfigError::Invalid {
+                variable: "GHE_GITHUB_APP_PRIVATE_KEY_PATH",
+            });
+        }
+        return Ok(Some(contents));
+    }
+
+    let Some(encoded) = optional_string(lookup, "GHE_GITHUB_APP_PRIVATE_KEY")?.map(Zeroizing::new)
+    else {
+        return Ok(None);
+    };
+    let decoded =
+        Zeroizing::new(
+            STANDARD
+                .decode(encoded.as_bytes())
+                .map_err(|_| ConfigError::Invalid {
+                    variable: "GHE_GITHUB_APP_PRIVATE_KEY",
+                })?,
+        );
+    if decoded.is_empty() {
+        return Err(ConfigError::Invalid {
+            variable: "GHE_GITHUB_APP_PRIVATE_KEY",
+        });
+    }
+    Ok(Some(decoded))
 }
 
 fn validated_endpoint(
@@ -666,7 +845,10 @@ mod tests {
 
     use crate::security::{AdminAuthenticator, RepositorySecretCipher};
 
-    use super::{ConfigError, RuntimeConfig, DEFAULT_OTEL_BATCH_SIZE, DEFAULT_OTEL_QUEUE_CAPACITY};
+    use super::{
+        ConfigError, RuntimeConfig, DEFAULT_GITHUB_API_BASE_URL, DEFAULT_OTEL_BATCH_SIZE,
+        DEFAULT_OTEL_QUEUE_CAPACITY,
+    };
 
     const ADMIN_TOKEN: &str = "admin-token-value";
 
@@ -1084,5 +1266,138 @@ mod tests {
         assert!(!rendered.contains("example.ingest.sentry.io"));
         assert!(!rendered.contains("public:secret"));
         assert!(rendered.contains("[REDACTED]"));
+    }
+
+    const PRIVATE_KEY_PEM: &str =
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END RSA PRIVATE KEY-----\n";
+
+    fn github_app_variables() -> HashMap<String, OsString> {
+        let mut variables = required_variables();
+        variables.insert("GHE_GITHUB_APP_ID".to_owned(), OsString::from("12345"));
+        variables.insert(
+            "GHE_GITHUB_APP_INSTALLATION_ID".to_owned(),
+            OsString::from("67890"),
+        );
+        variables.insert(
+            "GHE_GITHUB_APP_PRIVATE_KEY".to_owned(),
+            OsString::from(STANDARD.encode(PRIVATE_KEY_PEM)),
+        );
+        variables
+    }
+
+    #[test]
+    fn required_check_lookups_are_off_by_default_with_a_five_minute_cache() {
+        let config = RuntimeConfig::from_map(required_variables()).expect("configuration is valid");
+
+        assert!(config.github_app().is_none());
+        assert_eq!(config.required_check_ttl(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn a_complete_github_app_configuration_decodes_its_base64_private_key() {
+        let config =
+            RuntimeConfig::from_map(github_app_variables()).expect("configuration is valid");
+        let github_app = config.github_app().expect("GitHub App is configured");
+
+        assert_eq!(github_app.app_id(), 12_345);
+        assert_eq!(github_app.installation_id(), 67_890);
+        assert_eq!(github_app.private_key_pem(), PRIVATE_KEY_PEM.as_bytes());
+        assert_eq!(github_app.api_base_url(), DEFAULT_GITHUB_API_BASE_URL);
+    }
+
+    #[test]
+    fn a_mounted_private_key_file_wins_over_the_base64_variable() {
+        let directory = tempfile::tempdir().expect("temporary directory exists");
+        let path = directory.path().join("app.pem");
+        std::fs::write(&path, "mounted-key").expect("key file is written");
+        let mut variables = github_app_variables();
+        variables.insert(
+            "GHE_GITHUB_APP_PRIVATE_KEY_PATH".to_owned(),
+            OsString::from(path.as_os_str()),
+        );
+
+        let config = RuntimeConfig::from_map(variables).expect("configuration is valid");
+
+        assert_eq!(
+            config
+                .github_app()
+                .expect("GitHub App is configured")
+                .private_key_pem(),
+            b"mounted-key"
+        );
+    }
+
+    #[test]
+    fn a_partial_github_app_configuration_is_rejected_rather_than_silently_disabled() {
+        for absent in [
+            "GHE_GITHUB_APP_ID",
+            "GHE_GITHUB_APP_INSTALLATION_ID",
+            "GHE_GITHUB_APP_PRIVATE_KEY",
+        ] {
+            let mut variables = github_app_variables();
+            variables.remove(absent);
+
+            let error = RuntimeConfig::from_map(variables).expect_err("partial config is rejected");
+
+            assert!(
+                matches!(error, ConfigError::Missing { .. }),
+                "{absent} must be reported as missing, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_github_app_values_are_rejected_by_variable_name() {
+        for (variable, value) in [
+            ("GHE_GITHUB_APP_ID", "0"),
+            ("GHE_GITHUB_APP_ID", "not-a-number"),
+            ("GHE_GITHUB_APP_INSTALLATION_ID", "0"),
+            ("GHE_GITHUB_APP_PRIVATE_KEY", "not base64!"),
+            ("GHE_GITHUB_APP_PRIVATE_KEY", ""),
+            ("GHE_GITHUB_APP_PRIVATE_KEY_PATH", "/nonexistent/app.pem"),
+            ("GHE_GITHUB_API_BASE_URL", "ftp://github.invalid"),
+            ("GHE_REQUIRED_CHECK_TTL_SECONDS", "0"),
+            ("GHE_REQUIRED_CHECK_TTL_SECONDS", "86401"),
+        ] {
+            let mut variables = github_app_variables();
+            variables.insert(variable.to_owned(), OsString::from(value));
+
+            assert_eq!(
+                RuntimeConfig::from_map(variables).expect_err("invalid value is rejected"),
+                ConfigError::Invalid { variable },
+                "unexpected acceptance of {variable}={value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_github_api_base_url_is_overridable_and_loses_its_trailing_slash() {
+        let mut variables = github_app_variables();
+        variables.insert(
+            "GHE_GITHUB_API_BASE_URL".to_owned(),
+            OsString::from("https://github.example.com/api/v3/"),
+        );
+
+        let config = RuntimeConfig::from_map(variables).expect("configuration is valid");
+
+        assert_eq!(
+            config
+                .github_app()
+                .expect("GitHub App is configured")
+                .api_base_url(),
+            "https://github.example.com/api/v3"
+        );
+    }
+
+    #[test]
+    fn github_app_debug_output_redacts_the_private_key() {
+        let config =
+            RuntimeConfig::from_map(github_app_variables()).expect("configuration is valid");
+
+        let rendered = format!("{config:?}");
+
+        assert!(rendered.contains("private_key_pem: \"[REDACTED]\""));
+        assert!(!rendered.contains("BEGIN RSA PRIVATE KEY"));
+        assert!(!rendered.contains(&STANDARD.encode(PRIVATE_KEY_PEM)));
     }
 }

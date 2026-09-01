@@ -363,6 +363,7 @@ mod tests {
             head_sha: None,
             pull_requests: WorkflowPullRequests::new([]),
             workflow_run_context: None,
+            required: None,
             timing,
             steps: Vec::new(),
         })

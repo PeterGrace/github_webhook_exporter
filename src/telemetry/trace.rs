@@ -66,6 +66,7 @@ const GITHUB_WORKFLOW_RUN_ATTEMPT_KEY: &str = "github.workflow.run.attempt";
 const GITHUB_WORKFLOW_EVENT_KEY: &str = "github.workflow.event";
 const GITHUB_WORKFLOW_SOURCE_BRANCH_KEY: &str = "github.workflow.source_branch";
 const GITHUB_WORKFLOW_TARGET_BRANCH_KEY: &str = "github.workflow.target_branch";
+const GITHUB_WORKFLOW_REQUIRED_KEY: &str = "github.workflow.required";
 const TIMING_SOURCE_KEY: &str = "timing_source";
 
 pub(super) const GITHUB_ACTIONS_PIPELINE_OPERATION: &str = "github.actions.pipeline";
@@ -253,6 +254,22 @@ pub(crate) fn workflow_task_name_attribute(name: &str) -> KeyValue {
 /// Returns the workflow conclusion attribute.
 pub(crate) fn workflow_conclusion_attribute(conclusion: WorkflowConclusion) -> KeyValue {
     string_key_value(GITHUB_WORKFLOW_CONCLUSION_KEY, conclusion.as_str())
+}
+
+/// Returns the branch-protection required-status-check attribute, when it is known.
+///
+/// # Parameters
+///
+/// * `required` - Whether the job is a required status check, or `None` when the required-check
+///   cache holds no fresh answer for its target branch.
+///
+/// # Returns
+///
+/// `Some` boolean attribute for a confident answer, and `None` when the answer is unknown. Unknown
+/// omits the attribute entirely rather than defaulting either way, so a consumer can distinguish
+/// "not required" from "we do not know".
+pub(crate) fn workflow_required_attribute(required: Option<bool>) -> Option<KeyValue> {
+    required.map(|required| KeyValue::new(GITHUB_WORKFLOW_REQUIRED_KEY, required))
 }
 
 /// Returns the bounded semantic-convention task-run result attribute.
@@ -465,6 +482,12 @@ pub(crate) enum DatabaseOperation {
     WorkflowJobLinkList,
     /// Pruning emitted workflow-job trace identities.
     WorkflowJobLinkPrune,
+    /// Upserting cached branch-protection required checks.
+    RequiredCheckUpsert,
+    /// Loading fresh cached branch-protection required checks.
+    RequiredCheckGet,
+    /// Pruning cached branch-protection required checks.
+    RequiredCheckPrune,
 }
 
 /// Creates a bounded tracing span for a high-level operation.
@@ -871,6 +894,9 @@ impl DatabaseOperation {
             Self::WorkflowJobLinkRecord => "workflow_job_link.record",
             Self::WorkflowJobLinkList => "workflow_job_link.list",
             Self::WorkflowJobLinkPrune => "workflow_job_link.prune",
+            Self::RequiredCheckUpsert => "required_check.upsert",
+            Self::RequiredCheckGet => "required_check.get",
+            Self::RequiredCheckPrune => "required_check.prune",
         }
     }
 }

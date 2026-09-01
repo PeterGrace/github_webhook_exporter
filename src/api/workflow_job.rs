@@ -18,9 +18,9 @@ use crate::{
     telemetry::{
         trace::CommitSha,
         workflow::{
-            DisplayName, HistoricalTiming, WorkflowConclusion, WorkflowJobId, WorkflowJobTrace,
-            WorkflowJobTraceParts, WorkflowPullRequests, WorkflowRunAttempt, WorkflowRunContext,
-            WorkflowRunId, WorkflowStepTrace,
+            DisplayName, HistoricalTiming, RequiredChecks, WorkflowConclusion, WorkflowJobId,
+            WorkflowJobTrace, WorkflowJobTraceParts, WorkflowPullRequests, WorkflowRunAttempt,
+            WorkflowRunContext, WorkflowRunId, WorkflowStepTrace,
         },
     },
 };
@@ -204,6 +204,9 @@ pub(super) fn inspect_completed_job(body: &[u8]) -> Option<WorkflowJobAdmission>
 /// * `repository_name` - The canonical authenticated repository name.
 /// * `delivery_id` - The authenticated GitHub delivery identifier.
 /// * `received_at` - The bounded webhook receipt timestamp.
+/// * `workflow_run_context` - The correlated workflow-run metadata, when one was persisted.
+/// * `required_checks` - The fresh branch-protection required checks of the run's target branch,
+///   or `None` when the cache held no confident answer.
 ///
 /// # Returns
 ///
@@ -215,6 +218,7 @@ pub(crate) fn project_completed_job(
     delivery_id: &DeliveryId,
     received_at: OffsetDateTime,
     workflow_run_context: Option<WorkflowRunContext>,
+    required_checks: Option<&RequiredChecks>,
 ) -> Option<WorkflowJobTrace> {
     let received_at = offset_datetime_to_system_time(received_at)?;
     let envelope: WorkflowJobEnvelope = serde_json::from_slice(body).ok()?;
@@ -260,6 +264,13 @@ pub(crate) fn project_completed_job(
         );
     }
 
+    let job_name = sanitize_display_name(name.as_ref());
+    // "Required" is keyed by check name, and for GitHub Actions the check name is the job name.
+    // An unnamed job can never match a required check, so it stays unknown rather than false.
+    let required = required_checks
+        .zip(job_name.as_ref())
+        .map(|(checks, name)| checks.contains(name.as_str()));
+
     Some(WorkflowJobTrace::new(WorkflowJobTraceParts {
         repository_name: repository_name.clone(),
         delivery_id: *delivery_id,
@@ -267,7 +278,7 @@ pub(crate) fn project_completed_job(
         run_id,
         run_attempt,
         job_id,
-        job_name: sanitize_display_name(name.as_ref()),
+        job_name,
         conclusion: normalize_conclusion(conclusion.as_ref()),
         head_sha: parse_commit_sha(head_sha.as_ref()),
         pull_requests: WorkflowPullRequests::new(
@@ -277,6 +288,7 @@ pub(crate) fn project_completed_job(
                 .take(20),
         ),
         workflow_run_context,
+        required,
         timing,
         steps: projected_steps,
     }))
@@ -365,8 +377,8 @@ mod tests {
         domain::delivery::DeliveryId,
         security::CanonicalRepositoryName,
         telemetry::workflow::{
-            TimingSource, WorkflowBranch, WorkflowConclusion, WorkflowEvent, WorkflowRunAttempt,
-            WorkflowRunContext, WorkflowRunId,
+            DisplayName, RequiredChecks, TimingSource, WorkflowBranch, WorkflowConclusion,
+            WorkflowEvent, WorkflowRunAttempt, WorkflowRunContext, WorkflowRunId,
         },
     };
 
@@ -389,11 +401,101 @@ mod tests {
             &delivery_id(),
             received_at,
             None,
+            None,
         )
     }
 
     fn project_fixture(body: Value) -> Option<crate::telemetry::workflow::WorkflowJobTrace> {
         project_fixture_at(body, datetime!(2026-08-06 10:06:00 UTC))
+    }
+
+    fn project_fixture_with_required_checks(
+        body: Value,
+        required_checks: Option<&RequiredChecks>,
+    ) -> Option<crate::telemetry::workflow::WorkflowJobTrace> {
+        let bytes = serde_json::to_vec(&body).expect("fixture JSON serializes");
+        project_completed_job(
+            &bytes,
+            &repository_name(),
+            &delivery_id(),
+            datetime!(2026-08-06 10:06:00 UTC),
+            None,
+            required_checks,
+        )
+    }
+
+    fn required_checks(names: &[&str]) -> RequiredChecks {
+        RequiredChecks::new(names.iter().filter_map(|name| DisplayName::sanitize(name)))
+    }
+
+    fn named_job(name: Option<&str>) -> Value {
+        let mut workflow_job = json!({
+            "id": 41,
+            "run_id": 31,
+            "run_attempt": 1,
+            "conclusion": "success",
+            "steps": [],
+        });
+        if let Some(name) = name {
+            workflow_job["name"] = json!(name);
+        }
+        json!({ "workflow_job": workflow_job })
+    }
+
+    #[test]
+    fn a_job_named_by_a_cached_required_check_is_projected_as_required() {
+        let trace = project_fixture_with_required_checks(
+            named_job(Some("Linux Job")),
+            Some(&required_checks(&["Linux Job", "macOS Job"])),
+        )
+        .expect("fixture projects");
+
+        assert_eq!(trace.required(), Some(true));
+    }
+
+    #[test]
+    fn a_job_absent_from_a_cached_required_check_set_is_projected_as_not_required() {
+        let trace = project_fixture_with_required_checks(
+            named_job(Some("Lint")),
+            Some(&required_checks(&["Linux Job"])),
+        )
+        .expect("fixture projects");
+
+        assert_eq!(trace.required(), Some(false));
+    }
+
+    #[test]
+    fn a_job_is_matched_against_the_sanitized_name_that_the_span_reports() {
+        // The projected job name has its control characters stripped, and cached check names are
+        // sanitized identically, so the two forms compare equal.
+        let trace = project_fixture_with_required_checks(
+            named_job(Some("Linux	Job")),
+            Some(&required_checks(&["Linux	Job"])),
+        )
+        .expect("fixture projects");
+
+        assert_eq!(trace.job_name().map(DisplayName::as_str), Some("LinuxJob"));
+        assert_eq!(trace.required(), Some(true));
+    }
+
+    #[test]
+    fn an_absent_cache_answer_leaves_the_required_status_unknown() {
+        let trace = project_fixture_with_required_checks(named_job(Some("Linux Job")), None)
+            .expect("fixture projects");
+
+        assert_eq!(trace.required(), None);
+    }
+
+    #[test]
+    fn an_unnamed_job_stays_unknown_rather_than_claiming_it_is_not_required() {
+        let trace = project_fixture_with_required_checks(
+            named_job(None),
+            Some(&required_checks(&["Linux Job"])),
+        )
+        .expect("fixture projects");
+
+        assert_eq!(trace.job_name(), None);
+        assert_eq!(trace.required(), None);
     }
 
     fn render_admission(admission: &WorkflowJobAdmission) -> String {
@@ -616,6 +718,7 @@ mod tests {
             &delivery_id(),
             datetime!(2026-08-06 10:06:00 UTC),
             Some(context),
+            None,
         )
         .expect("valid completed job projects");
 

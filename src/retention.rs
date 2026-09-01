@@ -1,15 +1,19 @@
-use std::{future::Future, time::Duration};
+use std::time::Duration;
 
+use async_trait::async_trait;
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::{sync::watch, time::Instant};
 use tracing::{info, warn, Instrument};
 
 use crate::{
+    config::DEFAULT_REQUIRED_CHECK_TTL_SECONDS,
     error::ErrorCorrelationId,
+    lifecycle,
     storage::{
         DeliveryStore, DeliveryStoreError, MergeQueueStore, MergeQueueStoreError,
-        WorkflowJobLinkStore, WorkflowJobLinkStoreError, WorkflowRunStore, WorkflowRunStoreError,
+        RequiredCheckStore, RequiredCheckStoreError, WorkflowJobLinkStore,
+        WorkflowJobLinkStoreError, WorkflowRunStore, WorkflowRunStoreError,
     },
     telemetry::trace::{self, Operation, OperationOutcome},
 };
@@ -80,8 +84,7 @@ pub async fn run_retention(
     config: RetentionConfig,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let workflow_run_store = WorkflowRunStore::new(delivery_store.pool().clone());
-    let workflow_job_link_store = WorkflowJobLinkStore::new(delivery_store.pool().clone());
+    let stores = DerivedRetentionStores::new(delivery_store.pool());
     let start = Instant::now() + config.interval;
     let mut ticker = tokio::time::interval_at(start, config.interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -89,17 +92,10 @@ pub async fn run_retention(
     loop {
         tokio::select! {
             biased;
-            () = wait_for_shutdown(&mut shutdown) => return,
+            () = lifecycle::wait_for_cancellation(&mut shutdown) => return,
             _ = ticker.tick() => {
-                run_traced_retention_pass(
-                    &delivery_store,
-                    &merge_queue_store,
-                    &workflow_run_store,
-                    &workflow_job_link_store,
-                    config,
-                    &shutdown,
-                )
-                .await;
+                run_traced_retention_pass(&delivery_store, &merge_queue_store, &stores, config, &shutdown)
+                    .await;
             }
         }
     }
@@ -108,8 +104,7 @@ pub async fn run_retention(
 async fn run_traced_retention_pass(
     delivery_store: &DeliveryStore,
     merge_queue_store: &MergeQueueStore,
-    workflow_run_store: &WorkflowRunStore,
-    workflow_job_link_store: &WorkflowJobLinkStore,
+    derived_stores: &DerivedRetentionStores,
     config: RetentionConfig,
     shutdown: &watch::Receiver<bool>,
 ) {
@@ -117,14 +112,38 @@ async fn run_traced_retention_pass(
     let outcome = prune_retention_pass(
         delivery_store,
         merge_queue_store,
-        workflow_run_store,
-        workflow_job_link_store,
+        derived_stores,
         config,
         shutdown,
     )
     .instrument(retention_span.clone())
     .await;
     trace::set_status(&retention_span, outcome.operation_outcome());
+}
+
+/// The retention-owned stores derived from the shared pool rather than from application state.
+///
+/// Retention only ever prunes, so it constructs these itself instead of borrowing the request
+/// handlers' instances.
+struct DerivedRetentionStores {
+    workflow_run: WorkflowRunStore,
+    workflow_job_link: WorkflowJobLinkStore,
+    required_check: RequiredCheckStore,
+}
+
+impl DerivedRetentionStores {
+    fn new(pool: &sqlx::SqlitePool) -> Self {
+        Self {
+            workflow_run: WorkflowRunStore::new(pool.clone()),
+            workflow_job_link: WorkflowJobLinkStore::new(pool.clone()),
+            // Pruning works from an explicit cutoff, so the cache time-to-live configured here is
+            // never consulted; only reads honor it.
+            required_check: RequiredCheckStore::new(
+                pool.clone(),
+                Duration::from_secs(DEFAULT_REQUIRED_CHECK_TTL_SECONDS),
+            ),
+        }
+    }
 }
 
 /// Runs exactly one traced retention pass for deterministic test coverage.
@@ -135,13 +154,11 @@ pub(crate) async fn run_retention_once(
     config: RetentionConfig,
     shutdown: &watch::Receiver<bool>,
 ) {
-    let workflow_run_store = WorkflowRunStore::new(delivery_store.pool().clone());
-    let workflow_job_link_store = WorkflowJobLinkStore::new(delivery_store.pool().clone());
+    let derived_stores = DerivedRetentionStores::new(delivery_store.pool());
     run_traced_retention_pass(
         delivery_store,
         merge_queue_store,
-        &workflow_run_store,
-        &workflow_job_link_store,
+        &derived_stores,
         config,
         shutdown,
     )
@@ -151,61 +168,57 @@ pub(crate) async fn run_retention_once(
 async fn prune_retention_pass(
     delivery_store: &DeliveryStore,
     merge_queue_store: &MergeQueueStore,
-    workflow_run_store: &WorkflowRunStore,
-    workflow_job_link_store: &WorkflowJobLinkStore,
+    derived_stores: &DerivedRetentionStores,
     config: RetentionConfig,
     shutdown: &watch::Receiver<bool>,
 ) -> RetentionPassOutcome {
     let pass_started_at = OffsetDateTime::now_utc();
+    let delivery_cutoff = pass_started_at.checked_sub(config.delivery_retention);
+    let merge_queue_cutoff = pass_started_at.checked_sub(config.merge_queue_retention);
+    // Workflow correlation and required-check rows are short-lived caches keyed to deliveries, so
+    // they share the delivery cutoff rather than carrying retention settings of their own.
     prune_retention_workloads(
-        delivery_store,
-        merge_queue_store,
-        workflow_run_store,
-        workflow_job_link_store,
-        pass_started_at.checked_sub(config.delivery_retention),
-        pass_started_at.checked_sub(config.merge_queue_retention),
+        &[
+            (delivery_store, delivery_cutoff),
+            (merge_queue_store, merge_queue_cutoff),
+            (&derived_stores.workflow_run, delivery_cutoff),
+            (&derived_stores.workflow_job_link, delivery_cutoff),
+            (&derived_stores.required_check, delivery_cutoff),
+        ],
         shutdown,
     )
     .await
 }
 
-async fn prune_retention_workloads<D, M, W, L>(
-    delivery_store: &D,
-    merge_queue_store: &M,
-    workflow_run_store: &W,
-    workflow_job_link_store: &L,
-    delivery_cutoff: Option<OffsetDateTime>,
-    merge_queue_cutoff: Option<OffsetDateTime>,
+/// Prunes each workload in order, stopping early when shutdown is observed between stores.
+///
+/// # Parameters
+///
+/// * `workloads` - The stores to prune, each paired with its cutoff, in the order they run.
+/// * `shutdown` - The process-wide cancellation channel, checked between stores.
+///
+/// # Returns
+///
+/// The combined pass outcome. A pass that stops early because of shutdown reports `Cancelled` even
+/// when every store it did reach succeeded.
+async fn prune_retention_workloads(
+    workloads: &[(&dyn PrunableStore, Option<OffsetDateTime>)],
     shutdown: &watch::Receiver<bool>,
-) -> RetentionPassOutcome
-where
-    D: PrunableStore,
-    M: PrunableStore,
-    W: PrunableStore,
-    L: PrunableStore,
-{
-    let delivery_outcome = prune_store(delivery_store, delivery_cutoff, shutdown).await;
-    if *shutdown.borrow() || delivery_outcome == StorePruneOutcome::Cancelled {
-        return RetentionPassOutcome::from_store_outcome(delivery_outcome)
-            .combine(StorePruneOutcome::Cancelled);
+) -> RetentionPassOutcome {
+    let mut outcome = RetentionPassOutcome::Success;
+    let mut remaining = workloads.iter();
+    while let Some((store, cutoff)) = remaining.next() {
+        let store_outcome = prune_store(*store, *cutoff, shutdown).await;
+        outcome = outcome.combine(store_outcome);
+        // Shutdown is honored between stores, never mid-batch: an active SQLite batch finishes,
+        // and only the stores that never started are reported as cancelled.
+        if (*shutdown.borrow() || store_outcome == StorePruneOutcome::Cancelled)
+            && remaining.len() > 0
+        {
+            return outcome.combine(StorePruneOutcome::Cancelled);
+        }
     }
-
-    let merge_queue_outcome = prune_store(merge_queue_store, merge_queue_cutoff, shutdown).await;
-    let outcome =
-        RetentionPassOutcome::from_store_outcome(delivery_outcome).combine(merge_queue_outcome);
-    if *shutdown.borrow() || merge_queue_outcome == StorePruneOutcome::Cancelled {
-        return outcome.combine(StorePruneOutcome::Cancelled);
-    }
-
-    let workflow_run_outcome = prune_store(workflow_run_store, delivery_cutoff, shutdown).await;
-    let outcome = outcome.combine(workflow_run_outcome);
-    if *shutdown.borrow() || workflow_run_outcome == StorePruneOutcome::Cancelled {
-        return outcome.combine(StorePruneOutcome::Cancelled);
-    }
-
-    let workflow_job_link_outcome =
-        prune_store(workflow_job_link_store, delivery_cutoff, shutdown).await;
-    outcome.combine(workflow_job_link_outcome)
+    outcome
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,14 +229,6 @@ enum RetentionPassOutcome {
 }
 
 impl RetentionPassOutcome {
-    fn from_store_outcome(outcome: StorePruneOutcome) -> Self {
-        match outcome {
-            StorePruneOutcome::Completed => Self::Success,
-            StorePruneOutcome::Cancelled => Self::Cancelled,
-            StorePruneOutcome::Failed => Self::Failure,
-        }
-    }
-
     fn combine(self, outcome: StorePruneOutcome) -> Self {
         match (self, outcome) {
             (Self::Failure, StorePruneOutcome::Completed | StorePruneOutcome::Cancelled)
@@ -251,66 +256,100 @@ enum StorePruneOutcome {
     Failed,
 }
 
-trait PrunableStore {
-    type Error;
+/// One durable store that retention prunes in bounded batches.
+///
+/// The trait is object-safe (via [`async_trait`]) so a pass can iterate a heterogeneous list of
+/// stores instead of repeating the same sequence-and-check block per store. Store errors are
+/// already discarded at the call site, so implementations collapse them into
+/// [`StorePruneFailure`] rather than surfacing an associated error type.
+#[async_trait]
+trait PrunableStore: Sync {
+    /// Returns the fixed workload name recorded in retention logs.
+    fn workload(&self) -> &'static str;
 
-    const WORKLOAD: &'static str;
-
-    fn prune_batch(
-        &self,
-        cutoff: OffsetDateTime,
-    ) -> impl Future<Output = Result<u64, Self::Error>> + Send;
+    /// Deletes at most one bounded batch of rows last updated before `cutoff`.
+    async fn prune_batch_erased(&self, cutoff: OffsetDateTime) -> Result<u64, StorePruneFailure>;
 }
 
+/// A redacted store pruning failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StorePruneFailure;
+
+#[async_trait]
 impl PrunableStore for DeliveryStore {
-    type Error = DeliveryStoreError;
+    fn workload(&self) -> &'static str {
+        "delivery"
+    }
 
-    const WORKLOAD: &'static str = "delivery";
-
-    async fn prune_batch(&self, cutoff: OffsetDateTime) -> Result<u64, Self::Error> {
-        DeliveryStore::prune_batch(self, cutoff).await
+    async fn prune_batch_erased(&self, cutoff: OffsetDateTime) -> Result<u64, StorePruneFailure> {
+        DeliveryStore::prune_batch(self, cutoff)
+            .await
+            .map_err(|_: DeliveryStoreError| StorePruneFailure)
     }
 }
 
+#[async_trait]
 impl PrunableStore for MergeQueueStore {
-    type Error = MergeQueueStoreError;
+    fn workload(&self) -> &'static str {
+        "merge_queue"
+    }
 
-    const WORKLOAD: &'static str = "merge_queue";
-
-    async fn prune_batch(&self, cutoff: OffsetDateTime) -> Result<u64, Self::Error> {
-        self.prune_completed_batch(cutoff).await
+    async fn prune_batch_erased(&self, cutoff: OffsetDateTime) -> Result<u64, StorePruneFailure> {
+        self.prune_completed_batch(cutoff)
+            .await
+            .map_err(|_: MergeQueueStoreError| StorePruneFailure)
     }
 }
 
+#[async_trait]
 impl PrunableStore for WorkflowRunStore {
-    type Error = WorkflowRunStoreError;
+    fn workload(&self) -> &'static str {
+        "workflow_run"
+    }
 
-    const WORKLOAD: &'static str = "workflow_run";
-
-    async fn prune_batch(&self, cutoff: OffsetDateTime) -> Result<u64, Self::Error> {
-        WorkflowRunStore::prune_batch(self, cutoff).await
+    async fn prune_batch_erased(&self, cutoff: OffsetDateTime) -> Result<u64, StorePruneFailure> {
+        WorkflowRunStore::prune_batch(self, cutoff)
+            .await
+            .map_err(|_: WorkflowRunStoreError| StorePruneFailure)
     }
 }
 
+#[async_trait]
+impl PrunableStore for RequiredCheckStore {
+    fn workload(&self) -> &'static str {
+        "required_check"
+    }
+
+    async fn prune_batch_erased(&self, cutoff: OffsetDateTime) -> Result<u64, StorePruneFailure> {
+        RequiredCheckStore::prune_batch(self, cutoff)
+            .await
+            .map_err(|_: RequiredCheckStoreError| StorePruneFailure)
+    }
+}
+
+#[async_trait]
 impl PrunableStore for WorkflowJobLinkStore {
-    type Error = WorkflowJobLinkStoreError;
+    fn workload(&self) -> &'static str {
+        "workflow_job_link"
+    }
 
-    const WORKLOAD: &'static str = "workflow_job_link";
-
-    async fn prune_batch(&self, cutoff: OffsetDateTime) -> Result<u64, Self::Error> {
-        WorkflowJobLinkStore::prune_batch(self, cutoff).await
+    async fn prune_batch_erased(&self, cutoff: OffsetDateTime) -> Result<u64, StorePruneFailure> {
+        WorkflowJobLinkStore::prune_batch(self, cutoff)
+            .await
+            .map_err(|_: WorkflowJobLinkStoreError| StorePruneFailure)
     }
 }
 
-async fn prune_store<S: PrunableStore>(
-    store: &S,
+async fn prune_store(
+    store: &dyn PrunableStore,
     cutoff: Option<OffsetDateTime>,
     shutdown: &watch::Receiver<bool>,
 ) -> StorePruneOutcome {
+    let workload = store.workload();
     let Some(cutoff) = cutoff else {
         warn!(
             parent: None,
-            workload = S::WORKLOAD,
+            workload,
             outcome = "invalid_cutoff",
             "retention pass skipped"
         );
@@ -323,7 +362,7 @@ async fn prune_store<S: PrunableStore>(
         if *shutdown.borrow() {
             info!(
                 parent: None,
-                workload = S::WORKLOAD,
+                workload,
                 outcome = "cancelled",
                 batches,
                 deleted,
@@ -331,14 +370,14 @@ async fn prune_store<S: PrunableStore>(
             );
             return StorePruneOutcome::Cancelled;
         }
-        match store.prune_batch(cutoff).await {
+        match store.prune_batch_erased(cutoff).await {
             Ok(batch_deleted) => {
                 batches += 1;
                 deleted = deleted.saturating_add(batch_deleted);
                 if batch_deleted < FULL_PRUNE_BATCH_SIZE {
                     info!(
                         parent: None,
-                        workload = S::WORKLOAD,
+                        workload,
                         outcome = "completed",
                         batches,
                         deleted,
@@ -351,7 +390,7 @@ async fn prune_store<S: PrunableStore>(
                 let error_correlation_id = ErrorCorrelationId::new();
                 warn!(
                     parent: None,
-                    workload = S::WORKLOAD,
+                    workload,
                     outcome = "failed",
                     %error_correlation_id,
                     "retention pass failed"
@@ -374,14 +413,6 @@ async fn prune_expired_deliveries(
         shutdown,
     )
     .await;
-}
-
-async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
-    while !*shutdown.borrow() {
-        if shutdown.changed().await.is_err() {
-            return;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -449,7 +480,7 @@ mod tests {
             (StorePruneOutcome::Failed, RetentionPassOutcome::Failure),
         ] {
             assert_eq!(
-                RetentionPassOutcome::from_store_outcome(store_outcome),
+                RetentionPassOutcome::Success.combine(store_outcome),
                 expected
             );
         }

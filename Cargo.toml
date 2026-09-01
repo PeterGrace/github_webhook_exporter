@@ -37,6 +37,7 @@ hex = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
 http = "1"
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.32", default-features = false }
 opentelemetry-http = { version = "0.32", default-features = false, features = ["reqwest-blocking"] }

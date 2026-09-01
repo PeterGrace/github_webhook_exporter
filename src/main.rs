@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use github_webhook_exporter::{
-    app::{self, AppState, ShutdownOutcome},
+    app::{self, AppState, BackgroundServices, ShutdownOutcome},
     config::RuntimeConfig,
     lifecycle,
     metrics::Metrics,
@@ -59,14 +59,34 @@ async fn run_service(
         .context("failed to initialize SQLite storage")?;
     let cipher = RepositorySecretCipher::new(config.master_key())
         .context("failed to initialize repository-secret encryption")?;
-    let state = AppState::new(
+    let mut state = AppState::new(
         RepositoryStore::new(pool, cipher),
         AdminAuthenticator::new(config.admin_token()),
         config.webhook_body_limit_bytes(),
         config.workflow_job_max_steps(),
     )
     .with_metrics(metrics)
-    .with_workflow_trace_emitter(workflow_trace_emitter);
+    .with_workflow_trace_emitter(workflow_trace_emitter)
+    .with_required_check_ttl(config.required_check_ttl());
+
+    // Without GitHub App credentials the required-check cache is never filled, and every workflow
+    // job reports its required status as unknown. That is a supported deployment, not a failure.
+    let required_check_refresher = match config.github_app() {
+        Some(github_app) => {
+            let refresher = state
+                .enable_required_check_refresh(github_app)
+                .context("failed to initialize the GitHub App client")?;
+            info!(
+                required_check_ttl_seconds = config.required_check_ttl().as_secs(),
+                "branch-protection required-check lookups enabled"
+            );
+            Some(refresher)
+        }
+        None => {
+            info!("branch-protection required-check lookups disabled; no GitHub App configured");
+            None
+        }
+    };
     state
         .initialize_repository_metrics()
         .await
@@ -94,15 +114,13 @@ async fn run_service(
             Err(error) => error!(error = ?error, "failed to wait for shutdown signal"),
         }
     };
-    let outcome = app::serve_with_shutdown(
-        listener,
-        state,
-        shutdown,
-        shutdown_timeout,
-        retention_config,
-    )
-    .await
-    .context("HTTP server failed")?;
+    let background = required_check_refresher.into_iter().fold(
+        BackgroundServices::new(retention_config),
+        BackgroundServices::with_required_check_refresher,
+    );
+    let outcome = app::serve_with_shutdown(listener, state, shutdown, shutdown_timeout, background)
+        .await
+        .context("HTTP server failed")?;
     match outcome {
         ShutdownOutcome::Completed => info!("HTTP server stopped"),
         ShutdownOutcome::TimedOut => warn!(

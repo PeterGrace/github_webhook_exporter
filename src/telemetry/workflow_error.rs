@@ -499,6 +499,7 @@ mod tests {
                 PullRequestNumber::new(7).expect("pull request number is valid")
             ]),
             workflow_run_context: None,
+            required: None,
             timing,
             steps: vec![step],
         })
