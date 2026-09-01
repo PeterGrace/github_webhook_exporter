@@ -70,8 +70,9 @@ every reported step as a span; over-limit jobs emit no partial trace and increme
 `github_workflow_job_trace_rejections_total{reason="too_many_steps"}` once.
 
 Each accepted projection creates an independent task-run root with a trace identity unrelated to
-the live `http.request` trace. Its span name and `sentry.description` are
-`<workflow-name> / <job-name>`, and its `sentry.op` is `github.actions.job`. Every projected step is
+the live `http.request` trace. Its span name is `<workflow-name> / <job-name>`; its
+`sentry.description` is the bare `<job-name>`, since the workflow name is already carried by
+`cicd.pipeline.name`. Its `sentry.op` is `github.actions.job`. Every projected step is
 a direct task-run child named `<workflow-name> / <job-name> / <step-name>`; its `sentry.description`
 is the bare `<step-name>`, and its `sentry.op` is `github.actions.step`. Missing workflow, job, and
 step names use the fixed values `workflow`, `job`, and `step`. Both span kinds are `INTERNAL`. The
