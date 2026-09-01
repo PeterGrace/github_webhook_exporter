@@ -214,6 +214,18 @@ require_fragment(
 require_fragment("book/src/reference/release-and-packaging.md", "Existing image tags are never overwritten.")
 require_fragment(
     "book/src/reference/release-and-packaging.md",
+    "A successful publication also mints the GitHub release for the tag.",
+)
+require_fragment(
+    "book/src/reference/release-and-packaging.md",
+    "An existing release page is never rewritten.",
+)
+require_fragment(
+    "book/src/how-to/release-a-new-version.md",
+    "scripts/release-announce.sh",
+)
+require_fragment(
+    "book/src/reference/release-and-packaging.md",
     (
         "An exact matching existing image permits chart-only recovery only when "
         "the chart is absent."
@@ -324,6 +336,7 @@ expected_validate_steps = [
     {"uses": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"},
     {"run": "just workflow-test"},
     {"run": "just release-flow-test"},
+    {"run": "just release-notes-test"},
     {"run": "mapfile -t shell_files < <(git ls-files -- '*.sh')\nshellcheck \"${shell_files[@]}\"\n"},
     {"run": "just helm-static"},
     {"uses": "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f"},
@@ -403,7 +416,7 @@ expected_publish_job_contract = {
     "if": "github.ref_type == 'tag'",
     "needs": "validate",
     "runs-on": "ubuntu-24.04",
-    "permissions": {"contents": "read", "packages": "write"},
+    "permissions": {"contents": "write", "packages": "write"},
 }
 for key, expected_value in expected_publish_job_contract.items():
     if publish_job.get(key) != expected_value:
@@ -414,7 +427,10 @@ if not isinstance(publish_steps, list):
     fail("workflow publish-release job must define steps")
 
 expected_publish_steps = [
-    {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"},
+    {
+        "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+        "with": {"fetch-depth": 0},
+    },
     {
         "id": "version",
         "run": 'version="$(scripts/release-version.sh "$GITHUB_REF_NAME")"\ncommit_timestamp="$(git show -s --format=%cI "$GITHUB_SHA")"\nsource_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"\nprintf \'version=%s\\ncommit_timestamp=%s\\nsource_date_epoch=%s\\n\' \\\n    "$version" "$commit_timestamp" "$source_date_epoch" >> "$GITHUB_OUTPUT"\n',
@@ -478,6 +494,10 @@ expected_publish_steps = [
             "RELEASE_IMAGE": "ghcr.io/petergrace/github-webhook-exporter:${{ steps.version.outputs.version }}"
         },
         "run": "scripts/release-publish.sh \"${{ steps.version.outputs.version }}\" \\\n    \"$RELEASE_IMAGE\" \"${{ steps.chart.outputs.archive }}\"\n",
+    },
+    {
+        "env": {"GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}"},
+        "run": "scripts/release-announce.sh \"${{ steps.version.outputs.version }}\" \\\n    \"${{ steps.chart.outputs.archive }}\"\n",
     },
 ]
 

@@ -47,6 +47,26 @@ digest-conflict states fail closed without overwrite.
 The only resumable state is image-existing/chart-missing with an exact digest match. Any completed
 publication, chart-only registry state, or digest conflict must not be overwritten.
 
+### Release notes
+
+A successful publication also mints the GitHub release for the tag. `scripts/release-announce.sh`
+runs last, after the image and chart exist, so a release page never advertises artifacts that
+failed to publish. It generates the notes with `scripts/release-changelog.sh` and attaches the
+validated chart archive as a convenience copy of the published OCI chart.
+
+The notes list every non-merge commit between the previous stable tag that the release tag descends
+from and the release tag itself, grouped by conventional-commit type into Breaking changes,
+Features, Fixes, Performance, Refactoring, Documentation, Testing, Build, Continuous integration,
+Chores, Style, Reverts, and Other changes. Merge commits and the `cargo-release` version bump are
+excluded because they describe how the release landed rather than what changed in it. Subjects
+without a conventional prefix still appear, under Other changes. Prerelease tags are never chosen
+as the comparison base; the first release in a repository spans its full history.
+
+An existing release page is never rewritten. When a chart-only recovery rerun reaches an already
+announced tag, the announcement step reports the existing page and exits successfully, so recovery
+stays idempotent. Publishing the release requires `contents: write` on the tag job only; validation
+runs keep `contents: read`.
+
 ## Helm package validation and maintenance
 
 Prerequisites: `just`, `helm`, `docker`, `kubeconform`, `conftest`, and `yq` on `PATH`. The pinned
@@ -56,6 +76,7 @@ CI install script keeps those versions aligned with the workflow contract.
 just helm-static
 just image-smoke
 just workflow-test
+just release-notes-test
 just helm-maintenance-unit
 just helm-kind-acceptance
 KIND_ARTIFACT_DIRECTORY=dist/kind-lifecycle just helm-kind-lifecycle
@@ -64,7 +85,9 @@ KIND_ARTIFACT_DIRECTORY=dist/kind-lifecycle just helm-kind-lifecycle
 `just helm-static` validates chart metadata, rendering, schema, policy, secret, and packaged
 archive contracts across the supported Kubernetes range 1.31.0 through 1.35.0
 (`>=1.31.0-0 <1.36.0-0`). `just image-smoke` builds and exercises the production image locally.
-`just workflow-test` checks the GitHub Actions contract, including the exact archive path
+`just release-notes-test` checks the changelog grouping and the idempotent release announcement
+against fixture repositories and a fake `gh`. `just workflow-test` checks the GitHub Actions
+contract, including the exact archive path
 `dist/github-webhook-exporter-0.1.10.tgz`. `just helm-kind-acceptance` confirms API acceptance for
 the rendered StatefulSet, Service, ConfigMap, and PVC; it does not start the exporter.
 
