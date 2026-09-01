@@ -31,6 +31,14 @@ const GITHUB_ACCEPT: &str = "application/vnd.github+json";
 /// Percent-encodes everything a branch name may contain that would otherwise change the request
 /// target. `/` is deliberately left literal: GitHub resolves multi-segment branch names such as
 /// `gh-readonly-queue/main/pr-7` only when the separators stay unencoded.
+///
+/// Leaving `/` literal means a branch name from a webhook payload can add path segments to the
+/// request target, so path shape is *not* what makes this safe. Three other things are: the
+/// request carries an installation-scoped token, so an injected path cannot exceed what the App
+/// installation may already read; the base URL is validated as `http`/`https` at configuration
+/// time, so no injected segment can reach another host; and Git forbids `..` in ref names, which
+/// closes traversal. Tightening this set is therefore a defense-in-depth change, never the control
+/// that bounds the blast radius.
 const BRANCH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
