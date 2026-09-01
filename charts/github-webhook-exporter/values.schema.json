@@ -251,7 +251,7 @@
     "githubApp": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["appId", "installationId", "apiBaseUrl"],
+      "required": ["apiBaseUrl"],
       "properties": {
         "appId": {
           "type": ["integer", "null"],

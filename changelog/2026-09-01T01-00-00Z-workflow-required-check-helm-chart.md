@@ -44,6 +44,19 @@ rules. GitHub's API is outside the cluster, so its peers are normally an `ipBloc
 gateway; NetworkPolicy matches addresses, not hostnames, and the README says so rather than leaving
 operators to discover that `api.github.com` is not something a policy can name.
 
+**A null default must never be `required`.** The first version of the schema listed `githubApp.appId`
+and `githubApp.installationId` as required alongside `apiBaseUrl`. Both default to `null`, and Helm
+drops null-valued keys while coalescing values *before* schema validation runs — so the chart's own
+defaults failed `helm lint` with `missing properties 'appId', 'installationId'`. The repository
+already followed the right convention (`persistence.storageClass` and the two
+`telemetry.*TimeoutMilliseconds` values are declared but not required); this block simply broke it.
+
+Local Helm 4.1.4 accepted the bad schema, so `just helm-static` passed while Helm 3 rejected the
+chart. `scripts/helm-chart-test.sh` now asserts the invariant structurally — every null-defaulted
+value in `values.yaml` must be absent from its schema object's `required` list — rather than relying
+on whichever Helm the developer happens to have. The check was confirmed to fail on the original
+schema and pass on the corrected one.
+
 ## Validation
 
 `just helm-static` passes in full: lint, chart contract tests, kubeconform against Kubernetes 1.31

@@ -9,7 +9,7 @@ if [[ -z "${CHART_DIRECTORY}" ]]; then
     exit 2
 fi
 
-for command in awk cat cp find grep helm mktemp rm yq; do
+for command in awk cat cp find grep helm mktemp python3 rm yq; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         printf 'required command not found: %s\n' "${command}" >&2
         exit 2
@@ -108,6 +108,51 @@ assert_not_contains() {
 }
 
 helm lint "${CHART_DIRECTORY}"
+
+# Helm coalesces values before schema validation and drops null-valued keys while doing so, so a
+# key whose default is null is simply absent by the time the schema runs. Listing such a key as
+# "required" makes `helm lint` reject the chart's own default values. This invariant is checked
+# structurally rather than through `helm lint`, because whether nulls survive coalescing has
+# differed across Helm major versions: the chart must be valid under all of them.
+python3 - "${CHART_DIRECTORY}/values.yaml" "${CHART_DIRECTORY}/values.schema.json" <<'PYTHON' ||
+import json
+import subprocess
+import sys
+
+values_path, schema_path = sys.argv[1], sys.argv[2]
+values = json.loads(
+    subprocess.run(
+        ["yq", "-o=json", "-I=0", ".", values_path],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+)
+schema = json.load(open(schema_path, encoding="utf-8"))
+
+violations = []
+
+
+def walk(value, node, path):
+    """Report every null-defaulted value whose schema marks it required."""
+    if not isinstance(value, dict) or not isinstance(node, dict):
+        return
+    properties = node.get("properties", {})
+    required = set(node.get("required", []))
+    for name, child in value.items():
+        if child is None and name in required:
+            violations.append(".".join((*path, name)))
+        if name in properties:
+            walk(child, properties[name], (*path, name))
+
+
+walk(values, schema, ())
+for violation in sorted(violations):
+    print(f"null-defaulted value is marked required: {violation}", file=sys.stderr)
+sys.exit(1 if violations else 0)
+PYTHON
+    fail 'no null-defaulted value may be listed as required in values.schema.json'
+
 helm template github-webhook-exporter "${CHART_DIRECTORY}" \
     >"${TEMPORARY_DIRECTORY}/default.yaml"
 yq eval-all '[.] | flatten | map(select(. != null))' \
