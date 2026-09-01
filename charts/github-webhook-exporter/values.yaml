@@ -13,6 +13,7 @@ existingSecret:
     otlpTracesHeaders: ""
     otlpLogsHeaders: ""
     sentryDsn: ""
+    githubAppPrivateKey: ""
 service:
   type: ClusterIP
   port: 8080
@@ -20,7 +21,12 @@ application:
   shutdownTimeoutSeconds: 30
   webhookBodyLimitBytes: 2097152
   workflowJobMaxSteps: 256
+  requiredCheckTtlSeconds: 300
   rustLog: info
+githubApp:
+  appId: null
+  installationId: null
+  apiBaseUrl: ""
 retention:
   deliveryDays: 7
   mergeQueueDays: 90
@@ -110,6 +116,10 @@ networkPolicy:
       namespaceSelector: {}
       podSelector: {}
     otlp:
+      enabled: false
+      peers: []
+      ports: []
+    github:
       enabled: false
       peers: []
       ports: []

@@ -18,6 +18,7 @@ declare -A SUPPORTED_CASES=(
     [persistence]=1
     [external-secret]=1
     [otlp]=1
+    [github-app]=1
     [pdb]=1
     [webhook-ingress]=1
     [metrics]=1

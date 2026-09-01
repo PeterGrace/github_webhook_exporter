@@ -68,12 +68,10 @@ written by an older build or edited out of band cannot smuggle an unbounded name
 - `serve_with_shutdown`'s fifth parameter became `BackgroundServices`, grouping the retention
   configuration with the optional refresher rather than growing the signature.
 
-## Not included
+## Helm chart
 
-Helm chart plumbing. The chart has no escape hatch for arbitrary environment variables, so the new
-`GHE_GITHUB_APP_*`, `GHE_GITHUB_API_BASE_URL`, and `GHE_REQUIRED_CHECK_TTL_SECONDS` settings cannot
-currently be set through it. Adding them means new values plus schema entries, a ConfigMap and
-existing-secret key for the PEM, README and `helm-values.md` updates, revised assertions in
-`scripts/helm-chart-test.sh`, and — because the pod now needs egress to `api.github.com` — a new
-NetworkPolicy egress rule. That is a chart-shaped change with its own validation suite, and neither
-the issue nor its grooming discussion scoped it.
+Deliberately not part of this change, and delivered immediately after it in
+[2026-09-01T01-00-00Z-workflow-required-check-helm-chart.md](2026-09-01T01-00-00Z-workflow-required-check-helm-chart.md).
+The chart has its own validation suite and its own decisions — how the PEM reaches the pod, and what
+egress a NetworkPolicy must now allow — so it was worth separating from the application change
+rather than folding in.

@@ -9,6 +9,7 @@ data:
   GHE_SHUTDOWN_TIMEOUT_SECONDS: {{ .Values.application.shutdownTimeoutSeconds | int | quote }}
   GHE_WEBHOOK_BODY_LIMIT_BYTES: {{ .Values.application.webhookBodyLimitBytes | int | quote }}
   GHE_WORKFLOW_JOB_MAX_STEPS: {{ .Values.application.workflowJobMaxSteps | int | quote }}
+  GHE_REQUIRED_CHECK_TTL_SECONDS: {{ .Values.application.requiredCheckTtlSeconds | int | quote }}
   GHE_DELIVERY_RETENTION_DAYS: {{ .Values.retention.deliveryDays | int | quote }}
   GHE_MERGE_QUEUE_RETENTION_DAYS: {{ .Values.retention.mergeQueueDays | int | quote }}
   GHE_DELIVERY_PRUNE_INTERVAL_SECONDS: {{ .Values.retention.pruneIntervalSeconds | int | quote }}
@@ -32,4 +33,19 @@ data:
   {{- end }}
   {{- with .Values.telemetry.logsTimeoutMilliseconds }}
   OTEL_EXPORTER_OTLP_LOGS_TIMEOUT: {{ . | int | quote }}
+  {{- end }}
+  {{- if include "github-webhook-exporter.githubAppEnabled" . }}
+  GHE_GITHUB_APP_ID: {{ .Values.githubApp.appId | int64 | quote }}
+  GHE_GITHUB_APP_INSTALLATION_ID: {{ .Values.githubApp.installationId | int64 | quote }}
+  {{- /*
+    The chart supplies the key by file rather than by environment variable. A Secret value is
+    projected verbatim, so a mounted file is the raw PEM an operator already stores; the
+    environment form would require the Secret to hold base64-of-PEM instead.
+  */}}
+  GHE_GITHUB_APP_PRIVATE_KEY_PATH: {{ printf "%s/%s"
+    (include "github-webhook-exporter.githubAppKeyDirectory" .)
+    .Values.existingSecret.keys.githubAppPrivateKey | quote }}
+  {{- end }}
+  {{- with .Values.githubApp.apiBaseUrl }}
+  GHE_GITHUB_API_BASE_URL: {{ . | quote }}
   {{- end }}

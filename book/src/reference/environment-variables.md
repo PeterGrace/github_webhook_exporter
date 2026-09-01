@@ -73,7 +73,8 @@ output for configuration renders it as `[REDACTED]`.
 
 Do not place `GHE_GITHUB_APP_PRIVATE_KEY` in image arguments, labels, Dockerfiles, or committed
 manifests. Prefer `GHE_GITHUB_APP_PRIVATE_KEY_PATH` with a mounted secret, which keeps the key off
-the process environment entirely.
+the process environment entirely. The Helm chart only offers the path form for exactly that reason,
+and sets the variable for you — see [Helm values](helm-values.md).
 
 Structured logging to stderr is always on, independent of OTLP configuration.
 
