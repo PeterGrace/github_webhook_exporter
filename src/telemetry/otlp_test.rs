@@ -3247,7 +3247,7 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
     assert_attribute(job, "github.workflow.conclusion", "success");
     assert_attribute(job, "cicd.pipeline.task.run.result", "success");
     assert_attribute(job, "sentry.op", "github.actions.job");
-    assert_attribute(job, "sentry.description", "BuildWorkflow / LinuxJob");
+    assert_attribute(job, "sentry.description", "LinuxJob");
     assert_attribute(job, "timing_source", "reported");
     assert_i64_array_attribute(
         job,

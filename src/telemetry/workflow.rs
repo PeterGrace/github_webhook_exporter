@@ -778,7 +778,7 @@ fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
         job.job_id(),
     ));
     attributes.push(sentry_operation_attribute(GITHUB_ACTIONS_JOB_OPERATION));
-    attributes.push(sentry_description_attribute(job_span_name(job)));
+    attributes.push(sentry_description_attribute(job_description(job)));
     attributes.push(timing_source_attribute(job.timing().source()));
     attributes
 }
@@ -889,6 +889,12 @@ fn step_span_name(job: &WorkflowJobTrace, step: &WorkflowStepTrace) -> String {
         job_name(job),
         step_name(step)
     )
+}
+
+/// Builds the job `sentry.description`: the bare `<job-name>`, since the span name already carries
+/// the workflow context and `cicd.pipeline.name` records it as a dedicated attribute.
+fn job_description(job: &WorkflowJobTrace) -> String {
+    job_name(job).to_owned()
 }
 
 /// Builds the step `sentry.description`: the bare `<step-name>`, since the span name already
@@ -1578,7 +1584,7 @@ mod tests {
         assert_eq!(successful_step.span_kind, SpanKind::Internal);
         assert_eq!(timed_out_step.span_kind, SpanKind::Internal);
         assert_string_attribute(job_span, "sentry.op", "github.actions.job");
-        assert_string_attribute(job_span, "sentry.description", "Build Workflow / Linux Job");
+        assert_string_attribute(job_span, "sentry.description", "Linux Job");
         assert_string_attribute(successful_step, "sentry.op", "github.actions.step");
         assert_string_attribute(successful_step, "sentry.description", "Step 1");
         assert_string_attribute(job_span, "cicd.pipeline.run.id", "31");
@@ -1648,7 +1654,7 @@ mod tests {
 
         assert_string_attribute(job_span, "cicd.pipeline.task.run.result", "neutral");
         assert_string_attribute(step_span, "cicd.pipeline.task.run.result", "other");
-        assert_string_attribute(job_span, "sentry.description", "workflow / job");
+        assert_string_attribute(job_span, "sentry.description", "job");
         assert_string_attribute(step_span, "sentry.description", "step");
         assert_string_attribute(job_span, "cicd.pipeline.task.name", "job");
         assert_string_attribute(step_span, "cicd.pipeline.task.name", "step");
@@ -2100,7 +2106,7 @@ mod tests {
             "https://github.com/owner/repository",
         );
         assert_string_attribute(job, "sentry.op", "github.actions.job");
-        assert_string_attribute(job, "sentry.description", "Build Workflow / Linux Job");
+        assert_string_attribute(job, "sentry.description", "Linux Job");
         assert_i64_array_attribute(job, "github.pull_request.number", &[7, 11]);
         assert_string_attribute(job, "timing_source", "reported");
 
