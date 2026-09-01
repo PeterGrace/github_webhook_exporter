@@ -48,6 +48,7 @@ create_repository() {
         commit_subject 'feat!: require an explicit collector endpoint'
         commit_subject 'docs: describe the queue depth setting'
         commit_subject 'Land the vendored fixture refresh'
+        commit_subject 'wip: leave the parser half-finished'
 
         # A merge commit reproduces how pull requests land on main; it must never become a bullet.
         git checkout --quiet -b topic
@@ -124,12 +125,33 @@ assert_groups_landed_commits() {
     assert_contains 'cover the queue depth boundary'
     assert_contains '## Other changes'
     assert_contains 'Land the vendored fixture refresh'
+    # An unrecognized type has no section of its own, so it belongs in Other changes with its
+    # prefix intact rather than in a bucket that is never rendered.
+    assert_contains '- wip: leave the parser half-finished'
 
     assert_precedes '## Breaking changes' '## Features'
     assert_precedes '## Features' '## Fixes'
     assert_precedes '## Fixes' '## Documentation'
     assert_precedes '## Documentation' '## Testing'
     assert_precedes '## Testing' '## Other changes'
+}
+
+# Every landed commit must reach a rendered section. Only a total loss trips the generator's own
+# empty guard, so a partial drop would otherwise ship silently.
+assert_renders_every_landed_commit() {
+    local work="$1"
+    local expected actual
+    run_generator "${work}" 1.2.3 "${REPOSITORY}"
+    assert_success
+
+    expected="$(
+        cd "${work}" \
+            && git log --no-merges --format='%s' v1.2.2..v1.2.3 \
+            | grep -c -v '^chore: Release '
+    )"
+    actual="$(grep -c '^- ' <<<"${RUN_STDOUT}")"
+    (( actual == expected )) \
+        || fail "rendered ${actual} bullets for ${expected} landed commits"
 }
 
 assert_excludes_release_scaffolding() {
@@ -202,6 +224,7 @@ main() {
     work="$(create_repository)"
 
     assert_groups_landed_commits "${work}"
+    assert_renders_every_landed_commit "${work}"
     assert_excludes_release_scaffolding "${work}"
     assert_reports_install_and_comparison "${work}"
     assert_first_release_spans_full_history "${work}"

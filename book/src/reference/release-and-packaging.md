@@ -58,9 +58,12 @@ The notes list every non-merge commit between the previous stable tag that the r
 from and the release tag itself, grouped by conventional-commit type into Breaking changes,
 Features, Fixes, Performance, Refactoring, Documentation, Testing, Build, Continuous integration,
 Chores, Style, Reverts, and Other changes. Merge commits and the `cargo-release` version bump are
-excluded because they describe how the release landed rather than what changed in it. Subjects
-without a conventional prefix still appear, under Other changes. Prerelease tags are never chosen
-as the comparison base; the first release in a repository spans its full history.
+excluded because they describe how the release landed rather than what changed in it. Every other
+landed commit is reported: a `!` marker always means Breaking changes, a type that owns a section
+is filed there with its prefix becoming the heading, and everything else — a subject with no
+conventional prefix, or one whose type has no section, such as `wip:` — appears under Other
+changes with its full subject intact. Prerelease tags are never chosen as the comparison base; the
+first release in a repository spans its full history.
 
 An existing release page is never rewritten. When a chart-only recovery rerun reaches an already
 announced tag, the announcement step reports the existing page and exits successfully, so recovery

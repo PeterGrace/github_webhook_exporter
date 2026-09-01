@@ -14,6 +14,25 @@ readonly STABLE_TAG_PATTERN='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)
 # git log records are emitted with a unit separator so a subject may contain any printable text.
 readonly FIELD_SEPARATOR=$'\x1f'
 
+# The ordered rendered sections, as "bucket:heading" pairs. This is the single source of truth:
+# collect_entries only ever assigns a bucket named here and render_notes emits these in order, so
+# no commit can be filed under a section that is never rendered.
+readonly SECTION_ORDER=(
+    'breaking:Breaking changes'
+    'feat:Features'
+    'fix:Fixes'
+    'perf:Performance'
+    'refactor:Refactoring'
+    'docs:Documentation'
+    'test:Testing'
+    'build:Build'
+    'ci:Continuous integration'
+    'chore:Chores'
+    'style:Style'
+    'revert:Reverts'
+    'other:Other changes'
+)
+
 PREVIOUS_TAG=""
 # Bash associative array keyed by section bucket; each value accumulates rendered bullet lines.
 declare -A SECTION_ENTRIES=()
@@ -68,8 +87,21 @@ commit_range() {
     fi
 }
 
+# Report whether a parsed conventional type owns a rendered section.
+section_exists() {
+    local bucket="$1"
+    local pair
+
+    for pair in "${SECTION_ORDER[@]}"; do
+        [[ "${pair%%:*}" != "${bucket}" ]] || return 0
+    done
+    return 1
+}
+
 # Split each landed commit's "type(scope)!: description" subject into a section bucket and a
-# bullet. Non-conventional subjects keep their whole subject and land in the "other" bucket.
+# bullet. A "!" marker always means Breaking changes. Otherwise a type with its own section owns
+# the commit and the prefix becomes the heading; every other subject keeps its full text under
+# "other", so an unrecognized type such as "wip:" is still reported rather than dropped.
 collect_entries() {
     local record abbreviated subject bucket description
 
@@ -79,18 +111,23 @@ collect_entries() {
         # The cargo-release version bump describes the release itself, not a change within it.
         [[ "${subject}" != "chore: Release "* ]] || continue
 
+        bucket="other"
+        description="${subject}"
         if [[ "${subject}" =~ ^([a-z]+)(\(([^\)]*)\))?(!)?:[[:space:]]+(.+)$ ]]; then
-            bucket="${BASH_REMATCH[1]}"
-            description="${BASH_REMATCH[5]}"
-            if [[ -n "${BASH_REMATCH[3]}" ]]; then
-                description="(${BASH_REMATCH[3]}) ${description}"
-            fi
             if [[ -n "${BASH_REMATCH[4]}" ]]; then
                 bucket="breaking"
+            elif section_exists "${BASH_REMATCH[1]}"; then
+                bucket="${BASH_REMATCH[1]}"
             fi
-        else
-            bucket="other"
-            description="${subject}"
+
+            # Only a section that owns the type may drop the prefix from the bullet. An
+            # unrecognized prefix is meaningful text, so it stays in the rendered subject.
+            if [[ "${bucket}" != "other" ]]; then
+                description="${BASH_REMATCH[5]}"
+                if [[ -n "${BASH_REMATCH[3]}" ]]; then
+                    description="(${BASH_REMATCH[3]}) ${description}"
+                fi
+            fi
         fi
 
         SECTION_ENTRIES["${bucket}"]+="- ${description} (${abbreviated})"$'\n'
@@ -115,19 +152,10 @@ render_notes() {
     printf 'Published version tags are immutable. The attached chart archive is a convenience copy\n'
     printf 'of the published OCI chart.\n\n'
 
-    render_section breaking 'Breaking changes'
-    render_section feat 'Features'
-    render_section fix 'Fixes'
-    render_section perf 'Performance'
-    render_section refactor 'Refactoring'
-    render_section docs 'Documentation'
-    render_section test 'Testing'
-    render_section build 'Build'
-    render_section ci 'Continuous integration'
-    render_section chore 'Chores'
-    render_section style 'Style'
-    render_section revert 'Reverts'
-    render_section other 'Other changes'
+    local pair
+    for pair in "${SECTION_ORDER[@]}"; do
+        render_section "${pair%%:*}" "${pair#*:}"
+    done
 
     if [[ -n "${PREVIOUS_TAG}" ]]; then
         printf '**Full changelog**: https://github.com/%s/compare/%s...%s\n' \
