@@ -1,4 +1,5 @@
 {{- include "github-webhook-exporter.validate" . }}
+{{- $githubAppEnabled := include "github-webhook-exporter.githubAppEnabled" . }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -132,6 +133,26 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/github-webhook-exporter
+            {{- if $githubAppEnabled }}
+            - name: github-app
+              mountPath: {{ include "github-webhook-exporter.githubAppKeyDirectory" . | quote }}
+              readOnly: true
+            {{- end }}
+      {{- if $githubAppEnabled }}
+      volumes:
+        - name: github-app
+          secret:
+            secretName: {{ .Values.existingSecret.name | quote }}
+            # 288 is octal 0440. It must be written in decimal: YAML 1.2 parsers read a leading
+            # zero as part of a decimal number, so `0440` would silently mean octal 0670 and grant
+            # group write. 0440 keeps the key readable only by the fsGroup that owns projected
+            # Secret files; 0400 would restrict it to root, which this pod never runs as.
+            defaultMode: 288
+            optional: false
+            items:
+              - key: {{ .Values.existingSecret.keys.githubAppPrivateKey | quote }}
+                path: {{ .Values.existingSecret.keys.githubAppPrivateKey | quote }}
+      {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: data

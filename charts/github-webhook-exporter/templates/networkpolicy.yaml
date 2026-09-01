@@ -32,6 +32,7 @@ spec:
   egress:
     {{- $dns := .Values.networkPolicy.egress.dns }}
     {{- $otlp := .Values.networkPolicy.egress.otlp }}
+    {{- $github := .Values.networkPolicy.egress.github }}
     {{- if $dns.enabled }}
     - to:
         - namespaceSelector:
@@ -46,22 +47,22 @@ spec:
     {{- end }}
     {{- if $otlp.enabled }}
     - to:
-        {{- range $peer := $otlp.peers }}
-        - {{- with $peer.ipBlock }}
-          ipBlock:
-            {{- toYaml . | nindent 12 }}
-          {{- else }}
-          namespaceSelector:
-            {{- toYaml $peer.namespaceSelector | nindent 12 }}
-          podSelector:
-            {{- toYaml $peer.podSelector | nindent 12 }}
-          {{- end }}
-        {{- end }}
+        {{- include "github-webhook-exporter.egressPeers" $otlp.peers | nindent 8 }}
       ports:
         {{- range $port := $otlp.ports }}
         - protocol: TCP
           port: {{ $port }}
         {{- end }}
     {{- end }}
-    {{- if and (not $dns.enabled) (not $otlp.enabled) }} []{{- end }}
+    {{- if $github.enabled }}
+    # Reaching the GitHub REST API is what fills the branch-protection required-check cache.
+    - to:
+        {{- include "github-webhook-exporter.egressPeers" $github.peers | nindent 8 }}
+      ports:
+        {{- range $port := $github.ports }}
+        - protocol: TCP
+          port: {{ $port }}
+        {{- end }}
+    {{- end }}
+    {{- if and (not $dns.enabled) (not $otlp.enabled) (not $github.enabled) }} []{{- end }}
 {{- end }}

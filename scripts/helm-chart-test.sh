@@ -9,7 +9,7 @@ if [[ -z "${CHART_DIRECTORY}" ]]; then
     exit 2
 fi
 
-for command in awk cat cp find grep helm mktemp rm yq; do
+for command in awk cat cp find grep helm mktemp python3 rm yq; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         printf 'required command not found: %s\n' "${command}" >&2
         exit 2
@@ -108,6 +108,51 @@ assert_not_contains() {
 }
 
 helm lint "${CHART_DIRECTORY}"
+
+# Helm coalesces values before schema validation and drops null-valued keys while doing so, so a
+# key whose default is null is simply absent by the time the schema runs. Listing such a key as
+# "required" makes `helm lint` reject the chart's own default values. This invariant is checked
+# structurally rather than through `helm lint`, because whether nulls survive coalescing has
+# differed across Helm major versions: the chart must be valid under all of them.
+python3 - "${CHART_DIRECTORY}/values.yaml" "${CHART_DIRECTORY}/values.schema.json" <<'PYTHON' ||
+import json
+import subprocess
+import sys
+
+values_path, schema_path = sys.argv[1], sys.argv[2]
+values = json.loads(
+    subprocess.run(
+        ["yq", "-o=json", "-I=0", ".", values_path],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+)
+schema = json.load(open(schema_path, encoding="utf-8"))
+
+violations = []
+
+
+def walk(value, node, path):
+    """Report every null-defaulted value whose schema marks it required."""
+    if not isinstance(value, dict) or not isinstance(node, dict):
+        return
+    properties = node.get("properties", {})
+    required = set(node.get("required", []))
+    for name, child in value.items():
+        if child is None and name in required:
+            violations.append(".".join((*path, name)))
+        if name in properties:
+            walk(child, properties[name], (*path, name))
+
+
+walk(values, schema, ())
+for violation in sorted(violations):
+    print(f"null-defaulted value is marked required: {violation}", file=sys.stderr)
+sys.exit(1 if violations else 0)
+PYTHON
+    fail 'no null-defaulted value may be listed as required in values.schema.json'
+
 helm template github-webhook-exporter "${CHART_DIRECTORY}" \
     >"${TEMPORARY_DIRECTORY}/default.yaml"
 yq eval-all '[.] | flatten | map(select(. != null))' \
@@ -211,10 +256,11 @@ assert_yq \
     "${TEMPORARY_DIRECTORY}/default-statefulset.yaml" \
     'StatefulSet must mount and use the durable SQLite data path'
 assert_yq \
-    '(.data | length) == 13 and .data.GHE_BIND_ADDRESS == "[::]:8080" and
+    '(.data | length) == 14 and .data.GHE_BIND_ADDRESS == "[::]:8080" and
      .data.GHE_SHUTDOWN_TIMEOUT_SECONDS == "30" and
      .data.GHE_WEBHOOK_BODY_LIMIT_BYTES == "2097152" and
      .data.GHE_WORKFLOW_JOB_MAX_STEPS == "256" and
+     .data.GHE_REQUIRED_CHECK_TTL_SECONDS == "300" and
      .data.GHE_DELIVERY_RETENTION_DAYS == "7" and
      .data.GHE_MERGE_QUEUE_RETENTION_DAYS == "90" and
      .data.GHE_DELIVERY_PRUNE_INTERVAL_SECONDS == "3600" and
@@ -888,6 +934,13 @@ networkPolicy:
       ports:
         - 4318
         - 4319
+    github:
+      enabled: true
+      peers:
+        - ipBlock:
+            cidr: 198.51.100.0/24
+      ports:
+        - 443
 EOF
 helm template github-webhook-exporter "${CHART_DIRECTORY}" \
     --values "${TEMPORARY_DIRECTORY}/network-policy-values.yaml" \
@@ -906,7 +959,7 @@ assert_yq \
     "${TEMPORARY_DIRECTORY}/bounded-network-policy.yaml" \
     'every ingress allowance must use one bounded peer and the application TCP port'
 assert_yq \
-    '.spec.egress | length == 2 and
+    '.spec.egress | length == 3 and
      (.spec.egress[0].ports | length) == 2 and
      .spec.egress[0].ports[0].port == 53 and
      .spec.egress[0].ports[0].protocol == "UDP" and
@@ -918,9 +971,14 @@ assert_yq \
      .spec.egress[1].ports[0].port == 4318 and
      .spec.egress[1].ports[0].protocol == "TCP" and
      .spec.egress[1].ports[1].port == 4319 and
-     .spec.egress[1].ports[1].protocol == "TCP"' \
+     .spec.egress[1].ports[1].protocol == "TCP" and
+     (.spec.egress[2].to | length) == 1 and
+     .spec.egress[2].to[0].ipBlock.cidr == "198.51.100.0/24" and
+     (.spec.egress[2].ports | length) == 1 and
+     .spec.egress[2].ports[0].port == 443 and
+     .spec.egress[2].ports[0].protocol == "TCP"' \
     "${TEMPORARY_DIRECTORY}/bounded-network-policy.yaml" \
-    'egress must contain only configured DNS and OTLP destinations'
+    'egress must contain only configured DNS, OTLP, and GitHub destinations'
 expect_failure_contains \
     'ingress rule without selectors' \
     'networkPolicy.ingress.ingressController requires non-empty namespaceSelector and podSelector' \
@@ -954,6 +1012,118 @@ expect_failure \
         --set networkPolicy.egress.otlp.enabled=true \
         --set networkPolicy.egress.otlp.peers[0].ipBlock.cidr=not-a-cidr \
         --set networkPolicy.egress.otlp.ports[0]=4318
+expect_failure_contains \
+    'GitHub rule without peers and ports' \
+    'networkPolicy.egress.github requires at least one peer and port' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set networkPolicy.enabled=true \
+        --set networkPolicy.egress.github.enabled=true
+expect_failure_contains \
+    'GitHub selector peer without selectors' \
+    'networkPolicy.egress.github.peers[0] requires non-empty namespaceSelector and podSelector' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set networkPolicy.enabled=true \
+        --set networkPolicy.egress.github.enabled=true \
+        --set-json 'networkPolicy.egress.github.peers=[{"namespaceSelector":{},"podSelector":{}}]' \
+        --set networkPolicy.egress.github.ports[0]=443
+expect_failure \
+    'invalid GitHub CIDR' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set networkPolicy.enabled=true \
+        --set networkPolicy.egress.github.enabled=true \
+        --set networkPolicy.egress.github.peers[0].ipBlock.cidr=not-a-cidr \
+        --set networkPolicy.egress.github.ports[0]=443
+
+cat >"${TEMPORARY_DIRECTORY}/github-app-values.yaml" <<'EOF'
+githubApp:
+  appId: 12345
+  installationId: 67890
+  apiBaseUrl: https://github.example.test/api/v3
+application:
+  requiredCheckTtlSeconds: 120
+existingSecret:
+  keys:
+    githubAppPrivateKey: github-app-key.pem
+EOF
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --values "${TEMPORARY_DIRECTORY}/github-app-values.yaml" \
+    >"${TEMPORARY_DIRECTORY}/github-app.yaml"
+yq eval-all '[.] | flatten | map(select(. != null))' \
+    "${TEMPORARY_DIRECTORY}/github-app.yaml" \
+    >"${TEMPORARY_DIRECTORY}/github-app-manifests.yaml"
+assert_yq \
+    '([.[] | select(.kind == "ConfigMap")][0].data.GHE_GITHUB_APP_ID) == "12345" and
+     ([.[] | select(.kind == "ConfigMap")][0].data.GHE_GITHUB_APP_INSTALLATION_ID) == "67890" and
+     ([.[] | select(.kind == "ConfigMap")][0].data.GHE_GITHUB_APP_PRIVATE_KEY_PATH) ==
+     "/etc/github-webhook-exporter/github-app/github-app-key.pem" and
+     ([.[] | select(.kind == "ConfigMap")][0].data.GHE_GITHUB_API_BASE_URL) ==
+     "https://github.example.test/api/v3" and
+     ([.[] | select(.kind == "ConfigMap")][0].data.GHE_REQUIRED_CHECK_TTL_SECONDS) == "120"' \
+    "${TEMPORARY_DIRECTORY}/github-app-manifests.yaml" \
+    'configured GitHub App must reach the container through non-secret configuration'
+assert_yq \
+    '([.[] | select(.kind == "ConfigMap")][0].data |
+      has("GHE_GITHUB_APP_PRIVATE_KEY")) == false and
+     ([.[] | select(.kind == "StatefulSet")][0].spec.template.spec.containers[0].env[] |
+      select(.name == "GHE_GITHUB_APP_PRIVATE_KEY")) == null' \
+    "${TEMPORARY_DIRECTORY}/github-app-manifests.yaml" \
+    'GitHub App private key must never reach the container through the environment'
+assert_yq \
+    '([.[] | select(.kind == "StatefulSet")][0].spec.template.spec.volumes | length) == 1 and
+     ([.[] | select(.kind == "StatefulSet")][0].spec.template.spec.volumes[0].name) ==
+     "github-app" and
+     ([.[] | select(.kind == "StatefulSet")][0].spec.template.spec.volumes[0].secret.secretName) ==
+     "github-webhook-exporter" and
+     ([.[] | select(.kind == "StatefulSet")][0].spec.template.spec.volumes[0].secret.defaultMode) ==
+     288 and
+     ([.[] | select(.kind == "StatefulSet")][0].spec.template.spec.volumes[0].secret.optional) ==
+     false and
+     ([.[] | select(.kind == "StatefulSet")][0].spec.template.spec.volumes[0].secret.items |
+      length) == 1 and
+     ([.[] | select(.kind == "StatefulSet")][0].spec.template.spec.volumes[0].secret.items[0].key) ==
+     "github-app-key.pem" and
+     ([.[] | select(.kind == "StatefulSet")][0].spec.template.spec.volumes[0].secret.items[0].path) ==
+     "github-app-key.pem"' \
+    "${TEMPORARY_DIRECTORY}/github-app-manifests.yaml" \
+    'GitHub App key must project one Secret entry at mode 0440 as decimal 288'
+assert_yq \
+    '([.[] | select(.kind == "StatefulSet")][0].spec.template.spec.containers[0].volumeMounts |
+      length) == 2 and
+     ([.[] | select(.kind == "StatefulSet")][0].spec.template.spec.containers[0]
+       .volumeMounts[1].name) == "github-app" and
+     ([.[] | select(.kind == "StatefulSet")][0].spec.template.spec.containers[0]
+       .volumeMounts[1].mountPath) == "/etc/github-webhook-exporter/github-app" and
+     ([.[] | select(.kind == "StatefulSet")][0].spec.template.spec.containers[0]
+       .volumeMounts[1].readOnly) == true' \
+    "${TEMPORARY_DIRECTORY}/github-app-manifests.yaml" \
+    'GitHub App key must mount read-only beside the durable data volume'
+assert_yq \
+    '([.[] | select(.kind == "ConfigMap")][0].data | has("GHE_GITHUB_APP_ID")) == false and
+     ([.[] | select(.kind == "ConfigMap")][0].data |
+      has("GHE_GITHUB_APP_PRIVATE_KEY_PATH")) == false and
+     ([.[] | select(.kind == "ConfigMap")][0].data | has("GHE_GITHUB_API_BASE_URL")) == false and
+     ([.[] | select(.kind == "StatefulSet")][0].spec.template.spec.volumes) == null' \
+    "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
+    'an unconfigured GitHub App must add no configuration, volume, or mount'
+expect_failure_contains \
+    'GitHub App identifier without a key' \
+    'must be set together or left unset' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set githubApp.appId=12345 \
+        --set githubApp.installationId=67890
+expect_failure_contains \
+    'GitHub App key without identifiers' \
+    'must be set together or left unset' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set existingSecret.keys.githubAppPrivateKey=github-app-key.pem
+expect_failure \
+    'non-HTTP GitHub API base URL' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set githubApp.apiBaseUrl=ftp://github.invalid
+expect_failure \
+    'required-check cache lifetime above the supported maximum' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set application.requiredCheckTtlSeconds=86401
 
 assert_contains \
     '## Webhook ingress example' \
@@ -968,9 +1138,17 @@ assert_contains \
     "${CHART_DIRECTORY}/README.md" \
     'README must include a management example'
 assert_contains \
-    '## DNS and OTLP egress example' \
+    '## DNS, OTLP, and GitHub egress example' \
     "${CHART_DIRECTORY}/README.md" \
-    'README must include DNS and OTLP examples'
+    'README must include DNS, OTLP, and GitHub egress examples'
+assert_contains \
+    '## GitHub App required-check example' \
+    "${CHART_DIRECTORY}/README.md" \
+    'README must include a GitHub App example'
+assert_contains \
+    'no base64 wrapping' \
+    "${CHART_DIRECTORY}/README.md" \
+    'README must state that the mounted GitHub App key is a raw PEM'
 assert_contains \
     'NetworkPolicy cannot distinguish HTTP paths on the shared listener' \
     "${CHART_DIRECTORY}/README.md" \

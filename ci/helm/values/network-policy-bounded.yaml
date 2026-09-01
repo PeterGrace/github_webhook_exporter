@@ -46,3 +46,10 @@ networkPolicy:
       ports:
         - 4318
         - 4319
+    github:
+      enabled: true
+      peers:
+        - ipBlock:
+            cidr: 198.51.100.0/24
+      ports:
+        - 443

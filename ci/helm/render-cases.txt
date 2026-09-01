@@ -2,6 +2,7 @@ default
 persistence
 external-secret
 otlp
+github-app
 pdb
 webhook-ingress
 metrics

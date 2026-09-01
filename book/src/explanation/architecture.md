@@ -34,6 +34,25 @@ single bearer token rather than per-repository credentials, because the trust mo
 
 Full request-by-request behavior, including every status code, is in [HTTP API](../reference/http-api.md).
 
+## The one outbound GitHub dependency
+
+For almost everything, the service only ever authenticates *inbound*: a webhook is HMAC-verified
+against a repository secret and nothing leaves the process except telemetry. The single exception is
+the branch-protection required-check lookup that enriches workflow spans with
+`github.workflow.required`, because "is this job a required status check?" is a branch-protection
+property that no webhook payload carries.
+
+That lookup is kept strictly off the request path. The webhook handler reads a local cache and
+returns; a background task, and only that task, talks to GitHub. The reason is availability
+coupling: trace emission runs inline before the `204 No Content` is written, so an inline API call
+would put GitHub's latency and uptime directly in front of every webhook acknowledgement, and a
+GitHub incident would turn into redelivered or dropped deliveries here. Enriching a span is never
+worth that trade, which is why a cache miss degrades to "unknown" instead of waiting.
+
+The feature is off unless GitHub App credentials are configured, so a deployment that does not want
+a new outbound trust boundary simply does not get one. See
+[Branch-protection required checks](../reference/traces.md#branch-protection-required-checks).
+
 ## Why SQLite, and why a singleton
 
 SQLite holds three things: repository configuration (including encrypted secrets), delivery IDs

@@ -107,12 +107,17 @@ The chart never reads or copies Secret data into its ConfigMap.
 | `existingSecret.keys.otlpTracesHeaders` | `""` | Optional key projected as trace OTLP headers; empty omits it. |
 | `existingSecret.keys.otlpLogsHeaders` | `""` | Optional key projected as log OTLP headers; empty omits it. |
 | `existingSecret.keys.sentryDsn` | `""` | Optional key projected as `SENTRY_DSN`; empty disables synthetic workflow-task errors. |
+| `existingSecret.keys.githubAppPrivateKey` | `""` | Optional key holding the GitHub App PEM, mounted as a file; empty disables required-check lookups. |
 | `service.type` | `ClusterIP` | Fixed supported Service type. |
 | `service.port` | `8080` | Service, container, probe, and `[::]` application listener port. |
 | `application.shutdownTimeoutSeconds` | `30` | Drain deadline; range `1..=300` seconds. |
 | `application.webhookBodyLimitBytes` | `2097152` | Maximum webhook request body size. |
 | `application.workflowJobMaxSteps` | `256` | Maximum admitted steps in a completed workflow job. |
+| `application.requiredCheckTtlSeconds` | `300` | Branch-protection cache lifetime; range `1..=86400` seconds. |
 | `application.rustLog` | `info` | Rust logging filter. |
+| `githubApp.appId` | `null` | GitHub App identifier; null disables required-check lookups. |
+| `githubApp.installationId` | `null` | GitHub App installation identifier; null disables required-check lookups. |
+| `githubApp.apiBaseUrl` | `""` | REST API base URL; empty selects `https://api.github.com`. |
 | `retention.deliveryDays` | `7` | Authenticated delivery-claim retention in days. |
 | `retention.mergeQueueDays` | `90` | Completed merge-queue-attempt retention in days. |
 | `retention.pruneIntervalSeconds` | `3600` | Shared retention pruning interval in seconds. |
@@ -167,6 +172,7 @@ The chart never reads or copies Secret data into its ConfigMap.
 | `networkPolicy.ingress.*` | disabled | Selector-bounded controller, Prometheus, and management rules. |
 | `networkPolicy.egress.dns` | disabled | Selector-bounded TCP/UDP port 53 rule. |
 | `networkPolicy.egress.otlp` | disabled | Explicit selector/CIDR peers and TCP collector ports. |
+| `networkPolicy.egress.github` | disabled | Explicit selector/CIDR peers and TCP ports reaching the GitHub REST API. |
 
 The schema intentionally exposes no generic `extraEnv` map. Typed, non-secret application,
 retention, and telemetry values are projected through the generated ConfigMap. The fixed database
@@ -225,6 +231,14 @@ Non-secret typed configuration enters the pod from the generated ConfigMap. Requ
 and optional OTLP headers enter only through references to the configured existing Secret. The
 required key references are not optional, and the chart never creates a Secret or renders Secret
 values.
+
+The GitHub App key is the one credential the chart projects as a **file** rather than an
+environment variable. Kubernetes writes a Secret value verbatim into a mounted file, so the Secret
+holds the PEM exactly as GitHub issued it; the application's environment-variable form expects
+base64, which would force operators to double-encode. The file is mounted read-only at mode `0440`
+under `/etc/github-webhook-exporter/github-app`, and the chart sets the application's path variable
+to point at it. The key therefore never appears in the pod's environment, and never in the
+generated ConfigMap.
 
 ## Shutdown, disruption, and upgrades
 
@@ -410,12 +424,47 @@ administration:
 This route does not replace bearer-token authentication. Restrict the management ingress controller
 with the policy selector below or enforce the route through an authorization proxy.
 
-## DNS and OTLP egress example
+## GitHub App required-check example
+
+Workflow spans can report whether a job is a branch-protection required status check. That needs a
+GitHub App installation with `administration: read`, and it is off until all three of
+`githubApp.appId`, `githubApp.installationId`, and `existingSecret.keys.githubAppPrivateKey` are
+set. Setting only some of them fails at render time rather than starting a pod that reports every
+job's required status as unknown.
+
+Add the PEM to the same existing Secret and point the chart at its key name. The private key is
+mounted as a file, so store it exactly as GitHub issued it — no base64 wrapping:
+
+```bash
+: "${GHE_GITHUB_APP_KEY_FILE:?set GHE_GITHUB_APP_KEY_FILE to the downloaded PEM path}"
+
+kubectl --namespace github-webhook-exporter create secret generic github-webhook-exporter \
+  --from-file="master-key=${secret_directory}/master-key" \
+  --from-file="admin-token=${secret_directory}/admin-token" \
+  --from-file="github-app-key.pem=${GHE_GITHUB_APP_KEY_FILE}"
+
+helm upgrade --install github-webhook-exporter charts/github-webhook-exporter \
+  --namespace github-webhook-exporter \
+  --set githubApp.appId=12345 \
+  --set githubApp.installationId=67890 \
+  --set-string existingSecret.keys.githubAppPrivateKey=github-app-key.pem
+```
+
+Set `githubApp.apiBaseUrl` for GitHub Enterprise Server, for example
+`https://ghe.example.com/api/v3`. `application.requiredCheckTtlSeconds` controls how long a cached
+answer stays confident; it doubles as the rate limiter, since the exporter reads branch protection
+at most once per repository branch per window.
+
+Lookups never run on the webhook request path, so an unreachable GitHub API cannot delay or fail a
+delivery — affected jobs simply report their required status as unknown. When NetworkPolicy is
+enabled, the pod still needs egress to reach GitHub; see the next section.
+
+## DNS, OTLP, and GitHub egress example
 
 Enabling NetworkPolicy with no allowances creates default-deny ingress and egress. Every enabled
 inbound or DNS rule requires both namespace and pod selectors. The following permits a designated
-ingress controller, cluster DNS, and one in-cluster collector; omitted Prometheus and management
-rules remain denied:
+ingress controller, cluster DNS, one in-cluster collector, and the egress gateway CIDR that reaches
+the GitHub REST API; omitted Prometheus and management rules remain denied:
 
 ```yaml
 networkPolicy:
@@ -449,7 +498,19 @@ networkPolicy:
               app.kubernetes.io/name: otel-collector
       ports:
         - 4318
+    github:
+      enabled: true
+      peers:
+        - ipBlock:
+            cidr: 198.51.100.0/24
+      ports:
+        - 443
 ```
+
+`networkPolicy.egress.github` is only needed when `githubApp` is configured. GitHub's API is
+outside the cluster, so its peers are normally an `ipBlock` for an egress gateway or proxy rather
+than a pod selector. NetworkPolicy matches addresses, not hostnames: point it at whatever
+egress path your platform provides, not at `api.github.com`.
 
 DNS labels vary by distribution; inspect the cluster's DNS pods before enabling the rule. For an
 external collector, use an `ipBlock.cidr` peer instead of selectors. NetworkPolicy cannot allow a

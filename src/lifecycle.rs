@@ -1,5 +1,7 @@
 use std::{future::Future, io};
 
+use tokio::sync::watch;
+
 /// The operating-system event that initiated graceful shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownSignal {
@@ -43,6 +45,22 @@ where
     tokio::select! {
         result = &mut interrupt => result.map(|()| ShutdownSignal::Interrupt),
         result = &mut terminate => result.map(|()| ShutdownSignal::Terminate),
+    }
+}
+
+/// Waits until graceful cancellation is signalled, or until every sender is dropped.
+///
+/// A dropped sender means the process is already tearing down, so it is treated exactly like an
+/// explicit cancellation rather than left pending forever.
+///
+/// # Parameters
+///
+/// * `cancellation` - The receiver half of the process-wide cancellation channel.
+pub async fn wait_for_cancellation(cancellation: &mut watch::Receiver<bool>) {
+    while !*cancellation.borrow() {
+        if cancellation.changed().await.is_err() {
+            return;
+        }
     }
 }
 

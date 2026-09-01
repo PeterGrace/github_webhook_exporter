@@ -21,13 +21,17 @@ and completed pull-request merge-queue attempts for `GHE_MERGE_QUEUE_RETENTION_D
 `90`). Both must be positive integers. Pending merge-queue attempts are retained regardless of age
 so a later completion can correlate across a restart.
 
-One background task starts both pruning workloads every `GHE_DELIVERY_PRUNE_INTERVAL_SECONDS`
+One background task starts every pruning workload each `GHE_DELIVERY_PRUNE_INTERVAL_SECONDS`
 (default `3600`); there is no separate queue prune interval. There is no immediate startup pass,
 and missed ticks are skipped rather than replayed in a burst. Each scheduled pass fixes its cutoffs
 once, then each SQLite operation deletes at most 1,000 eligible rows, repeating until one deletes
 fewer than 1,000. Delivery pruning preserves fresh claims; queue pruning deletes only attempts with
 a non-null completion time older than its cutoff, preserving fresh completed and all pending
-attempts.
+attempts. Pruning runs in a fixed order: deliveries, merge-queue attempts, workflow-run contexts,
+workflow-job trace links, then the branch-protection required-check cache. The last three are
+correlation caches keyed to deliveries and share the delivery cutoff; the required-check cache
+additionally expires on read after `GHE_REQUIRED_CHECK_TTL_SECONDS`, so pruning only reclaims
+space rather than governing correctness.
 
 A database failure stops only the affected workload's current pass. Normalized structured logging
 identifies the workload and outcome and includes an opaque correlation ID for failures; it excludes
@@ -40,13 +44,33 @@ delivery-claim boundary. A process crash after a delivery or queue-state commit 
 corresponding in-memory metric update can undercount it — SQLite and Prometheus are not
 transactionally coupled, and the service does not promise exactly-once metrics across crashes.
 
+## Branch-protection required-check refresh
+
+When GitHub App credentials are configured (see
+[Environment variables](environment-variables.md#branch-protection-required-checks)), a second
+background task fills the required-check cache. It is entirely off the request path: webhook
+handlers only ever read the cache, and a miss simply queues a refresh request and reports the
+job's required status as unknown. The queue is bounded, and a request that arrives while it is full
+is dropped rather than applying backpressure to an inbound delivery.
+
+Each refresh re-checks the cache before calling GitHub, so a burst of deliveries for one branch
+costs one API read. One short-lived installation token is minted on demand and reused until shortly
+before it expires. Every failure — an unusable credential, a permission error, a rate limit, an
+unreachable API, or a cache write failure — is logged as a bounded structured warning naming only
+the outcome, and leaves the branch unknown. None of them can fail a webhook.
+
+Without configured credentials this task never starts, and every workflow job reports its required
+status as unknown. That is a supported deployment, not a degraded one.
+
 ## Graceful shutdown
 
 Tokio listens for both `SIGINT` and `SIGTERM`. Either signal follows the same sequence:
 
 1. Record the normalized signal in structured stderr logging.
-2. Notify both Axum and the shared retention task through one cancellation signal.
-3. Stop accepting new connections and stop scheduling new delivery or queue prune batches.
+2. Notify Axum, the shared retention task, and the required-check refresher through one
+   cancellation signal.
+3. Stop accepting new connections, stop scheduling new prune batches, and stop serving new
+   required-check refresh requests.
 4. Allow active requests and active SQLite prune work to finish within one shared
    `GHE_SHUTDOWN_TIMEOUT_SECONDS` deadline.
 5. Record that telemetry provider shutdown is starting, close both telemetry admission boundaries,

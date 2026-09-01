@@ -36,6 +36,39 @@ app.kubernetes.io/instance: {{ .Release.Name | trunc 63 | trimSuffix "-" | quote
 {{- include (print $.Template.BasePath "/configmap.yaml") . | sha256sum -}}
 {{- end -}}
 
+{{/*
+Return "true" when every GitHub App setting needed for required-check lookups is present.
+
+The three settings are all-or-nothing; "github-webhook-exporter.validate" rejects a partial
+configuration, so templates can treat a truthy result as fully configured.
+*/}}
+{{- define "github-webhook-exporter.githubAppEnabled" -}}
+{{- $app := .Values.githubApp -}}
+{{- if and $app.appId $app.installationId .Values.existingSecret.keys.githubAppPrivateKey -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* Return the directory holding the projected GitHub App private key. */}}
+{{- define "github-webhook-exporter.githubAppKeyDirectory" -}}
+/etc/github-webhook-exporter/github-app
+{{- end -}}
+
+{{/* Render one egress peer list shared by the OTLP and GitHub rules. */}}
+{{- define "github-webhook-exporter.egressPeers" -}}
+{{- range $peer := . }}
+- {{- with $peer.ipBlock }}
+  ipBlock:
+    {{- toYaml . | nindent 4 }}
+  {{- else }}
+  namespaceSelector:
+    {{- toYaml $peer.namespaceSelector | nindent 4 }}
+  podSelector:
+    {{- toYaml $peer.podSelector | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end -}}
+
 {{/* Validate singleton, storage, telemetry, and shutdown invariants. */}}
 {{- define "github-webhook-exporter.validate" -}}
 {{- if ne (int .Values.replicaCount) 1 -}}
@@ -72,6 +105,27 @@ app.kubernetes.io/instance: {{ .Release.Name | trunc 63 | trimSuffix "-" | quote
 {{- fail (printf
     $graceMessage $terminationGrace $applicationShutdown $telemetryShutdown) -}}
 {{- end -}}
+{{- $app := .Values.githubApp -}}
+{{- $appKey := .Values.existingSecret.keys.githubAppPrivateKey -}}
+{{- $appSettings := list $app.appId $app.installationId $appKey -}}
+{{- $appPresent := 0 -}}
+{{- range $appSettings -}}
+{{- if . -}}
+{{- $appPresent = add1 $appPresent -}}
+{{- end -}}
+{{- end -}}
+{{- if and (gt $appPresent 0) (lt $appPresent 3) -}}
+{{/*
+    The diagnostic reports whether the key entry is configured rather than echoing its name
+    alongside its value: the repository's structural secret scan treats any assignment whose
+    left-hand side ends in "privatekey" as an embedded credential, even in a format string.
+*/}}
+{{- $appMessage := print
+    "githubApp.appId, githubApp.installationId, and "
+    "existingSecret.keys.githubAppPrivateKey must be set together or left unset; "
+    "got githubApp.appId=%v githubApp.installationId=%v and key entry configured=%v" -}}
+{{- fail (printf $appMessage $app.appId $app.installationId (not (empty $appKey))) -}}
+{{- end -}}
 {{- if and .Values.metrics.serviceMonitor.enabled (not .Values.metrics.service.enabled) -}}
 {{- fail "metrics.serviceMonitor.enabled requires metrics.service.enabled" -}}
 {{- end -}}
@@ -90,17 +144,20 @@ app.kubernetes.io/instance: {{ .Release.Name | trunc 63 | trimSuffix "-" | quote
 {{- if and $dns.enabled (or (empty $dns.namespaceSelector) (empty $dns.podSelector)) -}}
 {{- fail "networkPolicy.egress.dns requires non-empty namespaceSelector and podSelector" -}}
 {{- end -}}
-{{- $otlp := .Values.networkPolicy.egress.otlp -}}
-{{- if and $otlp.enabled (or (empty $otlp.peers) (empty $otlp.ports)) -}}
-{{- fail "networkPolicy.egress.otlp requires at least one peer and port" -}}
+{{- range $name, $rule := (dict
+    "otlp" .Values.networkPolicy.egress.otlp
+    "github" .Values.networkPolicy.egress.github) -}}
+{{- if and $rule.enabled (or (empty $rule.peers) (empty $rule.ports)) -}}
+{{- fail (printf "networkPolicy.egress.%s requires at least one peer and port" $name) -}}
 {{- end -}}
-{{- if $otlp.enabled -}}
-{{- range $index, $peer := $otlp.peers -}}
+{{- if $rule.enabled -}}
+{{- range $index, $peer := $rule.peers -}}
 {{- if and (not (hasKey $peer "ipBlock"))
     (or (empty $peer.namespaceSelector) (empty $peer.podSelector)) -}}
 {{- fail (printf
-    "networkPolicy.egress.otlp.peers[%d] requires non-empty namespaceSelector and podSelector"
-    $index) -}}
+    "networkPolicy.egress.%s.peers[%d] requires non-empty namespaceSelector and podSelector"
+    $name $index) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

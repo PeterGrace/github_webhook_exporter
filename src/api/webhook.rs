@@ -19,6 +19,7 @@ use crate::{
     app::{AppState, RequestRepositoryContext},
     domain::{delivery::DeliveryId, repository::RepositoryId},
     error::AppError,
+    github::RequiredCheckRefreshRequest,
     metrics::{
         normalize_action, normalize_event_type, Action, EventType, FailureStage, Metrics,
         WebhookResult, WorkflowTraceRejectionReason,
@@ -30,7 +31,7 @@ use crate::{
     telemetry::{
         pipeline::{PipelineRunTrace, PipelineRunTraceParts, MAX_PIPELINE_JOB_SPANS},
         trace::{self, Operation, OperationOutcome, QueueEntity},
-        workflow::WorkflowRunContext,
+        workflow::{RequiredChecks, WorkflowRunContext},
         LOCAL_ONLY_LOG_TARGET,
     },
 };
@@ -215,12 +216,20 @@ async fn webhook_handler(
                                         FailureStage::Database,
                                     )
                                 })?;
+                            let required_checks = resolve_required_checks(
+                                &state,
+                                repository_id,
+                                &request.repository_name,
+                                workflow_run_context.as_ref(),
+                            )
+                            .await;
                             if let Some(workflow_trace) = workflow_job::project_completed_job(
                                 request.body.as_ref(),
                                 &request.repository_name,
                                 &request.delivery_id,
                                 received_at,
                                 workflow_run_context,
+                                required_checks.as_ref(),
                             ) {
                                 if let Some(identity) =
                                     state.workflow_trace_emitter().emit(&workflow_trace)
@@ -417,6 +426,51 @@ fn record_workflow_link_failure(state: &AppState, repository_name: &CanonicalRep
         %error_correlation_id,
         "workflow-job link persistence failed"
     );
+}
+
+/// Reads the cached branch-protection required checks for a completed job's target branch.
+///
+/// This runs inline in the webhook handler, so it only ever touches the local cache. A miss or a
+/// stale entry answers `None` — which the trace records as "unknown" — and asks the out-of-band
+/// refresher for a fresh answer that a later delivery can use. Nothing here awaits GitHub, so a
+/// GitHub outage cannot delay or fail this acknowledgement.
+async fn resolve_required_checks(
+    state: &AppState,
+    repository_id: RepositoryId,
+    repository_name: &CanonicalRepositoryName,
+    workflow_run_context: Option<&WorkflowRunContext>,
+) -> Option<RequiredChecks> {
+    // Required checks are branch-protection rules, so without a known target branch there is
+    // nothing to look up and the answer stays unknown.
+    let branch = workflow_run_context?.target_branch()?;
+    match state
+        .required_check_store()
+        .get_fresh(repository_id, branch, OffsetDateTime::now_utc())
+        .await
+    {
+        Ok(Some(checks)) => return Some(checks),
+        Ok(None) => {}
+        Err(error) => {
+            // A cache read failure degrades to unknown rather than failing the delivery: the
+            // required flag is an enrichment, never a reason to reject an authenticated webhook.
+            debug!(
+                target: LOCAL_ONLY_LOG_TARGET,
+                error = ?error,
+                outcome = "required_check_cache_unavailable",
+                "workflow job required status is unknown"
+            );
+            return None;
+        }
+    }
+
+    if let Some(refresher) = state.required_check_refresher() {
+        refresher.request(RequiredCheckRefreshRequest::new(
+            repository_id,
+            repository_name.clone(),
+            branch.clone(),
+        ));
+    }
+    None
 }
 
 fn record_workflow_trace_rejection(

@@ -176,6 +176,7 @@ const SPAN_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "github.workflow.event",
     "github.workflow.source_branch",
     "github.workflow.target_branch",
+    "github.workflow.required",
     "timing_source",
     "db.system.name",
     "db.operation.name",
@@ -1681,6 +1682,22 @@ fn any_value_contains_i64(value: &AnyValue, expected: i64) -> bool {
     }
 }
 
+fn bool_attribute(span: &Span, key: &str) -> Option<bool> {
+    span.attributes.iter().find_map(|attribute| {
+        if attribute.key != key {
+            return None;
+        }
+        match attribute.value.as_ref()?.value.as_ref()? {
+            AttributeValue::BoolValue(value) => Some(*value),
+            _ => None,
+        }
+    })
+}
+
+fn has_attribute(span: &Span, key: &str) -> bool {
+    span.attributes.iter().any(|attribute| attribute.key == key)
+}
+
 fn i64_attribute(span: &Span, key: &str) -> Option<i64> {
     span.attributes
         .iter()
@@ -1766,6 +1783,189 @@ fn assert_i64_attribute(span: &Span, key: &str, value: i64) {
 
 fn assert_i64_array_attribute(span: &Span, key: &str, value: &[i64]) {
     assert_eq!(i64_array_attribute(span, key), Some(value.to_vec()));
+}
+
+/// Posts a `workflow_run` for `main`, then a completed `workflow_job` named `job_name`.
+///
+/// Returns the flushed captures so a caller can inspect the emitted job and step spans.
+async fn workflow_job_with_seeded_required_checks(
+    fixture: &WebhookTraceFixture,
+    job_name: &str,
+    conclusion: &str,
+    cached_check_names: Option<&str>,
+) -> CapturedSpans {
+    let workflow_run_body = serde_json::to_vec(&serde_json::json!({
+        "action": "requested",
+        "workflow_run": {
+            "id": 31,
+            "run_attempt": 1,
+            "event": "pull_request",
+            "head_branch": "feature/source",
+            "pull_requests": [{
+                "head": {"ref": "feature/source"},
+                "base": {"ref": "main"}
+            }]
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("workflow-run payload serializes");
+    let response = fixture
+        .webhook(
+            &workflow_run_body,
+            "workflow_run",
+            "550e8400-e29b-41d4-a716-446655440700",
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    if let Some(check_names) = cached_check_names {
+        let repository_id: i64 =
+            sqlx::query_scalar("SELECT id FROM repositories WHERE full_name = ?")
+                .bind(WEBHOOK_REPOSITORY)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("repository row exists");
+        sqlx::query(
+            "INSERT INTO required_check_contexts \
+             (repository_id, target_branch, check_names, updated_at) \
+             VALUES (?, 'main', ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(repository_id)
+        .bind(check_names)
+        .execute(&fixture.pool)
+        .await
+        .expect("required-check cache row is seeded");
+    }
+
+    let body = workflow_job_body(
+        Some("completed"),
+        serde_json::json!({
+            "id": 41,
+            "run_id": 31,
+            "run_attempt": 1,
+            "workflow_name": "Build Workflow",
+            "name": job_name,
+            "conclusion": conclusion,
+            "started_at": "2026-09-01T10:00:00.000000000Z",
+            "completed_at": "2026-09-01T10:05:00.000000000Z",
+            "steps": [{
+                "number": 1,
+                "name": "Run Tests",
+                "conclusion": conclusion,
+                "started_at": "2026-09-01T10:00:01.000000000Z",
+                "completed_at": "2026-09-01T10:04:00.000000000Z"
+            }]
+        }),
+    );
+    let response = fixture
+        .webhook(
+            &body,
+            "workflow_job",
+            "550e8400-e29b-41d4-a716-446655440701",
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    fixture.force_flush()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cached_required_check_marks_the_job_and_its_steps_as_required() {
+    let fixture = WebhookTraceFixture::new().await;
+
+    let captured = workflow_job_with_seeded_required_checks(
+        &fixture,
+        "Linux Job",
+        "success",
+        Some("Linux Job"),
+    )
+    .await;
+
+    let job = captured.one_named("Build Workflow / Linux Job");
+    let step = captured.workflow_step(job);
+    assert_eq!(bool_attribute(job, "github.workflow.required"), Some(true));
+    assert_eq!(bool_attribute(step, "github.workflow.required"), Some(true));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_outside_the_cached_required_checks_is_reported_as_not_required() {
+    let fixture = WebhookTraceFixture::new().await;
+
+    let captured = workflow_job_with_seeded_required_checks(
+        &fixture,
+        "Optional Lint",
+        "success",
+        Some("Linux Job"),
+    )
+    .await;
+
+    let job = captured.one_named("Build Workflow / Optional Lint");
+    let step = captured.workflow_step(job);
+    assert_eq!(bool_attribute(job, "github.workflow.required"), Some(false));
+    assert_eq!(
+        bool_attribute(step, "github.workflow.required"),
+        Some(false)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unseeded_required_check_cache_omits_the_attribute_and_still_acknowledges() {
+    let fixture = WebhookTraceFixture::new().await;
+
+    let captured =
+        workflow_job_with_seeded_required_checks(&fixture, "Linux Job", "success", None).await;
+
+    let job = captured.one_named("Build Workflow / Linux Job");
+    let step = captured.workflow_step(job);
+    assert!(
+        !has_attribute(job, "github.workflow.required"),
+        "an unknown answer must omit the attribute rather than default it"
+    );
+    assert!(!has_attribute(step, "github.workflow.required"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_job_that_is_confidently_not_required_does_not_report_a_root_error() {
+    let fixture = WebhookTraceFixture::new().await;
+
+    let captured = workflow_job_with_seeded_required_checks(
+        &fixture,
+        "Optional Lint",
+        "failure",
+        Some("Linux Job"),
+    )
+    .await;
+
+    let job = captured.one_named("Build Workflow / Optional Lint");
+    let step = captured.workflow_step(job);
+    assert_otlp_status(job, OtlpStatusCode::Unset, "");
+    assert!(
+        job.events.is_empty(),
+        "a suppressed parent failure emits no exception event"
+    );
+    // The step still records what actually happened.
+    assert_otlp_status(step, OtlpStatusCode::Error, "workflow_failed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_required_job_still_reports_its_root_error() {
+    let fixture = WebhookTraceFixture::new().await;
+
+    let captured = workflow_job_with_seeded_required_checks(
+        &fixture,
+        "Linux Job",
+        "failure",
+        Some("Linux Job"),
+    )
+    .await;
+
+    let job = captured.one_named("Build Workflow / Linux Job");
+    assert_eq!(bool_attribute(job, "github.workflow.required"), Some(true));
+    assert_otlp_status(job, OtlpStatusCode::Error, "workflow_failed");
 }
 
 fn rfc3339_unix_nanos(value: &str) -> u64 {
@@ -5733,6 +5933,11 @@ async fn integrated_core_trace_privacy() {
         [
             ("sqlite.query", Some("delivery.prune"), Some("success")),
             ("sqlite.query", Some("merge_queue.prune"), Some("success")),
+            (
+                "sqlite.query",
+                Some("required_check.prune"),
+                Some("success")
+            ),
             (
                 "sqlite.query",
                 Some("workflow_job_link.prune"),

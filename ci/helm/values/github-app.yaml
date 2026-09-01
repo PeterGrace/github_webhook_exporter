@@ -1,0 +1,16 @@
+githubApp:
+  appId: 12345
+  installationId: 67890
+  apiBaseUrl: https://github.example.test/api/v3
+application:
+  requiredCheckTtlSeconds: 120
+existingSecret:
+  name: github-webhook-exporter
+  keys:
+    masterKey: master-key
+    adminToken: admin-token
+    otlpHeaders: ""
+    otlpTracesHeaders: ""
+    otlpLogsHeaders: ""
+    sentryDsn: ""
+    githubAppPrivateKey: github-app-key.pem
