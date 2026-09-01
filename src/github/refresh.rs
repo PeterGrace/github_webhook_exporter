@@ -3,8 +3,11 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
 use crate::{
-    domain::repository::RepositoryId, lifecycle, security::CanonicalRepositoryName,
-    storage::RequiredCheckStore, telemetry::workflow::WorkflowBranch,
+    domain::repository::RepositoryId,
+    lifecycle,
+    security::CanonicalRepositoryName,
+    storage::RequiredCheckStore,
+    telemetry::{workflow::WorkflowBranch, LOCAL_ONLY_LOG_TARGET},
 };
 
 use super::client::GitHubAppClient;
@@ -51,7 +54,13 @@ impl RequiredCheckRefreshHandle {
     /// inbound GitHub delivery.
     pub(crate) fn request(&self, request: RequiredCheckRefreshRequest) {
         if self.0.try_send(request).is_err() {
+            // This is the only log in this module emitted from the webhook handler rather than
+            // from the background task, so it needs both markers the rest of the module gets for
+            // free: the local-only target keeps a dropped refresh out of exported logs, and
+            // `parent: None` keeps it off the live request trace it would otherwise attach to.
             debug!(
+                target: LOCAL_ONLY_LOG_TARGET,
+                parent: None,
                 outcome = "queue_full",
                 "required-check refresh request dropped"
             );
