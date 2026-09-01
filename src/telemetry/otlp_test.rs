@@ -4,8 +4,9 @@ use std::{
     io::{self, Write},
     sync::{
         atomic::{AtomicU16, AtomicUsize, Ordering},
-        Arc, Condvar, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock, RwLock,
     },
+    time::Duration as StdDuration,
 };
 
 use axum::{
@@ -37,7 +38,12 @@ use sqlx::SqlitePool;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use tracing::instrument::WithSubscriber;
-use tracing_subscriber::layer::{Context as SubscriberContext, Layer, SubscriberExt};
+use tracing_subscriber::{
+    filter::LevelFilter,
+    layer::{Context as SubscriberContext, Layer, SubscriberExt},
+    registry::LookupSpan,
+    Registry,
+};
 
 use crate::{
     app::{build_router, AppState},
@@ -61,8 +67,8 @@ use tokio::{
     sync::{watch, Notify},
 };
 use tracing::{
-    span::{Attributes, Id},
-    Dispatch, Instrument, Subscriber,
+    span::{Attributes, Id, Record},
+    Dispatch, Event, Instrument, Metadata, Subscriber,
 };
 
 use crate::{config::TelemetryConfig, metrics::Metrics};
@@ -507,7 +513,7 @@ impl Drop for RunningReceiver {
 }
 
 struct RepositoryTraceFixture {
-    _otlp_guard: OtlpTestGuard,
+    _otlp_guard: FixtureDispatchRegistration,
     receiver: RunningReceiver,
     runtime: super::TelemetryRuntime,
     dispatch: Dispatch,
@@ -533,6 +539,7 @@ impl RepositoryTraceFixture {
         .expect("telemetry runtime initializes");
         let span_lifecycles = CapturedSpanLifecycles::default();
         let dispatch = Dispatch::new(subscriber.with(span_lifecycles.clone()));
+        let otlp_guard = register_fixture_dispatch(otlp_guard, &dispatch);
         let directory = tempfile::tempdir().expect("temporary directory is created");
         let pool = open_database(&directory.path().join("repository-trace.db"))
             .await
@@ -649,6 +656,142 @@ impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedOutput {
     }
 }
 
+/// How long [`flush_after_span_closure`] waits for the fixture's spans to close.
+///
+/// Closure is prompt once the parent references are released correctly, so this budget is only ever
+/// paid on the failure path; it is generous so a loaded machine cannot turn a slow close into a
+/// spurious assertion.
+const SPAN_CLOSURE_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+
+/// The dispatcher whose span closures the process-wide default forwards, if a fixture is active.
+static ACTIVE_FIXTURE_DISPATCH: OnceLock<RwLock<Option<Dispatch>>> = OnceLock::new();
+
+/// Tracks the one-time installation of [`FixtureSpanCloser`] as the process-wide default.
+static FIXTURE_SPAN_CLOSER_INSTALLED: OnceLock<()> = OnceLock::new();
+
+fn active_fixture_dispatch() -> &'static RwLock<Option<Dispatch>> {
+    ACTIVE_FIXTURE_DISPATCH.get_or_init(|| RwLock::new(None))
+}
+
+/// The process-wide default dispatcher that routes ambient span closures back to their fixture.
+///
+/// `tracing-subscriber`'s registry keeps a parent span open on behalf of each of its children and
+/// releases that reference from `DataInner::clear`. The release resolves its subscriber through
+/// `tracing::dispatcher::get_default` -- the *ambient* dispatcher of whichever thread runs the
+/// clear -- rather than through the dispatcher the span was created with. `sharded-slab` defers the
+/// clear to the thread that drops the last reference to the span's slot, which under CPU contention
+/// is sometimes a library-owned thread (a SQLite pool worker) that has no dispatcher of its own.
+///
+/// Production is immune because [`super::init`] installs a process-wide default, so the release
+/// always reaches the real subscriber. These fixtures instead attach their subscriber per-future
+/// with `WithSubscriber`, so without a global default the release lands on `NoSubscriber`, the
+/// parent's reference count leaks permanently, and the parent span never closes -- which means
+/// `tracing-opentelemetry` never ends it and it is never exported.
+///
+/// This subscriber therefore behaves exactly like `NoSubscriber` except for `try_close`, which it
+/// forwards to the fixture currently registered by [`register_fixture_dispatch`]. Because it records
+/// nothing and reports every callsite disabled, it cannot capture spans or events of its own.
+struct FixtureSpanCloser;
+
+impl FixtureSpanCloser {
+    /// Returns whether `dispatch` is the registry that issued `id`.
+    ///
+    /// Span identifiers are only meaningful to the registry that minted them, and `try_close` panics
+    /// on an unknown identifier, so a closure is forwarded only after the active registry confirms
+    /// it owns the span.
+    fn owns_span(dispatch: &Dispatch, id: &Id) -> bool {
+        dispatch
+            .downcast_ref::<Registry>()
+            .is_some_and(|registry| registry.span_data(id).is_some())
+    }
+}
+
+impl Subscriber for FixtureSpanCloser {
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        false
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(LevelFilter::OFF)
+    }
+
+    fn new_span(&self, _attributes: &Attributes<'_>) -> Id {
+        // Unreachable in practice: `enabled` reports every callsite disabled, so this dispatcher is
+        // never asked to create a span. `Id::from_u64` rejects zero, hence the sentinel.
+        Id::from_u64(u64::MAX)
+    }
+
+    fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, _event: &Event<'_>) {}
+
+    fn enter(&self, _span: &Id) {}
+
+    fn exit(&self, _span: &Id) {}
+
+    fn try_close(&self, id: Id) -> bool {
+        // The lock is released before forwarding: closing a span releases its own parent through
+        // this same dispatcher, so holding it across the call would re-enter the lock.
+        let active = active_fixture_dispatch()
+            .read()
+            .expect("active fixture dispatch lock is available")
+            .clone();
+        match active {
+            Some(dispatch) if Self::owns_span(&dispatch, &id) => dispatch.try_close(id),
+            _ => false,
+        }
+    }
+}
+
+/// Holds the telemetry test lock for as long as the fixture routes ambient span closures.
+///
+/// Bundling the two makes the ordering structural: the registration is cleared before the lock is
+/// released, so the next fixture can never observe a stale one.
+struct FixtureDispatchRegistration {
+    _test_lock: OtlpTestGuard,
+}
+
+impl Drop for FixtureDispatchRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut active) = active_fixture_dispatch().write() {
+            *active = None;
+        }
+    }
+}
+
+/// Routes ambient span closures to `dispatch` until the returned guard is dropped.
+///
+/// # Parameters
+///
+/// * `otlp_guard` - The held telemetry test lock, which serializes fixtures so that at most one
+///   registration is ever live.
+/// * `dispatch` - The fixture's dispatcher, to which ambient span closures are forwarded.
+///
+/// See [`FixtureSpanCloser`] for why this is required.
+#[must_use]
+fn register_fixture_dispatch(
+    otlp_guard: OtlpTestGuard,
+    dispatch: &Dispatch,
+) -> FixtureDispatchRegistration {
+    FIXTURE_SPAN_CLOSER_INSTALLED.get_or_init(|| {
+        tracing::dispatcher::set_global_default(Dispatch::new(FixtureSpanCloser))
+            .expect("the test binary installs no other global tracing dispatcher");
+    });
+    let previous = active_fixture_dispatch()
+        .write()
+        .expect("active fixture dispatch lock is available")
+        .replace(dispatch.clone());
+    assert!(
+        previous.is_none(),
+        "otlp_test_lock serializes telemetry fixtures, so only one may be registered"
+    );
+    FixtureDispatchRegistration {
+        _test_lock: otlp_guard,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SpanLifecycleEvent {
     Created,
@@ -665,18 +808,19 @@ struct SpanLifecycleState {
 struct CapturedSpanLifecycles(Arc<(Mutex<SpanLifecycleState>, Condvar)>);
 
 impl CapturedSpanLifecycles {
-    fn wait_until_all_closed(&self) -> bool {
+    /// Waits up to `timeout` for every captured span to close.
+    ///
+    /// Returns the sorted names of the spans still open when the wait expired, so a caller can name
+    /// them instead of reporting an unexplained gap in the export.
+    fn wait_until_all_closed(&self, timeout: StdDuration) -> Vec<&'static str> {
         let (state, closed) = self.0.as_ref();
         let state = state.lock().expect("span lifecycle lock is available");
-        if state.span_names.is_empty() {
-            return true;
-        }
         let (state, _) = closed
-            .wait_timeout_while(state, std::time::Duration::from_millis(10), |state| {
-                !state.span_names.is_empty()
-            })
+            .wait_timeout_while(state, timeout, |state| !state.span_names.is_empty())
             .expect("span lifecycle wait is available");
-        state.span_names.is_empty()
+        let mut open: Vec<_> = state.span_names.values().copied().collect();
+        open.sort_unstable();
+        open
     }
 
     fn assert_closed_before_created(&self, closed_name: &str, created_name: &str) {
@@ -726,23 +870,58 @@ where
     }
 }
 
+/// Exports every span the fixture recorded, once they have all closed.
+///
+/// A tracing span hands its OpenTelemetry span to the batch processor when it closes, so flushing
+/// while spans are still open captures a partial trace. This waits for closure first and then
+/// flushes, and fails naming the still-open spans rather than leaving a later assertion to report an
+/// unexplained gap in the export.
+///
+/// # Panics
+///
+/// Panics when a span is still open after [`SPAN_CLOSURE_TIMEOUT`]. No fixture legitimately holds a
+/// span open at flush time, so this means the capture would have been incomplete.
 fn flush_after_span_closure(
     runtime: &super::TelemetryRuntime,
     span_lifecycles: &CapturedSpanLifecycles,
 ) {
-    const MAX_PASSES: usize = 8;
-    for _ in 0..MAX_PASSES {
-        tokio::task::block_in_place(|| runtime.force_flush().expect("providers flush"));
-        if span_lifecycles.wait_until_all_closed() {
-            tokio::task::block_in_place(|| runtime.force_flush().expect("providers flush"));
-            return;
-        }
-    }
+    tokio::task::block_in_place(|| runtime.force_flush().expect("providers flush"));
+    let open = span_lifecycles.wait_until_all_closed(SPAN_CLOSURE_TIMEOUT);
+    assert!(
+        open.is_empty(),
+        "spans still open after {SPAN_CLOSURE_TIMEOUT:?}, so the capture is incomplete: {open:?}"
+    );
     tokio::task::block_in_place(|| runtime.force_flush().expect("providers flush"));
 }
 
+#[tokio::test]
+async fn parent_spans_close_when_a_child_is_released_off_a_dispatcher_thread() {
+    let otlp_guard = otlp_test_lock().lock_owned().await;
+    let span_lifecycles = CapturedSpanLifecycles::default();
+    let dispatch = Dispatch::new(Registry::default().with(span_lifecycles.clone()));
+    let _registration = register_fixture_dispatch(otlp_guard, &dispatch);
+
+    let (parent, child) = tracing::dispatcher::with_default(&dispatch, || {
+        let parent = tracing::info_span!("parent");
+        let child = parent.in_scope(|| tracing::info_span!("child"));
+        (parent, child)
+    });
+    // Release the child from a thread that carries no dispatcher of its own, the way a SQLite pool
+    // worker does when it drops the last reference to a query span's registry slot.
+    std::thread::spawn(move || drop(child))
+        .join()
+        .expect("child release thread joins");
+    tracing::dispatcher::with_default(&dispatch, || drop(parent));
+
+    let open = span_lifecycles.wait_until_all_closed(SPAN_CLOSURE_TIMEOUT);
+    assert!(
+        open.is_empty(),
+        "a child released off a dispatcher thread must still close its parent: {open:?}"
+    );
+}
+
 struct WebhookTraceFixture {
-    _otlp_guard: OtlpTestGuard,
+    _otlp_guard: FixtureDispatchRegistration,
     receiver: RunningReceiver,
     runtime: super::TelemetryRuntime,
     dispatch: Dispatch,
@@ -842,6 +1021,7 @@ impl WebhookTraceFixture {
         .expect("telemetry runtime initializes");
         let span_lifecycles = CapturedSpanLifecycles::default();
         let dispatch = Dispatch::new(subscriber.with(span_lifecycles.clone()));
+        let otlp_guard = register_fixture_dispatch(otlp_guard, &dispatch);
         let directory = tempfile::tempdir().expect("temporary directory is created");
         let pool = open_database(&directory.path().join("webhook-trace.db"))
             .await
@@ -2135,7 +2315,7 @@ mod sqlite {
     const COMPLETED_AT: &str = "2026-08-05T10:05:00.875Z";
 
     struct SqliteTraceFixture {
-        _otlp_guard: OtlpTestGuard,
+        _otlp_guard: FixtureDispatchRegistration,
         receiver: RunningReceiver,
         runtime: super::super::TelemetryRuntime,
         dispatch: Dispatch,
@@ -2165,6 +2345,7 @@ mod sqlite {
             .expect("telemetry runtime initializes");
             let span_lifecycles = CapturedSpanLifecycles::default();
             let dispatch = Dispatch::new(subscriber.with(span_lifecycles.clone()));
+            let otlp_guard = register_fixture_dispatch(otlp_guard, &dispatch);
             let directory = tempfile::tempdir().expect("temporary directory is created");
             let database_path = directory.path().join("sqlite-trace.db");
             let pool = open_database(&database_path)
@@ -6104,7 +6285,7 @@ mod retention {
     const RETENTION_TRACE_QUEUE_CAPACITY: usize = 128;
 
     struct RetentionTraceFixture {
-        _otlp_guard: OtlpTestGuard,
+        _otlp_guard: FixtureDispatchRegistration,
         receiver: RunningReceiver,
         runtime: super::super::TelemetryRuntime,
         dispatch: Dispatch,
@@ -6139,6 +6320,7 @@ mod retention {
             .expect("telemetry runtime initializes");
             let span_lifecycles = CapturedSpanLifecycles::default();
             let dispatch = Dispatch::new(subscriber.with(span_lifecycles.clone()));
+            let otlp_guard = register_fixture_dispatch(otlp_guard, &dispatch);
             let directory = tempfile::tempdir().expect("temporary directory is created");
             let database_path = directory.path().join("retention-trace.db");
             let pool = open_database(&database_path)
