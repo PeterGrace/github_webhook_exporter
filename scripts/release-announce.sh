@@ -56,6 +56,7 @@ validate_inputs() {
 
     require_command gh
     require_command mktemp
+    require_command python3
     require_command rm
 }
 
@@ -65,22 +66,47 @@ create_temporary_directory() {
     fi
 }
 
+# Extract the status field from a GitHub REST error envelope. An absent, malformed, or
+# non-object body yields nothing, so every caller fails closed on anything it cannot read.
+response_status() {
+    python3 -c '
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as response_file:
+        body = json.load(response_file)
+except (OSError, ValueError):
+    raise SystemExit(0)
+if isinstance(body, dict) and isinstance(body.get("status"), str):
+    print(body["status"])
+' "$1" 2>/dev/null
+}
+
 # A release page is a description of an already-published artifact set, so an existing page is
 # never rewritten. Chart-only recovery reruns therefore stay idempotent instead of failing closed.
+#
+# Absence is decided by the documented REST status code rather than by gh's human-readable
+# diagnostics, so a reworded CLI message can never turn a missing release into an inspection
+# failure and block a tag's first announcement.
 release_exists() {
     local stdout_path="${TEMPORARY_DIRECTORY}/stdout"
     local stderr_path="${TEMPORARY_DIRECTORY}/stderr"
-    local diagnostics
 
-    if gh release view "${RELEASE_TAG}" >"${stdout_path}" 2>"${stderr_path}"; then
+    # gh substitutes {owner} and {repo} from the checked-out repository.
+    if gh api "repos/{owner}/{repo}/releases/tags/${RELEASE_TAG}" \
+        >"${stdout_path}" 2>"${stderr_path}"; then
         return 0
     fi
 
-    diagnostics="$(<"${stderr_path}")"
-    if [[ "${diagnostics}" == *"release not found"* ]]; then
-        return 1
-    fi
-    fail "release inspection failed"
+    case "$(response_status "${stdout_path}")" in
+        404)
+            return 1
+            ;;
+        *)
+            fail "release inspection failed"
+            ;;
+    esac
 }
 
 generate_notes() {

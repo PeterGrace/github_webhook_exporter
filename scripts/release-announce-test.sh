@@ -50,18 +50,27 @@ set -Eeuo pipefail
     printf '\n'
 } >>"${COMMAND_LOG}"
 
-if (($# >= 2)) && [[ "$1" == "release" && "$2" == "view" ]]; then
+# Release lookups go through the REST endpoint, so the fixtures reproduce GitHub's response
+# envelopes rather than gh's human-readable diagnostics.
+if (($# >= 2)) && [[ "$1" == "api" && "$2" == repos/* ]]; then
     case "${FAKE_RELEASE_STATE:-missing}" in
         present)
-            printf 'title:\t%s\n' "$3"
+            printf '{"tag_name":"%s"}\n' "${2##*/}"
             exit 0
             ;;
         missing)
-            printf 'release not found\n' >&2
+            printf '{"message":"Not Found","status":"404"}'
+            printf 'gh: Not Found (HTTP 404)\n' >&2
             exit 1
             ;;
         error)
-            printf 'HTTP 500: unexpected\n' >&2
+            printf '{"message":"Server Error","status":"500"}'
+            printf 'gh: Server Error (HTTP 500)\n' >&2
+            exit 1
+            ;;
+        unreadable)
+            printf 'not json at all'
+            printf 'gh: connection reset\n' >&2
             exit 1
             ;;
         *)
@@ -165,7 +174,7 @@ assert_publishes_missing_release() {
     run_announcer "${VERSION}" "${CHART_ARCHIVE}"
     assert_success "published release notes for ${RELEASE_TAG}"
     assert_command_log \
-        "gh release view ${RELEASE_TAG}" \
+        "gh api repos/{owner}/{repo}/releases/tags/${RELEASE_TAG}" \
         "gh release create ${RELEASE_TAG} --title ${RELEASE_TAG} --notes-file <notes> --verify-tag ${CHART_ARCHIVE}"
     [[ -f "${NOTES_COPY}" ]] || fail 'release creation received no notes file'
     grep -q '^## Features$' "${NOTES_COPY}" \
@@ -179,13 +188,21 @@ assert_skips_existing_release() {
     export FAKE_RELEASE_STATE="present"
     run_announcer "${VERSION}" "${CHART_ARCHIVE}"
     assert_success "release notes already published for ${RELEASE_TAG}"
-    assert_command_log "gh release view ${RELEASE_TAG}"
+    assert_command_log "gh api repos/{owner}/{repo}/releases/tags/${RELEASE_TAG}"
     assert_no_create_logged
 }
 
 assert_fails_closed_on_inspection_error() {
     reset_fixture_state
     export FAKE_RELEASE_STATE="error"
+    run_announcer "${VERSION}" "${CHART_ARCHIVE}"
+    assert_failure 1 'release inspection failed'
+    assert_no_create_logged
+}
+
+assert_fails_closed_on_unreadable_inspection() {
+    reset_fixture_state
+    export FAKE_RELEASE_STATE="unreadable"
     run_announcer "${VERSION}" "${CHART_ARCHIVE}"
     assert_failure 1 'release inspection failed'
     assert_no_create_logged
@@ -230,6 +247,7 @@ main() {
     assert_publishes_missing_release
     assert_skips_existing_release
     assert_fails_closed_on_inspection_error
+    assert_fails_closed_on_unreadable_inspection
     assert_fails_closed_on_creation_error
     assert_rejects_invalid_requests
 
