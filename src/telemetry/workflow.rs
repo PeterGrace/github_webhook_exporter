@@ -690,7 +690,7 @@ impl WorkflowTraceEmitter {
         for step in job.steps() {
             let mut span = tracer.build_with_context(
                 tracer
-                    .span_builder(step_span_name(step))
+                    .span_builder(step_span_name(job, step))
                     .with_kind(SpanKind::Internal)
                     .with_start_time(step.timing().start())
                     .with_attributes(step_attributes(job, step)),
@@ -819,7 +819,7 @@ fn step_attributes(job: &WorkflowJobTrace, step: &WorkflowStepTrace) -> Vec<KeyV
         step,
     ));
     attributes.push(sentry_operation_attribute(GITHUB_ACTIONS_STEP_OPERATION));
-    attributes.push(sentry_description_attribute(step_description(job, step)));
+    attributes.push(sentry_description_attribute(step_description(step)));
     attributes.push(timing_source_attribute(step.timing().source()));
     attributes
 }
@@ -880,17 +880,21 @@ pub(super) fn job_span_name(job: &WorkflowJobTrace) -> String {
     format!("{} / {}", workflow_name(job), job_name(job))
 }
 
-fn step_span_name(step: &WorkflowStepTrace) -> String {
-    step_name(step).to_owned()
-}
-
-pub(super) fn step_description(job: &WorkflowJobTrace, step: &WorkflowStepTrace) -> String {
+/// Builds the step span name: the full `<workflow-name> / <job-name> / <step-name>` path that
+/// identifies a waterfall row on its own.
+fn step_span_name(job: &WorkflowJobTrace, step: &WorkflowStepTrace) -> String {
     format!(
         "{} / {} / {}",
         workflow_name(job),
         job_name(job),
         step_name(step)
     )
+}
+
+/// Builds the step `sentry.description`: the bare `<step-name>`, since the span name already
+/// carries the workflow and job context.
+pub(super) fn step_description(step: &WorkflowStepTrace) -> String {
+    step_name(step).to_owned()
 }
 
 /// Appends the optional correlated workflow-run trigger and branch context.
@@ -1563,11 +1567,11 @@ mod tests {
             .expect("descriptive job span is exported");
         let successful_step = spans
             .iter()
-            .find(|span| span.name == "Step 1")
+            .find(|span| span.name == "Build Workflow / Linux Job / Step 1")
             .expect("descriptive successful step span is exported");
         let timed_out_step = spans
             .iter()
-            .find(|span| span.name == "Step 2")
+            .find(|span| span.name == "Build Workflow / Linux Job / Step 2")
             .expect("descriptive timed-out step span is exported");
 
         assert_eq!(job_span.span_kind, SpanKind::Internal);
@@ -1576,11 +1580,7 @@ mod tests {
         assert_string_attribute(job_span, "sentry.op", "github.actions.job");
         assert_string_attribute(job_span, "sentry.description", "Build Workflow / Linux Job");
         assert_string_attribute(successful_step, "sentry.op", "github.actions.step");
-        assert_string_attribute(
-            successful_step,
-            "sentry.description",
-            "Build Workflow / Linux Job / Step 1",
-        );
+        assert_string_attribute(successful_step, "sentry.description", "Step 1");
         assert_string_attribute(job_span, "cicd.pipeline.run.id", "31");
         assert_string_attribute(
             job_span,
@@ -1643,13 +1643,13 @@ mod tests {
             .expect("fallback job span is exported");
         let step_span = spans
             .iter()
-            .find(|span| span.name == "step")
+            .find(|span| span.name == "workflow / job / step")
             .expect("fallback step span is exported");
 
         assert_string_attribute(job_span, "cicd.pipeline.task.run.result", "neutral");
         assert_string_attribute(step_span, "cicd.pipeline.task.run.result", "other");
         assert_string_attribute(job_span, "sentry.description", "workflow / job");
-        assert_string_attribute(step_span, "sentry.description", "workflow / job / step");
+        assert_string_attribute(step_span, "sentry.description", "step");
         assert_string_attribute(job_span, "cicd.pipeline.task.name", "job");
         assert_string_attribute(step_span, "cicd.pipeline.task.name", "step");
     }
@@ -1765,7 +1765,7 @@ mod tests {
             .expect("job span is exported");
         let mut steps = spans
             .iter()
-            .filter(|span| span.name.starts_with("Step "))
+            .filter(|span| span.name.starts_with("Build Workflow / Linux Job / Step "))
             .collect::<Vec<_>>();
         steps.sort_by_key(|span| span.start_time);
 
@@ -1855,7 +1855,7 @@ mod tests {
             .expect("job span is exported");
         let steps = spans
             .iter()
-            .filter(|span| span.name.starts_with("Step "))
+            .filter(|span| span.name.starts_with("Build Workflow / Linux Job / Step "))
             .collect::<Vec<_>>();
 
         assert_exception_event(
@@ -1987,7 +1987,13 @@ mod tests {
         assert_eq!(
             spans
                 .iter()
-                .filter(|span| matches!(span.name.as_ref(), "Checkout" | "Test"))
+                .filter(|span| {
+                    matches!(
+                        span.name.as_ref(),
+                        "Build Workflow / Linux Job / Checkout"
+                            | "Build Workflow / Linux Job / Test"
+                    )
+                })
                 .count(),
             2
         );
@@ -1998,7 +2004,12 @@ mod tests {
             .expect("job span is exported");
         let mut steps = spans
             .iter()
-            .filter(|span| matches!(span.name.as_ref(), "Checkout" | "Test"))
+            .filter(|span| {
+                matches!(
+                    span.name.as_ref(),
+                    "Build Workflow / Linux Job / Checkout" | "Build Workflow / Linux Job / Test"
+                )
+            })
             .collect::<Vec<_>>();
         steps.sort_by_key(|span| span.start_time);
 
@@ -2133,11 +2144,7 @@ mod tests {
         );
         assert_string_attribute(steps[0], "cicd.pipeline.task.run.result", "success");
         assert_string_attribute(steps[0], "sentry.op", "github.actions.step");
-        assert_string_attribute(
-            steps[0],
-            "sentry.description",
-            "Build Workflow / Linux Job / Checkout",
-        );
+        assert_string_attribute(steps[0], "sentry.description", "Checkout");
         assert_string_attribute(steps[0], "timing_source", "reported");
         assert_string_attribute(steps[1], "cicd.pipeline.task.name", "Test");
         assert_string_attribute(steps[1], "cicd.pipeline.task.run.id", "41:2");
@@ -2309,7 +2316,7 @@ mod tests {
             .expect("job span is exported");
         let step_span = spans
             .iter()
-            .find(|span| span.name == "Step 1")
+            .find(|span| span.name == "Build Workflow / Linux Job / Step 1")
             .expect("step span is exported");
 
         assert_eq!(job_span.status, Status::Unset);

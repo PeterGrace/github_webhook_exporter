@@ -3113,7 +3113,10 @@ async fn shutdown_exports_accepted_core_workflow_and_log_records() {
         .parent_span_id
         .is_empty());
     let job = captured.one_named("workflow / job");
-    assert_eq!(captured.child_count(job, "shutdown step"), 1);
+    assert_eq!(
+        captured.child_count(job, "workflow / job / shutdown step"),
+        1
+    );
     assert!(captured.has_log_body("shutdown export sentinel"));
     assert!(stderr.contains("shutdown export sentinel"));
 }
@@ -3296,11 +3299,7 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
         "webhook-private-repository",
     );
     assert_attribute(steps[0], "sentry.op", "github.actions.step");
-    assert_attribute(
-        steps[0],
-        "sentry.description",
-        "BuildWorkflow / LinuxJob / RunTests",
-    );
+    assert_attribute(steps[0], "sentry.description", "RunTests");
     assert_attribute(steps[0], "timing_source", "reported");
     assert_eq!(
         steps[0].start_time_unix_nano,
@@ -3327,11 +3326,7 @@ async fn workflow_job_completed_exports_one_independent_historical_trace() {
         "webhook-private-repository",
     );
     assert_attribute(steps[1], "sentry.op", "github.actions.step");
-    assert_attribute(
-        steps[1],
-        "sentry.description",
-        "BuildWorkflow / LinuxJob / Checkout",
-    );
+    assert_attribute(steps[1], "sentry.description", "Checkout");
     assert_attribute(steps[1], "timing_source", "reported");
     assert_eq!(
         steps[1].start_time_unix_nano,
@@ -4288,12 +4283,7 @@ async fn hostile_failed_workflow_payload_is_private() {
             assert_eq!(trace.op.as_deref(), Some("github.actions.step"));
             assert_eq!(
                 trace.description.as_deref(),
-                Some(
-                    format!(
-                        "{WORKFLOW_SANITIZED_NAME} / {WORKFLOW_SANITIZED_JOB_NAME} / {sanitized_step_name}"
-                    )
-                    .as_str()
-                )
+                Some(sanitized_step_name.as_str())
             );
             assert_eq!(trace.status, Some(SentrySpanStatus::InternalError));
             assert_eq!(trace.origin.as_deref(), Some("manual.github.workflow"));

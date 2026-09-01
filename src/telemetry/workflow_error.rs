@@ -179,7 +179,7 @@ impl SyntheticWorkflowError {
             || format!("unnamed-step:{}", step.number()),
             |name| name.as_str().to_owned(),
         );
-        let trace_description = step_description(job, step);
+        let trace_description = step_description(step);
         Self::new(
             job_origin(job),
             WorkflowErrorParts {
@@ -773,10 +773,7 @@ mod tests {
                     SpanId::from_bytes([2; 8]).to_string()
                 );
                 assert_eq!(trace.op.as_deref(), Some("github.actions.step"));
-                assert_eq!(
-                    trace.description.as_deref(),
-                    Some("Build Workflow / Linux Job / cargo test")
-                );
+                assert_eq!(trace.description.as_deref(), Some("cargo test"));
             }
             _ => panic!("trace context is present"),
         }
@@ -818,10 +815,7 @@ mod tests {
         assert_eq!(step_error.exception_type(), "GitHubActionsTaskTimeout");
         assert_eq!(step_error.description(), "CI task timed out: task 41:2");
         assert_eq!(step_error.task_name(), "task 41:2");
-        assert_eq!(
-            step_error.trace_description(),
-            "Build Workflow / job / step"
-        );
+        assert_eq!(step_error.trace_description(), "step");
         assert_eq!(job_error.kind(), WorkflowTaskKind::Job);
         assert_eq!(job_error.description(), "CI task timed out: task 41");
         assert_eq!(job_error.task_name(), "task 41");

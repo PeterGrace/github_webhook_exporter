@@ -72,12 +72,12 @@ every reported step as a span; over-limit jobs emit no partial trace and increme
 Each accepted projection creates an independent task-run root with a trace identity unrelated to
 the live `http.request` trace. Its span name and `sentry.description` are
 `<workflow-name> / <job-name>`, and its `sentry.op` is `github.actions.job`. Every projected step is
-a direct task-run child named `<step-name>`; its `sentry.description` is
-`<workflow-name> / <job-name> / <step-name>`, and its `sentry.op` is `github.actions.step`. Missing
-workflow, job, and step names use the fixed values `workflow`, `job`, and `step`. Both span kinds are
-`INTERNAL`. The service creates no workflow-run root and does not mutate merge-queue state for a
-`workflow_job` event. It persists only bounded workflow-run correlation metadata keyed by
-repository, run ID, and run attempt; these records use the processed-delivery retention cutoff.
+a direct task-run child named `<workflow-name> / <job-name> / <step-name>`; its `sentry.description`
+is the bare `<step-name>`, and its `sentry.op` is `github.actions.step`. Missing workflow, job, and
+step names use the fixed values `workflow`, `job`, and `step`. Both span kinds are `INTERNAL`. The
+service creates no workflow-run root and does not mutate merge-queue state for a `workflow_job`
+event. It persists only bounded workflow-run correlation metadata keyed by repository, run ID, and
+run attempt; these records use the processed-delivery retention cutoff.
 
 **Timing.** A job uses its exact RFC 3339 `started_at`/`completed_at` only when both parse and
 start is not after completion (`timing_source=reported`); otherwise it's instantaneous at a valid
