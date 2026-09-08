@@ -385,6 +385,25 @@ fn derive_pipeline_trace_id(
     let mut trace_bytes = [0_u8; TRACE_ID_BYTES];
     trace_bytes.copy_from_slice(&digest[..TRACE_ID_BYTES]);
 
+    addressable_trace_id(trace_bytes)
+}
+
+/// Converts 16 digest bytes into a trace identifier that can address a real trace.
+///
+/// This is the guard that keeps a pipeline root from ever being exported with
+/// [`TraceId::INVALID`], which no collector can join. It is split out from
+/// [`derive_pipeline_trace_id`] because the all-zero digest that triggers it cannot be reached
+/// through the hash without inverting SHA-256, so the branch is only directly testable from here.
+///
+/// # Parameters
+///
+/// * `trace_bytes` - The first 16 bytes of the preimage digest.
+///
+/// # Returns
+///
+/// The trace identifier, or [`None`] when every byte is zero and the caller must fall back to a
+/// randomly generated identifier.
+fn addressable_trace_id(trace_bytes: [u8; TRACE_ID_BYTES]) -> Option<TraceId> {
     let trace_id = TraceId::from_bytes(trace_bytes);
     (trace_id != TraceId::INVALID).then_some(trace_id)
 }
@@ -536,8 +555,9 @@ mod tests {
     };
 
     use super::{
-        derive_pipeline_trace_id, PipelineJobSummary, PipelineRunTrace, PipelineRunTraceParts,
-        SyntheticWorkflowError, WorkflowJobTraceIdentity, MAX_PIPELINE_JOB_SPANS,
+        addressable_trace_id, derive_pipeline_trace_id, PipelineJobSummary, PipelineRunTrace,
+        PipelineRunTraceParts, SyntheticWorkflowError, WorkflowJobTraceIdentity,
+        MAX_PIPELINE_JOB_SPANS, TRACE_ID_BYTES,
     };
     use crate::{
         domain::{delivery::DeliveryId, merge_queue::PullRequestNumber},
@@ -866,6 +886,22 @@ mod tests {
                 derived_trace_id("stackblitz/bolt", 12_345_678_901, 1)
             ),
             "18f1e9fd4498a37448e4d9a574bd3645"
+        );
+    }
+
+    /// The guard the hash itself cannot reach: `derive_pipeline_trace_id` can only return `None`
+    /// for a preimage whose digest truncates to all zeroes, which needs SHA-256 inverted to
+    /// construct. Exercising the decision directly is what keeps the fallback from being verified
+    /// by documentation alone.
+    #[test]
+    fn an_all_zero_digest_prefix_has_no_addressable_trace_id() {
+        assert_eq!(addressable_trace_id([0; TRACE_ID_BYTES]), None);
+
+        let mut single_bit = [0; TRACE_ID_BYTES];
+        single_bit[TRACE_ID_BYTES - 1] = 1;
+        assert_eq!(
+            addressable_trace_id(single_bit),
+            Some(TraceId::from_bytes(single_bit))
         );
     }
 
