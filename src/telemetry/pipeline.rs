@@ -12,6 +12,7 @@ use opentelemetry::{
     },
     Context, KeyValue,
 };
+use sha2::{Digest, Sha256};
 
 use crate::{domain::delivery::DeliveryId, security::CanonicalRepositoryName};
 
@@ -27,7 +28,7 @@ use super::{
     workflow::{
         append_pipeline_and_repository_context, append_workflow_run_context, DisplayName,
         HistoricalTiming, TimingSource, WorkflowConclusion, WorkflowJobId, WorkflowPullRequests,
-        WorkflowRunContext, WorkflowTraceEmitter,
+        WorkflowRunAttempt, WorkflowRunContext, WorkflowRunId, WorkflowTraceEmitter,
     },
     workflow_error::{PipelineTaskErrorParts, SyntheticWorkflowError},
 };
@@ -42,6 +43,15 @@ const UNNAMED_JOB_NAME: &str = "job";
 const UNKNOWN_WORKFLOW_NAME: &str = "workflow";
 const PIPELINE_ROOT_REQUIRED_ATTRIBUTE_COUNT: usize = 12;
 const PIPELINE_TASK_REQUIRED_ATTRIBUTE_COUNT: usize = 13;
+
+/// The domain separation prefix of the pipeline-run trace identifier preimage.
+///
+/// It keeps the hashed string from colliding with any other SHA-256 preimage this service or a
+/// consumer might derive from the same three GitHub identifiers.
+const PIPELINE_TRACE_ID_DOMAIN: &str = "gha-pipeline";
+
+/// The number of leading digest bytes that form a W3C trace identifier.
+const TRACE_ID_BYTES: usize = 16;
 
 /// The exported identity of one emitted workflow-job trace root span.
 ///
@@ -252,7 +262,7 @@ impl WorkflowTraceEmitter {
                 .with_kind(SpanKind::Internal)
                 .with_start_time(pipeline.timing().start())
                 .with_attributes(pipeline_root_attributes(pipeline)),
-            &Context::new(),
+            &pipeline_root_context(pipeline),
         );
         root.set_status(pipeline.conclusion().status());
         let parent_context = Context::current_with_span(root);
@@ -298,6 +308,104 @@ impl WorkflowTraceEmitter {
             .span()
             .end_with_timestamp(pipeline.timing().end());
     }
+}
+
+/// Returns the parent context that pins one pipeline-run root span to its derived trace.
+///
+/// `SpanBuilder` exposes no trace identifier of its own and `IdGenerator::new_trace_id` receives
+/// no per-span context, so the only way to preset a root's trace is through the parent context
+/// passed to `build_with_context`. Two details of that context are load bearing:
+///
+/// * The span identifier is [`SpanId::INVALID`]. The SDK copies the parent's span identifier into
+///   `parent_span_id`, so an invalid one leaves the emitted span a true root, byte-for-byte as it
+///   was when built from an empty context.
+/// * The trace flags are [`TraceFlags::SAMPLED`]. The default `ParentBased` sampler follows any
+///   parent present in the context, so an unsampled synthetic parent would drop the whole trace.
+///
+/// Falls back to an empty context, and therefore to a randomly generated trace identifier, when
+/// the digest cannot address a real trace.
+///
+/// # Parameters
+///
+/// * `pipeline` - The bounded pipeline-run summary trace about to be exported.
+fn pipeline_root_context(pipeline: &PipelineRunTrace) -> Context {
+    let Some(trace_id) = derive_pipeline_trace_id(
+        &pipeline.repository_name,
+        pipeline.run_context.run_id(),
+        pipeline.run_context.run_attempt(),
+    ) else {
+        return Context::new();
+    };
+
+    // `is_remote` is false: this context stands in for the absent parent of a locally built root,
+    // not for a span context received from another service.
+    Context::new().with_remote_span_context(SpanContext::new(
+        trace_id,
+        SpanId::INVALID,
+        TraceFlags::SAMPLED,
+        false,
+        TraceState::NONE,
+    ))
+}
+
+/// Derives the deterministic trace identifier of one pipeline-run summary trace.
+///
+/// The identifier is the first 16 bytes of
+/// `sha256("gha-pipeline:{repository}:{run_id}:{run_attempt}")`, where `{repository}` is the
+/// canonical lowercase `owner/repository` name and the two identifiers are decimal. Every input is
+/// available to a running job as `$GITHUB_REPOSITORY` (lowercased), `$GITHUB_RUN_ID`, and
+/// `$GITHUB_RUN_ATTEMPT`, so telemetry emitted from inside the run can compute the same value and
+/// attach natively to this trace long before the completed `workflow_run` webhook mints it.
+///
+/// # Parameters
+///
+/// * `repository_name` - The canonical repository name, which scopes run identifiers that GitHub
+///   only guarantees to be unique per repository.
+/// * `run_id` - The validated workflow run identifier.
+/// * `run_attempt` - The validated workflow run attempt.
+///
+/// # Returns
+///
+/// The derived trace identifier, or [`None`] when the digest truncates to [`TraceId::INVALID`] and
+/// the caller must fall back to a randomly generated identifier.
+fn derive_pipeline_trace_id(
+    repository_name: &CanonicalRepositoryName,
+    run_id: WorkflowRunId,
+    run_attempt: WorkflowRunAttempt,
+) -> Option<TraceId> {
+    // The preimage is built once per completed run and is the exact byte sequence a consumer must
+    // reproduce, so it is written out literally rather than fed to the digest piecewise.
+    let preimage = format!(
+        "{PIPELINE_TRACE_ID_DOMAIN}:{}:{}:{}",
+        repository_name.as_str(),
+        run_id.get(),
+        run_attempt.get()
+    );
+    let digest = Sha256::digest(preimage.as_bytes());
+    let mut trace_bytes = [0_u8; TRACE_ID_BYTES];
+    trace_bytes.copy_from_slice(&digest[..TRACE_ID_BYTES]);
+
+    addressable_trace_id(trace_bytes)
+}
+
+/// Converts 16 digest bytes into a trace identifier that can address a real trace.
+///
+/// This is the guard that keeps a pipeline root from ever being exported with
+/// [`TraceId::INVALID`], which no collector can join. It is split out from
+/// [`derive_pipeline_trace_id`] because the all-zero digest that triggers it cannot be reached
+/// through the hash without inverting SHA-256, so the branch is only directly testable from here.
+///
+/// # Parameters
+///
+/// * `trace_bytes` - The first 16 bytes of the preimage digest.
+///
+/// # Returns
+///
+/// The trace identifier, or [`None`] when every byte is zero and the caller must fall back to a
+/// randomly generated identifier.
+fn addressable_trace_id(trace_bytes: [u8; TRACE_ID_BYTES]) -> Option<TraceId> {
+    let trace_id = TraceId::from_bytes(trace_bytes);
+    (trace_id != TraceId::INVALID).then_some(trace_id)
 }
 
 fn pipeline_root_attributes(pipeline: &PipelineRunTrace) -> Vec<KeyValue> {
@@ -447,8 +555,9 @@ mod tests {
     };
 
     use super::{
-        PipelineJobSummary, PipelineRunTrace, PipelineRunTraceParts, SyntheticWorkflowError,
-        WorkflowJobTraceIdentity, MAX_PIPELINE_JOB_SPANS,
+        addressable_trace_id, derive_pipeline_trace_id, PipelineJobSummary, PipelineRunTrace,
+        PipelineRunTraceParts, SyntheticWorkflowError, WorkflowJobTraceIdentity,
+        MAX_PIPELINE_JOB_SPANS, TRACE_ID_BYTES,
     };
     use crate::{
         domain::{delivery::DeliveryId, merge_queue::PullRequestNumber},
@@ -536,6 +645,19 @@ mod tests {
             WorkflowBranch::sanitize("gh-readonly-queue/main/pr-7"),
             WorkflowBranch::sanitize("main"),
         )
+    }
+
+    fn repository(full_name: &str) -> CanonicalRepositoryName {
+        CanonicalRepositoryName::new(full_name).expect("repository name is canonical")
+    }
+
+    fn derived_trace_id(full_name: &str, run_id: i64, run_attempt: i64) -> TraceId {
+        derive_pipeline_trace_id(
+            &repository(full_name),
+            WorkflowRunId::new(run_id).expect("run id is positive"),
+            WorkflowRunAttempt::new(run_attempt).expect("attempt is positive"),
+        )
+        .expect("the fixture digest addresses a real trace")
     }
 
     fn parts(jobs: Vec<PipelineJobSummary>) -> PipelineRunTraceParts {
@@ -746,6 +868,112 @@ mod tests {
         assert_eq!(degraded.timing().start(), instant(50));
         assert_eq!(degraded.timing().end(), instant(400));
         assert_eq!(degraded.timing().source(), TimingSource::Fallback);
+    }
+
+    /// The shared fixture both this exporter and any in-job emitter must reproduce.
+    ///
+    /// Changing either value is a breaking change to the association contract documented in
+    /// `book/src/reference/traces.md`, not a test detail.
+    #[test]
+    fn the_derived_trace_id_matches_the_published_shared_fixture() {
+        assert_eq!(
+            format!("{:032x}", derived_trace_id("owner/repository", 31, 2)),
+            "744f46e18e520d0324ebe726e54e6861"
+        );
+        assert_eq!(
+            format!(
+                "{:032x}",
+                derived_trace_id("stackblitz/bolt", 12_345_678_901, 1)
+            ),
+            "18f1e9fd4498a37448e4d9a574bd3645"
+        );
+    }
+
+    /// The guard the hash itself cannot reach: `derive_pipeline_trace_id` can only return `None`
+    /// for a preimage whose digest truncates to all zeroes, which needs SHA-256 inverted to
+    /// construct. Exercising the decision directly is what keeps the fallback from being verified
+    /// by documentation alone.
+    #[test]
+    fn an_all_zero_digest_prefix_has_no_addressable_trace_id() {
+        assert_eq!(addressable_trace_id([0; TRACE_ID_BYTES]), None);
+
+        let mut single_bit = [0; TRACE_ID_BYTES];
+        single_bit[TRACE_ID_BYTES - 1] = 1;
+        assert_eq!(
+            addressable_trace_id(single_bit),
+            Some(TraceId::from_bytes(single_bit))
+        );
+    }
+
+    #[test]
+    fn the_derived_trace_id_separates_repositories_runs_and_attempts() {
+        let baseline = derived_trace_id("owner/repository", 31, 2);
+
+        assert_ne!(baseline, derived_trace_id("owner/other-repository", 31, 2));
+        assert_ne!(baseline, derived_trace_id("owner/repository", 32, 2));
+        assert_ne!(baseline, derived_trace_id("owner/repository", 31, 1));
+        assert_eq!(baseline, derived_trace_id("owner/repository", 31, 2));
+    }
+
+    /// The consumer hashes `$GITHUB_REPOSITORY` lowercased, so a mixed-case payload must not move
+    /// the trace: `CanonicalRepositoryName` is what reaches the digest.
+    #[test]
+    fn the_derived_trace_id_ignores_repository_name_casing_and_padding() {
+        assert_eq!(
+            derived_trace_id("owner/repository", 31, 2),
+            derived_trace_id("  Owner/Repository  ", 31, 2)
+        );
+    }
+
+    #[test]
+    fn the_exported_root_carries_the_derived_trace_id_and_stays_a_root() {
+        let pipeline = PipelineRunTrace::new(parts(vec![
+            job(41, Some("Linux Job"), WorkflowConclusion::Success, 100, 300),
+            job(42, None, WorkflowConclusion::Failure, 200, 400),
+        ]))
+        .expect("a summarized run builds a trace");
+        let expected = derived_trace_id(REPOSITORY, 31, 2);
+
+        let spans = emitted_spans(&pipeline);
+        let root = spans
+            .iter()
+            .find(|span| span.parent_span_id == SpanId::INVALID)
+            .expect("one independent pipeline root is exported");
+
+        assert_eq!(root.span_context.trace_id(), expected);
+        assert_ne!(root.span_context.trace_id(), TraceId::INVALID);
+        assert_ne!(root.span_context.span_id(), SpanId::INVALID);
+        // The synthetic parent context must not survive into the exported span: a preset trace
+        // that also introduced a parent or unsampled the trace would change the emitted shape.
+        assert!(!root.parent_span_is_remote);
+        assert!(root.span_context.is_sampled());
+        assert!(spans
+            .iter()
+            .all(|span| span.span_context.trace_id() == expected));
+    }
+
+    #[test]
+    fn a_re_emitted_run_reuses_its_trace_while_a_re_run_gets_its_own() {
+        let pipeline = PipelineRunTrace::new(parts(vec![job(
+            41,
+            Some("Linux Job"),
+            WorkflowConclusion::Success,
+            100,
+            300,
+        )]))
+        .expect("a summarized run builds a trace");
+
+        let first = emitted_spans(&pipeline);
+        let second = emitted_spans(&pipeline);
+
+        assert_eq!(
+            first[0].span_context.trace_id(),
+            second[0].span_context.trace_id()
+        );
+        assert_ne!(
+            first[0].span_context.trace_id(),
+            derived_trace_id(REPOSITORY, 31, 3)
+        );
     }
 
     #[test]

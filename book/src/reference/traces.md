@@ -213,6 +213,54 @@ Every child carries exactly one OpenTelemetry span link whose trace and span IDs
 `github.actions.job` root span exported when that job completed, so a pipeline waterfall row leads
 directly to the full job-and-step trace. The root itself carries no links.
 
+**Trace identifier.** The root's trace ID is not random. It is derived from the run itself, so
+telemetry emitted from *inside* a running job can compute the same value and attach natively to
+this trace, rather than only correlating by attribute. A completed `workflow_run` webhook arrives
+strictly after the jobs it summarizes, so a random identifier could never be looked up in time;
+both sides must compute it independently from data GitHub gives to both.
+
+The trace ID is the first 16 bytes of the SHA-256 digest of this exact preimage:
+
+```text
+gha-pipeline:{repository}:{run_id}:{run_attempt}
+```
+
+* `{repository}` is the canonical `owner/repository` name: trimmed and **lowercased**. GitHub does
+  not guarantee `$GITHUB_REPOSITORY` is lowercase, so a consumer must lowercase it before hashing.
+* `{run_id}` and `{run_attempt}` are decimal, matching `$GITHUB_RUN_ID` and `$GITHUB_RUN_ATTEMPT`.
+* The three fields are separated by `:` with no padding, and the digest is truncated to its first
+  16 bytes, rendered as 32 lowercase hex characters.
+
+The repository is part of the key because GitHub only guarantees `run_id` to be unique per
+repository, so one exporter can serve several repositories into one Sentry organization without
+collisions. This fixture pins the contract and is asserted by the exporter's own tests:
+
+| Preimage | Trace ID |
+| --- | --- |
+| `gha-pipeline:owner/repository:31:2` | `744f46e18e520d0324ebe726e54e6861` |
+| `gha-pipeline:stackblitz/bolt:12345678901:1` | `18f1e9fd4498a37448e4d9a574bd3645` |
+
+An in-job emitter reproduces this with, for example:
+
+```bash
+printf 'gha-pipeline:%s:%s:%s' \
+  "$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" \
+  "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" |
+  sha256sum | cut -c1-32
+```
+
+Three consequences are deliberate. A re-run gets its own trace, because `run_attempt` is part of
+the key, and jobs that did not re-execute do not appear under it — matching what GitHub itself
+reports for that attempt. Only runs completed after this behaviour was deployed have derived
+identifiers; traces exported before it keep their random ones and cannot be joined. And in the
+theoretical case where the truncated digest is all zeroes, which is not a valid trace ID, the root
+falls back to a randomly generated identifier and simply loses in-job association for that one run.
+
+Only the pipeline root is derived. Job traces keep independent random identifiers, and the
+`github.actions.pipeline.task` child span IDs are random too, so an in-job emitter can attach to
+the run's trace but not to its own job's summary span — that would need the numeric GitHub job ID,
+which is not exposed to a running job.
+
 **Conclusion and status.** The run conclusion is derived from the summarized jobs, not from the
 payload. Severity descends `failure`, `timed_out`, `cancelled`, `other`, `neutral`, `success`,
 `skipped`, so any failed or timed-out job decides the run and skipped jobs never mask an otherwise
