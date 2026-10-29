@@ -2,3 +2,4 @@
 /dist/
 .env
 .worktrees/
+.claims.json.lock
