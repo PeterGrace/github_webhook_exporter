@@ -2363,7 +2363,8 @@
         "src/telemetry/workflow.rs"
       ],
       "tags": [
-        "area:merge-queue"
+        "area:merge-queue",
+        "issue:112"
       ],
       "status": {
         "state": "active"
@@ -2398,10 +2399,10 @@
         }
       ],
       "created_at": "2026-10-29T13:08:30.478782863Z",
-      "updated_at": "2026-10-29T13:11:35.797296783Z",
+      "updated_at": "2026-10-29T13:18:51.656596957Z",
       "seal": {
         "by": "server",
-        "mac": "265eab820fb64b1c4d5f1824bb0efe79ad476342a176dae74008a36956eee512"
+        "mac": "7ee1dc0e36a3e67c6ea6966aa75805246b045834bd1daacd243e3900d2afac43"
       }
     },
     {
@@ -3765,7 +3766,8 @@
         "src/security/mod.rs"
       ],
       "tags": [
-        "area:config-security"
+        "area:config-security",
+        "issue:113"
       ],
       "status": {
         "state": "active"
@@ -3813,10 +3815,10 @@
         }
       ],
       "created_at": "2026-10-29T13:09:23.261493766Z",
-      "updated_at": "2026-10-29T13:12:24.188646070Z",
+      "updated_at": "2026-10-29T13:18:51.670511405Z",
       "seal": {
         "by": "server",
-        "mac": "e67ed0b1a54b2a61190fa3195b41768521ced73e0af69539df1aebd1fd8b60fa"
+        "mac": "6cb2e356ea56830c9d18b21f7492a9f73ff3106f99b5cde483c7f759587e7d30"
       }
     },
     {
@@ -6085,7 +6087,8 @@
         "src"
       ],
       "tags": [
-        "area:docs-constraints"
+        "area:docs-constraints",
+        "issue:114"
       ],
       "status": {
         "state": "active"
@@ -6120,10 +6123,10 @@
         }
       ],
       "created_at": "2026-10-29T13:09:37.326828561Z",
-      "updated_at": "2026-10-29T13:11:03.124861998Z",
+      "updated_at": "2026-10-29T13:18:51.693744756Z",
       "seal": {
         "by": "server",
-        "mac": "98e319a500257ccd2d73ae0e2aecf54c9cf7aa34ddc8d5942b407042826e6aa0"
+        "mac": "eb021b6d89b5a65a4cda8c7bb353394d92f9270080eec2005641d6e243150da5"
       }
     },
     {
@@ -7441,7 +7444,8 @@
         "ci/helm/render-cases.txt"
       ],
       "tags": [
-        "area:packaging"
+        "area:packaging",
+        "issue:115"
       ],
       "status": {
         "state": "active"
@@ -7476,10 +7480,10 @@
         }
       ],
       "created_at": "2026-10-29T13:09:51.971781670Z",
-      "updated_at": "2026-10-29T13:11:35.609368949Z",
+      "updated_at": "2026-10-29T13:18:51.707624214Z",
       "seal": {
         "by": "server",
-        "mac": "2d5e3c69baf4c205e9b6d50fca78a9eeb8bd59ee654e162fa7231af9facfab1c"
+        "mac": "4edbe6167325bd6776b3cdf6cdf77a1ad4090fc1e172fc03fd50d4a717fe0891"
       }
     },
     {
@@ -8070,7 +8074,8 @@
         "scripts/release-publish-test.sh"
       ],
       "tags": [
-        "area:packaging"
+        "area:packaging",
+        "issue:116"
       ],
       "status": {
         "state": "active"
@@ -8105,10 +8110,10 @@
         }
       ],
       "created_at": "2026-10-29T13:09:51.971781670Z",
-      "updated_at": "2026-10-29T13:11:35.775911295Z",
+      "updated_at": "2026-10-29T13:18:51.721244131Z",
       "seal": {
         "by": "server",
-        "mac": "6690aabeb80604803e2fe57fab9f1bed696913ff1be2d57cc98835d65adc2a4f"
+        "mac": "dd589fb304ea2df8078d18a46e6f90eb7a1cf1068e50affb3fb1c2bd16a3ad0b"
       }
     },
     {
@@ -10186,7 +10191,8 @@
         "docs/superpowers/specs/2026-08-03-02-webhook-ingestion-and-metrics.md"
       ],
       "tags": [
-        "area:ingestion-metrics"
+        "area:ingestion-metrics",
+        "issue:117"
       ],
       "status": {
         "state": "active"
@@ -10221,10 +10227,10 @@
         }
       ],
       "created_at": "2026-10-29T13:09:53.077924556Z",
-      "updated_at": "2026-10-29T13:12:13.551630524Z",
+      "updated_at": "2026-10-29T13:18:51.735212460Z",
       "seal": {
         "by": "server",
-        "mac": "878b90e5cf8d35740877aa719848ef2958fdd8ef34107dc94d0b6c34152ee096"
+        "mac": "9741d0194b80fd04a921d6948b393dc8aa417b26c62d5edb83d8e893b60724d5"
       }
     },
     {
@@ -11946,7 +11952,8 @@
         "src/telemetry/http_client.rs"
       ],
       "tags": [
-        "area:otlp"
+        "area:otlp",
+        "issue:111"
       ],
       "status": {
         "state": "active"
@@ -11994,10 +12001,10 @@
         }
       ],
       "created_at": "2026-10-29T13:10:15.874454913Z",
-      "updated_at": "2026-10-29T13:13:45.243199601Z",
+      "updated_at": "2026-10-29T13:18:51.641493144Z",
       "seal": {
         "by": "server",
-        "mac": "e77b932c2864ef4ea390890c471cbf3c7572d1b4c08ee2323effb723adea6011"
+        "mac": "0c4ce7d4779976c8bdaf7232db2990deed641a3479bce2390e98623124d3709c"
       }
     },
     {
