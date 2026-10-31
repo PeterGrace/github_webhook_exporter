@@ -5,10 +5,10 @@
     "by": "server",
     "mac": "7799f3280dfba18ec8f96556a3b0a425a88d93217d82f7b371de45e2b22f4b22"
   },
-  "next_evidence_seq": 286,
+  "next_evidence_seq": 290,
   "next_evidence_seq_seal": {
     "by": "server",
-    "mac": "88cc2a2510d4d151b13d52459988474e0e3c77e5a98ea1effb0c03ea3ea9c712"
+    "mac": "aa6e3e90ad3073fbf63ca6d23153c5ef5d0a92b310887b811a807b89f708779d"
   },
   "claims": [
     {
@@ -42,6 +42,18 @@
             "by": "server",
             "mac": "e86bdc25398972cd10fed0bffaf8c6f0269d821a210711d2cd7d5b9f07bcd208"
           }
+        },
+        {
+          "id": "EVD-0289",
+          "kind": "analysis",
+          "locator": "current verdicts of descendants of CLM-0001 after PR #118 / commit 92ea43b",
+          "summary": "Across 201 leaves, 182 are supported, 16 refuted, and 3 not_enough_info. CLM-0195 is now supported; all six area parents remain refuted because each still has at least one other refuted descendant.",
+          "stance": "refutes",
+          "recorded_at": "2026-10-31T17:05:07.223492695Z",
+          "seal": {
+            "by": "server",
+            "mac": "b0881477370b2cb2a8562486f1035f6d58d58ce2bf598b5678d847ee2e4ad882"
+          }
         }
       ],
       "verdicts": [
@@ -57,13 +69,26 @@
             "by": "server",
             "mac": "4b7035aab2cf0e7173fe9579edaf53754a4cb7cef5b1645ceab751b3d029056c"
           }
+        },
+        {
+          "verdict": "refuted",
+          "rationale": "PR #118 moves CLM-0195 to supported, so the ledger now has 182 supported, 16 refuted, and 3 not_enough_info leaves. The root remains refuted because all six area parents still have at least one unresolved refuted descendant.",
+          "auditor": "codex/gpt-5",
+          "evidence_ids": [
+            "EVD-0289"
+          ],
+          "recorded_at": "2026-10-31T17:05:10.619982596Z",
+          "seal": {
+            "by": "server",
+            "mac": "933c94b0b5e85cde9ecbe1f8c76bef2f780ef6e36bd0d95b8bfcbab55a589d5f"
+          }
         }
       ],
       "created_at": "2026-10-29T13:05:29.267124631Z",
-      "updated_at": "2026-10-29T13:14:54.094498694Z",
+      "updated_at": "2026-10-31T17:05:10.619982596Z",
       "seal": {
         "by": "server",
-        "mac": "49530785560c1f2527fe1dd6fdc2bf7469d43755f12bdb482ebaddbab18ed0c5"
+        "mac": "efbb36c4bcf4c8e7947e48df21cde3e3c17a870fd929cd24759a6dcc5d25ff91"
       }
     },
     {
@@ -287,6 +312,18 @@
             "by": "server",
             "mac": "71ad78eed34d7b47f856185a499de7564e525e0d0cd076ee44e7cf203d9f80ed"
           }
+        },
+        {
+          "id": "EVD-0288",
+          "kind": "analysis",
+          "locator": "current verdicts of children of CLM-0005 after PR #118 / commit 92ea43b",
+          "summary": "The OTLP area now has 37 supported leaves and one refuted leaf. CLM-0195 is supported after the redirect fix; CLM-0194 remains refuted because the original OTLP specification forbids attributes deliberately required by later specifications and emitted by the implementation.",
+          "stance": "refutes",
+          "recorded_at": "2026-10-31T17:05:07.214928707Z",
+          "seal": {
+            "by": "server",
+            "mac": "39ab0838d01bbfe36db59037e7659ed97ea98fd6bf5b809132ffac5bb710edca"
+          }
         }
       ],
       "verdicts": [
@@ -302,13 +339,26 @@
             "by": "server",
             "mac": "1d717aabc1a503588929584072b9e9500c300a357c39b70939726ed7cb44c54e"
           }
+        },
+        {
+          "verdict": "refuted",
+          "rationale": "The redirect security finding CLM-0195 is now supported after PR #118, leaving 37 supported OTLP leaves. The area remains refuted solely because CLM-0194 documents an unresolved contradiction between the original OTLP specification and later specifications plus the implementation.",
+          "auditor": "codex/gpt-5",
+          "evidence_ids": [
+            "EVD-0288"
+          ],
+          "recorded_at": "2026-10-31T17:05:10.610488644Z",
+          "seal": {
+            "by": "server",
+            "mac": "787cd83fb62111cbb9744fa2ed54a71c20049003fe85ab868288779d1fb2eeb7"
+          }
         }
       ],
       "created_at": "2026-10-29T13:05:29.267124631Z",
-      "updated_at": "2026-10-29T13:14:44.511380520Z",
+      "updated_at": "2026-10-31T17:05:10.610488644Z",
       "seal": {
         "by": "server",
-        "mac": "19b6f700a91c56c22508177e38d44d8212f010295b256e64e140a667a9999a9b"
+        "mac": "173800b5c88a926d240a19eff30a3bfe3e7494804a6fb04c4d7d27924572953b"
       }
     },
     {
@@ -11982,6 +12032,50 @@
             "by": "server",
             "mac": "309f5797a056eae81b8477a812f961872aaabee343be6997d89a79da0373f98e"
           }
+        },
+        {
+          "id": "EVD-0286",
+          "kind": "inspection",
+          "locator": "src/telemetry.rs:691-705 at commit 92ea43b",
+          "summary": "The production OTLP blocking client installs a custom redirect policy whose callback returns an error, so reqwest cannot follow a 3xx response to another host.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "src/telemetry.rs",
+              "lines": {
+                "start": 691,
+                "end": 705
+              },
+              "commit": "92ea43b31a82aa384aecd8acc12803f7cc79373a"
+            }
+          },
+          "recorded_at": "2026-10-31T17:05:01.263123895Z",
+          "seal": {
+            "by": "server",
+            "mac": "18962325e9561507f5b58dd4e590feabfdece727564f1c48b03febc91ea5b342"
+          }
+        },
+        {
+          "id": "EVD-0287",
+          "kind": "test",
+          "locator": "telemetry::http_client::tests::production_client_rejects_redirects_without_contacting_the_target",
+          "summary": "The production client sends a request carrying x-api-key to a listener that returns a cross-host 307; the request fails with the bounded redirect diagnostic and the redirect target receives no connection. The test passed in the full 370-test suite.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "src/telemetry/http_client.rs",
+              "lines": {
+                "start": 258,
+                "end": 311
+              },
+              "commit": "92ea43b31a82aa384aecd8acc12803f7cc79373a"
+            }
+          },
+          "recorded_at": "2026-10-31T17:05:01.275926868Z",
+          "seal": {
+            "by": "server",
+            "mac": "ac235070be51430175face4d2edc380573f90be0fb8662ec747dc423510579c7"
+          }
         }
       ],
       "verdicts": [
@@ -11998,13 +12092,27 @@
             "by": "server",
             "mac": "19a7ec9c16dfbec191a95fc784da744a65e8c76535db91da37bde7ebe105bc7f"
           }
+        },
+        {
+          "verdict": "supported",
+          "rationale": "The production client now rejects every redirect before a follow-up request is made. The regression uses the real production builder with an x-api-key-bearing request, observes a 307 redirect failure classified as transport/redirect, and proves the target listener receives no connection.",
+          "auditor": "codex/gpt-5",
+          "evidence_ids": [
+            "EVD-0286",
+            "EVD-0287"
+          ],
+          "recorded_at": "2026-10-31T17:05:07.205965817Z",
+          "seal": {
+            "by": "server",
+            "mac": "256e71d1a57c1b35f245f162b1b4e952bce6ae74ba82edca0062de836fdb4f18"
+          }
         }
       ],
       "created_at": "2026-10-29T13:10:15.874454913Z",
-      "updated_at": "2026-10-29T13:18:51.641493144Z",
+      "updated_at": "2026-10-31T17:05:07.205965817Z",
       "seal": {
         "by": "server",
-        "mac": "0c4ce7d4779976c8bdaf7232db2990deed641a3479bce2390e98623124d3709c"
+        "mac": "dd2d52ea4565cc223fa22971ca89fa2aee9a101eccce3e378217fd7d2e214f2d"
       }
     },
     {
