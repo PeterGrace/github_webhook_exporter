@@ -694,6 +694,9 @@ fn build_blocking_http_client(timeout: Duration) -> Result<reqwest::blocking::Cl
         .spawn(move || {
             reqwest::blocking::Client::builder()
                 .timeout(timeout)
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    attempt.error("OTLP HTTP redirects are disabled")
+                }))
                 .build()
         })
         .map_err(|_| ())?

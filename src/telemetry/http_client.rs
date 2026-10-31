@@ -135,11 +135,11 @@ fn classify_reqwest_error(error: &reqwest::Error) -> ClassifiedHttpFailure {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{Read, Write},
+        io::{self, Read, Write},
         net::TcpListener,
         sync::Mutex,
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response};
@@ -147,6 +147,7 @@ mod tests {
     use crate::{
         metrics::{Metrics, TelemetryExportFailureReason, TelemetrySignal},
         telemetry::{
+            build_blocking_http_client,
             diagnostics::{DiagnosticsObserver, ExportFailureDetail},
             http_client::{classify_reqwest_error, ClassifiedHttpFailure, ObservingHttpClient},
         },
@@ -255,32 +256,37 @@ mod tests {
     }
 
     #[test]
-    fn redirect_policy_failures_have_bounded_detail() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("listener binds");
-        let address = listener
+    fn production_client_rejects_redirects_without_contacting_the_target() {
+        let redirect_target = TcpListener::bind("127.0.0.1:0").expect("target listener binds");
+        redirect_target
+            .set_nonblocking(true)
+            .expect("target listener becomes nonblocking");
+        let target_address = redirect_target
             .local_addr()
-            .expect("listener address is available");
-        let location = format!("http://{address}/redirected");
+            .expect("target listener address is available");
+        let redirect_source = TcpListener::bind("127.0.0.1:0").expect("source listener binds");
+        let source_address = redirect_source
+            .local_addr()
+            .expect("source listener address is available");
         thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("test request arrives");
+            let (mut stream, _) = redirect_source.accept().expect("test request arrives");
             let mut request = [0_u8; 1024];
             let _ = stream.read(&mut request);
-            let response =
-                format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n");
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_address}/\r\n\
+                 Content-Length: 0\r\n\r\n"
+            );
             stream
                 .write_all(response.as_bytes())
                 .expect("redirect response writes");
         });
-        let client = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                attempt.error("blocked redirect")
-            }))
-            .build()
-            .expect("client builds");
+        let client = build_blocking_http_client(Duration::from_secs(1))
+            .expect("production HTTP client builds");
         let error = client
-            .get(format!("http://{address}"))
+            .get(format!("http://{source_address}"))
+            .header("x-api-key", "test-exporter-credential")
             .send()
-            .expect_err("redirect policy rejects response");
+            .expect_err("production redirect policy rejects response");
 
         assert_eq!(
             classify_reqwest_error(&error),
@@ -289,6 +295,19 @@ mod tests {
                 ExportFailureDetail::Redirect,
             )
         );
+        let deadline = Instant::now() + Duration::from_millis(100);
+        loop {
+            match redirect_target.accept() {
+                Ok(_) => panic!("redirect target must not receive a request"),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("target listener failed: {error}"),
+            }
+        }
     }
 
     #[tokio::test]
