@@ -27,4 +27,12 @@ Percent-encoding `/` and `.` was rejected: GitHub resolves multi-segment branch 
 the separators stay unencoded (see the existing `a_multi_segment_branch_keeps_its_separators_unencoded`
 test).
 
+Commit-pinned implementation and test evidence (EVD-0290, EVD-0291) is in the claims ledger.
+CLM-0037 is marked supported, and the merge-queue (CLM-0004) and root (CLM-0001) rollups are
+refreshed. Both stay refuted because of other leaves.
+
+Known edge: a `workflow_run_contexts` row stored before this change with a dot-segment branch
+now fails `validated_stored_branch` on load. A job webhook for that run then answers 503 until
+retention prunes the row. Only a payload signed with the webhook secret could have stored one.
+
 This resolves the CLM-0037 security finding tracked by issue #112.
