@@ -19,7 +19,7 @@ fn configured_command(database_path: &Path, bind_address: SocketAddr) -> Command
         .env_clear()
         .env("GHE_DATABASE_PATH", database_path)
         .env("GHE_MASTER_KEY", STANDARD.encode([7_u8; 32]))
-        .env("GHE_ADMIN_TOKEN", "startup-admin-token-secret")
+        .env("GHE_ADMIN_TOKEN", "startup-admin-token-secret-padded")
         .env("GHE_BIND_ADDRESS", bind_address.to_string())
         .env("GHE_SHUTDOWN_TIMEOUT_SECONDS", "2")
         .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:0")
@@ -40,7 +40,7 @@ fn unused_loopback_address() -> SocketAddr {
 #[test]
 fn invalid_configuration_reports_variable_without_leaking_credentials() {
     const INVALID_MASTER_KEY: &str = "invalid-master-key-secret";
-    const ADMIN_TOKEN: &str = "invalid-admin-token-secret";
+    const ADMIN_TOKEN: &str = "invalid-admin-token-secret-padded";
     let output = Command::new(env!("CARGO_BIN_EXE_github_webhook_exporter"))
         .env_clear()
         .env("GHE_DATABASE_PATH", "/tmp/exporter-invalid.db")
@@ -68,7 +68,7 @@ fn database_startup_failure_is_fatal_and_redacted() {
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     assert!(stderr.contains("failed to initialize SQLite storage"));
     assert!(stderr.contains("telemetry provider shutdown"));
-    assert!(!stderr.contains("startup-admin-token-secret"));
+    assert!(!stderr.contains("startup-admin-token-secret-padded"));
     assert!(!stderr.contains("startup-otlp-header-secret"));
     assert!(!stderr.contains(&STANDARD.encode([7_u8; 32])));
     assert!(!stderr.contains(database_path.to_string_lossy().as_ref()));
@@ -200,7 +200,7 @@ fn assert_graceful_signal(signal: &str, expected_signal: &str) {
     }
     for captured in [&health_response, &stderr] {
         for forbidden in [
-            "startup-admin-token-secret",
+            "startup-admin-token-secret-padded",
             "startup-otlp-header-secret",
             STANDARD.encode([7_u8; 32]).as_str(),
             "Authorization",

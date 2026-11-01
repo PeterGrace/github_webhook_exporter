@@ -77,7 +77,7 @@ mod tests {
     use super::{AdminAuthenticator, AuthenticationError};
     use crate::security::AdminToken;
 
-    const ADMIN_TOKEN: &str = "independent-admin-token";
+    const ADMIN_TOKEN: &str = "independent-admin-token-for-tests";
 
     fn authenticator() -> AdminAuthenticator {
         let token = AdminToken::new(ADMIN_TOKEN.to_owned()).expect("test token is valid");
@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn exact_bearer_token_authenticates() {
         assert_eq!(
-            authenticator().authenticate(Some("Bearer independent-admin-token")),
+            authenticator().authenticate(Some("Bearer independent-admin-token-for-tests")),
             Ok(())
         );
     }
@@ -97,7 +97,7 @@ mod tests {
         for authorization in [
             "Bearer incorrect-token",
             "Bearer independent-admin-toke",
-            "Bearer independent-admin-token-extra",
+            "Bearer independent-admin-token-for-tests-extra",
             "Bearer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         ] {
             assert_eq!(
@@ -114,8 +114,8 @@ mod tests {
             Some(""),
             Some("Bearer"),
             Some("Bearer "),
-            Some("bearer independent-admin-token"),
-            Some("Basic independent-admin-token"),
+            Some("bearer independent-admin-token-for-tests"),
+            Some("Basic independent-admin-token-for-tests"),
         ] {
             assert_eq!(
                 authenticator().authenticate(authorization),

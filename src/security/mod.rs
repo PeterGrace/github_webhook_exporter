@@ -12,6 +12,8 @@ use secrecy::{zeroize::Zeroizing, ExposeSecret, SecretBox, SecretSlice, SecretSt
 use thiserror::Error;
 
 const MASTER_KEY_LENGTH: usize = 32;
+/// Minimum administrator-token length in bytes, matching the master key's 256 bits.
+const MIN_ADMIN_TOKEN_LENGTH: usize = 32;
 const NONCE_LENGTH: usize = 12;
 const GCM_TAG_LENGTH: usize = 16;
 const MAX_REPOSITORY_SECRET_LENGTH: usize = 65_536;
@@ -54,13 +56,14 @@ impl fmt::Debug for MasterKey {
 pub struct AdminToken(SecretString);
 
 impl AdminToken {
-    /// Stores a non-empty administrator token in zeroizing secret storage.
+    /// Stores an administrator token of at least 32 bytes in zeroizing secret storage.
     ///
     /// # Errors
     ///
-    /// Returns [`SecurityError::InvalidAdminToken`] when `token` is empty.
+    /// Returns [`SecurityError::InvalidAdminToken`] when `token` is shorter than 32 bytes.
     pub fn new(token: String) -> Result<Self, SecurityError> {
-        if token.is_empty() {
+        // `String::len` counts UTF-8 bytes, not characters, so the floor is in bytes.
+        if token.len() < MIN_ADMIN_TOKEN_LENGTH {
             return Err(SecurityError::InvalidAdminToken);
         }
 
@@ -227,8 +230,8 @@ pub enum SecurityError {
     /// The database-encryption root key was not exactly 32 bytes.
     #[error("master key must contain exactly 32 bytes")]
     InvalidMasterKeyLength,
-    /// The administrator credential was empty.
-    #[error("administrator token must not be empty")]
+    /// The administrator credential was shorter than 32 bytes.
+    #[error("administrator token must contain at least 32 bytes")]
     InvalidAdminToken,
     /// The repository webhook secret was empty or larger than 65,536 bytes.
     #[error("repository secret has an invalid length")]
@@ -303,6 +306,28 @@ mod tests {
             AdminToken::new(String::new()).expect_err("empty tokens must be rejected"),
             SecurityError::InvalidAdminToken
         );
+    }
+
+    #[test]
+    fn admin_token_requires_at_least_32_bytes() {
+        // Arrange: one token just under the floor, one exactly at it.
+        let short_token = "a".repeat(31);
+        let minimum_token = "a".repeat(32);
+
+        // Act and Assert
+        assert_eq!(
+            AdminToken::new(short_token).expect_err("31-byte tokens must be rejected"),
+            SecurityError::InvalidAdminToken
+        );
+        assert!(AdminToken::new(minimum_token).is_ok());
+    }
+
+    #[test]
+    fn admin_token_length_counts_bytes_not_characters() {
+        // Eleven three-byte characters are 33 bytes but only 11 characters.
+        let multibyte_token = "\u{20AC}".repeat(11);
+
+        assert!(AdminToken::new(multibyte_token).is_ok());
     }
 
     #[test]
@@ -388,7 +413,7 @@ mod tests {
     #[test]
     fn secret_types_and_errors_are_redacted() {
         const MASTER_KEY_TEXT: &str = "master-key-sensitive-value";
-        const ADMIN_TOKEN_TEXT: &str = "admin-token-sensitive-value";
+        const ADMIN_TOKEN_TEXT: &str = "admin-token-sensitive-value-padded";
         const REPOSITORY_SECRET_TEXT: &str = "repository-secret-sensitive-value";
         let mut master_key_bytes = [0_u8; 32];
         master_key_bytes[..MASTER_KEY_TEXT.len()].copy_from_slice(MASTER_KEY_TEXT.as_bytes());

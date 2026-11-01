@@ -81,7 +81,7 @@ use super::{
 
 const QUEUE_CAPACITY: usize = 4;
 const SATURATION_RECORDS: usize = 10;
-const ADMIN_TOKEN: &str = "independent-admin-token";
+const ADMIN_TOKEN: &str = "independent-admin-token-for-tests";
 const MASTER_KEY_BYTES: &[u8; 32] = b"MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM";
 const WEBHOOK_SECRET: &str = "webhook-trace-secret-must-not-appear";
 const WEBHOOK_REPOSITORY: &str = "owner/webhook-private-repository";
@@ -591,7 +591,7 @@ impl RepositoryTraceFixture {
         self.request(
             method,
             uri,
-            Some("Bearer independent-admin-token"),
+            Some("Bearer independent-admin-token-for-tests"),
             Some("application/json"),
             Body::from(serialized),
         )
@@ -1114,7 +1114,7 @@ impl WebhookTraceFixture {
         self.request(
             method,
             uri,
-            Some("Bearer independent-admin-token"),
+            Some("Bearer independent-admin-token-for-tests"),
             Some("application/json"),
             Body::from(serialized),
         )
@@ -2646,7 +2646,7 @@ async fn repository_routes_emit_http_roots_and_write_children() {
         .request(
             Method::GET,
             "/api/v1/repositories",
-            Some("Bearer independent-admin-token"),
+            Some("Bearer independent-admin-token-for-tests"),
             None,
             Body::empty(),
         )
@@ -2671,7 +2671,7 @@ async fn repository_routes_emit_http_roots_and_write_children() {
         .request(
             Method::GET,
             &format!("/api/v1/repositories/{repository_id}"),
-            Some("Bearer independent-admin-token"),
+            Some("Bearer independent-admin-token-for-tests"),
             None,
             Body::empty(),
         )
@@ -2683,7 +2683,7 @@ async fn repository_routes_emit_http_roots_and_write_children() {
         .request(
             Method::DELETE,
             &format!("/api/v1/repositories/{repository_id}"),
-            Some("Bearer independent-admin-token"),
+            Some("Bearer independent-admin-token-for-tests"),
             None,
             Body::empty(),
         )
@@ -2727,7 +2727,7 @@ async fn repository_routes_emit_http_roots_and_write_children() {
 
     captured.assert_absent("raw-secret=must-not-appear");
     captured.assert_absent("create-secret-must-not-appear");
-    captured.assert_absent("Bearer independent-admin-token");
+    captured.assert_absent("Bearer independent-admin-token-for-tests");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2738,7 +2738,7 @@ async fn repository_error_routes_emit_redacted_http_roots_without_unapproved_chi
         .request(
             Method::POST,
             "/api/v1/repositories?query-secret=must-not-appear",
-            Some("Bearer independent-admin-token"),
+            Some("Bearer independent-admin-token-for-tests"),
             Some("application/json"),
             Body::from(r#"{"full_name":"owner/bad","webhook_secret":"bad-secret""#),
         )

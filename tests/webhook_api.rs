@@ -108,7 +108,8 @@ fn router_for_pool(pool: SqlitePool, body_limit: usize) -> Router {
         &MasterKey::from_slice(&[7_u8; 32]).expect("test master key is valid"),
     )
     .expect("repository cipher initializes");
-    let admin_token = AdminToken::new("admin-token".to_owned()).expect("admin token is valid");
+    let admin_token = AdminToken::new("admin-token-for-application-tests".to_owned())
+        .expect("admin token is valid");
     build_router(AppState::new(
         RepositoryStore::new(pool, cipher),
         AdminAuthenticator::new(&admin_token),
@@ -151,7 +152,8 @@ async fn test_app_with_repositories(
             .await
             .expect("repository fixture is created");
     }
-    let admin_token = AdminToken::new("admin-token".to_owned()).expect("admin token is valid");
+    let admin_token = AdminToken::new("admin-token-for-application-tests".to_owned())
+        .expect("admin token is valid");
     let state = AppState::new(
         store,
         AdminAuthenticator::new(&admin_token),
@@ -1182,7 +1184,8 @@ async fn restart_preserves_configuration_deduplication_and_bounded_metrics() {
         &MasterKey::from_slice(&[7_u8; 32]).expect("test master key is valid"),
     )
     .expect("repository cipher initializes");
-    let admin_token = AdminToken::new("admin-token".to_owned()).expect("admin token is valid");
+    let admin_token = AdminToken::new("admin-token-for-application-tests".to_owned())
+        .expect("admin token is valid");
     let state = AppState::new(
         RepositoryStore::new(second_pool.clone(), cipher),
         AdminAuthenticator::new(&admin_token),

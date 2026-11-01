@@ -360,9 +360,20 @@ impl RuntimeConfig {
             }
         })?;
 
-        let admin_token = AdminToken::new(required_string(&mut lookup, "GHE_ADMIN_TOKEN")?)
-            .map_err(|_| ConfigError::Invalid {
+        // `Zeroizing` wipes the plaintext if this function returns before `AdminToken` owns it.
+        let mut admin_token_text = Zeroizing::new(required_string(&mut lookup, "GHE_ADMIN_TOKEN")?);
+        // The admin token must be an independent credential, never the master key reused.
+        if *admin_token_text == *encoded_master_key {
+            return Err(ConfigError::Invalid {
                 variable: "GHE_ADMIN_TOKEN",
+            });
+        }
+        // `mem::take` moves the heap buffer into `AdminToken` without copying the plaintext.
+        let admin_token =
+            AdminToken::new(std::mem::take(&mut *admin_token_text)).map_err(|_| {
+                ConfigError::Invalid {
+                    variable: "GHE_ADMIN_TOKEN",
+                }
             })?;
 
         let bind_address = optional_string(&mut lookup, "GHE_BIND_ADDRESS")?
@@ -850,7 +861,7 @@ mod tests {
         DEFAULT_OTEL_QUEUE_CAPACITY,
     };
 
-    const ADMIN_TOKEN: &str = "admin-token-value";
+    const ADMIN_TOKEN: &str = "admin-token-value-for-config-tests";
 
     fn required_variables() -> HashMap<String, OsString> {
         HashMap::from([
@@ -874,7 +885,7 @@ mod tests {
         assert!(RepositorySecretCipher::new(config.master_key()).is_ok());
         assert_eq!(
             AdminAuthenticator::new(config.admin_token())
-                .authenticate(Some("Bearer admin-token-value")),
+                .authenticate(Some("Bearer admin-token-value-for-config-tests")),
             Ok(())
         );
         assert_eq!(config.bind_address(), SocketAddr::from(([0_u16; 8], 8080)));
@@ -976,6 +987,8 @@ mod tests {
             ("GHE_MASTER_KEY", "not-base64"),
             ("GHE_MASTER_KEY", "c2hvcnQ="),
             ("GHE_ADMIN_TOKEN", ""),
+            ("GHE_ADMIN_TOKEN", "x"),
+            ("GHE_ADMIN_TOKEN", "0123456789abcdef0123456789abcde"),
             ("GHE_BIND_ADDRESS", "invalid-address"),
             ("GHE_SHUTDOWN_TIMEOUT_SECONDS", "0"),
             ("GHE_SHUTDOWN_TIMEOUT_SECONDS", "not-a-number"),
@@ -1009,6 +1022,32 @@ mod tests {
                 assert!(!rendered.contains(invalid_value));
             }
         }
+    }
+
+    #[test]
+    fn admin_token_equal_to_encoded_master_key_is_rejected_without_disclosure() {
+        // Arrange: reuse the encoded master key as the admin token.
+        let mut variables = required_variables();
+        let encoded_master_key = variables
+            .get("GHE_MASTER_KEY")
+            .expect("fixture supplies a master key")
+            .clone();
+        variables.insert("GHE_ADMIN_TOKEN".to_owned(), encoded_master_key.clone());
+
+        // Act
+        let error = RuntimeConfig::from_map(variables).expect_err("shared credential is rejected");
+
+        // Assert: the error names the admin token variable and echoes no secret.
+        assert_eq!(
+            error,
+            ConfigError::Invalid {
+                variable: "GHE_ADMIN_TOKEN"
+            }
+        );
+        let encoded_master_key = encoded_master_key
+            .into_string()
+            .expect("fixture master key is UTF-8");
+        assert!(!error.to_string().contains(&encoded_master_key));
     }
 
     #[cfg(unix)]
