@@ -33,7 +33,7 @@ and GID `65532`.
 | --- | --- |
 | `GHE_DATABASE_PATH` | Writable SQLite file path, normally below the mounted data directory. |
 | `GHE_MASTER_KEY` | Base64 encoding of exactly 32 random bytes, from a secret store. |
-| `GHE_ADMIN_TOKEN` | Non-empty administrator bearer token, from a secret store. |
+| `GHE_ADMIN_TOKEN` | Administrator bearer token of at least 32 bytes, not equal to `GHE_MASTER_KEY`, from a secret store. |
 
 Optional `GHE_*`, `OTEL_*`, and `RUST_LOG` variables retain the contracts in
 [Environment variables](environment-variables.md). Never place secret values in image arguments,

@@ -9,7 +9,7 @@ matter directly when running the container or binary yourself.
 | --- | --- |
 | `GHE_DATABASE_PATH` | Writable SQLite file path. |
 | `GHE_MASTER_KEY` | Base64 encoding of exactly 32 random bytes. Derives the repository-secret encryption key. |
-| `GHE_ADMIN_TOKEN` | Non-empty bearer token for the admin API. |
+| `GHE_ADMIN_TOKEN` | Bearer token for the admin API: at least 32 bytes, and not equal to `GHE_MASTER_KEY`. |
 
 ## Optional application settings
 

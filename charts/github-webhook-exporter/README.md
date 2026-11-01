@@ -41,9 +41,9 @@ helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webh
 
 The chart requires one existing Secret in the release namespace. The default Secret name and key
 names are `github-webhook-exporter`, `master-key`, and `admin-token`. `GHE_MASTER_KEY` must be the
-base64 encoding of exactly 32 random bytes, and `GHE_ADMIN_TOKEN` must be non-empty. Read both
-required values from the operator's shell environment; do not commit them to a values file or
-manifest.
+base64 encoding of exactly 32 random bytes. `GHE_ADMIN_TOKEN` must be at least 32 bytes and must
+not equal `GHE_MASTER_KEY`; `openssl rand -hex 32` satisfies both. Read both required values from the
+operator's shell environment; do not commit them to a values file or manifest.
 
 ```bash
 : "${GHE_MASTER_KEY:?set GHE_MASTER_KEY in the operator shell}"

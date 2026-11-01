@@ -472,7 +472,8 @@ mod tests {
             .expect("in-memory SQLite opens");
         let key = MasterKey::from_slice(&[7_u8; 32]).expect("test key is valid");
         let cipher = RepositorySecretCipher::new(&key).expect("test cipher initializes");
-        let token = AdminToken::new("admin-token".to_owned()).expect("test token is valid");
+        let token = AdminToken::new("admin-token-for-application-tests".to_owned())
+            .expect("test token is valid");
         AppState::new(
             RepositoryStore::new(pool, cipher),
             AdminAuthenticator::new(&token),

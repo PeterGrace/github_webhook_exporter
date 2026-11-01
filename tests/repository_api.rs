@@ -20,7 +20,7 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 use tracing_subscriber::fmt::MakeWriter;
 
-const ADMIN_TOKEN: &str = "independent-admin-token";
+const ADMIN_TOKEN: &str = "independent-admin-token-for-tests";
 const MASTER_KEY_BYTES: &[u8; 32] = b"MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM";
 
 struct TestApp {
@@ -83,7 +83,10 @@ impl TestApp {
         let request = Request::builder()
             .method(method)
             .uri(uri)
-            .header(header::AUTHORIZATION, "Bearer independent-admin-token")
+            .header(
+                header::AUTHORIZATION,
+                "Bearer independent-admin-token-for-tests",
+            )
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(serialized))
             .expect("request is valid");
@@ -103,7 +106,10 @@ impl TestApp {
         let request = Request::builder()
             .method(method)
             .uri(uri)
-            .header(header::AUTHORIZATION, "Bearer independent-admin-token")
+            .header(
+                header::AUTHORIZATION,
+                "Bearer independent-admin-token-for-tests",
+            )
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body))
             .expect("request is valid");
@@ -171,7 +177,7 @@ async fn authentication_rejects_all_invalid_credentials_uniformly() {
 
     for authorization in [
         None,
-        Some("Basic independent-admin-token"),
+        Some("Basic independent-admin-token-for-tests"),
         Some("Bearer incorrect-admin-token"),
     ] {
         let response = app
@@ -209,7 +215,10 @@ async fn repository_metadata_remains_available_after_process_state_restart() {
     let create = Request::builder()
         .method(Method::POST)
         .uri("/api/v1/repositories")
-        .header(header::AUTHORIZATION, "Bearer independent-admin-token")
+        .header(
+            header::AUTHORIZATION,
+            "Bearer independent-admin-token-for-tests",
+        )
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
             r#"{"full_name":"owner/persistent","webhook_secret":"restart-secret"}"#,
@@ -228,7 +237,10 @@ async fn repository_metadata_remains_available_after_process_state_restart() {
     let list = Request::builder()
         .method(Method::GET)
         .uri("/api/v1/repositories")
-        .header(header::AUTHORIZATION, "Bearer independent-admin-token")
+        .header(
+            header::AUTHORIZATION,
+            "Bearer independent-admin-token-for-tests",
+        )
         .body(Body::empty())
         .expect("request is valid");
     let listed = router_for_pool(second_pool)
@@ -251,7 +263,7 @@ async fn authentication_accepts_the_exact_admin_bearer_token() {
         .request(
             Method::GET,
             "/api/v1/repositories",
-            Some("Bearer independent-admin-token"),
+            Some("Bearer independent-admin-token-for-tests"),
             Body::empty(),
         )
         .await;
@@ -310,7 +322,7 @@ async fn create_accepts_explicit_disabled_and_list_is_ordered() {
         .request(
             Method::GET,
             "/api/v1/repositories",
-            Some("Bearer independent-admin-token"),
+            Some("Bearer independent-admin-token-for-tests"),
             Body::empty(),
         )
         .await;
@@ -441,7 +453,7 @@ async fn get_returns_metadata_and_maps_unknown_or_invalid_ids() {
         .request(
             Method::GET,
             "/api/v1/repositories/1",
-            Some("Bearer independent-admin-token"),
+            Some("Bearer independent-admin-token-for-tests"),
             Body::empty(),
         )
         .await;
@@ -458,7 +470,7 @@ async fn get_returns_metadata_and_maps_unknown_or_invalid_ids() {
             .request(
                 Method::GET,
                 &format!("/api/v1/repositories/{id}"),
-                Some("Bearer independent-admin-token"),
+                Some("Bearer independent-admin-token-for-tests"),
                 Body::empty(),
             )
             .await;
@@ -645,7 +657,7 @@ async fn patch_rejects_empty_unknown_conflicting_missing_and_invalid_requests_at
         .request(
             Method::GET,
             "/api/v1/repositories/2",
-            Some("Bearer independent-admin-token"),
+            Some("Bearer independent-admin-token-for-tests"),
             Body::empty(),
         )
         .await;
@@ -685,7 +697,7 @@ async fn delete_removes_repositories_and_maps_missing_or_invalid_ids() {
         .request(
             Method::DELETE,
             "/api/v1/repositories/1",
-            Some("Bearer independent-admin-token"),
+            Some("Bearer independent-admin-token-for-tests"),
             Body::empty(),
         )
         .await;
@@ -701,7 +713,7 @@ async fn delete_removes_repositories_and_maps_missing_or_invalid_ids() {
             .request(
                 Method::DELETE,
                 &format!("/api/v1/repositories/{id}"),
-                Some("Bearer independent-admin-token"),
+                Some("Bearer independent-admin-token-for-tests"),
                 Body::empty(),
             )
             .await;
@@ -781,7 +793,7 @@ async fn repository_configuration_gauge_changes_only_after_successful_mutations(
         .request(
             Method::DELETE,
             "/api/v1/repositories/1",
-            Some("Bearer independent-admin-token"),
+            Some("Bearer independent-admin-token-for-tests"),
             Body::empty(),
         )
         .await;
@@ -794,7 +806,7 @@ async fn repository_configuration_gauge_changes_only_after_successful_mutations(
         .request(
             Method::DELETE,
             "/api/v1/repositories/1",
-            Some("Bearer independent-admin-token"),
+            Some("Bearer independent-admin-token-for-tests"),
             Body::empty(),
         )
         .await;
@@ -831,7 +843,7 @@ async fn authentication_protects_every_configuration_route() {
     for (method, uri) in routes {
         for authorization in [
             None,
-            Some("Basic independent-admin-token"),
+            Some("Basic independent-admin-token-for-tests"),
             Some("Bearer incorrect-admin-token"),
         ] {
             let response = app
@@ -879,7 +891,7 @@ async fn redaction_omits_security_material_from_responses_and_logs() {
         .request(
             Method::GET,
             "/api/v1/repositories/1",
-            Some("Bearer independent-admin-token"),
+            Some("Bearer independent-admin-token-for-tests"),
             Body::empty(),
         )
         .await;
