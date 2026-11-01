@@ -5,10 +5,10 @@
     "by": "server",
     "mac": "7799f3280dfba18ec8f96556a3b0a425a88d93217d82f7b371de45e2b22f4b22"
   },
-  "next_evidence_seq": 294,
+  "next_evidence_seq": 299,
   "next_evidence_seq_seal": {
     "by": "server",
-    "mac": "f2cbd51dbe2a6dd473b4c78f5dc309662022d945012708a4155b7bdf5a5002d0"
+    "mac": "4c59bf7a52e9c6ae24666ef5652a2846da014839d0add7c55b592b6050a6c138"
   },
   "claims": [
     {
@@ -66,6 +66,18 @@
             "by": "server",
             "mac": "398a8bc2ba1cdada4778c108f70c23f73826959b7ebafc08d3434ceac90a5bce"
           }
+        },
+        {
+          "id": "EVD-0298",
+          "kind": "analysis",
+          "locator": "current verdicts of descendants of CLM-0001 after the fix for #113 / commit aaa6728",
+          "summary": "Across 201 leaves: 184 supported, 14 refuted, 3 not_enough_info. CLM-0058 is now supported. All six area parents stay refuted because each still has at least one other refuted descendant (config-security: CLM-0051, CLM-0073).",
+          "stance": "refutes",
+          "recorded_at": "2026-11-01T02:08:36.268144826Z",
+          "seal": {
+            "by": "server",
+            "mac": "756f2c94a30e7689de826cade68507d7e1e911ec3c385dbdd55c83d57effe7f8"
+          }
         }
       ],
       "verdicts": [
@@ -107,13 +119,26 @@
             "by": "server",
             "mac": "38757abd323abe1defd2cd02815c2fcf2e8c9e9e6549c3b64041c2c9a00adfc6"
           }
+        },
+        {
+          "verdict": "refuted",
+          "rationale": "After the #113 fix, 14 leaves remain refuted and every area parent still has a refuted descendant (EVD-0298), so the system claim stays refuted.",
+          "auditor": "claude-opus-5-5",
+          "evidence_ids": [
+            "EVD-0298"
+          ],
+          "recorded_at": "2026-11-01T02:08:41.440872803Z",
+          "seal": {
+            "by": "server",
+            "mac": "eed013085da2d455c754b49a6bba556662baba2ded6816b79183c113495cd838"
+          }
         }
       ],
       "created_at": "2026-10-29T13:05:29.267124631Z",
-      "updated_at": "2026-11-01T01:51:58.783753579Z",
+      "updated_at": "2026-11-01T02:08:41.440872803Z",
       "seal": {
         "by": "server",
-        "mac": "1bef0f22edbade921159e6beb91b39559f3373a59a7dcf54fd809a4e723a08a7"
+        "mac": "1610f0c62b7b7fbd715aa8284919fa7f96e784acbd7537beced0dd1ee8705144"
       }
     },
     {
@@ -155,6 +180,18 @@
             "by": "server",
             "mac": "91e32aeaed1d30759e29332bc32630409b352e491295eade1af1be4ed18c1a64"
           }
+        },
+        {
+          "id": "EVD-0297",
+          "kind": "analysis",
+          "locator": "current verdicts of descendants of CLM-0002 after the fix for #113 / commit aaa6728",
+          "summary": "Across 35 leaves: 33 supported, 2 refuted. CLM-0058 is now supported. CLM-0002 stays refuted because CLM-0051 and CLM-0073 are still refuted.",
+          "stance": "refutes",
+          "recorded_at": "2026-11-01T02:08:36.255002805Z",
+          "seal": {
+            "by": "server",
+            "mac": "e880ff315913d7356565a3b7e5b792e3b4887efd325b25a03c9bfa9202d3dbb2"
+          }
         }
       ],
       "verdicts": [
@@ -170,13 +207,26 @@
             "by": "server",
             "mac": "2c8371569a321a18cb4c0210b823774131dcccb4f2fd314dd3fb31d93fc52a53"
           }
+        },
+        {
+          "verdict": "refuted",
+          "rationale": "CLM-0058 is now supported after the #113 fix, but CLM-0051 and CLM-0073 remain refuted (EVD-0297), so spec 01 does not yet fully hold.",
+          "auditor": "claude-opus-5-5",
+          "evidence_ids": [
+            "EVD-0297"
+          ],
+          "recorded_at": "2026-11-01T02:08:41.409428913Z",
+          "seal": {
+            "by": "server",
+            "mac": "f92e03c7cc46630e7c1d085699e02ccabfcba860a39cdaacac3278d676b5e95c"
+          }
         }
       ],
       "created_at": "2026-10-29T13:05:29.267124631Z",
-      "updated_at": "2026-10-29T13:14:44.434340933Z",
+      "updated_at": "2026-11-01T02:08:41.409428913Z",
       "seal": {
         "by": "server",
-        "mac": "b38e908047feb24249a802f3e287f86e0abd0f88b4f103351c95c532492fa724"
+        "mac": "badf8d4b1053ac7d88d6104c30d3a0c8c9571b09ca552ef643eda7edf632ebc6"
       }
     },
     {
@@ -3954,6 +4004,62 @@
             "by": "server",
             "mac": "c0c0d20641bb122b536fe3a41916e91f1f799ad6e85cb3567190ed63145369e8"
           }
+        },
+        {
+          "id": "EVD-0294",
+          "kind": "inspection",
+          "locator": "src/security/mod.rs:16,64-70; src/config.rs:362-378",
+          "summary": "AdminToken::new rejects tokens shorter than MIN_ADMIN_TOKEN_LENGTH (32 bytes). RuntimeConfig::from_lookup rejects a GHE_ADMIN_TOKEN equal to the encoded GHE_MASTER_KEY before building AdminToken. Both map to ConfigError::Invalid { variable: \"GHE_ADMIN_TOKEN\" }, which names only the variable.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "src/config.rs",
+              "lines": {
+                "start": 362,
+                "end": 378
+              },
+              "commit": "aaa6728efac8c278e20989cd11685db26ab04038"
+            }
+          },
+          "recorded_at": "2026-11-01T02:08:16.873453846Z",
+          "seal": {
+            "by": "server",
+            "mac": "4fc8097779c373d73982b70f95d04f31121faf5977d10990966d58e174819d4b"
+          }
+        },
+        {
+          "id": "EVD-0295",
+          "kind": "test",
+          "locator": "security::tests::admin_token_requires_at_least_32_bytes; security::tests::admin_token_length_counts_bytes_not_characters; config::tests::admin_token_equal_to_encoded_master_key_is_rejected_without_disclosure; config::tests::invalid_values_report_only_variable_names (cargo test --all-targets, 377 passed)",
+          "summary": "Unit tests reject a 31-byte token and accept a 32-byte one, count bytes not characters, reject an admin token equal to the encoded master key with ConfigError::Invalid naming GHE_ADMIN_TOKEN and no secret in the message, and reject 1- and 31-byte tokens through config without echoing them. Written failing first, pass after the fix.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "src/security/mod.rs",
+              "lines": {
+                "start": 311,
+                "end": 331
+              },
+              "commit": "aaa6728efac8c278e20989cd11685db26ab04038"
+            }
+          },
+          "recorded_at": "2026-11-01T02:08:16.891154553Z",
+          "seal": {
+            "by": "server",
+            "mac": "f40187280507b8f3e6290b350065b37d6f37ae5f74e2556e20348e4fc9e626b6"
+          }
+        },
+        {
+          "id": "EVD-0296",
+          "kind": "demonstration",
+          "locator": "timeout 3 env -i GHE_DATABASE_PATH=... GHE_MASTER_KEY=$MK GHE_ADMIN_TOKEN={x | $MK | 32-char random} GHE_BIND_ADDRESS=127.0.0.1:18099 target/debug/github_webhook_exporter",
+          "summary": "Re-ran the audit's demonstration on the fixed binary: a 1-character token and a token equal to the master key each exit 1 with 'GHE_ADMIN_TOKEN has an invalid value' and the master key not in output; a random 32-character token starts and serves until timeout (rc=124).",
+          "stance": "supports",
+          "recorded_at": "2026-11-01T02:08:16.903547402Z",
+          "seal": {
+            "by": "server",
+            "mac": "a06806d8491ab0e059e85d99d8ab84ae8a06366b6e2222da77c0b1e42166c94b"
+          }
         }
       ],
       "verdicts": [
@@ -3970,13 +4076,28 @@
             "by": "server",
             "mac": "fbf06c0055eb6fb2e3e4a53130879a1ce2c7ac0be5b3b6b615af3aa61bf5271b"
           }
+        },
+        {
+          "verdict": "supported",
+          "rationale": "After commit aaa6728 the binary refuses a 1-character admin token and an admin token equal to the encoded master key, naming only GHE_ADMIN_TOKEN, and still starts with a 32-byte random token (EVD-0296). The 32-byte floor lives in AdminToken::new and the independence check in RuntimeConfig (EVD-0294), and unit tests cover both plus the redaction (EVD-0295). The earlier refuting evidence (EVD-0187/0188) describes the pre-fix code. Length is a proxy for entropy: 32 repeated characters still pass, which the claim's 'trivially short' wording permits.",
+          "auditor": "claude-opus-5-5",
+          "evidence_ids": [
+            "EVD-0294",
+            "EVD-0295",
+            "EVD-0296"
+          ],
+          "recorded_at": "2026-11-01T02:08:21.973787073Z",
+          "seal": {
+            "by": "server",
+            "mac": "7574011d55b9d0c9066848ecffa01d73e9f5624ff895a3604efb1543f6185980"
+          }
         }
       ],
       "created_at": "2026-10-29T13:09:23.261493766Z",
-      "updated_at": "2026-10-29T13:18:51.670511405Z",
+      "updated_at": "2026-11-01T02:08:21.973787073Z",
       "seal": {
         "by": "server",
-        "mac": "6cb2e356ea56830c9d18b21f7492a9f73ff3106f99b5cde483c7f759587e7d30"
+        "mac": "325a81e15c2898255e30adb4f89507076c530ba4e08dd3e52be397609efffa19"
       }
     },
     {

@@ -32,3 +32,7 @@ Length cannot prove entropy; 32 repeated characters still pass. The documented g
 (`openssl rand -hex 32`) produces 64 random hex characters.
 
 This resolves the CLM-0058 security finding tracked by issue #113.
+
+Commit-pinned implementation, test and demonstration evidence (EVD-0294, EVD-0295, EVD-0296) is
+in the claims ledger. CLM-0058 is marked supported, and the config-security (CLM-0002) and root
+(CLM-0001) rollups are refreshed. Both stay refuted because of other leaves (CLM-0051, CLM-0073).
