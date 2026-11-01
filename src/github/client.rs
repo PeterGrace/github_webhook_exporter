@@ -36,9 +36,10 @@ const GITHUB_ACCEPT: &str = "application/vnd.github+json";
 /// request target, so path shape is *not* what makes this safe. Three other things are: the
 /// request carries an installation-scoped token, so an injected path cannot exceed what the App
 /// installation may already read; the base URL is validated as `http`/`https` at configuration
-/// time, so no injected segment can reach another host; and Git forbids `..` in ref names, which
-/// closes traversal. Tightening this set is therefore a defense-in-depth change, never the control
-/// that bounds the blast radius.
+/// time, so no injected segment can reach another host; and [`WorkflowBranch::sanitize`] refuses
+/// any name with an empty, `.`, or `..` segment, so URL normalization cannot climb out of the
+/// `/repos/{owner}/{repo}/branches/` prefix. Tightening this set is therefore a defense-in-depth
+/// change, never the control that bounds the blast radius.
 const BRANCH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')

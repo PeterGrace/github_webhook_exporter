@@ -470,6 +470,17 @@ pub(crate) struct WorkflowBranch(String);
 
 impl WorkflowBranch {
     /// Removes Unicode control characters and retains at most 255 remaining characters.
+    ///
+    /// # Parameters
+    ///
+    /// * `value` - The branch name taken from an authenticated webhook payload.
+    ///
+    /// # Returns
+    ///
+    /// The sanitized branch, or `None` when nothing visible remains or when the sanitized name
+    /// has an empty, `.`, or `..` path segment. The branch is later placed, with `/` unencoded,
+    /// into a token-bearing GitHub API path, where such segments would let URL normalization
+    /// rewrite the request target. Git refuses these names, so no real branch is lost.
     pub(crate) fn sanitize(value: &str) -> Option<Self> {
         let mut sanitized = String::with_capacity(value.len().min(MAX_BRANCH_NAME_LENGTH));
         for character in value
@@ -479,7 +490,13 @@ impl WorkflowBranch {
         {
             sanitized.push(character);
         }
-        if sanitized.is_empty() {
+        // The check runs on the truncated name because that is the exact text sent to GitHub.
+        // `split('/')` yields an empty segment for a leading, trailing, or doubled `/`, and for an
+        // empty string, so this one test also rejects a name with nothing left in it.
+        let has_unsafe_segment = sanitized
+            .split('/')
+            .any(|segment| matches!(segment, "" | "." | ".."));
+        if has_unsafe_segment {
             None
         } else {
             Some(Self(sanitized))
@@ -2404,5 +2421,53 @@ mod tests {
             Some(&Value::Array(Array::I64(expected.to_vec()))),
             "unexpected attribute {key}"
         );
+    }
+
+    #[test]
+    fn workflow_branch_accepts_multi_segment_and_dotted_names() {
+        for name in [
+            "main",
+            "gh-readonly-queue/main/pr-7",
+            "release/v1.2",
+            "a.b/.c./d..e",
+        ] {
+            assert_eq!(
+                WorkflowBranch::sanitize(name).map(|branch| branch.as_str().to_owned()),
+                Some(name.to_owned()),
+                "branch {name:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_branch_rejects_dot_and_empty_segments() {
+        for name in [
+            "",
+            "\u{7}",
+            ".",
+            "..",
+            "main/../../../../orgs/x",
+            "../main",
+            "main/..",
+            "main/./x",
+            "/main",
+            "main/",
+            "main//x",
+            "main/.\u{0}./x",
+        ] {
+            assert!(
+                WorkflowBranch::sanitize(name).is_none(),
+                "branch {name:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_branch_rejects_unsafe_segment_created_by_truncation() {
+        // Arrange: a name whose 255-character prefix ends in `/`, leaving an empty final segment.
+        let name = format!("{}/rest", "a".repeat(254));
+
+        // Act / Assert
+        assert!(WorkflowBranch::sanitize(&name).is_none());
     }
 }

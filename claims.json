@@ -5,10 +5,10 @@
     "by": "server",
     "mac": "7799f3280dfba18ec8f96556a3b0a425a88d93217d82f7b371de45e2b22f4b22"
   },
-  "next_evidence_seq": 290,
+  "next_evidence_seq": 294,
   "next_evidence_seq_seal": {
     "by": "server",
-    "mac": "aa6e3e90ad3073fbf63ca6d23153c5ef5d0a92b310887b811a807b89f708779d"
+    "mac": "f2cbd51dbe2a6dd473b4c78f5dc309662022d945012708a4155b7bdf5a5002d0"
   },
   "claims": [
     {
@@ -54,6 +54,18 @@
             "by": "server",
             "mac": "b0881477370b2cb2a8562486f1035f6d58d58ce2bf598b5678d847ee2e4ad882"
           }
+        },
+        {
+          "id": "EVD-0293",
+          "kind": "analysis",
+          "locator": "current verdicts of descendants of CLM-0001 after the fix for #112 / commit 9e2d03f",
+          "summary": "Across 201 leaves: 183 supported, 15 refuted, 3 not_enough_info. CLM-0037 is now supported. All six area parents stay refuted because each still has at least one other refuted descendant (merge-queue: CLM-0038).",
+          "stance": "refutes",
+          "recorded_at": "2026-11-01T01:51:55.003050174Z",
+          "seal": {
+            "by": "server",
+            "mac": "398a8bc2ba1cdada4778c108f70c23f73826959b7ebafc08d3434ceac90a5bce"
+          }
         }
       ],
       "verdicts": [
@@ -82,13 +94,26 @@
             "by": "server",
             "mac": "933c94b0b5e85cde9ecbe1f8c76bef2f780ef6e36bd0d95b8bfcbab55a589d5f"
           }
+        },
+        {
+          "verdict": "refuted",
+          "rationale": "The fix for #112 moves CLM-0037 to supported, leaving 183 supported, 15 refuted and 3 not_enough_info leaves. The root stays refuted because all six area parents still have at least one unresolved refuted descendant.",
+          "auditor": "claude-opus-5-5",
+          "evidence_ids": [
+            "EVD-0293"
+          ],
+          "recorded_at": "2026-11-01T01:51:58.783753579Z",
+          "seal": {
+            "by": "server",
+            "mac": "38757abd323abe1defd2cd02815c2fcf2e8c9e9e6549c3b64041c2c9a00adfc6"
+          }
         }
       ],
       "created_at": "2026-10-29T13:05:29.267124631Z",
-      "updated_at": "2026-10-31T17:05:10.619982596Z",
+      "updated_at": "2026-11-01T01:51:58.783753579Z",
       "seal": {
         "by": "server",
-        "mac": "efbb36c4bcf4c8e7947e48df21cde3e3c17a870fd929cd24759a6dcc5d25ff91"
+        "mac": "1bef0f22edbade921159e6beb91b39559f3373a59a7dcf54fd809a4e723a08a7"
       }
     },
     {
@@ -251,6 +276,18 @@
             "by": "server",
             "mac": "146bb59c64e33c6e19aa8f97cac9bd8f87a0bd2989c3d8404ee3cde1d4c997cb"
           }
+        },
+        {
+          "id": "EVD-0292",
+          "kind": "analysis",
+          "locator": "current verdicts of children of CLM-0004 after the fix for #112 / commit 9e2d03f",
+          "summary": "The merge-queue area now has 29 supported leaves, one not_enough_info (CLM-0031) and one refuted (CLM-0038). CLM-0037 (branch path traversal) is supported after the fix. The area stays refuted only because CLM-0038 records that docs/build-spec.md describes dequeue handling out of line with the implemented v1 behaviour.",
+          "stance": "refutes",
+          "recorded_at": "2026-11-01T01:51:49.173159856Z",
+          "seal": {
+            "by": "server",
+            "mac": "6ea83ab47195893916955d859b1d6521566c67a7ad539ca7f09a1bfaa41cd3c9"
+          }
         }
       ],
       "verdicts": [
@@ -266,13 +303,26 @@
             "by": "server",
             "mac": "63a6f5161964386770b247767cfe2700f1124a69e5e60b2cb2120cf08b5051b9"
           }
+        },
+        {
+          "verdict": "refuted",
+          "rationale": "The branch path traversal leaf CLM-0037 is supported after the fix for #112. The area stays refuted only because of CLM-0038: docs/build-spec.md describes dequeue handling out of line with the implemented v1 behaviour. CLM-0031 is not_enough_info. Fix: update docs/build-spec.md dequeue handling to match v1.",
+          "auditor": "claude-opus-5-5",
+          "evidence_ids": [
+            "EVD-0292"
+          ],
+          "recorded_at": "2026-11-01T01:51:54.988280950Z",
+          "seal": {
+            "by": "server",
+            "mac": "2b873d564f69aca79c3d1077a1562c56e4bbb8738b9a08544e922e86d0cf3ca9"
+          }
         }
       ],
       "created_at": "2026-10-29T13:05:29.267124631Z",
-      "updated_at": "2026-10-29T13:14:44.483279775Z",
+      "updated_at": "2026-11-01T01:51:54.988280950Z",
       "seal": {
         "by": "server",
-        "mac": "edb8438594e679ec2e6fa86f08abc69c2c3571d846a93d9c25df5f172efa668f"
+        "mac": "93211e031a349334f81e71bbeda6152921148de42b5c94ae46ff87a3777e77ee"
       }
     },
     {
@@ -2431,6 +2481,50 @@
             "by": "server",
             "mac": "1cee7d9e58248452050f4a8d35cf707a6380fd55f63c20b764e29e7fa932dc2c"
           }
+        },
+        {
+          "id": "EVD-0290",
+          "kind": "inspection",
+          "locator": "src/telemetry/workflow.rs:472-504 (commit 9e2d03f, PR for #112)",
+          "summary": "WorkflowBranch::sanitize now returns None when the sanitized, truncated name has an empty, '.' or '..' '/'-separated segment. WorkflowBranch has no other constructor, and GitHubAppClient::required_checks takes &WorkflowBranch, so no branch that URL dot-segment normalization could act on can reach the request path. '?', '#' and '%' are still percent-encoded by BRANCH_SEGMENT_ENCODE_SET, so query and fragment injection stays blocked.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "src/telemetry/workflow.rs",
+              "lines": {
+                "start": 472,
+                "end": 504
+              },
+              "commit": "9e2d03f596b63b58dd86aac9d77e9448b959a5d2"
+            }
+          },
+          "recorded_at": "2026-11-01T01:51:24.313268441Z",
+          "seal": {
+            "by": "server",
+            "mac": "c9f21ba859cc064a94b897bbdb8ece35b56dd534c433cfc9c97f5a2ad79fb15a"
+          }
+        },
+        {
+          "id": "EVD-0291",
+          "kind": "test",
+          "locator": "cargo test workflow_branch_ drops_dot_segment_branches_so_no_protection_lookup_can_use_them (src/telemetry/workflow.rs:2426-2473, src/api/workflow_run.rs:183-201; commit 9e2d03f)",
+          "summary": "Unit tests pass. Rejected: '', control-only, '.', '..', 'main/../../../../orgs/x', '../main', 'main/..', 'main/./x', '/main', 'main/', 'main//x', and a name whose 255-char truncation leaves a trailing '/'. Still accepted: 'gh-readonly-queue/main/pr-7' and names that only contain dots inside a segment. A signed workflow_run payload with dot-segment head/base refs projects no source or target branch, so the required-check lookup (keyed on target_branch) is never issued. The existing client test a_multi_segment_branch_keeps_its_separators_unencoded still passes.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "src/telemetry/workflow.rs",
+              "lines": {
+                "start": 2426,
+                "end": 2473
+              },
+              "commit": "9e2d03f596b63b58dd86aac9d77e9448b959a5d2"
+            }
+          },
+          "recorded_at": "2026-11-01T01:51:24.330591643Z",
+          "seal": {
+            "by": "server",
+            "mac": "dca12ddaa4b6333c06f56fcbe6d1149e498722d4b1967d750e34b224fc68e9a0"
+          }
         }
       ],
       "verdicts": [
@@ -2446,13 +2540,27 @@
             "by": "server",
             "mac": "a33b09b85e365191211ade03a774a28ad4d8deec863ccc0edda7f7685d0f2c0a"
           }
+        },
+        {
+          "verdict": "supported",
+          "rationale": "The EVD-0146 gap is closed. WorkflowBranch, the only type the GitHub client accepts for the branch path segment, can no longer hold an empty, '.' or '..' segment (EVD-0290). Unit and payload-projection tests cover the traversal names and confirm the protection lookup never sees them (EVD-0291). Query and fragment characters stay percent-encoded.",
+          "auditor": "claude-opus-5-5",
+          "evidence_ids": [
+            "EVD-0290",
+            "EVD-0291"
+          ],
+          "recorded_at": "2026-11-01T01:51:32.095074308Z",
+          "seal": {
+            "by": "server",
+            "mac": "b89f9b373911fefcafdb079a98c39f5161fae1b68db263d2b91262a1d98c4ad7"
+          }
         }
       ],
       "created_at": "2026-10-29T13:08:30.478782863Z",
-      "updated_at": "2026-10-29T13:18:51.656596957Z",
+      "updated_at": "2026-11-01T01:51:32.095074308Z",
       "seal": {
         "by": "server",
-        "mac": "7ee1dc0e36a3e67c6ea6966aa75805246b045834bd1daacd243e3900d2afac43"
+        "mac": "2ef77497f9f3f9a80262b48d3a391fa32bd807a1947d2039c94602d1c0f85dbb"
       }
     },
     {
