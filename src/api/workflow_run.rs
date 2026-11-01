@@ -181,6 +181,27 @@ mod tests {
     }
 
     #[test]
+    fn drops_dot_segment_branches_so_no_protection_lookup_can_use_them() {
+        // Arrange: a signed payload whose branches would rewrite the GitHub API path.
+        let context = project(json!({
+            "workflow_run": {
+                "id": 31,
+                "run_attempt": 1,
+                "event": "merge_group",
+                "head_branch": "main/../../../../orgs/x",
+                "pull_requests": [{
+                    "head": {"ref": "feature/./x"},
+                    "base": {"ref": "../main"}
+                }]
+            }
+        }));
+
+        // Assert: neither branch survives, so the required-check lookup has nothing to request.
+        assert!(context.source_branch().is_none());
+        assert!(context.target_branch().is_none());
+    }
+
+    #[test]
     fn falls_back_to_one_unique_pull_request_source_and_omits_ambiguous_target() {
         let context = project(json!({
             "workflow_run": {
