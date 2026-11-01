@@ -5,10 +5,10 @@
     "by": "server",
     "mac": "7799f3280dfba18ec8f96556a3b0a425a88d93217d82f7b371de45e2b22f4b22"
   },
-  "next_evidence_seq": 299,
+  "next_evidence_seq": 311,
   "next_evidence_seq_seal": {
     "by": "server",
-    "mac": "4c59bf7a52e9c6ae24666ef5652a2846da014839d0add7c55b592b6050a6c138"
+    "mac": "beefbeb58732f744841b8080a33de5c5695d9d21b1ba4d5369c3c5fb972065b3"
   },
   "claims": [
     {
@@ -78,6 +78,18 @@
             "by": "server",
             "mac": "756f2c94a30e7689de826cade68507d7e1e911ec3c385dbdd55c83d57effe7f8"
           }
+        },
+        {
+          "id": "EVD-0310",
+          "kind": "analysis",
+          "locator": "children of CLM-0001",
+          "summary": "Re-audit 2026-11-01 at b763061: all six area parents remain refuted. CLM-0195 (IL4 OTLP redirect) is now supported after #118, independently confirmed. CLM-0037 (branch path traversal) stays refuted: #119 missed backslash-delimited traversal. CLM-0058 (#120) was not re-audited independently in this pass.",
+          "stance": "refutes",
+          "recorded_at": "2026-11-01T14:48:29.454567952Z",
+          "seal": {
+            "by": "server",
+            "mac": "43b5db539ee21b134c5a52bef3731b580073a4478a5327c6ef9e9bc2ccfa3506"
+          }
         }
       ],
       "verdicts": [
@@ -132,13 +144,26 @@
             "by": "server",
             "mac": "eed013085da2d455c754b49a6bba556662baba2ded6816b79183c113495cd838"
           }
+        },
+        {
+          "verdict": "refuted",
+          "rationale": "Every area parent still has a refuted leaf. The IL4 OTLP redirect finding is closed, but the branch path traversal remains exploitable through backslashes. Fix: add .add(b'\\\\') to BRANCH_SEGMENT_ENCODE_SET in src/github/client.rs (or reject '\\' in WorkflowBranch::sanitize) with backslash traversal regression tests, then re-audit.",
+          "auditor": "claude-opus-5-5",
+          "evidence_ids": [
+            "EVD-0310"
+          ],
+          "recorded_at": "2026-11-01T14:48:35.875097446Z",
+          "seal": {
+            "by": "server",
+            "mac": "ecf0c4716857925f60a55534a76c96b49be7ae21f46ca981e1673514b4c3ec18"
+          }
         }
       ],
       "created_at": "2026-10-29T13:05:29.267124631Z",
-      "updated_at": "2026-11-01T02:08:41.440872803Z",
+      "updated_at": "2026-11-01T14:48:35.875097446Z",
       "seal": {
         "by": "server",
-        "mac": "1610f0c62b7b7fbd715aa8284919fa7f96e784acbd7537beced0dd1ee8705144"
+        "mac": "768ac61da4b6f1657648d2f165d284f9ae56294bd8f39d67bf572ad66ddc83f0"
       }
     },
     {
@@ -338,6 +363,18 @@
             "by": "server",
             "mac": "6ea83ab47195893916955d859b1d6521566c67a7ad539ca7f09a1bfaa41cd3c9"
           }
+        },
+        {
+          "id": "EVD-0309",
+          "kind": "analysis",
+          "locator": "children of CLM-0004",
+          "summary": "Re-audit 2026-11-01 at b763061: CLM-0037 stays refuted. #119 rejects '/'-delimited dot segments, but backslash-delimited traversal ('a\\..\\..\\orgs\\x') still moves the installation-token GET to another API path. CLM-0038 (IL1 build-spec drift) stays refuted and CLM-0031 not_enough_info.",
+          "stance": "refutes",
+          "recorded_at": "2026-11-01T14:48:20.294456503Z",
+          "seal": {
+            "by": "server",
+            "mac": "e71a163b5a792229493c80dfd89c0624db2b83545e022533868412fc7690faa8"
+          }
         }
       ],
       "verdicts": [
@@ -366,13 +403,26 @@
             "by": "server",
             "mac": "2b873d564f69aca79c3d1077a1562c56e4bbb8738b9a08544e922e86d0cf3ca9"
           }
+        },
+        {
+          "verdict": "refuted",
+          "rationale": "CLM-0037 remains refuted after #119 because backslash-delimited dot segments still traverse the GitHub API path, and CLM-0038 is still refuted. Fix: add .add(b'\\\\') to BRANCH_SEGMENT_ENCODE_SET in src/github/client.rs (or reject '\\' in WorkflowBranch::sanitize) with backslash traversal regression tests.",
+          "auditor": "claude-opus-5-5",
+          "evidence_ids": [
+            "EVD-0309"
+          ],
+          "recorded_at": "2026-11-01T14:48:29.439852208Z",
+          "seal": {
+            "by": "server",
+            "mac": "6cefb087d7659ede11e8204e9a695af4697b42f5a19c5bcad263e14cbe80a13b"
+          }
         }
       ],
       "created_at": "2026-10-29T13:05:29.267124631Z",
-      "updated_at": "2026-11-01T01:51:54.988280950Z",
+      "updated_at": "2026-11-01T14:48:29.439852208Z",
       "seal": {
         "by": "server",
-        "mac": "93211e031a349334f81e71bbeda6152921148de42b5c94ae46ff87a3777e77ee"
+        "mac": "2870cde92224358b2ce0b777a7ff4ab25a0b91658563a501d8e113405c756444"
       }
     },
     {
@@ -424,6 +474,18 @@
             "by": "server",
             "mac": "39ab0838d01bbfe36db59037e7659ed97ea98fd6bf5b809132ffac5bb710edca"
           }
+        },
+        {
+          "id": "EVD-0308",
+          "kind": "analysis",
+          "locator": "children of CLM-0005",
+          "summary": "Re-audit 2026-11-01 at b763061: CLM-0195 (OTLP redirect credential forwarding) is now supported after #118, confirmed independently. One child remains refuted: CLM-0194 (IL2, spec 04 forbids repo/PR/SHA/delivery span attributes that later specs and the code emit).",
+          "stance": "refutes",
+          "recorded_at": "2026-11-01T14:48:20.280728892Z",
+          "seal": {
+            "by": "server",
+            "mac": "34d39cd75e0798ada310278b3a61028cf94bb4e2833642ea184c3293dd09108c"
+          }
         }
       ],
       "verdicts": [
@@ -452,13 +514,26 @@
             "by": "server",
             "mac": "787cd83fb62111cbb9744fa2ed54a71c20049003fe85ab868288779d1fb2eeb7"
           }
+        },
+        {
+          "verdict": "refuted",
+          "rationale": "The IL4 redirect finding is fixed and independently confirmed, but one child (CLM-0194, spec 04 span-attribute drift) is still refuted. Fix: amend the Spans section of docs/superpowers/specs/2026-08-03-04-otlp-observability.md to allow the repository, PR, SHA and delivery attributes the code deliberately emits.",
+          "auditor": "claude-opus-5-5",
+          "evidence_ids": [
+            "EVD-0308"
+          ],
+          "recorded_at": "2026-11-01T14:48:29.423925471Z",
+          "seal": {
+            "by": "server",
+            "mac": "1f8dcdd215ecbbd257ebd81e140c88f2c79e91492c9fb54664b3734bca0752db"
+          }
         }
       ],
       "created_at": "2026-10-29T13:05:29.267124631Z",
-      "updated_at": "2026-10-31T17:05:10.610488644Z",
+      "updated_at": "2026-11-01T14:48:29.423925471Z",
       "seal": {
         "by": "server",
-        "mac": "173800b5c88a926d240a19eff30a3bfe3e7494804a6fb04c4d7d27924572953b"
+        "mac": "bceb0ce4ceda447df45b4b447070a46a5cf15480a283437f97cf59c080324f7c"
       }
     },
     {
@@ -2505,6 +2580,14 @@
       "integrity_level": 3,
       "verification_method": "test",
       "source": "client.rs BRANCH_SEGMENT_ENCODE_SET docs",
+      "source_anchor": {
+        "path": "src/github/client.rs",
+        "lines": {
+          "start": 35,
+          "end": 42
+        },
+        "commit": "b763061593ec97f39dbfba9cd78a4028ff5d997a"
+      },
       "derived_from": [
         "CLM-0004"
       ],
@@ -2514,7 +2597,8 @@
       ],
       "tags": [
         "area:merge-queue",
-        "issue:112"
+        "issue:112",
+        "issue:122"
       ],
       "status": {
         "state": "active"
@@ -2575,6 +2659,64 @@
             "by": "server",
             "mac": "dca12ddaa4b6333c06f56fcbe6d1149e498722d4b1967d750e34b224fc68e9a0"
           }
+        },
+        {
+          "id": "EVD-0302",
+          "kind": "inspection",
+          "locator": "src/telemetry/workflow.rs:485-507",
+          "summary": "Independent re-audit at b763061: WorkflowBranch has a private field and sanitize is its only constructor; it strips control characters, truncates to 255 chars, then rejects names whose '/'-split segments include \"\", \".\" or \"..\". It does not consider '\\' as a separator.",
+          "stance": "neutral",
+          "recorded_at": "2026-11-01T14:47:20.802364744Z",
+          "seal": {
+            "by": "server",
+            "mac": "df384d17f271b62c956a188feee72dfa05fab64fe4bc170208a9f639dcb2779c"
+          }
+        },
+        {
+          "id": "EVD-0303",
+          "kind": "inspection",
+          "locator": "src/github/client.rs:43-53",
+          "summary": "BRANCH_SEGMENT_ENCODE_SET encodes CONTROLS plus space, '\"', '#', '%', '<', '>', '?', '`', '{', '}'. It does not encode backslash, so a '\\' in a sanitized branch reaches the URL string literally (client.rs:122-127 formats it into /repos/{repo}/branches/{branch}/protection/required_status_checks).",
+          "stance": "refutes",
+          "recorded_at": "2026-11-01T14:47:20.818555612Z",
+          "seal": {
+            "by": "server",
+            "mac": "cd725bc5887d85f9d3cde8d4727742b3d160da00e0ab19beff7c4720c9dde15e"
+          }
+        },
+        {
+          "id": "EVD-0304",
+          "kind": "test",
+          "locator": "cargo run --offline -q in scratchpad program copying BRANCH_SEGMENT_ENCODE_SET and WorkflowBranch::sanitize, url 2.5.8 (Cargo.lock version)",
+          "summary": "The url crate treats '\\' as '/' for http(s). Branches that pass sanitize: 'a\\..\\..\\orgs\\x' -> https://api.github.com/repos/o/r/orgs/x/protection/required_status_checks; '..\\..\\orgs' -> /repos/o/orgs/protection/required_status_checks (outside the repo); 'x\\..' -> /repos/o/r/branches/protection/required_status_checks; 'a/..\\b' -> /repos/o/r/branches/b/... Safe: '%2e%2e' double-encodes to %252e, 'main/...' stays literal, fullwidth dots and ?/# are encoded. Reproduced by the coordinator.",
+          "stance": "refutes",
+          "recorded_at": "2026-11-01T14:47:20.833597177Z",
+          "seal": {
+            "by": "server",
+            "mac": "8bb1822a2d51660a77472b13204902c9506d386215092652598b1c5d8ca73448"
+          }
+        },
+        {
+          "id": "EVD-0305",
+          "kind": "inspection",
+          "locator": "src/github/client.rs:43-53",
+          "summary": "Commit-pinned anchor for EVD-0303: BRANCH_SEGMENT_ENCODE_SET has no .add(b'\\\\'), so backslashes in a sanitized branch reach the GitHub API URL literally, where the url crate treats them as '/'.",
+          "stance": "refutes",
+          "anchor": {
+            "file": {
+              "path": "src/github/client.rs",
+              "lines": {
+                "start": 43,
+                "end": 53
+              },
+              "commit": "b763061593ec97f39dbfba9cd78a4028ff5d997a"
+            }
+          },
+          "recorded_at": "2026-11-01T14:47:49.415208698Z",
+          "seal": {
+            "by": "server",
+            "mac": "d3e738fb7e764cae18c8f0974122b84c2eb26f36ac94e9d9d9277fda8f937733"
+          }
         }
       ],
       "verdicts": [
@@ -2604,13 +2746,42 @@
             "by": "server",
             "mac": "b89f9b373911fefcafdb079a98c39f5161fae1b68db263d2b91262a1d98c4ad7"
           }
+        },
+        {
+          "verdict": "refuted",
+          "rationale": "The #112 fix closes '/'-delimited dot segments but not backslash-delimited ones: '\\' is neither rejected by WorkflowBranch::sanitize nor encoded by BRANCH_SEGMENT_ENCODE_SET (EVD-0303), and the url crate normalizes '\\' as '/', so branches such as 'a\\..\\..\\orgs\\x' and '..\\..\\orgs' move the installation-token GET outside /repos/{repo}/branches/ (EVD-0304). The builder's supported verdict did not test backslashes. Fix: add .add(b'\\\\') to BRANCH_SEGMENT_ENCODE_SET in src/github/client.rs (or reject any '\\' in WorkflowBranch::sanitize) and add tests for 'a\\..\\..\\orgs\\x', 'x\\..' and '..\\..\\orgs' asserting the parsed Url::path() starts with /repos/{repo}/branches/.",
+          "auditor": "claude-sonnet-5-5 (independent re-audit), confirmed by claude-opus-5-5",
+          "evidence_ids": [
+            "EVD-0303",
+            "EVD-0304"
+          ],
+          "recorded_at": "2026-11-01T14:47:29.256107537Z",
+          "seal": {
+            "by": "server",
+            "mac": "47cbbb2a4ffbccdbda98c9a3a7be16900957dd9814ed2048dc82d7dc3534e259"
+          }
+        },
+        {
+          "verdict": "refuted",
+          "rationale": "Re-recorded to cite the commit-pinned anchor. The #112 fix closes '/'-delimited dot segments but not backslash-delimited ones: '\\' is neither rejected by WorkflowBranch::sanitize nor encoded by BRANCH_SEGMENT_ENCODE_SET (EVD-0303, EVD-0305), and the url crate normalizes '\\' as '/', so 'a\\..\\..\\orgs\\x' and '..\\..\\orgs' move the installation-token GET outside /repos/{repo}/branches/ (EVD-0304). Fix: add .add(b'\\\\') to BRANCH_SEGMENT_ENCODE_SET in src/github/client.rs (or reject any '\\' in WorkflowBranch::sanitize) and add tests for 'a\\..\\..\\orgs\\x', 'x\\..' and '..\\..\\orgs' asserting the parsed Url::path() starts with /repos/{repo}/branches/.",
+          "auditor": "claude-sonnet-5-5 (independent re-audit), confirmed by claude-opus-5-5",
+          "evidence_ids": [
+            "EVD-0303",
+            "EVD-0304",
+            "EVD-0305"
+          ],
+          "recorded_at": "2026-11-01T14:48:20.268720037Z",
+          "seal": {
+            "by": "server",
+            "mac": "f993ed17332e40b292dbbaa3178678ca34232dbe16e2394e58b7d4c890e81684"
+          }
         }
       ],
       "created_at": "2026-10-29T13:08:30.478782863Z",
-      "updated_at": "2026-11-01T01:51:32.095074308Z",
+      "updated_at": "2026-11-01T14:51:22.695480847Z",
       "seal": {
         "by": "server",
-        "mac": "2ef77497f9f3f9a80262b48d3a391fa32bd807a1947d2039c94602d1c0f85dbb"
+        "mac": "05347908cbd931e7da02c2c24770f23eb08bb56a8a0fb6ba7a5900ecc8f61670"
       }
     },
     {
@@ -12305,6 +12476,86 @@
             "by": "server",
             "mac": "ac235070be51430175face4d2edc380573f90be0fb8662ec747dc423510579c7"
           }
+        },
+        {
+          "id": "EVD-0299",
+          "kind": "inspection",
+          "locator": "src/telemetry.rs:691-707",
+          "summary": "Independent re-audit at b763061: build_blocking_http_client now builds reqwest::blocking::Client with .timeout(..) and .redirect(Policy::custom(|attempt| attempt.error(\"OTLP HTTP redirects are disabled\"))), so every redirect errors and no follow-up request is built.",
+          "stance": "supports",
+          "recorded_at": "2026-11-01T14:47:20.754710863Z",
+          "seal": {
+            "by": "server",
+            "mac": "c0ebaa4f7620959b0f0b9a3f744332adfe38c100f95961159098621725159ea3"
+          }
+        },
+        {
+          "id": "EVD-0300",
+          "kind": "inspection",
+          "locator": "src/telemetry.rs:624-676",
+          "summary": "Both OTLP exporters (spans at 624-640, logs at 661-676) pass build_blocking_http_client, wrapped in ObservingHttpClient, to .with_http_client(..) before .with_headers(settings.headers()); neither lets opentelemetry-otlp build a default client. Cargo.toml enables only the trace and logs OTLP features, so there is no other exporter path. The Sentry transport client (src/telemetry.rs:583) and GitHub client keep reqwest's default redirect policy but carry no OTLP headers.",
+          "stance": "supports",
+          "recorded_at": "2026-11-01T14:47:20.770070288Z",
+          "seal": {
+            "by": "server",
+            "mac": "67b4af54b657b36267f441e70cc2b9c07fb833c36561411bda006238f0609b21"
+          }
+        },
+        {
+          "id": "EVD-0301",
+          "kind": "test",
+          "locator": "src/telemetry/http_client.rs:259-311 (cargo test production_client_rejects_redirects_without_contacting_the_target)",
+          "summary": "Ran at b763061: 1 passed. The test drives the real build_blocking_http_client with an x-api-key header against a source listener answering 307 Location: http://<target>/, asserts the request fails classified as ExportFailureDetail::Redirect, then polls a separate target listener for 100 ms and panics if any connection arrives.",
+          "stance": "supports",
+          "recorded_at": "2026-11-01T14:47:20.785887405Z",
+          "seal": {
+            "by": "server",
+            "mac": "e6fff2b27d310a2ab50adac976aa6903bd465b86724871a1c859602bec9fe196"
+          }
+        },
+        {
+          "id": "EVD-0306",
+          "kind": "inspection",
+          "locator": "src/telemetry.rs:691-707",
+          "summary": "Commit-pinned anchor for EVD-0299: build_blocking_http_client installs a redirect policy that errors on every redirect attempt.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "src/telemetry.rs",
+              "lines": {
+                "start": 691,
+                "end": 707
+              },
+              "commit": "b763061593ec97f39dbfba9cd78a4028ff5d997a"
+            }
+          },
+          "recorded_at": "2026-11-01T14:48:06.514806674Z",
+          "seal": {
+            "by": "server",
+            "mac": "dbe810d95c5ce268a29826c07afc2cd21d81bb169523d4d0a69954df427e1967"
+          }
+        },
+        {
+          "id": "EVD-0307",
+          "kind": "test",
+          "locator": "cargo test production_client_rejects_redirects_without_contacting_the_target",
+          "summary": "Commit-pinned anchor for EVD-0301: the regression test that drives the real builder with an x-api-key header against a 307 and asserts the redirect target receives no connection; passed at b763061.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "src/telemetry/http_client.rs",
+              "lines": {
+                "start": 259,
+                "end": 311
+              },
+              "commit": "b763061593ec97f39dbfba9cd78a4028ff5d997a"
+            }
+          },
+          "recorded_at": "2026-11-01T14:48:06.540732231Z",
+          "seal": {
+            "by": "server",
+            "mac": "25594241e434a74c779e72e663320c67a4de87853f1e919336c6c86d1af67f80"
+          }
         }
       ],
       "verdicts": [
@@ -12335,13 +12586,45 @@
             "by": "server",
             "mac": "256e71d1a57c1b35f245f162b1b4e952bce6ae74ba82edca0062de836fdb4f18"
           }
+        },
+        {
+          "verdict": "supported",
+          "rationale": "Independent of the builder's own verdict: the only client feeding the OTLP trace and log exporters now errors on every redirect (EVD-0299, EVD-0300), and a test against the real builder shows a cross-origin redirect target receives no connection while an x-api-key header is set (EVD-0301). The original refutation (default redirect policy forwarding custom headers) no longer applies.",
+          "auditor": "claude-sonnet-5-5 (independent re-audit), confirmed by claude-opus-5-5",
+          "evidence_ids": [
+            "EVD-0299",
+            "EVD-0300",
+            "EVD-0301"
+          ],
+          "recorded_at": "2026-11-01T14:47:29.239744638Z",
+          "seal": {
+            "by": "server",
+            "mac": "15bc6f6e4059d1e76c3ca3f9852bae5dbbdf4c5f26ea63fdd810005812690c9c"
+          }
+        },
+        {
+          "verdict": "supported",
+          "rationale": "Re-recorded to cite the commit-pinned anchors. Independent of the builder's verdict: the only client feeding the OTLP trace and log exporters errors on every redirect (EVD-0299, EVD-0300, EVD-0306), and a test against the real builder shows a cross-origin redirect target receives no connection while an x-api-key header is set (EVD-0301, EVD-0307).",
+          "auditor": "claude-sonnet-5-5 (independent re-audit), confirmed by claude-opus-5-5",
+          "evidence_ids": [
+            "EVD-0299",
+            "EVD-0300",
+            "EVD-0301",
+            "EVD-0306",
+            "EVD-0307"
+          ],
+          "recorded_at": "2026-11-01T14:48:20.254184594Z",
+          "seal": {
+            "by": "server",
+            "mac": "a27d440599b614342e261cf042c5392c2a635d85d1927e036b3c13c55ea8b5c4"
+          }
         }
       ],
       "created_at": "2026-10-29T13:10:15.874454913Z",
-      "updated_at": "2026-10-31T17:05:07.205965817Z",
+      "updated_at": "2026-11-01T14:48:20.254184594Z",
       "seal": {
         "by": "server",
-        "mac": "dd2d52ea4565cc223fa22971ca89fa2aee9a101eccce3e378217fd7d2e214f2d"
+        "mac": "c419dbccbbb86495ce7fdca36e5259bb0f99e7d4fcfea09ca58ed37ea6b5a8d0"
       }
     },
     {
