@@ -16,7 +16,10 @@ use secrecy::zeroize::Zeroizing;
 use thiserror::Error;
 use tracing_subscriber::EnvFilter;
 
-use crate::security::{AdminToken, MasterKey};
+use crate::{
+    costs::{CostsConfig, COSTS_VARIABLE},
+    security::{AdminToken, MasterKey},
+};
 
 const DEFAULT_BIND_ADDRESS: &str = "[::]:8080";
 const DEFAULT_RUST_LOG: &str = "info";
@@ -245,6 +248,7 @@ pub struct RuntimeConfig {
     delivery_prune_interval: Duration,
     required_check_ttl: Duration,
     github_app: Option<GitHubAppConfig>,
+    costs: Option<CostsConfig>,
     rust_log: String,
     telemetry: TelemetryConfig,
 }
@@ -318,6 +322,11 @@ impl RuntimeConfig {
     /// Returns the optional GitHub App credentials that fill the required-check cache.
     pub fn github_app(&self) -> Option<&GitHubAppConfig> {
         self.github_app.as_ref()
+    }
+
+    /// Returns the optional unit-price table; `None` disables every cost feature.
+    pub fn costs(&self) -> Option<&CostsConfig> {
+        self.costs.as_ref()
     }
 
     /// Returns the validated tracing filter directive.
@@ -460,6 +469,9 @@ impl RuntimeConfig {
             });
         }
         let github_app = GitHubAppConfig::from_lookup(&mut lookup)?;
+        let costs = optional_string(&mut lookup, COSTS_VARIABLE)?
+            .map(|json| CostsConfig::from_json(&json))
+            .transpose()?;
 
         let rust_log = optional_string(&mut lookup, "RUST_LOG")?
             .unwrap_or_else(|| DEFAULT_RUST_LOG.to_owned());
@@ -482,6 +494,7 @@ impl RuntimeConfig {
             delivery_prune_interval: Duration::from_secs(delivery_prune_interval_seconds),
             required_check_ttl: Duration::from_secs(required_check_ttl_seconds),
             github_app,
+            costs,
             rust_log,
             telemetry,
         })
@@ -599,6 +612,11 @@ impl fmt::Debug for RuntimeConfig {
             .field("delivery_prune_interval", &self.delivery_prune_interval)
             .field("required_check_ttl", &self.required_check_ttl)
             .field("github_app", &self.github_app)
+            .field("costs_enabled", &self.costs.is_some())
+            .field(
+                "costs_version",
+                &self.costs.as_ref().map(CostsConfig::version),
+            )
             .field("rust_log", &self.rust_log)
             .field("telemetry", &self.telemetry)
             .finish()
@@ -899,6 +917,46 @@ mod tests {
         assert_eq!(config.delivery_prune_interval(), Duration::from_secs(3_600));
         assert_eq!(config.workflow_job_max_steps(), 256);
         assert_eq!(config.rust_log(), "info");
+    }
+
+    #[test]
+    fn costs_are_disabled_unless_configured() {
+        let config = RuntimeConfig::from_map(required_variables()).expect("configuration is valid");
+
+        assert!(config.costs().is_none());
+        assert!(format!("{config:?}").contains("costs_enabled: false, costs_version: None"));
+    }
+
+    #[test]
+    fn valid_costs_load_and_report_their_version() {
+        let mut variables = required_variables();
+        variables.insert(
+            "GHE_COSTS_JSON".to_owned(),
+            OsString::from(r#"{"runners":{"default_usd_per_minute":0.008}}"#),
+        );
+
+        let config = RuntimeConfig::from_map(variables).expect("configuration is valid");
+        let version = config.costs().expect("costs are enabled").version();
+
+        assert!(format!("{config:?}").contains(&format!(
+            "costs_enabled: true, costs_version: Some(\"{version}\")"
+        )));
+    }
+
+    #[test]
+    fn invalid_costs_fail_startup_naming_only_the_variable() {
+        let mut variables = required_variables();
+        variables.insert(
+            "GHE_COSTS_JSON".to_owned(),
+            OsString::from(r#"{"runners":{"default_usd_per_minute":-1}}"#),
+        );
+
+        assert_eq!(
+            RuntimeConfig::from_map(variables).err(),
+            Some(ConfigError::Invalid {
+                variable: "GHE_COSTS_JSON"
+            })
+        );
     }
 
     #[test]

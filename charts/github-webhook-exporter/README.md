@@ -118,6 +118,7 @@ The chart never reads or copies Secret data into its ConfigMap.
 | `githubApp.appId` | `null` | GitHub App identifier; null disables required-check lookups. |
 | `githubApp.installationId` | `null` | GitHub App installation identifier; null disables required-check lookups. |
 | `githubApp.apiBaseUrl` | `""` | REST API base URL; empty selects `https://api.github.com`. |
+| `costs` | `{}` | Optional CI cost unit-price table rendered as `GHE_COSTS_JSON`; empty disables cost features. Requires `runners.default_usd_per_minute`; rates are non-negative numbers and each vendor has exactly one `match` rule. See the book's CI cost price table reference. |
 | `retention.deliveryDays` | `7` | Authenticated delivery-claim retention in days. |
 | `retention.mergeQueueDays` | `90` | Completed merge-queue-attempt retention in days. |
 | `retention.pruneIntervalSeconds` | `3600` | Shared retention pruning interval in seconds. |

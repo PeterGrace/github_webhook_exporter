@@ -76,6 +76,12 @@ manifests. Prefer `GHE_GITHUB_APP_PRIVATE_KEY_PATH` with a mounted secret, which
 the process environment entirely. The Helm chart only offers the path form for exactly that reason,
 and sets the variable for you — see [Helm values](helm-values.md).
 
+## CI cost prices
+
+| Variable | Default | Contract |
+| --- | --- | --- |
+| `GHE_COSTS_JSON` | unset | Unit-price table as JSON; unset disables every cost feature. Invalid JSON, an unknown field, a negative rate, or an ambiguous vendor match fails startup. See [CI cost price table](costs.md). |
+
 Structured logging to stderr is always on, independent of OTLP configuration.
 
 Do not place secret values (`GHE_MASTER_KEY`, `GHE_ADMIN_TOKEN`, `SENTRY_DSN`, OTLP header values) in image

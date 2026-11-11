@@ -26,6 +26,7 @@
 - [Release and packaging](reference/release-and-packaging.md)
 - [Startup, retention, and shutdown](reference/lifecycle.md)
 - [Helm values](reference/helm-values.md)
+- [CI cost price table](reference/costs.md)
 
 # Explanation
 

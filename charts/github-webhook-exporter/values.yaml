@@ -27,6 +27,7 @@ githubApp:
   appId: null
   installationId: null
   apiBaseUrl: ""
+costs: {}
 retention:
   deliveryDays: 7
   mergeQueueDays: 90
