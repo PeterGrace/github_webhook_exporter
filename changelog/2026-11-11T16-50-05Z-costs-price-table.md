@@ -12,7 +12,8 @@ Date: 2026-11-11T16:50:05Z
   `ConfigError::Invalid { variable: "GHE_COSTS_JSON" }`. Parser messages are dropped because
   serde can quote configured values.
 - Validation is mostly done by types. `UsdRate` deserializes through `TryFrom<f64>`, so a
-  negative or non-finite rate cannot be represented. The vendor `match` is an externally tagged
+  negative or non-finite rate cannot be represented. `-0.0` is normalized to `0.0` so it
+  cannot change the version hash. The vendor `match` is an externally tagged
   enum, which accepts exactly one key. `deny_unknown_fields` rejects typos. Empty match strings,
   and two vendors claiming the same app slug or login, are rejected while building the lookup
   indexes.

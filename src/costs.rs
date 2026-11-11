@@ -45,7 +45,9 @@ impl TryFrom<f64> for UsdRate {
 
     fn try_from(value: f64) -> Result<Self, Self::Error> {
         if value.is_finite() && value >= 0.0 {
-            Ok(Self(value))
+            // `-0.0 >= 0.0` holds, and adding `+0.0` turns `-0.0` into `+0.0`, so every zero
+            // serializes the same way and leaves the version unchanged.
+            Ok(Self(value + 0.0))
         } else {
             Err("rate must be a finite, non-negative number")
         }
@@ -494,6 +496,8 @@ mod tests {
             0.0000045,"usd_per_cpu_second":0.000014},"runners":{"labels":{"ubuntu-24.04-xl":0.082,
             "ubuntu-latest-m":0.0120},"default_usd_per_minute":0.012}}"#;
         let changed = EXAMPLE.replace("0.082", "0.083");
+        let zero = r#"{"runners":{"default_usd_per_minute":0}}"#;
+        let negative_zero = r#"{"runners":{"default_usd_per_minute":-0.0}}"#;
 
         let version = example().version().to_owned();
 
@@ -504,6 +508,14 @@ mod tests {
                 .expect("reordered table is valid")
                 .version(),
             version
+        );
+        assert_eq!(
+            CostsConfig::from_json(negative_zero)
+                .expect("negative zero is a valid rate")
+                .version(),
+            CostsConfig::from_json(zero)
+                .expect("zero is a valid rate")
+                .version()
         );
         assert_ne!(
             CostsConfig::from_json(&changed)
