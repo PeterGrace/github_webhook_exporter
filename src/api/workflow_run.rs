@@ -115,21 +115,25 @@ fn unique_pull_request(pull_requests: &[PullRequestProjection]) -> Option<PullRe
 ///
 /// Comment-triggered workflows set `run-name` this way because GitHub leaves their
 /// `pull_requests` empty. The marker must start the name or follow a non-alphanumeric character,
-/// so `APR #3` does not match. The first match wins.
+/// so `APR #3` does not match. The first marker followed by a positive number wins.
 fn pull_request_from_run_name(run_name: &str) -> Option<PullRequestNumber> {
     const MARKER: &str = "PR #";
-    let (start, _) = run_name.match_indices(MARKER).find(|(start, _)| {
-        run_name[..*start]
-            .chars()
-            .next_back()
-            .is_none_or(|previous| !previous.is_alphanumeric())
-    })?;
-    let rest = &run_name[start + MARKER.len()..];
-    let digits_end = rest
-        .find(|character: char| !character.is_ascii_digit())
-        .unwrap_or(rest.len());
-    let number = rest[..digits_end].parse().ok()?;
-    PullRequestNumber::new(number).ok()
+    run_name
+        .match_indices(MARKER)
+        .filter(|(start, _)| {
+            run_name[..*start]
+                .chars()
+                .next_back()
+                .is_none_or(|previous| !previous.is_alphanumeric())
+        })
+        .find_map(|(start, _)| {
+            let rest = &run_name[start + MARKER.len()..];
+            let digits_end = rest
+                .find(|character: char| !character.is_ascii_digit())
+                .unwrap_or(rest.len());
+            let number = rest[..digits_end].parse().ok()?;
+            PullRequestNumber::new(number).ok()
+        })
 }
 
 /// Projects bounded run-level summary metadata from an authenticated workflow-run payload.
@@ -378,6 +382,7 @@ mod tests {
             ("Claude (PR #12)", Some(12)),
             ("APR #3", None),
             ("APR #3 then PR #4", Some(4)),
+            ("PR #tbd, see PR #12", Some(12)),
         ] {
             assert_eq!(
                 pull_request_of(json!({
