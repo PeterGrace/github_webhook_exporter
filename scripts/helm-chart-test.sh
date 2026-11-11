@@ -1125,6 +1125,99 @@ expect_failure \
     helm template github-webhook-exporter "${CHART_DIRECTORY}" \
         --set application.requiredCheckTtlSeconds=86401
 
+cat >"${TEMPORARY_DIRECTORY}/costs-values.yaml" <<'EOF'
+costs:
+  runners:
+    default_usd_per_minute: 0.012
+    labels:
+      ubuntu-latest-m: 0.012
+      ubuntu-24.04-xl: 0.082
+  daytona:
+    usd_per_cpu_second: 0.000014
+    usd_per_ram_gb_second: 0.0000045
+  vendors:
+    example-review-bot:
+      match: { review_login: "review-bot[bot]" }
+      usd_per_run: 0.50
+    example-visual-tests:
+      match: { check_suite_app: "visual-tests" }
+      usd_per_run: 0.25
+EOF
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --values "${TEMPORARY_DIRECTORY}/costs-values.yaml" \
+    >"${TEMPORARY_DIRECTORY}/costs.yaml"
+yq eval-all '[.] | flatten | map(select(. != null))' \
+    "${TEMPORARY_DIRECTORY}/costs.yaml" \
+    >"${TEMPORARY_DIRECTORY}/costs-manifests.yaml"
+yq '[.[] | select(.kind == "ConfigMap")][0].data.GHE_COSTS_JSON' \
+    "${TEMPORARY_DIRECTORY}/costs-manifests.yaml" \
+    >"${TEMPORARY_DIRECTORY}/costs.json"
+python3 -I - "${TEMPORARY_DIRECTORY}/costs.json" <<'PYTHON' ||
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as rendered:
+    costs = json.load(rendered)
+assert costs["runners"]["labels"]["ubuntu-24.04-xl"] == 0.082
+assert costs["daytona"]["usd_per_ram_gb_second"] == 0.0000045
+assert costs["vendors"]["example-visual-tests"]["match"] == {"check_suite_app": "visual-tests"}
+PYTHON
+    fail 'a configured costs block must render as valid JSON in GHE_COSTS_JSON'
+assert_yq \
+    '([.[] | select(.kind == "ConfigMap")][0].data | has("GHE_COSTS_JSON")) == false' \
+    "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
+    'an unconfigured costs block must add no configuration'
+# Helm's --set renders decimals as strings, so numeric rates use --set-json.
+expect_failure_contains \
+    'costs block without runner prices' \
+    "missing property 'runners'" \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set-json costs.daytona.usd_per_cpu_second=1 \
+        --set-json costs.daytona.usd_per_ram_gb_second=1
+expect_failure_contains \
+    'negative runner rate' \
+    'minimum: got -0.01, want 0' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set-json costs.runners.default_usd_per_minute=-0.01
+expect_failure_contains \
+    'non-numeric runner rate' \
+    'got string, want number' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set costs.runners.default_usd_per_minute=cheap
+expect_failure_contains \
+    'unknown costs field' \
+    "additional properties 'runner_group' not allowed" \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set-json costs.runners.default_usd_per_minute=0.01 \
+        --set-json costs.runner_group=1
+expect_failure_contains \
+    'vendor with two match rules' \
+    'maxProperties: got 2, want 1' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set-json costs.runners.default_usd_per_minute=0.01 \
+        --set-json costs.vendors.example.usd_per_run=1 \
+        --set costs.vendors.example.match.check_suite_app=visual-tests \
+        --set costs.vendors.example.match.review_login=review-bot
+expect_failure_contains \
+    'vendor with no match rule' \
+    'minProperties: got 0, want 1' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set-json costs.runners.default_usd_per_minute=0.01 \
+        --set-json costs.vendors.example.usd_per_run=1 \
+        --set-json 'costs.vendors.example.match={}'
+expect_failure_contains \
+    'vendor with an empty match string' \
+    'minLength: got 0, want 1' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set-json costs.runners.default_usd_per_minute=0.01 \
+        --set-json costs.vendors.example.usd_per_run=1 \
+        --set-json 'costs.vendors.example.match={"review_login":""}'
+expect_failure_contains \
+    'empty runner label' \
+    'minLength: got 0, want 1' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set-json 'costs.runners={"default_usd_per_minute":0.01,"labels":{"":0.02}}'
+
 assert_contains \
     '## Webhook ingress example' \
     "${CHART_DIRECTORY}/README.md" \

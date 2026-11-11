@@ -6,6 +6,8 @@ pub mod api;
 pub mod app;
 /// Typed, validated, and redacted runtime configuration.
 pub mod config;
+/// Optional validated unit-price table for CI cost attribution.
+pub mod costs;
 /// Validated delivery, repository, and merge-queue domain values.
 pub mod domain;
 /// Safe HTTP-facing application errors.

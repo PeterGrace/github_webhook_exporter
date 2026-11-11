@@ -20,6 +20,20 @@
         }
       }
     },
+    "usdRate": {
+      "type": "number",
+      "minimum": 0
+    },
+    "vendorMatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "maxProperties": 1,
+      "properties": {
+        "check_suite_app": {"type": "string", "minLength": 1},
+        "review_login": {"type": "string", "minLength": 1}
+      }
+    },
     "networkPeerRule": {
       "type": "object",
       "additionalProperties": false,
@@ -108,6 +122,7 @@
     "service",
     "application",
     "githubApp",
+    "costs",
     "retention",
     "telemetry",
     "persistence",
@@ -264,6 +279,48 @@
         "apiBaseUrl": {
           "type": "string",
           "anyOf": [{"maxLength": 0}, {"pattern": "^https?://[^\\s]+$"}]
+        }
+      }
+    },
+    "costs": {
+      "type": "object",
+      "additionalProperties": false,
+      "anyOf": [{"maxProperties": 0}, {"required": ["runners"]}],
+      "properties": {
+        "runners": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["default_usd_per_minute"],
+          "properties": {
+            "default_usd_per_minute": {"$ref": "#/definitions/usdRate"},
+            "labels": {
+              "type": "object",
+              "propertyNames": {"minLength": 1},
+              "additionalProperties": {"$ref": "#/definitions/usdRate"}
+            }
+          }
+        },
+        "daytona": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["usd_per_cpu_second", "usd_per_ram_gb_second"],
+          "properties": {
+            "usd_per_cpu_second": {"$ref": "#/definitions/usdRate"},
+            "usd_per_ram_gb_second": {"$ref": "#/definitions/usdRate"}
+          }
+        },
+        "vendors": {
+          "type": "object",
+          "propertyNames": {"minLength": 1},
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["match", "usd_per_run"],
+            "properties": {
+              "match": {"$ref": "#/definitions/vendorMatch"},
+              "usd_per_run": {"$ref": "#/definitions/usdRate"}
+            }
+          }
         }
       }
     },

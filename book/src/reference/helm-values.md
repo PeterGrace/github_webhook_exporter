@@ -12,6 +12,7 @@ This table is only a map of the value groups, so you know where to look.
 | `service.*` | Fixed `ClusterIP`; `service.port` drives the Service, container port, probes, and the application listener together. |
 | `application.*` | Shutdown deadline, webhook body limit, workflow-job step cap, required-check cache lifetime, `RUST_LOG`. |
 | `githubApp.*` | Optional GitHub App identifiers and API base URL enabling branch-protection required-check lookups. |
+| `costs.*` | Optional CI cost unit-price table, rendered as `GHE_COSTS_JSON`; empty disables cost features. See [CI cost price table](costs.md). |
 | `retention.*` | Delivery and merge-queue retention windows and the prune interval. |
 | `telemetry.*` | OTLP endpoints, timeouts, service name, queue capacity, batch size, shutdown deadline. |
 | `persistence.*` | Storage class, fixed `ReadWriteOnce` access mode, PVC size. |
