@@ -7378,6 +7378,7 @@ async fn a_priced_job_exports_its_cost_on_the_span_and_one_cost_log() {
             "started_at": "2026-08-06T10:00:00Z",
             "completed_at": "2026-08-06T10:05:00.5Z",
             "labels": ["ubuntu-24.04-xl"],
+            "runner_id": 7,
             "runner_group_name": "Larger runners",
             "steps": []
         },
@@ -7465,6 +7466,7 @@ async fn an_unpriced_deployment_logs_no_job_cost() {
             "started_at": "2026-08-06T10:00:00Z",
             "completed_at": "2026-08-06T10:05:00Z",
             "labels": ["ubuntu-24.04-xl"],
+            "runner_id": 7,
             "steps": []
         },
         "repository": {"full_name": WEBHOOK_REPOSITORY}

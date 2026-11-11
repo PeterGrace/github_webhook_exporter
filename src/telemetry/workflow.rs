@@ -45,7 +45,7 @@ pub(crate) const MAX_REQUIRED_CHECK_COUNT: usize = 100;
 const UNKNOWN_WORKFLOW_NAME: &str = "workflow";
 const UNNAMED_JOB_NAME: &str = "job";
 const UNNAMED_STEP_NAME: &str = "step";
-const JOB_REQUIRED_ATTRIBUTE_COUNT: usize = 15;
+const JOB_REQUIRED_ATTRIBUTE_COUNT: usize = 16;
 const STEP_REQUIRED_ATTRIBUTE_COUNT: usize = 13;
 
 /// A malformed workflow telemetry value.
@@ -366,6 +366,7 @@ impl WorkflowJobTrace {
     }
 
     /// Returns the bounded pull-request collection.
+    #[cfg(test)]
     pub(crate) fn pull_requests(&self) -> &[PullRequestNumber] {
         self.pull_requests.as_slice()
     }
@@ -896,13 +897,11 @@ fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
     let mut attributes = Vec::with_capacity(
         JOB_REQUIRED_ATTRIBUTE_COUNT
             + usize::from(job.head_sha().is_some())
-            + usize::from(!job.pull_requests().is_empty())
+            + usize::from(!job.attributed_pull_requests().is_empty())
             + usize::from(job.conclusion().error_type().is_some())
             + usize::from(job.required().is_some())
-            + job.workflow_run_context().map_or(0, |context| {
-                1 + usize::from(context.source_branch().is_some())
-                    + usize::from(context.target_branch().is_some())
-            }),
+            + workflow_run_context_attribute_count(job.workflow_run_context())
+            + job.billing().map_or(0, job_billing_attribute_count),
     );
     append_job_pipeline_and_repository_context(&mut attributes, job);
     attributes.push(delivery_id_attribute(&job.delivery_id()));
@@ -953,16 +952,28 @@ fn append_job_billing(attributes: &mut Vec<KeyValue>, billing: &WorkflowJobBilli
     }
 }
 
+fn job_billing_attribute_count(billing: &WorkflowJobBilling) -> usize {
+    1 + usize::from(!billing.runner_labels.is_empty())
+        + usize::from(billing.runner_group.is_some())
+        + billing.cost.as_ref().map_or(0, |_| 4)
+}
+
+/// Returns how many attributes [`append_workflow_run_context`] adds for `context`.
+pub(super) fn workflow_run_context_attribute_count(context: Option<&WorkflowRunContext>) -> usize {
+    context.map_or(0, |context| {
+        1 + usize::from(context.source_branch().is_some())
+            + usize::from(context.target_branch().is_some())
+            + usize::from(context.workflow_file().is_some())
+    })
+}
+
 fn step_attributes(job: &WorkflowJobTrace, step: &WorkflowStepTrace) -> Vec<KeyValue> {
     let mut attributes = Vec::with_capacity(
         STEP_REQUIRED_ATTRIBUTE_COUNT
             + usize::from(job.head_sha().is_some())
             + usize::from(step.conclusion().error_type().is_some())
             + usize::from(job.required().is_some())
-            + job.workflow_run_context().map_or(0, |context| {
-                1 + usize::from(context.source_branch().is_some())
-                    + usize::from(context.target_branch().is_some())
-            }),
+            + workflow_run_context_attribute_count(job.workflow_run_context()),
     );
     append_job_pipeline_and_repository_context(&mut attributes, job);
     attributes.push(workflow_task_name_attribute(step_name(step)));

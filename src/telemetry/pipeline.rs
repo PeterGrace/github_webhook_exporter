@@ -30,9 +30,10 @@ use super::{
         GITHUB_ACTIONS_PIPELINE_TASK_OPERATION,
     },
     workflow::{
-        append_pipeline_and_repository_context, append_workflow_run_context, DisplayName,
-        HistoricalTiming, TimingSource, WorkflowConclusion, WorkflowJobId, WorkflowPullRequests,
-        WorkflowRunAttempt, WorkflowRunContext, WorkflowRunId, WorkflowTraceEmitter,
+        append_pipeline_and_repository_context, append_workflow_run_context,
+        workflow_run_context_attribute_count, DisplayName, HistoricalTiming, TimingSource,
+        WorkflowConclusion, WorkflowJobId, WorkflowPullRequests, WorkflowRunAttempt,
+        WorkflowRunContext, WorkflowRunId, WorkflowTraceEmitter,
     },
     workflow_error::{PipelineTaskErrorParts, SyntheticWorkflowError},
 };
@@ -428,8 +429,7 @@ fn pipeline_root_attributes(pipeline: &PipelineRunTrace) -> Vec<KeyValue> {
             + usize::from(pipeline.head_sha.is_some())
             + usize::from(pipeline.conclusion.error_type().is_some())
             + usize::from(!pipeline.pull_requests().is_empty())
-            + usize::from(pipeline.run_context.source_branch().is_some())
-            + usize::from(pipeline.run_context.target_branch().is_some()),
+            + workflow_run_context_attribute_count(Some(&pipeline.run_context)),
     );
     append_pipeline_context(&mut attributes, pipeline);
     attributes.push(delivery_id_attribute(&pipeline.delivery_id));
@@ -463,8 +463,7 @@ fn pipeline_task_attributes(
         PIPELINE_TASK_REQUIRED_ATTRIBUTE_COUNT
             + usize::from(pipeline.head_sha.is_some())
             + usize::from(job.conclusion.error_type().is_some())
-            + usize::from(pipeline.run_context.source_branch().is_some())
-            + usize::from(pipeline.run_context.target_branch().is_some()),
+            + workflow_run_context_attribute_count(Some(&pipeline.run_context)),
     );
     append_pipeline_context(&mut attributes, pipeline);
     attributes.push(workflow_task_name_attribute(job.name()));

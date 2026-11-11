@@ -111,6 +111,7 @@ struct WorkflowJobProjection {
     started_at: Option<Value>,
     completed_at: Option<Value>,
     labels: Option<Value>,
+    runner_id: Option<Value>,
     runner_group_name: Option<Value>,
     #[serde(default)]
     pull_requests: Vec<PullRequestProjection>,
@@ -239,6 +240,7 @@ pub(crate) fn project_completed_job(
         started_at,
         completed_at,
         labels,
+        runner_id,
         runner_group_name,
         pull_requests,
         steps,
@@ -273,11 +275,14 @@ pub(crate) fn project_completed_job(
     }
 
     let conclusion = normalize_conclusion(conclusion.as_ref());
+    let ran_on_runner = runner_id
+        .as_ref()
+        .and_then(Value::as_i64)
+        .is_some_and(|id| id > 0);
     let billing = project_billing(
         labels.as_ref(),
         runner_group_name.as_ref(),
-        conclusion,
-        &timing,
+        billable_minutes(conclusion, ran_on_runner, &timing),
         costs,
     );
     let job_name = sanitize_display_name(name.as_ref());
@@ -316,8 +321,7 @@ pub(crate) fn project_completed_job(
 fn project_billing(
     labels: Option<&Value>,
     runner_group: Option<&Value>,
-    conclusion: WorkflowConclusion,
-    timing: &HistoricalTiming,
+    billable_minutes: i64,
     costs: Option<&CostsConfig>,
 ) -> WorkflowJobBilling {
     let runner_labels: Vec<DisplayName> = labels
@@ -328,7 +332,6 @@ fn project_billing(
         .filter_map(DisplayName::sanitize)
         .take(MAX_RUNNER_LABEL_COUNT)
         .collect();
-    let billable_minutes = billable_minutes(conclusion, timing);
     let cost = costs.map(|costs| {
         // A job that billed nothing has no rate to look up, which also keeps skipped jobs, whose
         // labels are often empty, from logging `ci price missing`.
@@ -356,10 +359,17 @@ fn project_billing(
 
 /// Returns the whole minutes GitHub bills for a job: its run time rounded up to a minute.
 ///
-/// Skipped jobs and jobs without reported start and end times never ran on a runner, so they
-/// bill nothing.
-fn billable_minutes(conclusion: WorkflowConclusion, timing: &HistoricalTiming) -> i64 {
-    if conclusion == WorkflowConclusion::Skipped || timing.source() != TimingSource::Reported {
+/// A job bills nothing when it was skipped, never got a runner (GitHub still reports timestamps
+/// for a job cancelled while queued), or has no valid reported start and end times.
+fn billable_minutes(
+    conclusion: WorkflowConclusion,
+    ran_on_runner: bool,
+    timing: &HistoricalTiming,
+) -> i64 {
+    if conclusion == WorkflowConclusion::Skipped
+        || !ran_on_runner
+        || timing.source() != TimingSource::Reported
+    {
         return 0;
     }
     let nanos = timing
@@ -1112,6 +1122,7 @@ mod tests {
             "started_at": "2026-08-06T10:00:00Z",
             "completed_at": "2026-08-06T10:05:00.5Z",
             "labels": labels,
+            "runner_id": 7,
             "runner_group_name": "Larger\nrunners",
             "steps": []
         })
@@ -1139,13 +1150,17 @@ mod tests {
     }
 
     #[test]
-    fn skipped_and_untimed_jobs_bill_nothing() {
+    fn skipped_untimed_and_runnerless_jobs_bill_nothing() {
         let skipped = priced_job(timed_job("skipped", json!([])), None);
         let mut untimed = timed_job("cancelled", json!([]));
         untimed["started_at"] = Value::Null;
         let untimed = priced_job(untimed, None);
 
-        for trace in [skipped, untimed] {
+        let mut queued = timed_job("cancelled", json!(["ubuntu-24.04-xl"]));
+        queued["runner_id"] = Value::Null;
+        let queued = priced_job(queued, None);
+
+        for trace in [skipped, untimed, queued] {
             assert_eq!(
                 trace.billing().map(|billing| billing.billable_minutes),
                 Some(0)

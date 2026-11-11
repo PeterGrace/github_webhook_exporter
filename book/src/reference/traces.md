@@ -153,7 +153,7 @@ The same delivery also attributes the run to at most one pull request. That is t
 distinct number in the run's `pull_requests`. A run started by `issue_comment`,
 `pull_request_review`, or `pull_request_review_comment` has an empty `pull_requests`, so its PR is
 read from the first `PR #<number>` in the run name (`display_title`, set by the workflow's
-`run-name`). Other events never read the run name, because squash-merge commit titles contain
+`run-name`) that starts the name or follows a non-alphanumeric character. Other events never read the run name, because squash-merge commit titles contain
 `(#<number>)`. GitHub's `workflow_job` payload carries no pull requests, so a job root whose own
 list is empty uses the run's attributed PR for `github.pull_request.number`.
 
@@ -168,7 +168,7 @@ Every job root carries the runner and the minutes GitHub bills for the job:
 | --- | --- |
 | `cicd.runner.labels` | The job's runner labels in job order: at most 16, each sanitized like display names. Omitted when the job reported none. |
 | `cicd.runner.group` | The sanitized runner group name, when reported. |
-| `ci.billable_minutes` | The job's run time rounded up to a whole minute. `0` for a skipped job and for a job without valid reported start and end times. |
+| `ci.billable_minutes` | The job's run time rounded up to a whole minute. `0` for a skipped job, a job that never got a runner (no positive `runner_id`, such as one cancelled while queued), and a job without valid reported start and end times. |
 
 When a [`costs`](costs.md) table is configured, the root also carries the job's price:
 

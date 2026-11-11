@@ -6,7 +6,8 @@ Date: 2026-11-11T21:34:38Z
 
 - Completed `workflow_job` deliveries now project the runner labels (at most 16, sanitized) and
   runner group, and compute billable minutes: run time rounded up to a whole minute, or 0 for a
-  skipped job or one without valid reported timing.
+  skipped job, a job that never got a runner (no positive `runner_id`, as when cancelled while
+  queued), or one without valid reported timing.
 - With a `costs` table configured, each job is priced at billable minutes times the runner rate
   from `CostsConfig::runner_rate`. A job that billed 0 minutes is priced at 0 without a rate
   lookup, so skipped jobs never log `ci price missing`.
@@ -19,7 +20,7 @@ Date: 2026-11-11T21:34:38Z
 - `workflow_run` context now records the workflow file (`github.workflow_file`) and one
   attributed pull request: the single distinct number in `pull_requests`, or, for
   `issue_comment`, `pull_request_review` and `pull_request_review_comment` runs, the first
-  `PR #<number>` in the run name. Job roots whose own PR list is empty (GitHub sends none on
+  `PR #<number>` in the run name that starts it or follows a non-alphanumeric character. Job roots whose own PR list is empty (GitHub sends none on
   `workflow_job`) and pipeline roots whose run reported none use that PR.
 - The stored workflow event vocabulary adds `pull_request_target`, `pull_request_review`,
   `pull_request_review_comment`, `issue_comment`, `schedule`, and `workflow_dispatch`.
@@ -42,6 +43,8 @@ per-PR and per-workflow cost queries group by.
   spans will group by it.
 - **The run name is parsed only for comment-triggered events.** Push runs on the default branch
   have squash-merge titles such as `fix: x (#9088)` that would otherwise match.
+- **`cost_usd` is stored as `REAL`.** Run totals sum at most a few hundred job costs, so `f64`
+  rounding stays many orders of magnitude below a cent, and spans and logs carry `f64` anyway.
 - **No dedupe for `ci price missing`.** One warning per priced job is bounded, and
   `ci.price.fell_back` on the span lets fallbacks be counted without searching logs.
 

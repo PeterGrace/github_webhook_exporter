@@ -114,10 +114,17 @@ fn unique_pull_request(pull_requests: &[PullRequestProjection]) -> Option<PullRe
 /// Reads the pull request from a run name that contains `PR #<number>`.
 ///
 /// Comment-triggered workflows set `run-name` this way because GitHub leaves their
-/// `pull_requests` empty. The first match wins.
+/// `pull_requests` empty. The marker must start the name or follow a non-alphanumeric character,
+/// so `APR #3` does not match. The first match wins.
 fn pull_request_from_run_name(run_name: &str) -> Option<PullRequestNumber> {
     const MARKER: &str = "PR #";
-    let (_, rest) = run_name.split_once(MARKER)?;
+    let (start, _) = run_name.match_indices(MARKER).find(|(start, _)| {
+        run_name[..*start]
+            .chars()
+            .next_back()
+            .is_none_or(|previous| !previous.is_alphanumeric())
+    })?;
+    let rest = &run_name[start + MARKER.len()..];
     let digits_end = rest
         .find(|character: char| !character.is_ascii_digit())
         .unwrap_or(rest.len());
@@ -366,6 +373,21 @@ mod tests {
             })),
             None
         );
+        for (title, expected) in [
+            ("PR #12", Some(12)),
+            ("Claude (PR #12)", Some(12)),
+            ("APR #3", None),
+            ("APR #3 then PR #4", Some(4)),
+        ] {
+            assert_eq!(
+                pull_request_of(json!({
+                    "id": 31, "run_attempt": 1, "event": "issue_comment",
+                    "display_title": title
+                })),
+                expected,
+                "{title}"
+            );
+        }
     }
 
     #[test]
