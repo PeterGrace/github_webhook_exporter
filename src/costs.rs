@@ -6,6 +6,7 @@
 //! variable and never its value.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap},
     fmt,
 };
@@ -150,18 +151,31 @@ impl CostsConfig {
         let invalid = || ConfigError::Invalid {
             variable: COSTS_VARIABLE,
         };
-        let table: PriceTable = serde_json::from_str(json).map_err(|_| invalid())?;
+        let mut table: PriceTable = serde_json::from_str(json).map_err(|_| invalid())?;
+
+        // GitHub compares runner labels, logins and app slugs case-insensitively, so keys are
+        // lowercased before indexing and hashing. Two keys that collide after lowercasing are
+        // ambiguous and rejected; `insert` returning `Some` is that collision.
+        let labels = std::mem::take(&mut table.runners.labels);
+        for (mut label, rate) in labels {
+            label.make_ascii_lowercase();
+            if label.is_empty() || table.runners.labels.insert(label, rate).is_some() {
+                return Err(invalid());
+            }
+        }
 
         let mut vendors_by_check_suite_app = HashMap::new();
         let mut vendors_by_review_login = HashMap::new();
-        for (name, vendor) in &table.vendors {
-            let (index, key) = match &vendor.matcher {
+        for (name, vendor) in &mut table.vendors {
+            let (index, key) = match &mut vendor.matcher {
                 VendorMatch::CheckSuiteApp(slug) => (&mut vendors_by_check_suite_app, slug),
                 VendorMatch::ReviewLogin(login) => (&mut vendors_by_review_login, login),
             };
-            // `insert` returns the previous value, so `Some` means another vendor already
-            // claimed this key and lookups would be ambiguous.
-            if key.is_empty() || index.insert(key.clone(), name.clone()).is_some() {
+            key.make_ascii_lowercase();
+            if name.is_empty()
+                || key.is_empty()
+                || index.insert(key.clone(), name.clone()).is_some()
+            {
                 return Err(invalid());
             }
         }
@@ -179,41 +193,58 @@ impl CostsConfig {
     }
 
     /// Returns `ci.price_table.version`: a short hash of the canonical table, stable across
-    /// key order and whitespace and changed by any rate.
+    /// key order, key case and whitespace and changed by any rate.
     pub fn version(&self) -> &str {
         &self.version
     }
 
     /// Returns the rate for a job given its labels in job order.
     ///
-    /// The first label present in `runners.labels` wins. With no match the default rate is
-    /// returned and one `ci price missing` warning is logged with the bounded job labels.
+    /// Labels match case-insensitively, and the first label present in `runners.labels` wins.
+    /// With no match the default rate is returned. When `runners.labels` is non-empty, one
+    /// `ci price missing` warning is also logged with the bounded job labels; an empty map is a
+    /// deliberate flat rate and logs nothing.
     pub fn runner_rate(&self, labels: &[&str]) -> RunnerRate {
         let runners = &self.table.runners;
-        if let Some(rate) = labels.iter().find_map(|label| runners.labels.get(*label)) {
+        if let Some(rate) = labels
+            .iter()
+            .find_map(|label| runners.labels.get(ascii_lowercase(label).as_ref()))
+        {
             return RunnerRate {
                 usd_per_minute: *rate,
                 fell_back: false,
             };
         }
 
-        let bounded_labels: Vec<&str> = labels
-            .iter()
-            .take(MAX_LOGGED_LABELS)
-            .map(|label| truncate_chars(label, MAX_LOGGED_LABEL_CHARS))
-            .collect();
-        warn!(
-            parent: None,
-            labels = ?bounded_labels,
-            labels_truncated = labels.len() > MAX_LOGGED_LABELS,
-            default_usd_per_minute = runners.default_usd_per_minute.usd(),
-            price_table_version = self.version.as_str(),
-            "ci price missing"
-        );
+        // An empty `labels` map is a deliberate flat rate, so falling back is expected there.
+        if !runners.labels.is_empty() {
+            self.warn_price_missing(labels);
+        }
         RunnerRate {
             usd_per_minute: runners.default_usd_per_minute,
             fell_back: true,
         }
+    }
+
+    fn warn_price_missing(&self, labels: &[&str]) {
+        let mut labels_truncated = labels.len() > MAX_LOGGED_LABELS;
+        let bounded_labels: Vec<&str> = labels
+            .iter()
+            .take(MAX_LOGGED_LABELS)
+            .map(|label| {
+                let bounded = truncate_chars(label, MAX_LOGGED_LABEL_CHARS);
+                labels_truncated |= bounded.len() < label.len();
+                bounded
+            })
+            .collect();
+        warn!(
+            parent: None,
+            labels = ?bounded_labels,
+            labels_truncated,
+            default_usd_per_minute = self.table.runners.default_usd_per_minute.usd(),
+            price_table_version = self.version.as_str(),
+            "ci price missing"
+        );
     }
 
     /// Returns the Daytona CPU-second and RAM-GB-second rates, when configured.
@@ -223,12 +254,18 @@ impl CostsConfig {
 
     /// Returns the vendor matched by a check-suite GitHub App slug.
     pub fn vendor_for_check_suite_app(&self, slug: &str) -> Option<VendorRate<'_>> {
-        self.vendor_rate(self.vendors_by_check_suite_app.get(slug)?)
+        self.vendor_rate(
+            self.vendors_by_check_suite_app
+                .get(ascii_lowercase(slug).as_ref())?,
+        )
     }
 
     /// Returns the vendor matched by a pull-request reviewer login.
     pub fn vendor_for_review_login(&self, login: &str) -> Option<VendorRate<'_>> {
-        self.vendor_rate(self.vendors_by_review_login.get(login)?)
+        self.vendor_rate(
+            self.vendors_by_review_login
+                .get(ascii_lowercase(login).as_ref())?,
+        )
     }
 
     fn vendor_rate(&self, name: &str) -> Option<VendorRate<'_>> {
@@ -248,6 +285,16 @@ impl fmt::Debug for CostsConfig {
             .debug_struct("CostsConfig")
             .field("version", &self.version)
             .finish_non_exhaustive()
+    }
+}
+
+/// Lowercases ASCII letters, borrowing when `text` is already lowercase so the common lookup
+/// path does not allocate.
+fn ascii_lowercase(text: &str) -> Cow<'_, str> {
+    if text.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(text.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
@@ -434,9 +481,59 @@ mod tests {
         let costs = CostsConfig::from_json(r#"{"runners":{"default_usd_per_minute":0}}"#)
             .expect("minimal table is valid");
 
+        let (rate, logs) = with_captured_logs(|| costs.runner_rate(&["self-hosted"]));
+
         assert_eq!(costs.daytona_rates(), None);
         assert_eq!(costs.vendor_for_check_suite_app("anything"), None);
-        assert_eq!(costs.runner_rate(&[]).usd_per_minute, UsdRate(0.0));
+        assert_eq!(
+            rate,
+            RunnerRate {
+                usd_per_minute: UsdRate(0.0),
+                fell_back: true
+            }
+        );
+        assert!(
+            !logs.contains("ci price missing"),
+            "flat rate must not warn"
+        );
+    }
+
+    #[test]
+    fn lookups_ignore_ascii_case() {
+        let costs = CostsConfig::from_json(
+            r#"{"runners":{"default_usd_per_minute":1,"labels":{"Ubuntu-24.04-XL":2}},
+                "vendors":{"v":{"match":{"review_login":"Review-Bot[bot]"},"usd_per_run":3}}}"#,
+        )
+        .expect("mixed-case table is valid");
+
+        assert_eq!(
+            costs.runner_rate(&["UBUNTU-24.04-xl"]).usd_per_minute,
+            UsdRate(2.0)
+        );
+        assert_eq!(
+            costs
+                .vendor_for_review_login("review-bot[BOT]")
+                .map(|vendor| vendor.name),
+            Some("v")
+        );
+        assert_eq!(
+            example()
+                .vendor_for_check_suite_app("Visual-Tests")
+                .map(|vendor| vendor.name),
+            Some("example-visual-tests")
+        );
+    }
+
+    #[test]
+    fn labels_truncated_covers_a_single_long_label() {
+        let costs = example();
+        let long_label = "y".repeat(MAX_LOGGED_LABEL_CHARS + 1);
+
+        let (_, logs) = with_captured_logs(|| costs.runner_rate(&[long_label.as_str()]));
+
+        assert!(logs.contains("labels_truncated=true"));
+        let (_, logs) = with_captured_logs(|| costs.runner_rate(&["short"]));
+        assert!(logs.contains("labels_truncated=false"));
     }
 
     #[test]
@@ -464,6 +561,10 @@ mod tests {
             &vendor(r#"{"check_suite_app":"a","review_login":"b"}"#),
             &vendor(r#"{"check_suite_app":""}"#),
             &vendor(r#"{"other":"a"}"#),
+            r#"{"runners":{"default_usd_per_minute":1,"labels":{"":1}}}"#,
+            r#"{"runners":{"default_usd_per_minute":1,"labels":{"XL":1,"xl":2}}}"#,
+            r#"{"runners":{"default_usd_per_minute":1},
+                "vendors":{"":{"match":{"review_login":"bot"},"usd_per_run":1}}}"#,
         ] {
             assert_invalid(json);
         }
@@ -479,6 +580,11 @@ mod tests {
             r#"{"runners":{"default_usd_per_minute":1},"vendors":{
                 "a":{"match":{"review_login":"bot"},"usd_per_run":1},
                 "b":{"match":{"review_login":"bot"},"usd_per_run":2}}}"#,
+        );
+        assert_invalid(
+            r#"{"runners":{"default_usd_per_minute":1},"vendors":{
+                "a":{"match":{"check_suite_app":"Bot"},"usd_per_run":1},
+                "b":{"match":{"check_suite_app":"bot"},"usd_per_run":2}}}"#,
         );
         CostsConfig::from_json(
             r#"{"runners":{"default_usd_per_minute":1},"vendors":{
@@ -497,6 +603,9 @@ mod tests {
             "ubuntu-latest-m":0.0120},"default_usd_per_minute":0.012}}"#;
         let changed = EXAMPLE.replace("0.082", "0.083");
         let zero = r#"{"runners":{"default_usd_per_minute":0}}"#;
+        let upper_case = EXAMPLE
+            .replace("ubuntu-latest-m", "Ubuntu-Latest-M")
+            .replace("review-bot[bot]", "Review-Bot[bot]");
         let negative_zero = r#"{"runners":{"default_usd_per_minute":-0.0}}"#;
 
         let version = example().version().to_owned();
@@ -506,6 +615,12 @@ mod tests {
         assert_eq!(
             CostsConfig::from_json(reordered)
                 .expect("reordered table is valid")
+                .version(),
+            version
+        );
+        assert_eq!(
+            CostsConfig::from_json(&upper_case)
+                .expect("upper-case keys are valid")
                 .version(),
             version
         );

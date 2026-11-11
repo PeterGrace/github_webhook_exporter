@@ -31,6 +31,9 @@ costs:
 
 The values above are placeholders, not real prices.
 
+Put prices in a values file, or pass them with `--set-json`. Helm's `--set` passes decimals such
+as `0.01` as strings, and the schema rejects them.
+
 | Field | Required | Contract |
 | --- | --- | --- |
 | `runners.default_usd_per_minute` | yes | USD per billable minute for a job whose labels match no entry in `runners.labels`. |
@@ -48,12 +51,14 @@ invalid when:
 
 - the JSON is malformed or has an unknown field;
 - a rate is negative or not a number;
+- a runner label or vendor name is empty;
 - a vendor has no match rule, two match rules, or an empty one;
-- two vendors claim the same app slug, or the same reviewer login.
+- two runner labels, two app slugs, or two reviewer logins differ only in case, or two vendors
+  claim the same app slug or the same reviewer login.
 
 The error names `GHE_COSTS_JSON` and never includes its value. The Helm chart schema enforces the
-same rules at render time, except the duplicate-vendor check, so most mistakes fail at
-`helm template` or `helm upgrade` before a pod starts.
+same rules at render time, except the checks that compare keys with each other, so most mistakes
+fail at `helm template` or `helm upgrade` before a pod starts.
 
 Unknown fields are rejected on both sides. If a later release adds a field to `costs`, roll out
 that release before adding the field to your values.
@@ -70,13 +75,18 @@ ConfigMap changes.
 | Vendor by check-suite app | The vendor whose `match.check_suite_app` equals the app slug. |
 | Vendor by reviewer login | The vendor whose `match.review_login` equals the login. |
 
-A runner fallback logs one `ci price missing` warning. It is a parentless log on the default
+Runner labels, app slugs and reviewer logins match regardless of ASCII case, as GitHub compares
+them. The table stores them lowercased.
+
+A runner fallback logs one `ci price missing` warning when `runners.labels` has at least one
+entry. A table with no `labels` is a deliberate flat rate, so falling back to
+`default_usd_per_minute` logs nothing. It is a parentless log on the default
 target, so it is exported with other OTLP logs. Its fields are:
 
 | Field | Contents |
 | --- | --- |
 | `labels` | The job's labels: at most 8, each cut to 64 characters. |
-| `labels_truncated` | `true` when the job had more than 8 labels. |
+| `labels_truncated` | `true` when the job had more than 8 labels, or any logged label was cut. |
 | `default_usd_per_minute` | The rate used instead. |
 | `price_table_version` | The table version. |
 
@@ -86,7 +96,8 @@ credentials, and they are logged on purpose so you can see which label needs a p
 ## Version
 
 `ci.price_table.version` is the first 12 hex characters of the SHA-256 digest of the table's
-canonical form. The canonical form is the parsed table re-serialized as compact JSON, with struct
-fields in a fixed order and map keys sorted. Key order, whitespace, and number spelling (`0.5`
-compared with `5e-1`) don't change the version. Changing any rate, label, or vendor does. Cost
-records carry this version so a figure can be traced back to the rates that produced it.
+canonical form. The canonical form is the parsed table, with labels, slugs and logins lowercased,
+re-serialized as compact JSON with struct fields in a fixed order and map keys sorted. Key order,
+whitespace, the case of labels, slugs and logins, and number spelling (`0.5` compared with `5e-1`,
+or `-0` compared with `0`) don't change the version. Changing any rate, label, or vendor does.
+Cost records carry this version so a figure can be traced back to the rates that produced it.

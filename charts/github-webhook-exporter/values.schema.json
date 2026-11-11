@@ -295,6 +295,7 @@
             "default_usd_per_minute": {"$ref": "#/definitions/usdRate"},
             "labels": {
               "type": "object",
+              "propertyNames": {"minLength": 1},
               "additionalProperties": {"$ref": "#/definitions/usdRate"}
             }
           }
@@ -310,6 +311,7 @@
         },
         "vendors": {
           "type": "object",
+          "propertyNames": {"minLength": 1},
           "additionalProperties": {
             "type": "object",
             "additionalProperties": false,

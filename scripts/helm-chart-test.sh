@@ -1205,6 +1205,18 @@ expect_failure_contains \
         --set-json costs.runners.default_usd_per_minute=0.01 \
         --set-json costs.vendors.example.usd_per_run=1 \
         --set-json 'costs.vendors.example.match={}'
+expect_failure_contains \
+    'vendor with an empty match string' \
+    'minLength: got 0, want 1' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set-json costs.runners.default_usd_per_minute=0.01 \
+        --set-json costs.vendors.example.usd_per_run=1 \
+        --set-json 'costs.vendors.example.match={"review_login":""}'
+expect_failure_contains \
+    'empty runner label' \
+    'minLength: got 0, want 1' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set-json 'costs.runners={"default_usd_per_minute":0.01,"labels":{"":0.02}}'
 
 assert_contains \
     '## Webhook ingress example' \

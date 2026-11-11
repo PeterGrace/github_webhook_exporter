@@ -15,21 +15,27 @@ Date: 2026-11-11T16:50:05Z
   negative or non-finite rate cannot be represented. `-0.0` is normalized to `0.0` so it
   cannot change the version hash. The vendor `match` is an externally tagged
   enum, which accepts exactly one key. `deny_unknown_fields` rejects typos. Empty match strings,
-  and two vendors claiming the same app slug or login, are rejected while building the lookup
-  indexes.
+  empty runner labels and vendor names, and two vendors claiming the same app slug or login, are
+  rejected while building the lookup indexes.
+- Runner labels, app slugs and reviewer logins are lowercased (ASCII) at load and at lookup,
+  because GitHub compares them case-insensitively. Keys that collide after lowercasing are
+  rejected. Lowercasing happens before hashing, so key case does not change the version. Lookups
+  borrow already-lowercase input instead of allocating.
 - `CostsConfig::version()` is `ci.price_table.version`: the first 12 hex characters of the
   SHA-256 digest of the parsed table re-serialized as compact JSON. Fixed field order and
   `BTreeMap` keys make that form canonical.
 - Lookups: `runner_rate` (first job label found, else the default, reporting whether it fell back),
   `daytona_rates`, `vendor_for_check_suite_app`, and `vendor_for_review_login`. Vendor lookups
   use `HashMap` indexes built once at startup.
-- A runner fallback emits one parentless `ci price missing` warning on the default (exported)
-  target, with `labels` (at most `MAX_LOGGED_LABELS` = 8, each cut to
-  `MAX_LOGGED_LABEL_CHARS` = 64 characters), `labels_truncated`, `default_usd_per_minute`, and
-  `price_table_version`.
+- A runner fallback emits one parentless `ci price missing` warning, only when `runners.labels`
+  is non-empty (an empty map is a deliberate flat rate). The warning goes to the default
+  (exported) target, with `labels` (at most `MAX_LOGGED_LABELS` = 8, each cut to
+  `MAX_LOGGED_LABEL_CHARS` = 64 characters), `labels_truncated` (either bound applied),
+  `default_usd_per_minute`, and `price_table_version`.
 - `RuntimeConfig` `Debug` output reports `costs_enabled` and `costs_version`.
 - Helm: `costs: {}` in `values.yaml`, a matching schema (non-negative numbers, exactly one match
-  rule per vendor, `runners` required once `costs` is non-empty, no unknown fields), and
+  rule per vendor, non-empty match strings, runner labels and vendor names, `runners` required
+  once `costs` is non-empty, no unknown fields), and
   `GHE_COSTS_JSON` rendered by the ConfigMap only when `costs` is non-empty.
   `scripts/helm-chart-test.sh` covers the absent and present renders and the schema rejections.
 - Docs: a new book page `reference/costs.md`, plus entries in the environment-variable,
