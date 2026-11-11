@@ -14,16 +14,20 @@ use opentelemetry::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{domain::delivery::DeliveryId, security::CanonicalRepositoryName};
+use crate::{
+    domain::{delivery::DeliveryId, merge_queue::PullRequestNumber},
+    security::CanonicalRepositoryName,
+};
 
 use super::{
     trace::{
-        delivery_id_attribute, pull_request_numbers_attribute, sentry_description_attribute,
-        sentry_operation_attribute, timing_source_attribute, workflow_conclusion_attribute,
-        workflow_error_type_attribute, workflow_pipeline_task_run_id_attribute,
-        workflow_pipeline_task_run_result_attribute, workflow_run_attempt_attribute,
-        workflow_task_name_attribute, workflow_task_run_url_attribute, CommitSha,
-        GITHUB_ACTIONS_PIPELINE_OPERATION, GITHUB_ACTIONS_PIPELINE_TASK_OPERATION,
+        delivery_id_attribute, github_workflow_attribute, pull_request_numbers_attribute,
+        sentry_description_attribute, sentry_operation_attribute, timing_source_attribute,
+        workflow_conclusion_attribute, workflow_error_type_attribute,
+        workflow_pipeline_task_run_id_attribute, workflow_pipeline_task_run_result_attribute,
+        workflow_run_attempt_attribute, workflow_task_name_attribute,
+        workflow_task_run_url_attribute, CommitSha, GITHUB_ACTIONS_PIPELINE_OPERATION,
+        GITHUB_ACTIONS_PIPELINE_TASK_OPERATION,
     },
     workflow::{
         append_pipeline_and_repository_context, append_workflow_run_context, DisplayName,
@@ -234,6 +238,16 @@ impl PipelineRunTrace {
             .as_ref()
             .map_or(UNKNOWN_WORKFLOW_NAME, DisplayName::as_str)
     }
+
+    /// Returns the run's pull requests, falling back to the PR the run context attributes it to.
+    fn pull_requests(&self) -> &[PullRequestNumber] {
+        if !self.pull_requests.as_slice().is_empty() {
+            return self.pull_requests.as_slice();
+        }
+        self.run_context
+            .pull_request_ref()
+            .map_or(&[], std::slice::from_ref)
+    }
 }
 
 impl WorkflowTraceEmitter {
@@ -413,7 +427,7 @@ fn pipeline_root_attributes(pipeline: &PipelineRunTrace) -> Vec<KeyValue> {
         PIPELINE_ROOT_REQUIRED_ATTRIBUTE_COUNT
             + usize::from(pipeline.head_sha.is_some())
             + usize::from(pipeline.conclusion.error_type().is_some())
-            + usize::from(!pipeline.pull_requests.as_slice().is_empty())
+            + usize::from(!pipeline.pull_requests().is_empty())
             + usize::from(pipeline.run_context.source_branch().is_some())
             + usize::from(pipeline.run_context.target_branch().is_some()),
     );
@@ -426,12 +440,11 @@ fn pipeline_root_attributes(pipeline: &PipelineRunTrace) -> Vec<KeyValue> {
     if let Some(error_type) = workflow_error_type_attribute(pipeline.conclusion) {
         attributes.push(error_type);
     }
-    if let Some(pull_request_numbers) =
-        pull_request_numbers_attribute(pipeline.pull_requests.as_slice())
-    {
+    if let Some(pull_request_numbers) = pull_request_numbers_attribute(pipeline.pull_requests()) {
         attributes.push(pull_request_numbers);
     }
     append_workflow_run_context(&mut attributes, Some(&pipeline.run_context));
+    attributes.push(github_workflow_attribute(pipeline.workflow_name()));
     attributes.push(sentry_operation_attribute(
         GITHUB_ACTIONS_PIPELINE_OPERATION,
     ));
@@ -547,7 +560,7 @@ mod tests {
 
     use opentelemetry::{
         trace::{SpanId, SpanKind, Status, TraceId, TracerProvider as _},
-        Value,
+        Array, Value,
     };
     use opentelemetry_sdk::{
         error::OTelSdkResult,
@@ -566,8 +579,8 @@ mod tests {
             trace::CommitSha,
             workflow::{
                 DisplayName, HistoricalTiming, TimingSource, WorkflowBranch, WorkflowConclusion,
-                WorkflowEvent, WorkflowJobId, WorkflowPullRequests, WorkflowRunAttempt,
-                WorkflowRunContext, WorkflowRunId, WorkflowTraceEmitter,
+                WorkflowEvent, WorkflowFile, WorkflowJobId, WorkflowPullRequests,
+                WorkflowRunAttempt, WorkflowRunContext, WorkflowRunId, WorkflowTraceEmitter,
             },
             workflow_error::WorkflowErrorReporter,
         },
@@ -760,6 +773,35 @@ mod tests {
 
     fn string_attribute(span: &SpanData, key: &str) -> Option<String> {
         attribute(span, key).map(|value| value.as_str().into_owned())
+    }
+
+    #[test]
+    fn a_comment_triggered_root_falls_back_to_the_run_context_pull_request() {
+        let mut comment_run = parts(vec![fallback_job(41, 10)]);
+        comment_run.pull_requests = WorkflowPullRequests::new([]);
+        comment_run.run_context = run_context()
+            .with_pull_request(PullRequestNumber::new(9201).ok())
+            .with_workflow_file(WorkflowFile::from_path(".github/workflows/claude.yml"));
+        let pipeline = PipelineRunTrace::new(comment_run).expect("pipeline builds");
+
+        let spans = emitted_spans(&pipeline);
+        let root = spans
+            .iter()
+            .find(|span| span.parent_span_id == SpanId::INVALID)
+            .expect("root span is exported");
+
+        assert_eq!(
+            attribute(root, "github.pull_request.number"),
+            Some(&Value::Array(Array::I64(vec![9201])))
+        );
+        assert_eq!(
+            string_attribute(root, "github.workflow").as_deref(),
+            Some("Build Workflow")
+        );
+        assert_eq!(
+            string_attribute(root, "github.workflow_file").as_deref(),
+            Some("claude.yml")
+        );
     }
 
     #[test]

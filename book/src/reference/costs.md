@@ -78,6 +78,11 @@ ConfigMap changes.
 Runner labels, app slugs and reviewer logins match regardless of ASCII case, as GitHub compares
 them. The table stores them lowercased.
 
+Each completed job is priced at its billable minutes times its runner rate. The job span then
+carries `ci.cost_usd`, and the exporter writes a `ci cost recorded` log; see
+[Runner and cost attributes](traces.md#runner-and-cost-attributes). A job that billed 0 minutes,
+such as a skipped job, is priced at 0 without a rate lookup.
+
 A runner fallback logs one `ci price missing` warning when `runners.labels` has at least one
 entry. A table with no `labels` is a deliberate flat rate, so falling back to
 `default_usd_per_minute` logs nothing. It is a parentless log on the default

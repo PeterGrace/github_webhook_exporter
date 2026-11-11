@@ -12,7 +12,7 @@ use axum::{
 use opentelemetry::Context;
 use serde::Deserialize;
 use time::OffsetDateTime;
-use tracing::{debug, error, warn, Instrument};
+use tracing::{debug, error, info, warn, Instrument};
 
 use crate::{
     api::{merge_group::EventProjection, pull_request::QueueProcessor, workflow_job, workflow_run},
@@ -30,8 +30,10 @@ use crate::{
     storage::DeliveryClaim,
     telemetry::{
         pipeline::{PipelineRunTrace, PipelineRunTraceParts, MAX_PIPELINE_JOB_SPANS},
-        trace::{self, Operation, OperationOutcome, QueueEntity},
-        workflow::{RequiredChecks, WorkflowRunContext},
+        trace::{self, Operation, OperationOutcome, QueueEntity, CI_SOURCE_GITHUB_ACTIONS},
+        workflow::{
+            DisplayName, RequiredChecks, WorkflowFile, WorkflowJobTrace, WorkflowRunContext,
+        },
         LOCAL_ONLY_LOG_TARGET,
     },
 };
@@ -230,7 +232,9 @@ async fn webhook_handler(
                                 received_at,
                                 workflow_run_context,
                                 required_checks.as_ref(),
+                                state.costs(),
                             ) {
+                                log_job_cost(&workflow_trace);
                                 if let Some(identity) =
                                     state.workflow_trace_emitter().emit(&workflow_trace)
                                 {
@@ -311,6 +315,51 @@ async fn webhook_handler(
             Err(error)
         }
     }
+}
+
+/// Logs `ci cost recorded` for one priced job, with the attributes of its job span.
+///
+/// The log is independent of span export, so cost data reaches the logs dataset even when the
+/// trace emitter is off.
+fn log_job_cost(job: &WorkflowJobTrace) {
+    let Some(billing) = job.billing() else {
+        return;
+    };
+    let Some(cost) = billing.cost.as_ref() else {
+        return;
+    };
+    let context = job.workflow_run_context();
+    let runner_labels = billing
+        .runner_labels
+        .iter()
+        .map(DisplayName::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+    let _parentless_context = Context::new().attach();
+    info!(
+        parent: None,
+        ci.source = CI_SOURCE_GITHUB_ACTIONS,
+        ci.cost_usd = cost.cost_usd,
+        ci.billable_minutes = billing.billable_minutes,
+        ci.price_table.version = cost.price_table_version.as_str(),
+        ci.price.fell_back = cost.fell_back,
+        ci.job = job.job_name().map(DisplayName::as_str),
+        cicd.runner.labels = runner_labels.as_str(),
+        github.workflow = job.workflow_name().map(DisplayName::as_str),
+        github.workflow_file = context
+            .and_then(WorkflowRunContext::workflow_file)
+            .map(WorkflowFile::as_str),
+        github.workflow.event = context.map(|context| context.event().as_str()),
+        github.pull_request.number = job
+            .attributed_pull_requests()
+            .first()
+            .map(|number| number.get()),
+        github.repository = job.repository_name().as_str(),
+        cicd.pipeline.run.id = job.run_id().get(),
+        github.workflow.run.attempt = job.run_attempt().get(),
+        cicd.pipeline.task.run.id = job.job_id().get(),
+        "ci cost recorded"
+    );
 }
 
 /// Emits the pipeline-run summary trace for one terminal `workflow_run` delivery.

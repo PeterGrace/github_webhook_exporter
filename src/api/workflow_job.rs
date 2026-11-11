@@ -13,14 +13,16 @@ use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
+    costs::CostsConfig,
     domain::{delivery::DeliveryId, merge_queue::PullRequestNumber},
     security::CanonicalRepositoryName,
     telemetry::{
         trace::CommitSha,
         workflow::{
-            DisplayName, HistoricalTiming, RequiredChecks, WorkflowConclusion, WorkflowJobId,
-            WorkflowJobTrace, WorkflowJobTraceParts, WorkflowPullRequests, WorkflowRunAttempt,
-            WorkflowRunContext, WorkflowRunId, WorkflowStepTrace,
+            DisplayName, HistoricalTiming, RequiredChecks, TimingSource, WorkflowConclusion,
+            WorkflowJobBilling, WorkflowJobCost, WorkflowJobId, WorkflowJobTrace,
+            WorkflowJobTraceParts, WorkflowPullRequests, WorkflowRunAttempt, WorkflowRunContext,
+            WorkflowRunId, WorkflowStepTrace, MAX_RUNNER_LABEL_COUNT,
         },
     },
 };
@@ -108,6 +110,8 @@ struct WorkflowJobProjection {
     head_sha: Option<Value>,
     started_at: Option<Value>,
     completed_at: Option<Value>,
+    labels: Option<Value>,
+    runner_group_name: Option<Value>,
     #[serde(default)]
     pull_requests: Vec<PullRequestProjection>,
     #[serde(default)]
@@ -207,6 +211,7 @@ pub(super) fn inspect_completed_job(body: &[u8]) -> Option<WorkflowJobAdmission>
 /// * `workflow_run_context` - The correlated workflow-run metadata, when one was persisted.
 /// * `required_checks` - The fresh branch-protection required checks of the run's target branch,
 ///   or `None` when the cache held no confident answer.
+/// * `costs` - The price table, or `None` when cost attribution is off.
 ///
 /// # Returns
 ///
@@ -219,6 +224,7 @@ pub(crate) fn project_completed_job(
     received_at: OffsetDateTime,
     workflow_run_context: Option<WorkflowRunContext>,
     required_checks: Option<&RequiredChecks>,
+    costs: Option<&CostsConfig>,
 ) -> Option<WorkflowJobTrace> {
     let received_at = offset_datetime_to_system_time(received_at)?;
     let envelope: WorkflowJobEnvelope = serde_json::from_slice(body).ok()?;
@@ -232,6 +238,8 @@ pub(crate) fn project_completed_job(
         head_sha,
         started_at,
         completed_at,
+        labels,
+        runner_group_name,
         pull_requests,
         steps,
     } = envelope.workflow_job;
@@ -264,6 +272,14 @@ pub(crate) fn project_completed_job(
         );
     }
 
+    let conclusion = normalize_conclusion(conclusion.as_ref());
+    let billing = project_billing(
+        labels.as_ref(),
+        runner_group_name.as_ref(),
+        conclusion,
+        &timing,
+        costs,
+    );
     let job_name = sanitize_display_name(name.as_ref());
     // "Required" is keyed by check name, and for GitHub Actions the check name is the job name.
     // An unnamed job can never match a required check, so it stays unknown rather than false.
@@ -271,27 +287,88 @@ pub(crate) fn project_completed_job(
         .zip(job_name.as_ref())
         .map(|(checks, name)| checks.contains(name.as_str()));
 
-    Some(WorkflowJobTrace::new(WorkflowJobTraceParts {
-        repository_name: repository_name.clone(),
-        delivery_id: *delivery_id,
-        workflow_name: sanitize_display_name(workflow_name.as_ref()),
-        run_id,
-        run_attempt,
-        job_id,
-        job_name,
-        conclusion: normalize_conclusion(conclusion.as_ref()),
-        head_sha: parse_commit_sha(head_sha.as_ref()),
-        pull_requests: WorkflowPullRequests::new(
-            pull_requests
-                .iter()
-                .filter_map(|value| PullRequestNumber::new(value.number).ok())
-                .take(20),
-        ),
-        workflow_run_context,
-        required,
-        timing,
-        steps: projected_steps,
-    }))
+    Some(
+        WorkflowJobTrace::new(WorkflowJobTraceParts {
+            repository_name: repository_name.clone(),
+            delivery_id: *delivery_id,
+            workflow_name: sanitize_display_name(workflow_name.as_ref()),
+            run_id,
+            run_attempt,
+            job_id,
+            job_name,
+            conclusion,
+            head_sha: parse_commit_sha(head_sha.as_ref()),
+            pull_requests: WorkflowPullRequests::new(
+                pull_requests
+                    .iter()
+                    .filter_map(|value| PullRequestNumber::new(value.number).ok())
+                    .take(20),
+            ),
+            workflow_run_context,
+            required,
+            timing,
+            steps: projected_steps,
+        })
+        .with_billing(billing),
+    )
+}
+
+fn project_billing(
+    labels: Option<&Value>,
+    runner_group: Option<&Value>,
+    conclusion: WorkflowConclusion,
+    timing: &HistoricalTiming,
+    costs: Option<&CostsConfig>,
+) -> WorkflowJobBilling {
+    let runner_labels: Vec<DisplayName> = labels
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(DisplayName::sanitize)
+        .take(MAX_RUNNER_LABEL_COUNT)
+        .collect();
+    let billable_minutes = billable_minutes(conclusion, timing);
+    let cost = costs.map(|costs| {
+        // A job that billed nothing has no rate to look up, which also keeps skipped jobs, whose
+        // labels are often empty, from logging `ci price missing`.
+        let (usd_per_minute, fell_back) = if billable_minutes == 0 {
+            (0.0, false)
+        } else {
+            let labels: Vec<&str> = runner_labels.iter().map(DisplayName::as_str).collect();
+            let rate = costs.runner_rate(&labels);
+            (rate.usd_per_minute.usd(), rate.fell_back)
+        };
+        WorkflowJobCost {
+            cost_usd: billable_minutes as f64 * usd_per_minute,
+            price_table_version: costs.version().to_owned(),
+            fell_back,
+        }
+    });
+
+    WorkflowJobBilling {
+        runner_labels,
+        runner_group: sanitize_display_name(runner_group),
+        billable_minutes,
+        cost,
+    }
+}
+
+/// Returns the whole minutes GitHub bills for a job: its run time rounded up to a minute.
+///
+/// Skipped jobs and jobs without reported start and end times never ran on a runner, so they
+/// bill nothing.
+fn billable_minutes(conclusion: WorkflowConclusion, timing: &HistoricalTiming) -> i64 {
+    if conclusion == WorkflowConclusion::Skipped || timing.source() != TimingSource::Reported {
+        return 0;
+    }
+    let nanos = timing
+        .end()
+        .duration_since(timing.start())
+        .unwrap_or_default()
+        .as_nanos();
+    let minutes = nanos.div_ceil(60 * 1_000_000_000);
+    i64::try_from(minutes).unwrap_or(i64::MAX)
 }
 
 fn parse_timestamp(value: Option<&Value>) -> Option<SystemTime> {
@@ -374,6 +451,10 @@ mod tests {
         step_count_deserialize_calls, WorkflowJobAdmission,
     };
     use crate::{
+        costs::CostsConfig,
+        telemetry::workflow::{WorkflowJobCost, WorkflowJobTrace, MAX_RUNNER_LABEL_COUNT},
+    };
+    use crate::{
         domain::delivery::DeliveryId,
         security::CanonicalRepositoryName,
         telemetry::workflow::{
@@ -402,6 +483,7 @@ mod tests {
             received_at,
             None,
             None,
+            None,
         )
     }
 
@@ -421,6 +503,7 @@ mod tests {
             datetime!(2026-08-06 10:06:00 UTC),
             None,
             required_checks,
+            None,
         )
     }
 
@@ -719,6 +802,7 @@ mod tests {
             datetime!(2026-08-06 10:06:00 UTC),
             Some(context),
             None,
+            None,
         )
         .expect("valid completed job projects");
 
@@ -995,5 +1079,140 @@ mod tests {
         assert_eq!(trace.timing().source(), TimingSource::Fallback);
         assert_eq!(trace.timing().start(), expected);
         assert_eq!(trace.timing().end(), expected);
+    }
+
+    const COSTS: &str = r#"{
+        "runners": {
+            "default_usd_per_minute": 0.01,
+            "labels": {"ubuntu-24.04-xl": 0.08}
+        }
+    }"#;
+
+    fn priced_job(workflow_job: Value, costs: Option<&CostsConfig>) -> WorkflowJobTrace {
+        let body = serde_json::to_vec(&json!({ "workflow_job": workflow_job }))
+            .expect("fixture serializes");
+        project_completed_job(
+            &body,
+            &repository_name(),
+            &delivery_id(),
+            datetime!(2026-08-06 10:06:00 UTC),
+            None,
+            None,
+            costs,
+        )
+        .expect("fixture projects")
+    }
+
+    fn timed_job(conclusion: &str, labels: Value) -> Value {
+        json!({
+            "id": 41,
+            "run_id": 31,
+            "run_attempt": 1,
+            "conclusion": conclusion,
+            "started_at": "2026-08-06T10:00:00Z",
+            "completed_at": "2026-08-06T10:05:00.5Z",
+            "labels": labels,
+            "runner_group_name": "Larger\nrunners",
+            "steps": []
+        })
+    }
+
+    #[test]
+    fn a_job_bills_its_run_time_rounded_up_to_whole_minutes() {
+        let trace = priced_job(timed_job("success", json!(["ubuntu-24.04-xl"])), None);
+
+        let billing = trace.billing().expect("billing is projected");
+        assert_eq!(billing.billable_minutes, 6);
+        assert_eq!(
+            billing
+                .runner_labels
+                .iter()
+                .map(DisplayName::as_str)
+                .collect::<Vec<_>>(),
+            ["ubuntu-24.04-xl"]
+        );
+        assert_eq!(
+            billing.runner_group.as_ref().map(DisplayName::as_str),
+            Some("Largerrunners")
+        );
+        assert_eq!(billing.cost, None);
+    }
+
+    #[test]
+    fn skipped_and_untimed_jobs_bill_nothing() {
+        let skipped = priced_job(timed_job("skipped", json!([])), None);
+        let mut untimed = timed_job("cancelled", json!([]));
+        untimed["started_at"] = Value::Null;
+        let untimed = priced_job(untimed, None);
+
+        for trace in [skipped, untimed] {
+            assert_eq!(
+                trace.billing().map(|billing| billing.billable_minutes),
+                Some(0)
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_table_prices_the_job_by_its_first_priced_label() {
+        let costs = CostsConfig::from_json(COSTS).expect("costs are valid");
+
+        let priced = priced_job(
+            timed_job("failure", json!(["self-hosted", "Ubuntu-24.04-XL"])),
+            Some(&costs),
+        );
+        let fallback = priced_job(timed_job("success", json!(["unknown"])), Some(&costs));
+
+        let cost = priced.billing().and_then(|billing| billing.cost.clone());
+        assert_eq!(
+            cost,
+            Some(WorkflowJobCost {
+                cost_usd: 6.0 * 0.08,
+                price_table_version: costs.version().to_owned(),
+                fell_back: false,
+            })
+        );
+        let cost = fallback.billing().and_then(|billing| billing.cost.clone());
+        assert_eq!(cost.as_ref().map(|cost| cost.cost_usd), Some(6.0 * 0.01));
+        assert_eq!(cost.map(|cost| cost.fell_back), Some(true));
+    }
+
+    #[test]
+    fn a_job_that_billed_nothing_is_priced_at_zero_without_a_rate_lookup() {
+        let costs = CostsConfig::from_json(COSTS).expect("costs are valid");
+
+        let trace = priced_job(timed_job("skipped", json!([])), Some(&costs));
+
+        let cost = trace.billing().and_then(|billing| billing.cost.clone());
+        assert_eq!(cost.as_ref().map(|cost| cost.cost_usd), Some(0.0));
+        assert_eq!(cost.map(|cost| cost.fell_back), Some(false));
+    }
+
+    #[test]
+    fn runner_labels_are_sanitized_bounded_and_tolerate_bad_shapes() {
+        let many: Vec<String> = (0..20).map(|index| format!("label-{index}")).collect();
+        let bounded = priced_job(timed_job("success", json!(many)), None);
+        let mixed = priced_job(timed_job("success", json!(["a\tb", 7, null, ""])), None);
+        let not_an_array = priced_job(timed_job("success", json!("ubuntu-latest")), None);
+
+        let labels = |trace: &WorkflowJobTrace| {
+            trace
+                .billing()
+                .map(|billing| {
+                    billing
+                        .runner_labels
+                        .iter()
+                        .map(|label| label.as_str().to_owned())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(labels(&bounded).len(), MAX_RUNNER_LABEL_COUNT);
+        assert_eq!(
+            labels(&bounded).last().map(String::as_str),
+            Some("label-15")
+        );
+        assert_eq!(labels(&mixed), ["ab"]);
+        assert!(labels(&not_an_array).is_empty());
     }
 }
