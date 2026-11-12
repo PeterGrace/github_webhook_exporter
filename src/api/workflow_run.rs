@@ -6,8 +6,8 @@ use crate::{
     telemetry::{
         trace::CommitSha,
         workflow::{
-            DisplayName, WorkflowBranch, WorkflowEvent, WorkflowPullRequests, WorkflowRunAttempt,
-            WorkflowRunContext, WorkflowRunId,
+            DisplayName, WorkflowBranch, WorkflowEvent, WorkflowFile, WorkflowPullRequests,
+            WorkflowRunAttempt, WorkflowRunContext, WorkflowRunId,
         },
     },
 };
@@ -25,6 +25,8 @@ struct WorkflowRunProjection {
     event: Option<Value>,
     head_branch: Option<Value>,
     head_sha: Option<Value>,
+    path: Option<Value>,
+    display_title: Option<Value>,
     #[serde(default)]
     pull_requests: Vec<PullRequestProjection>,
 }
@@ -74,13 +76,64 @@ pub(super) fn project_context(body: &[u8]) -> Option<WorkflowRunContext> {
         &pull_request.base
     });
 
-    Some(WorkflowRunContext::new(
-        run_id,
-        run_attempt,
-        event,
-        source_branch,
-        target_branch,
-    ))
+    let pull_request = unique_pull_request(&workflow_run.pull_requests).or_else(|| {
+        event
+            .is_comment_triggered()
+            .then(|| {
+                workflow_run
+                    .display_title
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .and_then(pull_request_from_run_name)
+            })
+            .flatten()
+    });
+    let workflow_file = workflow_run
+        .path
+        .as_ref()
+        .and_then(Value::as_str)
+        .and_then(WorkflowFile::from_path);
+
+    Some(
+        WorkflowRunContext::new(run_id, run_attempt, event, source_branch, target_branch)
+            .with_pull_request(pull_request)
+            .with_workflow_file(workflow_file),
+    )
+}
+
+/// Returns the run's pull request when its `pull_requests` name exactly one distinct number.
+fn unique_pull_request(pull_requests: &[PullRequestProjection]) -> Option<PullRequestNumber> {
+    let mut numbers = pull_requests
+        .iter()
+        .filter_map(|pull_request| pull_request.number)
+        .filter_map(|number| PullRequestNumber::new(number).ok());
+    let first = numbers.next()?;
+    numbers.all(|number| number == first).then_some(first)
+}
+
+/// Reads the pull request from a run name that contains `PR #<number>`.
+///
+/// Comment-triggered workflows set `run-name` this way because GitHub leaves their
+/// `pull_requests` empty. The marker must start the name or follow a non-alphanumeric character,
+/// so `APR #3` does not match. The first marker followed by a positive number wins.
+fn pull_request_from_run_name(run_name: &str) -> Option<PullRequestNumber> {
+    const MARKER: &str = "PR #";
+    run_name
+        .match_indices(MARKER)
+        .filter(|(start, _)| {
+            run_name[..*start]
+                .chars()
+                .next_back()
+                .is_none_or(|previous| !previous.is_alphanumeric())
+        })
+        .find_map(|(start, _)| {
+            let rest = &run_name[start + MARKER.len()..];
+            let digits_end = rest
+                .find(|character: char| !character.is_ascii_digit())
+                .unwrap_or(rest.len());
+            let number = rest[..digits_end].parse().ok()?;
+            PullRequestNumber::new(number).ok()
+        })
 }
 
 /// Projects bounded run-level summary metadata from an authenticated workflow-run payload.
@@ -268,6 +321,111 @@ mod tests {
         assert_eq!(context.event(), WorkflowEvent::Other);
         assert!(context.source_branch().is_none());
         assert!(context.target_branch().is_none());
+    }
+    fn pull_request_of(workflow_run: serde_json::Value) -> Option<i64> {
+        project(json!({ "workflow_run": workflow_run }))
+            .pull_request()
+            .map(|number| number.get())
+    }
+
+    #[test]
+    fn a_run_is_attributed_to_its_single_pull_request() {
+        assert_eq!(
+            pull_request_of(json!({
+                "id": 31, "run_attempt": 1, "event": "pull_request",
+                "pull_requests": [{"number": 9201}, {"number": 9201}]
+            })),
+            Some(9201)
+        );
+        assert_eq!(
+            pull_request_of(json!({
+                "id": 31, "run_attempt": 1, "event": "pull_request",
+                "pull_requests": [{"number": 9201}, {"number": 9202}]
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn comment_triggered_runs_read_their_pull_request_from_the_run_name() {
+        for event in [
+            "issue_comment",
+            "pull_request_review",
+            "pull_request_review_comment",
+        ] {
+            assert_eq!(
+                pull_request_of(json!({
+                    "id": 31, "run_attempt": 1, "event": event,
+                    "display_title": "Claude on PR #9201 (comment)",
+                    "pull_requests": []
+                })),
+                Some(9201),
+                "{event}"
+            );
+        }
+        assert_eq!(
+            pull_request_of(json!({
+                "id": 31, "run_attempt": 1, "event": "issue_comment",
+                "display_title": "Claude on issue #77"
+            })),
+            None
+        );
+        assert_eq!(
+            pull_request_of(json!({
+                "id": 31, "run_attempt": 1, "event": "issue_comment",
+                "display_title": "PR #0"
+            })),
+            None
+        );
+        for (title, expected) in [
+            ("PR #12", Some(12)),
+            ("Claude (PR #12)", Some(12)),
+            ("APR #3", None),
+            ("APR #3 then PR #4", Some(4)),
+            ("PR #tbd, see PR #12", Some(12)),
+        ] {
+            assert_eq!(
+                pull_request_of(json!({
+                    "id": 31, "run_attempt": 1, "event": "issue_comment",
+                    "display_title": title
+                })),
+                expected,
+                "{title}"
+            );
+        }
+    }
+
+    #[test]
+    fn push_runs_never_read_a_pull_request_from_a_squash_merge_title() {
+        assert_eq!(
+            pull_request_of(json!({
+                "id": 31, "run_attempt": 1, "event": "push",
+                "display_title": "fix(api): handle errors PR #9088 (#9088)"
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn the_workflow_file_is_the_last_segment_of_the_workflow_path() {
+        let context = project(json!({
+            "workflow_run": {
+                "id": 31, "run_attempt": 1, "event": "schedule",
+                "path": ".github/workflows/ci.yaml"
+            }
+        }));
+
+        assert_eq!(context.event(), WorkflowEvent::Schedule);
+        assert_eq!(
+            context.workflow_file().map(|file| file.as_str()),
+            Some("ci.yaml")
+        );
+        let unusable = project(json!({
+            "workflow_run": {
+                "id": 31, "run_attempt": 1, "path": ".github/workflows/bad name.yaml"
+            }
+        }));
+        assert!(unusable.workflow_file().is_none());
     }
 }
 

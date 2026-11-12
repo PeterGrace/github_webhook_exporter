@@ -67,7 +67,8 @@ async fn run_service(
     )
     .with_metrics(metrics)
     .with_workflow_trace_emitter(workflow_trace_emitter)
-    .with_required_check_ttl(config.required_check_ttl());
+    .with_required_check_ttl(config.required_check_ttl())
+    .with_costs(config.costs().cloned());
 
     // Without GitHub App credentials the required-check cache is never filled, and every workflow
     // job reports its required status as unknown. That is a supported deployment, not a failure.

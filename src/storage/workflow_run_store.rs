@@ -5,11 +5,12 @@ use thiserror::Error;
 use time::{format_description::FormatItem, macros::format_description, OffsetDateTime, UtcOffset};
 
 use crate::{
-    domain::repository::RepositoryId,
+    domain::{merge_queue::PullRequestNumber, repository::RepositoryId},
     telemetry::{
         trace::{self, DatabaseOperation},
         workflow::{
-            WorkflowBranch, WorkflowEvent, WorkflowRunAttempt, WorkflowRunContext, WorkflowRunId,
+            WorkflowBranch, WorkflowEvent, WorkflowFile, WorkflowRunAttempt, WorkflowRunContext,
+            WorkflowRunId,
         },
     },
 };
@@ -53,11 +54,13 @@ impl WorkflowRunStore {
         sqlx::query(
             "INSERT INTO workflow_run_contexts \
              (repository_id, workflow_run_id, workflow_run_attempt, event, source_branch, \
-              target_branch, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+              target_branch, pull_request_number, workflow_file, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
              ON CONFLICT(repository_id, workflow_run_id, workflow_run_attempt) DO UPDATE SET \
              event = excluded.event, source_branch = excluded.source_branch, \
-             target_branch = excluded.target_branch, updated_at = excluded.updated_at",
+             target_branch = excluded.target_branch, \
+             pull_request_number = excluded.pull_request_number, \
+             workflow_file = excluded.workflow_file, updated_at = excluded.updated_at",
         )
         .bind(repository_id.get())
         .bind(context.run_id().get())
@@ -65,6 +68,8 @@ impl WorkflowRunStore {
         .bind(context.event().as_str())
         .bind(context.source_branch().map(WorkflowBranch::as_str))
         .bind(context.target_branch().map(WorkflowBranch::as_str))
+        .bind(context.pull_request().map(PullRequestNumber::get))
+        .bind(context.workflow_file().map(WorkflowFile::as_str))
         .execute(&self.pool)
         .await
         .map_err(map_sqlx_error)?;
@@ -92,7 +97,8 @@ impl WorkflowRunStore {
         run_attempt: WorkflowRunAttempt,
     ) -> Result<Option<WorkflowRunContext>, WorkflowRunStoreError> {
         let row = sqlx::query_as::<_, StoredWorkflowRunContext>(
-            "SELECT event, source_branch, target_branch FROM workflow_run_contexts \
+            "SELECT event, source_branch, target_branch, pull_request_number, workflow_file \
+             FROM workflow_run_contexts \
              WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ?",
         )
         .bind(repository_id.get())
@@ -146,6 +152,8 @@ struct StoredWorkflowRunContext {
     event: String,
     source_branch: Option<String>,
     target_branch: Option<String>,
+    pull_request_number: Option<i64>,
+    workflow_file: Option<String>,
 }
 
 impl StoredWorkflowRunContext {
@@ -154,22 +162,26 @@ impl StoredWorkflowRunContext {
         run_id: WorkflowRunId,
         run_attempt: WorkflowRunAttempt,
     ) -> Result<WorkflowRunContext, WorkflowRunStoreError> {
-        let event = match self.event.as_str() {
-            "pull_request" => WorkflowEvent::PullRequest,
-            "merge_group" => WorkflowEvent::MergeGroup,
-            "push" => WorkflowEvent::Push,
-            "other" => WorkflowEvent::Other,
-            _ => return Err(WorkflowRunStoreError::Internal),
-        };
+        let event =
+            WorkflowEvent::from_stored(&self.event).ok_or(WorkflowRunStoreError::Internal)?;
         let source_branch = validated_stored_branch(self.source_branch.as_deref())?;
         let target_branch = validated_stored_branch(self.target_branch.as_deref())?;
-        Ok(WorkflowRunContext::new(
-            run_id,
-            run_attempt,
-            event,
-            source_branch,
-            target_branch,
-        ))
+        let pull_request = self
+            .pull_request_number
+            .map(|number| {
+                PullRequestNumber::new(number).map_err(|_| WorkflowRunStoreError::Internal)
+            })
+            .transpose()?;
+        let workflow_file = self
+            .workflow_file
+            .as_deref()
+            .map(|file| WorkflowFile::from_path(file).ok_or(WorkflowRunStoreError::Internal))
+            .transpose()?;
+        Ok(
+            WorkflowRunContext::new(run_id, run_attempt, event, source_branch, target_branch)
+                .with_pull_request(pull_request)
+                .with_workflow_file(workflow_file),
+        )
     }
 }
 
@@ -216,10 +228,11 @@ mod tests {
 
     use super::WorkflowRunStore;
     use crate::{
-        domain::repository::RepositoryId,
+        domain::{merge_queue::PullRequestNumber, repository::RepositoryId},
         storage::open_database,
         telemetry::workflow::{
-            WorkflowBranch, WorkflowEvent, WorkflowRunAttempt, WorkflowRunContext, WorkflowRunId,
+            WorkflowBranch, WorkflowEvent, WorkflowFile, WorkflowRunAttempt, WorkflowRunContext,
+            WorkflowRunId,
         },
     };
 
@@ -269,6 +282,8 @@ mod tests {
                 "event",
                 "source_branch",
                 "target_branch",
+                "pull_request_number",
+                "workflow_file",
                 "updated_at",
             ]
         );
@@ -433,6 +448,114 @@ mod tests {
             loaded.source_branch().map(WorkflowBranch::as_str),
             Some("featurebranch")
         );
+    }
+
+    #[tokio::test]
+    async fn widened_events_pull_requests_and_workflow_files_round_trip() {
+        let directory = tempfile::tempdir().expect("temporary directory exists");
+        let pool = open_database(&directory.path().join("exporter.sqlite3"))
+            .await
+            .expect("database opens");
+        let repository_id = insert_repository(&pool).await;
+        let store = WorkflowRunStore::new(pool.clone());
+        let attributed = WorkflowRunContext::new(
+            WorkflowRunId::new(31).expect("run id is positive"),
+            WorkflowRunAttempt::new(1).expect("attempt is positive"),
+            WorkflowEvent::IssueComment,
+            WorkflowBranch::sanitize("master"),
+            None,
+        )
+        .with_pull_request(Some(PullRequestNumber::new(9201).expect("PR is positive")))
+        .with_workflow_file(WorkflowFile::from_path(".github/workflows/claude.yml"));
+
+        store
+            .upsert(repository_id, &attributed)
+            .await
+            .expect("context persists");
+        let stored = store
+            .get(repository_id, attributed.run_id(), attributed.run_attempt())
+            .await
+            .expect("lookup succeeds");
+
+        assert_eq!(stored, Some(attributed));
+    }
+
+    #[tokio::test]
+    async fn tampered_pull_request_or_workflow_file_fails_the_lookup() {
+        let directory = tempfile::tempdir().expect("temporary directory exists");
+        let pool = open_database(&directory.path().join("exporter.sqlite3"))
+            .await
+            .expect("database opens");
+        let repository_id = insert_repository(&pool).await;
+        let store = WorkflowRunStore::new(pool.clone());
+        store
+            .upsert(repository_id, &context(1, "main"))
+            .await
+            .expect("context persists");
+
+        sqlx::query("UPDATE workflow_run_contexts SET workflow_file = 'bad name.yaml'")
+            .execute(&pool)
+            .await
+            .expect("row updates");
+
+        assert!(store
+            .get(
+                repository_id,
+                WorkflowRunId::new(31).expect("run id is positive"),
+                WorkflowRunAttempt::new(1).expect("attempt is positive"),
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn widening_the_event_column_keeps_existing_contexts() {
+        const WIDENING_VERSION: i64 = 202_611_110_001;
+        let directory = tempfile::tempdir().expect("temporary directory exists");
+        let path = directory.path().join("exporter.sqlite3");
+        let pool = SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .expect("database opens");
+        let mut earlier = sqlx::migrate!();
+        earlier.migrations = earlier
+            .migrations
+            .iter()
+            .filter(|migration| migration.version < WIDENING_VERSION)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        earlier.run(&pool).await.expect("earlier migrations apply");
+        let repository_id = insert_repository(&pool).await;
+        sqlx::query(
+            "INSERT INTO workflow_run_contexts (repository_id, workflow_run_id, \
+             workflow_run_attempt, event, source_branch, target_branch, updated_at) \
+             VALUES (?, 31, 1, 'merge_group', 'gh-readonly-queue/main/pr-7', 'main', \
+             '2026-08-19T10:00:00.000Z')",
+        )
+        .bind(repository_id.get())
+        .execute(&pool)
+        .await
+        .expect("legacy context inserts");
+        pool.close().await;
+
+        let migrated = open_database(&path)
+            .await
+            .expect("remaining migrations apply");
+        let stored = WorkflowRunStore::new(migrated)
+            .get(
+                repository_id,
+                WorkflowRunId::new(31).expect("run id is positive"),
+                WorkflowRunAttempt::new(1).expect("attempt is positive"),
+            )
+            .await
+            .expect("lookup succeeds");
+
+        assert_eq!(stored, Some(context(1, "main")));
     }
 
     #[tokio::test]

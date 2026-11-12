@@ -17,9 +17,11 @@ use crate::{
 use super::{
     pipeline::WorkflowJobTraceIdentity,
     trace::{
-        delivery_id_attribute, pull_request_numbers_attribute, sentry_description_attribute,
-        sentry_operation_attribute, timing_source_attribute, workflow_conclusion_attribute,
-        workflow_error_type_attribute, workflow_event_attribute, workflow_head_revision_attribute,
+        billable_minutes_attribute, delivery_id_attribute, github_workflow_attribute,
+        job_cost_attributes, pull_request_numbers_attribute, runner_group_attribute,
+        runner_labels_attribute, sentry_description_attribute, sentry_operation_attribute,
+        timing_source_attribute, workflow_conclusion_attribute, workflow_error_type_attribute,
+        workflow_event_attribute, workflow_file_attribute, workflow_head_revision_attribute,
         workflow_name_attribute, workflow_pipeline_run_id_attribute,
         workflow_pipeline_run_url_attribute, workflow_pipeline_step_task_run_id_attribute,
         workflow_pipeline_task_run_id_attribute, workflow_pipeline_task_run_result_attribute,
@@ -36,12 +38,14 @@ use super::{
 const MAX_DISPLAY_NAME_LENGTH: usize = 128;
 const MAX_BRANCH_NAME_LENGTH: usize = 255;
 const MAX_PULL_REQUEST_COUNT: usize = 20;
+/// The greatest number of runner labels kept for one job.
+pub(crate) const MAX_RUNNER_LABEL_COUNT: usize = 16;
 /// Maximum branch-protection required-check names retained for one repository branch.
 pub(crate) const MAX_REQUIRED_CHECK_COUNT: usize = 100;
 const UNKNOWN_WORKFLOW_NAME: &str = "workflow";
 const UNNAMED_JOB_NAME: &str = "job";
 const UNNAMED_STEP_NAME: &str = "step";
-const JOB_REQUIRED_ATTRIBUTE_COUNT: usize = 15;
+const JOB_REQUIRED_ATTRIBUTE_COUNT: usize = 16;
 const STEP_REQUIRED_ATTRIBUTE_COUNT: usize = 13;
 
 /// A malformed workflow telemetry value.
@@ -287,7 +291,33 @@ impl WorkflowJobTrace {
             required: parts.required,
             timing: parts.timing,
             steps: parts.steps,
+            billing: None,
         }
+    }
+
+    /// Returns this trace with the job's runner and billing details.
+    pub(crate) fn with_billing(mut self, billing: WorkflowJobBilling) -> Self {
+        self.billing = Some(billing);
+        self
+    }
+
+    /// Returns the job's pull requests, or the run's attributed pull request when it has none.
+    ///
+    /// GitHub's `workflow_job` payload has no pull requests, so the run context usually supplies
+    /// it.
+    pub(crate) fn attributed_pull_requests(&self) -> &[PullRequestNumber] {
+        if !self.pull_requests.as_slice().is_empty() {
+            return self.pull_requests.as_slice();
+        }
+        self.workflow_run_context
+            .as_ref()
+            .and_then(WorkflowRunContext::pull_request_ref)
+            .map_or(&[], std::slice::from_ref)
+    }
+
+    /// Returns the job's runner and billing details, when they were projected.
+    pub(crate) fn billing(&self) -> Option<&WorkflowJobBilling> {
+        self.billing.as_ref()
     }
 
     /// Returns the canonical repository name.
@@ -336,6 +366,7 @@ impl WorkflowJobTrace {
     }
 
     /// Returns the bounded pull-request collection.
+    #[cfg(test)]
     pub(crate) fn pull_requests(&self) -> &[PullRequestNumber] {
         self.pull_requests.as_slice()
     }
@@ -434,33 +465,106 @@ impl fmt::Debug for DisplayName {
 pub(crate) enum WorkflowEvent {
     /// A pull-request validation run.
     PullRequest,
+    /// A pull-request run in the base repository's context.
+    PullRequestTarget,
+    /// A run started by a pull-request review.
+    PullRequestReview,
+    /// A run started by a pull-request review comment.
+    PullRequestReviewComment,
+    /// A run started by an issue or pull-request comment.
+    IssueComment,
     /// A merge-queue validation run.
     MergeGroup,
     /// A push-triggered run.
     Push,
+    /// A scheduled run.
+    Schedule,
+    /// A manually dispatched run.
+    WorkflowDispatch,
     /// Any trigger outside the approved vocabulary.
     Other,
 }
 
 impl WorkflowEvent {
+    const ALL: [Self; 10] = [
+        Self::PullRequest,
+        Self::PullRequestTarget,
+        Self::PullRequestReview,
+        Self::PullRequestReviewComment,
+        Self::IssueComment,
+        Self::MergeGroup,
+        Self::Push,
+        Self::Schedule,
+        Self::WorkflowDispatch,
+        Self::Other,
+    ];
+
     /// Normalizes an optional raw trigger into the bounded workflow vocabulary.
     pub(crate) fn normalize(value: Option<&str>) -> Self {
-        match value {
-            Some("pull_request") => Self::PullRequest,
-            Some("merge_group") => Self::MergeGroup,
-            Some("push") => Self::Push,
-            Some(_) | None => Self::Other,
-        }
+        value.and_then(Self::from_stored).unwrap_or(Self::Other)
+    }
+
+    /// Parses a value previously produced by [`Self::as_str`], rejecting anything else.
+    pub(crate) fn from_stored(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|event| event.as_str() == value)
+    }
+
+    /// Returns whether the run was started by a comment or review, so its PR is not in the
+    /// run's `pull_requests` and is read from its run name instead.
+    pub(crate) const fn is_comment_triggered(self) -> bool {
+        matches!(
+            self,
+            Self::IssueComment | Self::PullRequestReview | Self::PullRequestReviewComment
+        )
     }
 
     /// Returns the normalized trigger value.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::PullRequest => "pull_request",
+            Self::PullRequestTarget => "pull_request_target",
+            Self::PullRequestReview => "pull_request_review",
+            Self::PullRequestReviewComment => "pull_request_review_comment",
+            Self::IssueComment => "issue_comment",
             Self::MergeGroup => "merge_group",
             Self::Push => "push",
+            Self::Schedule => "schedule",
+            Self::WorkflowDispatch => "workflow_dispatch",
             Self::Other => "other",
         }
+    }
+}
+
+/// The file name of a workflow definition, such as `ci.yaml`.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct WorkflowFile(String);
+
+impl WorkflowFile {
+    /// Extracts the file name from a workflow `path` such as `.github/workflows/ci.yaml`.
+    ///
+    /// Returns `None` unless the last path segment is 1 to 128 ASCII letters, digits, `.`, `_`
+    /// or `-`.
+    pub(crate) fn from_path(path: &str) -> Option<Self> {
+        let name = path.rsplit('/').next()?;
+        let valid = (1..=MAX_DISPLAY_NAME_LENGTH).contains(&name.len())
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+        valid.then(|| Self(name.to_owned()))
+    }
+
+    /// Returns the workflow file name.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for WorkflowFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("WorkflowFile")
+            .field(&self.0)
+            .finish()
     }
 }
 
@@ -576,6 +680,8 @@ pub(crate) struct WorkflowRunContext {
     event: WorkflowEvent,
     source_branch: Option<WorkflowBranch>,
     target_branch: Option<WorkflowBranch>,
+    pull_request: Option<PullRequestNumber>,
+    workflow_file: Option<WorkflowFile>,
 }
 
 impl WorkflowRunContext {
@@ -593,7 +699,21 @@ impl WorkflowRunContext {
             event,
             source_branch,
             target_branch,
+            pull_request: None,
+            workflow_file: None,
         }
+    }
+
+    /// Returns this context attributed to one pull request, or to none.
+    pub(crate) fn with_pull_request(mut self, pull_request: Option<PullRequestNumber>) -> Self {
+        self.pull_request = pull_request;
+        self
+    }
+
+    /// Returns this context with the file name of the workflow definition, when known.
+    pub(crate) fn with_workflow_file(mut self, workflow_file: Option<WorkflowFile>) -> Self {
+        self.workflow_file = workflow_file;
+        self
     }
 
     /// Returns the workflow run identifier.
@@ -619,6 +739,21 @@ impl WorkflowRunContext {
     /// Returns the optional target branch.
     pub(crate) fn target_branch(&self) -> Option<&WorkflowBranch> {
         self.target_branch.as_ref()
+    }
+
+    /// Returns the single pull request this run is attributed to, when one is known.
+    pub(crate) fn pull_request(&self) -> Option<PullRequestNumber> {
+        self.pull_request
+    }
+
+    /// Returns the attributed pull request by reference, for building one-element slices.
+    pub(crate) fn pull_request_ref(&self) -> Option<&PullRequestNumber> {
+        self.pull_request.as_ref()
+    }
+
+    /// Returns the file name of the workflow definition, when known.
+    pub(crate) fn workflow_file(&self) -> Option<&WorkflowFile> {
+        self.workflow_file.as_ref()
     }
 }
 
@@ -762,13 +897,11 @@ fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
     let mut attributes = Vec::with_capacity(
         JOB_REQUIRED_ATTRIBUTE_COUNT
             + usize::from(job.head_sha().is_some())
-            + usize::from(!job.pull_requests().is_empty())
+            + usize::from(!job.attributed_pull_requests().is_empty())
             + usize::from(job.conclusion().error_type().is_some())
             + usize::from(job.required().is_some())
-            + job.workflow_run_context().map_or(0, |context| {
-                1 + usize::from(context.source_branch().is_some())
-                    + usize::from(context.target_branch().is_some())
-            }),
+            + workflow_run_context_attribute_count(job.workflow_run_context())
+            + job.billing().map_or(0, job_billing_attribute_count),
     );
     append_job_pipeline_and_repository_context(&mut attributes, job);
     attributes.push(delivery_id_attribute(&job.delivery_id()));
@@ -785,10 +918,16 @@ fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
     if let Some(required) = workflow_required_attribute(job.required()) {
         attributes.push(required);
     }
-    if let Some(pull_request_numbers) = pull_request_numbers_attribute(job.pull_requests()) {
+    if let Some(pull_request_numbers) =
+        pull_request_numbers_attribute(job.attributed_pull_requests())
+    {
         attributes.push(pull_request_numbers);
     }
     append_workflow_run_context(&mut attributes, job.workflow_run_context());
+    attributes.push(github_workflow_attribute(workflow_name(job)));
+    if let Some(billing) = job.billing() {
+        append_job_billing(&mut attributes, billing);
+    }
     attributes.push(workflow_task_run_url_attribute(
         job.repository_name(),
         job.run_id(),
@@ -800,16 +939,41 @@ fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
     attributes
 }
 
+fn append_job_billing(attributes: &mut Vec<KeyValue>, billing: &WorkflowJobBilling) {
+    if let Some(labels) = runner_labels_attribute(&billing.runner_labels) {
+        attributes.push(labels);
+    }
+    if let Some(group) = &billing.runner_group {
+        attributes.push(runner_group_attribute(group));
+    }
+    attributes.push(billable_minutes_attribute(billing.billable_minutes));
+    if let Some(cost) = &billing.cost {
+        attributes.extend(job_cost_attributes(cost));
+    }
+}
+
+fn job_billing_attribute_count(billing: &WorkflowJobBilling) -> usize {
+    1 + usize::from(!billing.runner_labels.is_empty())
+        + usize::from(billing.runner_group.is_some())
+        + billing.cost.as_ref().map_or(0, |_| 4)
+}
+
+/// Returns how many attributes [`append_workflow_run_context`] adds for `context`.
+pub(super) fn workflow_run_context_attribute_count(context: Option<&WorkflowRunContext>) -> usize {
+    context.map_or(0, |context| {
+        1 + usize::from(context.source_branch().is_some())
+            + usize::from(context.target_branch().is_some())
+            + usize::from(context.workflow_file().is_some())
+    })
+}
+
 fn step_attributes(job: &WorkflowJobTrace, step: &WorkflowStepTrace) -> Vec<KeyValue> {
     let mut attributes = Vec::with_capacity(
         STEP_REQUIRED_ATTRIBUTE_COUNT
             + usize::from(job.head_sha().is_some())
             + usize::from(step.conclusion().error_type().is_some())
             + usize::from(job.required().is_some())
-            + job.workflow_run_context().map_or(0, |context| {
-                1 + usize::from(context.source_branch().is_some())
-                    + usize::from(context.target_branch().is_some())
-            }),
+            + workflow_run_context_attribute_count(job.workflow_run_context()),
     );
     append_job_pipeline_and_repository_context(&mut attributes, job);
     attributes.push(workflow_task_name_attribute(step_name(step)));
@@ -939,6 +1103,9 @@ pub(super) fn append_workflow_run_context(
     }
     if let Some(target_branch) = context.target_branch() {
         attributes.push(workflow_target_branch_attribute(target_branch));
+    }
+    if let Some(workflow_file) = context.workflow_file() {
+        attributes.push(workflow_file_attribute(workflow_file));
     }
 }
 
@@ -1135,7 +1302,35 @@ pub(crate) struct WorkflowJobTrace {
     required: Option<bool>,
     timing: HistoricalTiming,
     steps: Vec<WorkflowStepTrace>,
+    billing: Option<WorkflowJobBilling>,
 }
+
+/// The runner a completed job ran on and what it was billed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkflowJobBilling {
+    /// The job's runner labels in job order, at most [`MAX_RUNNER_LABEL_COUNT`].
+    pub(crate) runner_labels: Vec<DisplayName>,
+    /// The runner group name, when reported.
+    pub(crate) runner_group: Option<DisplayName>,
+    /// Whole minutes GitHub bills for the job.
+    pub(crate) billable_minutes: i64,
+    /// The job's price, when a `costs` table is configured.
+    pub(crate) cost: Option<WorkflowJobCost>,
+}
+
+/// The price of one completed job.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WorkflowJobCost {
+    /// `billable_minutes` times the runner rate.
+    pub(crate) cost_usd: f64,
+    /// The version of the price table that supplied the rate.
+    pub(crate) price_table_version: String,
+    /// Whether no runner label had a price and the default rate was used.
+    pub(crate) fell_back: bool,
+}
+
+// `cost_usd` is a finite rate times a bounded minute count, so it is never NaN.
+impl Eq for WorkflowJobCost {}
 
 /// An owned workflow-step trace accepted by the telemetry emitter.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1184,6 +1379,7 @@ impl WorkflowStepTrace {
 
 #[cfg(test)]
 mod tests {
+
     use std::{
         collections::BTreeSet,
         sync::{Arc, Mutex},
@@ -1201,9 +1397,10 @@ mod tests {
 
     use super::{
         DisplayName, HistoricalTiming, RequiredChecks, TimingSource, WorkflowBranch,
-        WorkflowConclusion, WorkflowEvent, WorkflowJobId, WorkflowJobTrace, WorkflowJobTraceParts,
-        WorkflowPullRequests, WorkflowRunAttempt, WorkflowRunContext, WorkflowRunId,
-        WorkflowStepTrace, WorkflowTraceEmitter, MAX_REQUIRED_CHECK_COUNT,
+        WorkflowConclusion, WorkflowEvent, WorkflowFile, WorkflowJobBilling, WorkflowJobCost,
+        WorkflowJobId, WorkflowJobTrace, WorkflowJobTraceParts, WorkflowPullRequests,
+        WorkflowRunAttempt, WorkflowRunContext, WorkflowRunId, WorkflowStepTrace,
+        WorkflowTraceEmitter, MAX_REQUIRED_CHECK_COUNT,
     };
     use crate::{
         domain::merge_queue::PullRequestNumber,
@@ -2068,6 +2265,7 @@ mod tests {
             "error.type",
             "github.delivery.id",
             "github.pull_request.number",
+            "github.workflow",
             "github.workflow.conclusion",
             "github.workflow.event",
             "github.workflow.run.attempt",
@@ -2398,6 +2596,142 @@ mod tests {
                 .as_deref(),
             Some(expected_message)
         );
+    }
+
+    #[test]
+    fn every_workflow_event_round_trips_through_storage_and_unknown_events_are_other() {
+        for event in WorkflowEvent::ALL {
+            assert_eq!(WorkflowEvent::from_stored(event.as_str()), Some(event));
+            assert_eq!(WorkflowEvent::normalize(Some(event.as_str())), event);
+        }
+        assert_eq!(WorkflowEvent::from_stored("release"), None);
+        assert_eq!(
+            WorkflowEvent::normalize(Some("release")),
+            WorkflowEvent::Other
+        );
+        assert_eq!(WorkflowEvent::normalize(None), WorkflowEvent::Other);
+    }
+
+    #[test]
+    fn workflow_files_keep_only_a_bounded_safe_file_name() {
+        let file = |path: &str| WorkflowFile::from_path(path).map(|file| file.as_str().to_owned());
+
+        assert_eq!(
+            file(".github/workflows/eval.yaml").as_deref(),
+            Some("eval.yaml")
+        );
+        assert_eq!(file("ci.yml").as_deref(), Some("ci.yml"));
+        assert_eq!(file(".github/workflows/"), None);
+        assert_eq!(file("dynamic/../evil;rm"), None);
+        assert_eq!(file(&"a".repeat(129)), None);
+    }
+
+    fn billed_job(
+        pull_requests: &[i64],
+        context: Option<WorkflowRunContext>,
+        cost: Option<WorkflowJobCost>,
+    ) -> WorkflowJobTrace {
+        WorkflowJobTrace::new(WorkflowJobTraceParts {
+            repository_name: crate::security::CanonicalRepositoryName::new("Owner/Repository")
+                .expect("repository name is valid"),
+            delivery_id: crate::domain::delivery::DeliveryId::parse(
+                "550e8400-e29b-41d4-a716-446655440000",
+            )
+            .expect("delivery id is valid"),
+            workflow_name: DisplayName::sanitize("Build Workflow"),
+            run_id: WorkflowRunId::new(31).expect("run id is valid"),
+            run_attempt: WorkflowRunAttempt::new(2).expect("run attempt is valid"),
+            job_id: WorkflowJobId::new(41).expect("job id is valid"),
+            job_name: DisplayName::sanitize("Linux Job"),
+            conclusion: WorkflowConclusion::Success,
+            head_sha: None,
+            pull_requests: WorkflowPullRequests::new(
+                pull_requests
+                    .iter()
+                    .map(|number| PullRequestNumber::new(*number).expect("PR is positive")),
+            ),
+            workflow_run_context: context,
+            required: None,
+            timing: HistoricalTiming::fallback(SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            steps: Vec::new(),
+        })
+        .with_billing(WorkflowJobBilling {
+            runner_labels: ["ubuntu-24.04-xl", "self-hosted"]
+                .into_iter()
+                .filter_map(DisplayName::sanitize)
+                .collect(),
+            runner_group: DisplayName::sanitize("Larger runners"),
+            billable_minutes: 6,
+            cost,
+        })
+    }
+
+    fn attributed_context() -> WorkflowRunContext {
+        WorkflowRunContext::new(
+            WorkflowRunId::new(31).expect("run id is valid"),
+            WorkflowRunAttempt::new(2).expect("run attempt is valid"),
+            WorkflowEvent::IssueComment,
+            None,
+            None,
+        )
+        .with_pull_request(Some(PullRequestNumber::new(9201).expect("PR is positive")))
+        .with_workflow_file(WorkflowFile::from_path(".github/workflows/claude.yml"))
+    }
+
+    #[test]
+    fn a_priced_job_span_carries_runner_billing_cost_and_run_attribution() {
+        let job = billed_job(
+            &[],
+            Some(attributed_context()),
+            Some(WorkflowJobCost {
+                cost_usd: 0.48,
+                price_table_version: "0123456789ab".to_owned(),
+                fell_back: true,
+            }),
+        );
+
+        let (spans, _) = emitted_spans_and_errors(&job);
+        let span = &spans[0];
+
+        assert_eq!(
+            attribute(span, "cicd.runner.labels"),
+            Some(&Value::Array(Array::String(vec![
+                "ubuntu-24.04-xl".into(),
+                "self-hosted".into()
+            ])))
+        );
+        assert_string_attribute(span, "cicd.runner.group", "Larger runners");
+        assert_eq!(attribute(span, "ci.billable_minutes"), Some(&Value::I64(6)));
+        assert_string_attribute(span, "ci.source", "github_actions");
+        assert_eq!(attribute(span, "ci.cost_usd"), Some(&Value::F64(0.48)));
+        assert_string_attribute(span, "ci.price_table.version", "0123456789ab");
+        assert_eq!(
+            attribute(span, "ci.price.fell_back"),
+            Some(&Value::Bool(true))
+        );
+        assert_string_attribute(span, "github.workflow", "Build Workflow");
+        assert_string_attribute(span, "github.workflow_file", "claude.yml");
+        assert_string_attribute(span, "github.workflow.event", "issue_comment");
+        assert_i64_array_attribute(span, "github.pull_request.number", &[9201]);
+    }
+
+    #[test]
+    fn an_unpriced_job_span_has_minutes_but_no_cost_and_keeps_its_own_pull_requests() {
+        let job = billed_job(&[7], Some(attributed_context()), None);
+
+        let (spans, _) = emitted_spans_and_errors(&job);
+        let keys = attribute_keys(&spans[0]);
+
+        assert!(keys.contains("ci.billable_minutes"));
+        for key in [
+            "ci.source",
+            "ci.cost_usd",
+            "ci.price_table.version",
+            "ci.price.fell_back",
+        ] {
+            assert!(!keys.contains(key), "{key} needs a price table");
+        }
+        assert_i64_array_attribute(&spans[0], "github.pull_request.number", &[7]);
     }
 
     fn attribute_keys(span: &SpanData) -> BTreeSet<&str> {

@@ -63,7 +63,7 @@ impl From<UsdRate> for f64 {
 
 /// The wire shape of the `costs` block. Field order and `BTreeMap` keys make its compact JSON
 /// serialization canonical, which is what the version hash is computed over.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PriceTable {
     runners: RunnerPrices,
@@ -73,7 +73,7 @@ struct PriceTable {
     vendors: BTreeMap<String, VendorPrice>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RunnerPrices {
     default_usd_per_minute: UsdRate,
@@ -91,7 +91,7 @@ pub struct DaytonaRates {
     pub usd_per_ram_gb_second: UsdRate,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct VendorPrice {
     #[serde(rename = "match")]
@@ -101,7 +101,7 @@ struct VendorPrice {
 
 /// How a vendor is recognised. Serde's externally tagged enum form accepts exactly one key, so
 /// `{}` and `{ check_suite_app, review_login }` both fail to parse.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum VendorMatch {
     CheckSuiteApp(String),
@@ -127,6 +127,7 @@ pub struct RunnerRate {
 }
 
 /// Validated price table plus its version and the reverse vendor indexes.
+#[derive(Clone)]
 pub struct CostsConfig {
     table: PriceTable,
     version: String,

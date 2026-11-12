@@ -81,19 +81,25 @@ impl WorkflowJobLinkStore {
             .ok_or(WorkflowJobLinkStoreError::Internal)?;
         let completed_at_nanos =
             system_time_to_nanos(job.timing().end()).ok_or(WorkflowJobLinkStoreError::Internal)?;
+        let billing = job.billing();
+        let cost = billing.and_then(|billing| billing.cost.as_ref());
 
         sqlx::query(
             "INSERT INTO workflow_job_links \
              (repository_id, workflow_run_id, workflow_run_attempt, workflow_job_id, job_name, \
               conclusion, trace_id, span_id, started_at_nanos, completed_at_nanos, timing_source, \
-              updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+              billable_minutes, cost_usd, price_table_version, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
              ON CONFLICT(repository_id, workflow_run_id, workflow_run_attempt, workflow_job_id) \
              DO UPDATE SET job_name = excluded.job_name, conclusion = excluded.conclusion, \
              trace_id = excluded.trace_id, span_id = excluded.span_id, \
              started_at_nanos = excluded.started_at_nanos, \
              completed_at_nanos = excluded.completed_at_nanos, \
-             timing_source = excluded.timing_source, updated_at = excluded.updated_at",
+             timing_source = excluded.timing_source, \
+             billable_minutes = excluded.billable_minutes, cost_usd = excluded.cost_usd, \
+             price_table_version = excluded.price_table_version, \
+             updated_at = excluded.updated_at",
         )
         .bind(repository_id.get())
         .bind(job.run_id().get())
@@ -106,6 +112,9 @@ impl WorkflowJobLinkStore {
         .bind(started_at_nanos)
         .bind(completed_at_nanos)
         .bind(job.timing().source().as_str())
+        .bind(billing.map(|billing| billing.billable_minutes))
+        .bind(cost.map(|cost| cost.cost_usd))
+        .bind(cost.map(|cost| cost.price_table_version.as_str()))
         .execute(&self.pool)
         .await
         .map_err(map_sqlx_error)?;
@@ -324,9 +333,9 @@ mod tests {
         telemetry::{
             pipeline::WorkflowJobTraceIdentity,
             workflow::{
-                DisplayName, HistoricalTiming, TimingSource, WorkflowConclusion, WorkflowJobId,
-                WorkflowJobTrace, WorkflowJobTraceParts, WorkflowPullRequests, WorkflowRunAttempt,
-                WorkflowRunId,
+                DisplayName, HistoricalTiming, TimingSource, WorkflowConclusion,
+                WorkflowJobBilling, WorkflowJobCost, WorkflowJobId, WorkflowJobTrace,
+                WorkflowJobTraceParts, WorkflowPullRequests, WorkflowRunAttempt, WorkflowRunId,
             },
         },
     };
@@ -434,6 +443,9 @@ mod tests {
                 "completed_at_nanos",
                 "timing_source",
                 "updated_at",
+                "billable_minutes",
+                "cost_usd",
+                "price_table_version",
             ]
         );
         for forbidden in [
@@ -646,6 +658,51 @@ mod tests {
                 .await
                 .expect("second prune succeeds"),
             5
+        );
+    }
+
+    #[tokio::test]
+    async fn billing_columns_store_minutes_and_cost_only_when_priced() {
+        let (_directory, pool, store, repository_id) = store_with_repository().await;
+        let timing =
+            HistoricalTiming::reported(instant(0), instant(300)).expect("timing is ordered");
+        let billing = |cost| WorkflowJobBilling {
+            runner_labels: Vec::new(),
+            runner_group: None,
+            billable_minutes: 5,
+            cost,
+        };
+        let priced = job(41, None, WorkflowConclusion::Success, timing.clone()).with_billing(
+            billing(Some(WorkflowJobCost {
+                cost_usd: 0.4,
+                price_table_version: "0123456789ab".to_owned(),
+                fell_back: false,
+            })),
+        );
+        let unpriced =
+            job(42, None, WorkflowConclusion::Success, timing).with_billing(billing(None));
+
+        for (job, seed) in [(&priced, 41), (&unpriced, 42)] {
+            store
+                .record(repository_id, job, identity(seed))
+                .await
+                .expect("link persists");
+        }
+        type BillingRow = (i64, Option<i64>, Option<f64>, Option<String>);
+        let rows: Vec<BillingRow> = sqlx::query_as(
+            "SELECT workflow_job_id, billable_minutes, cost_usd, price_table_version \
+             FROM workflow_job_links ORDER BY workflow_job_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("rows load");
+
+        assert_eq!(
+            rows,
+            [
+                (41, Some(5), Some(0.4), Some("0123456789ab".to_owned())),
+                (42, Some(5), None, None),
+            ]
         );
     }
 

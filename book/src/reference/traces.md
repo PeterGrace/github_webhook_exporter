@@ -139,11 +139,57 @@ Workflow spans do not emit the replaced fields `github.repository.name`, `github
 `cicd.pipeline.action.name`.
 
 An earlier authenticated `workflow_run` delivery supplies the authoritative normalized
-`github.workflow.event` and sanitized `github.workflow.source_branch` and
-`github.workflow.target_branch`. Correlation uses repository, run ID, and run attempt. The event is
-`pull_request`, `merge_group`, `push`, or `other`; branches remove control characters and retain at
-most 255 Unicode scalar values. Missing or ambiguous branches are omitted. The same available
-context is attached to the job root and every step.
+`github.workflow.event`, sanitized `github.workflow.source_branch` and
+`github.workflow.target_branch`, and `github.workflow_file`. Correlation uses repository, run ID,
+and run attempt. The event is `pull_request`, `pull_request_target`, `pull_request_review`,
+`pull_request_review_comment`, `issue_comment`, `merge_group`, `push`, `schedule`,
+`workflow_dispatch`, or `other`; branches remove control characters and retain at most 255 Unicode
+scalar values. Missing or ambiguous branches are omitted. `github.workflow_file` is the last
+segment of the run's workflow `path`, such as `ci.yaml`, kept only when it is 1 to 128 ASCII
+letters, digits, `.`, `_`, or `-`. The same available context is attached to the job root and
+every step.
+
+The same delivery also attributes the run to at most one pull request. That is the single
+distinct number in the run's `pull_requests`. A run started by `issue_comment`,
+`pull_request_review`, or `pull_request_review_comment` has an empty `pull_requests`, so its PR is
+read from the first `PR #<number>` in the run name (`display_title`, set by the workflow's
+`run-name`) that starts the name or follows a non-alphanumeric character. Other events never read the run name, because squash-merge commit titles contain
+`(#<number>)`. GitHub's `workflow_job` payload carries no pull requests, so a job root whose own
+list is empty uses the run's attributed PR for `github.pull_request.number`.
+
+The job root also carries `github.workflow`, the workflow name. It repeats `cicd.pipeline.name` so
+job spans and in-job usage spans group spend by the same key.
+
+### Runner and cost attributes
+
+Every job root carries the runner and the minutes GitHub bills for the job:
+
+| Attribute | Contents |
+| --- | --- |
+| `cicd.runner.labels` | The job's runner labels in job order: at most 16, each sanitized like display names. Omitted when the job reported none. |
+| `cicd.runner.group` | The sanitized runner group name, when reported. |
+| `ci.billable_minutes` | The job's run time rounded up to a whole minute. `0` for a skipped job, a job that never got a runner (no positive `runner_id`, such as one cancelled while queued), and a job without valid reported start and end times. |
+
+When a [`costs`](costs.md) table is configured, the root also carries the job's price:
+
+| Attribute | Contents |
+| --- | --- |
+| `ci.source` | `github_actions`. |
+| `ci.cost_usd` | `ci.billable_minutes` times the runner rate. |
+| `ci.price_table.version` | The version of the table that supplied the rate. |
+| `ci.price.fell_back` | `true` when no runner label had a price and the default rate was used. |
+
+A job that billed 0 minutes is priced at 0 without a rate lookup, so it never logs
+`ci price missing`. Step spans carry none of these attributes.
+
+Each priced job also writes one parentless `ci cost recorded` info log, whether or not trace
+export is enabled. It carries `ci.source`, `ci.cost_usd`, `ci.billable_minutes`,
+`ci.price_table.version`, `ci.price.fell_back`, `ci.job` (the sanitized job name),
+`cicd.runner.labels` (comma-joined), `github.workflow`, `github.workflow_file`,
+`github.workflow.event`, `github.pull_request.number` (the job's first PR or the run's attributed
+PR), `github.repository` (the canonical repository name), `cicd.pipeline.run.id`,
+`github.workflow.run.attempt`, and `cicd.pipeline.task.run.id`. Optional fields are omitted when
+unknown. Without a `costs` table the log is never written.
 
 ### Branch-protection required checks
 
@@ -185,10 +231,12 @@ or metrics.
 
 Commands, output, logs, actors, payload-provided URLs, request bodies, arbitrary payload fragments,
 secrets, signatures, authorization/other headers, unsupported actions, and raw unknown conclusions
-never enter workflow telemetry, in traces, logs, or metrics. The one exception is a parentless
-structured warning on a newly claimed `too_many_steps` rejection, which may contain only
-`repository_name`, `delivery_id`, `workflow_run_id`, `workflow_run_attempt`, `workflow_job_id`,
-`step_count`, and `step_limit`. Operators can query
+never enter workflow telemetry, in traces, logs, or metrics. Workflow identifiers and names stay
+out of logs with two exceptions. One is a parentless structured warning on a newly claimed
+`too_many_steps` rejection, which may contain only `repository_name`, `delivery_id`,
+`workflow_run_id`, `workflow_run_attempt`, `workflow_job_id`, `step_count`, and `step_limit`. The
+other is the `ci cost recorded` log described above, which exists only when a `costs` table is
+configured and carries only the listed fields, so cost can be charted from the logs dataset. Operators can query
 `GET /repos/{owner}/{repo}/actions/jobs/{job_id}` with the canonical repository name and
 `workflow_job_id`, and correlate against the delivery UUID for the original webhook delivery.
 
@@ -305,14 +353,16 @@ used reported timing; a single fallback job marks the derived run boundary `fall
 `vcs.repository.url.full`, `vcs.repository.name`, `vcs.ref.head.revision` when available, and the
 correlated `github.workflow.event`, `github.workflow.source_branch`, and
 `github.workflow.target_branch`. The root additionally carries the `workflow_run` delivery UUID,
-the positive run attempt, and at most the first 20 positive pull-request numbers reported by the
-run. Each child additionally carries `cicd.pipeline.task.name`, the decimal
+the positive run attempt, `github.workflow`, and at most the first 20 positive pull-request
+numbers reported by the run, or the run's attributed PR when the run reported none. Both the root
+and every child carry `github.workflow_file` when known. Each child additionally carries `cicd.pipeline.task.name`, the decimal
 `cicd.pipeline.task.run.id`, `cicd.pipeline.task.run.result`, and `cicd.pipeline.task.run.url.full`.
 
 **Persistence.** Linking requires the job trace identities to outlive the delivery that produced
 them, so each emitted job trace durably records its trace ID, span ID, sanitized job name, bounded
-conclusion, and selected interval, keyed by repository, run ID, run attempt, and job ID. Nothing
-else is retained: no payload data, logs, commands, output, secrets, actors, or raw URLs. These
+conclusion, selected interval, billable minutes, and, when priced, its USD cost and price-table
+version, keyed by repository, run ID, run attempt, and job ID. The cost columns are what a later
+run total sums. Nothing else is retained: no payload data, logs, commands, output, secrets, actors, or raw URLs. These
 records use the processed-delivery retention cutoff and are pruned in the same scheduled pass as
 workflow-run context. Identities are recorded only when remote telemetry is enabled, since a
 disabled emitter exports no job trace to link to.

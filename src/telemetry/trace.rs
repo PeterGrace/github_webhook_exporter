@@ -18,8 +18,8 @@ use crate::metrics::{
 };
 use crate::security::CanonicalRepositoryName;
 use crate::telemetry::workflow::{
-    TimingSource, WorkflowBranch, WorkflowConclusion, WorkflowEvent, WorkflowJobId,
-    WorkflowRunAttempt, WorkflowRunId, WorkflowStepTrace,
+    DisplayName, TimingSource, WorkflowBranch, WorkflowConclusion, WorkflowEvent, WorkflowFile,
+    WorkflowJobCost, WorkflowJobId, WorkflowRunAttempt, WorkflowRunId, WorkflowStepTrace,
 };
 
 const TELEMETRY_TARGET: &str = "github_webhook_exporter";
@@ -68,6 +68,18 @@ const GITHUB_WORKFLOW_SOURCE_BRANCH_KEY: &str = "github.workflow.source_branch";
 const GITHUB_WORKFLOW_TARGET_BRANCH_KEY: &str = "github.workflow.target_branch";
 const GITHUB_WORKFLOW_REQUIRED_KEY: &str = "github.workflow.required";
 const TIMING_SOURCE_KEY: &str = "timing_source";
+const GITHUB_WORKFLOW_KEY: &str = "github.workflow";
+const GITHUB_WORKFLOW_FILE_KEY: &str = "github.workflow_file";
+const CICD_RUNNER_LABELS_KEY: &str = "cicd.runner.labels";
+const CICD_RUNNER_GROUP_KEY: &str = "cicd.runner.group";
+const CI_BILLABLE_MINUTES_KEY: &str = "ci.billable_minutes";
+const CI_SOURCE_KEY: &str = "ci.source";
+const CI_COST_USD_KEY: &str = "ci.cost_usd";
+const CI_PRICE_TABLE_VERSION_KEY: &str = "ci.price_table.version";
+const CI_PRICE_FELL_BACK_KEY: &str = "ci.price.fell_back";
+
+/// The `ci.source` of GitHub Actions runner minutes.
+pub(crate) const CI_SOURCE_GITHUB_ACTIONS: &str = "github_actions";
 
 pub(super) const GITHUB_ACTIONS_PIPELINE_OPERATION: &str = "github.actions.pipeline";
 pub(super) const GITHUB_ACTIONS_PIPELINE_TASK_OPERATION: &str = "github.actions.pipeline.task";
@@ -154,6 +166,53 @@ pub(crate) fn workflow_source_branch_attribute(branch: &WorkflowBranch) -> KeyVa
 /// Returns a sanitized workflow target-branch attribute.
 pub(crate) fn workflow_target_branch_attribute(branch: &WorkflowBranch) -> KeyValue {
     string_key_value(GITHUB_WORKFLOW_TARGET_BRANCH_KEY, branch.as_str())
+}
+
+/// Returns the `github.workflow` attribute that CI cost queries group by.
+///
+/// It repeats `cicd.pipeline.name` so job spans and usage spans share one grouping key.
+pub(crate) fn github_workflow_attribute(name: &str) -> KeyValue {
+    string_key_value(GITHUB_WORKFLOW_KEY, name)
+}
+
+/// Returns the workflow file-name attribute.
+pub(crate) fn workflow_file_attribute(file: &WorkflowFile) -> KeyValue {
+    string_key_value(GITHUB_WORKFLOW_FILE_KEY, file.as_str())
+}
+
+/// Returns the runner-labels attribute, or `None` when the job reported no labels.
+pub(crate) fn runner_labels_attribute(labels: &[DisplayName]) -> Option<KeyValue> {
+    (!labels.is_empty()).then(|| {
+        KeyValue::new(
+            CICD_RUNNER_LABELS_KEY,
+            Value::Array(Array::String(
+                labels
+                    .iter()
+                    .map(|label| label.as_str().to_owned().into())
+                    .collect(),
+            )),
+        )
+    })
+}
+
+/// Returns the runner-group attribute.
+pub(crate) fn runner_group_attribute(group: &DisplayName) -> KeyValue {
+    string_key_value(CICD_RUNNER_GROUP_KEY, group.as_str())
+}
+
+/// Returns the billable-minutes attribute.
+pub(crate) fn billable_minutes_attribute(minutes: i64) -> KeyValue {
+    KeyValue::new(CI_BILLABLE_MINUTES_KEY, minutes)
+}
+
+/// Returns the cost source, amount, price-table version and fallback attributes of a priced job.
+pub(crate) fn job_cost_attributes(cost: &WorkflowJobCost) -> [KeyValue; 4] {
+    [
+        string_key_value(CI_SOURCE_KEY, CI_SOURCE_GITHUB_ACTIONS),
+        KeyValue::new(CI_COST_USD_KEY, cost.cost_usd),
+        string_key_value(CI_PRICE_TABLE_VERSION_KEY, cost.price_table_version.clone()),
+        KeyValue::new(CI_PRICE_FELL_BACK_KEY, cost.fell_back),
+    ]
 }
 
 /// Returns the semantic-convention URL for a GitHub Actions workflow run.

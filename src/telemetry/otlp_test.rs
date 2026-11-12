@@ -71,7 +71,7 @@ use tracing::{
     Dispatch, Event, Instrument, Metadata, Subscriber,
 };
 
-use crate::{config::TelemetryConfig, metrics::Metrics};
+use crate::{config::TelemetryConfig, costs::CostsConfig, metrics::Metrics};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use super::{
@@ -183,6 +183,15 @@ const SPAN_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "github.workflow.source_branch",
     "github.workflow.target_branch",
     "github.workflow.required",
+    "github.workflow",
+    "github.workflow_file",
+    "cicd.runner.labels",
+    "cicd.runner.group",
+    "ci.billable_minutes",
+    "ci.source",
+    "ci.cost_usd",
+    "ci.price_table.version",
+    "ci.price.fell_back",
     "timing_source",
     "db.system.name",
     "db.operation.name",
@@ -942,6 +951,7 @@ impl WebhookTraceFixture {
             false,
             "github_webhook_exporter=info",
             None,
+            None,
         )
         .await
     }
@@ -955,9 +965,22 @@ impl WebhookTraceFixture {
             false,
             "github_webhook_exporter=info",
             Some(factory),
+            None,
         )
         .await;
         (fixture, transport)
+    }
+
+    async fn new_with_costs(costs: CostsConfig) -> Self {
+        Self::new_with_exporter_timeout_and_step_limit(
+            2_000,
+            DEFAULT_WORKFLOW_JOB_MAX_STEPS,
+            false,
+            "github_webhook_exporter=info",
+            None,
+            Some(costs),
+        )
+        .await
     }
 
     async fn new_with_debug_logging() -> Self {
@@ -966,6 +989,7 @@ impl WebhookTraceFixture {
             DEFAULT_WORKFLOW_JOB_MAX_STEPS,
             false,
             "github_webhook_exporter=debug",
+            None,
             None,
         )
         .await
@@ -978,6 +1002,7 @@ impl WebhookTraceFixture {
             true,
             "github_webhook_exporter=info",
             None,
+            None,
         )
         .await
     }
@@ -989,6 +1014,7 @@ impl WebhookTraceFixture {
             false,
             "github_webhook_exporter=info",
             None,
+            None,
         )
         .await
     }
@@ -999,6 +1025,7 @@ impl WebhookTraceFixture {
         include_actionable_repository: bool,
         rust_log: &str,
         sentry_transport: Option<Arc<dyn TransportFactory>>,
+        costs: Option<CostsConfig>,
     ) -> Self {
         let otlp_guard = otlp_test_lock().lock_owned().await;
         let receiver = RunningReceiver::start_released().await;
@@ -1066,7 +1093,8 @@ impl WebhookTraceFixture {
                 workflow_job_max_steps,
             )
             .with_metrics(metrics)
-            .with_workflow_trace_emitter(runtime.workflow_trace_emitter()),
+            .with_workflow_trace_emitter(runtime.workflow_trace_emitter())
+            .with_costs(costs),
         );
         Self {
             _otlp_guard: otlp_guard,
@@ -7292,4 +7320,172 @@ async fn a_run_over_the_job_limit_emits_an_actionable_rejection_without_a_pipeli
         "github_webhook_processing_failures_total{repository=\"unknown\",stage=\"workflow_link\"} 0",
     );
     captured.assert_absent("seeded job");
+}
+
+fn log_attribute<'record>(
+    record: &'record LogRecord,
+    key: &str,
+) -> Option<&'record AttributeValue> {
+    record
+        .attributes
+        .iter()
+        .find(|attribute| attribute.key == key)
+        .and_then(|attribute| attribute.value.as_ref())
+        .and_then(|value| value.value.as_ref())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_priced_job_exports_its_cost_on_the_span_and_one_cost_log() {
+    let costs = CostsConfig::from_json(
+        r#"{"runners": {"default_usd_per_minute": 0.01, "labels": {"ubuntu-24.04-xl": 0.08}}}"#,
+    )
+    .expect("costs are valid");
+    let version = costs.version().to_owned();
+    let fixture = WebhookTraceFixture::new_with_costs(costs).await;
+    let workflow_run_body = serde_json::to_vec(&serde_json::json!({
+        "action": "requested",
+        "workflow_run": {
+            "id": 31,
+            "run_attempt": 1,
+            "event": "issue_comment",
+            "display_title": "Claude on PR #9201",
+            "path": ".github/workflows/claude.yml",
+            "head_branch": "master",
+            "pull_requests": []
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("workflow-run payload serializes");
+    let response = fixture
+        .webhook(
+            &workflow_run_body,
+            "workflow_run",
+            "550e8400-e29b-41d4-a716-446655440301",
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+    let job_body = serde_json::to_vec(&serde_json::json!({
+        "action": "completed",
+        "workflow_job": {
+            "id": 41,
+            "run_id": 31,
+            "run_attempt": 1,
+            "workflow_name": "Claude",
+            "name": "claude",
+            "conclusion": "success",
+            "started_at": "2026-08-06T10:00:00Z",
+            "completed_at": "2026-08-06T10:05:00.5Z",
+            "labels": ["ubuntu-24.04-xl"],
+            "runner_id": 7,
+            "runner_group_name": "Larger runners",
+            "steps": []
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("workflow-job payload serializes");
+
+    let response = fixture
+        .webhook(
+            &job_body,
+            "workflow_job",
+            "550e8400-e29b-41d4-a716-446655440302",
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    let captured = fixture.force_flush();
+    captured.assert_approved_attribute_keys();
+    let expected_cost = 6.0 * 0.08;
+    let job = captured.one_named("Claude / claude");
+    assert_i64_attribute(job, "ci.billable_minutes", 6);
+    assert_attribute(job, "ci.source", "github_actions");
+    assert_attribute(job, "ci.price_table.version", &version);
+    assert_attribute(job, "cicd.runner.group", "Larger runners");
+    assert_attribute(job, "github.workflow", "Claude");
+    assert_attribute(job, "github.workflow_file", "claude.yml");
+    assert_attribute(job, "github.workflow.event", "issue_comment");
+    assert_i64_array_attribute(job, "github.pull_request.number", &[9201]);
+    assert!(job.attributes.iter().any(|attribute| {
+        attribute.key == "ci.cost_usd"
+            && attribute
+                .value
+                .as_ref()
+                .and_then(|value| value.value.as_ref())
+                == Some(&AttributeValue::DoubleValue(expected_cost))
+    }));
+
+    let log = captured.one_log_with_body("ci cost recorded");
+    assert_eq!(
+        log_attribute(log, "ci.cost_usd"),
+        Some(&AttributeValue::DoubleValue(expected_cost))
+    );
+    assert_eq!(
+        log_attribute(log, "ci.source"),
+        Some(&AttributeValue::StringValue("github_actions".to_owned()))
+    );
+    assert_eq!(
+        log_attribute(log, "ci.billable_minutes"),
+        Some(&AttributeValue::IntValue(6))
+    );
+    assert_eq!(
+        log_attribute(log, "ci.price.fell_back"),
+        Some(&AttributeValue::BoolValue(false))
+    );
+    assert_eq!(
+        log_attribute(log, "ci.job"),
+        Some(&AttributeValue::StringValue("claude".to_owned()))
+    );
+    assert_eq!(
+        log_attribute(log, "github.workflow"),
+        Some(&AttributeValue::StringValue("Claude".to_owned()))
+    );
+    assert_eq!(
+        log_attribute(log, "github.pull_request.number"),
+        Some(&AttributeValue::IntValue(9201))
+    );
+    assert_eq!(
+        log_attribute(log, "cicd.pipeline.run.id"),
+        Some(&AttributeValue::IntValue(31))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unpriced_deployment_logs_no_job_cost() {
+    let fixture = WebhookTraceFixture::new().await;
+    let job_body = serde_json::to_vec(&serde_json::json!({
+        "action": "completed",
+        "workflow_job": {
+            "id": 41,
+            "run_id": 31,
+            "run_attempt": 1,
+            "conclusion": "success",
+            "started_at": "2026-08-06T10:00:00Z",
+            "completed_at": "2026-08-06T10:05:00Z",
+            "labels": ["ubuntu-24.04-xl"],
+            "runner_id": 7,
+            "steps": []
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("workflow-job payload serializes");
+
+    let response = fixture
+        .webhook(
+            &job_body,
+            "workflow_job",
+            "550e8400-e29b-41d4-a716-446655440303",
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    let captured = fixture.force_flush();
+    assert!(!captured.has_log_body("ci cost recorded"));
+    assert!(!captured.has_trace_attribute_key("ci.cost_usd"));
+    assert!(captured.has_trace_i64_attribute("ci.billable_minutes", 5));
 }

@@ -17,6 +17,7 @@ use tracing::Instrument;
 use crate::{
     api,
     config::{GitHubAppConfig, DEFAULT_REQUIRED_CHECK_TTL_SECONDS},
+    costs::CostsConfig,
     github::{
         GitHubAppClient, GitHubClientError, RequiredCheckRefreshHandle, RequiredCheckRefresher,
     },
@@ -67,6 +68,7 @@ pub struct AppState {
     workflow_trace_emitter: WorkflowTraceEmitter,
     webhook_body_limit_bytes: usize,
     workflow_job_max_steps: usize,
+    costs: Option<Arc<CostsConfig>>,
 }
 
 impl AppState {
@@ -100,7 +102,18 @@ impl AppState {
             workflow_trace_emitter: WorkflowTraceEmitter::disabled(),
             webhook_body_limit_bytes,
             workflow_job_max_steps,
+            costs: None,
         }
+    }
+
+    /// Returns application state that prices completed jobs with `costs`.
+    ///
+    /// # Parameters
+    ///
+    /// * `costs` - The validated price table, or `None` to leave cost attribution off.
+    pub fn with_costs(mut self, costs: Option<CostsConfig>) -> Self {
+        self.costs = costs.map(Arc::new);
+        self
     }
 
     /// Returns application state updated with a shared metrics registry.
@@ -218,6 +231,11 @@ impl AppState {
     /// Returns the configured explicit-time historical workflow trace emitter.
     pub fn workflow_trace_emitter(&self) -> &WorkflowTraceEmitter {
         &self.workflow_trace_emitter
+    }
+
+    /// Returns the price table, when cost attribution is on.
+    pub(crate) fn costs(&self) -> Option<&CostsConfig> {
+        self.costs.as_deref()
     }
 
     /// Returns the maximum reported steps accepted for one completed workflow-job trace.
