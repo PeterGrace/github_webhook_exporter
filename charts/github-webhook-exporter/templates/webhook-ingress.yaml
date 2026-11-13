@@ -30,4 +30,13 @@ spec:
                 name: {{ include "github-webhook-exporter.fullname" . }}
                 port:
                   name: http
+          {{- if .Values.ingest.oidc }}
+          - path: /ci-cost/usage
+            pathType: Exact
+            backend:
+              service:
+                name: {{ include "github-webhook-exporter.fullname" . }}
+                port:
+                  name: http
+          {{- end }}
 {{- end }}

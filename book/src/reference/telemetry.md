@@ -89,5 +89,6 @@ bounded task identity attached to an enabled application-generated Sentry workfl
 [Traces](traces.md). Canonical OpenTelemetry `exception` span events do not require `SENTRY_DSN`.
 Canonical repository names additionally appear on repository-scoped Prometheus series. None of
 these identifiers appears in local or OTLP application logs, except the bounded
-workflow-rejection warning and the `ci cost recorded` log, both documented in
+workflow-rejection warning, the `ci cost recorded` log, and the `ci usage post rejected`
+warning and `ci usage post failed` error, all documented in
 [Traces](traces.md#completed-workflow-traces).

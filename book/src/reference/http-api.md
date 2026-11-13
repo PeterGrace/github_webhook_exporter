@@ -59,6 +59,101 @@ so an unauthenticated payload cannot create arbitrary metric series. Successfull
 requests use the canonical lowercase `owner/repository` form — `PeterGrace/github-webhook-exporter`
 normalizes to `petergrace/github-webhook-exporter`, never to `github-webhook-exporter` alone.
 
+## `POST /ci-cost/usage`
+
+Served only when `GHE_INGEST_OIDC_JSON` is set; otherwise the route is not registered and returns
+`404 Not Found`. A GitHub Actions job reports spend that no webhook carries: model inference it has
+already priced in USD, and Daytona sandbox time that the exporter prices from `costs.daytona`.
+
+The caller authenticates with the OIDC token GitHub minted for the job, as
+`Authorization: Bearer <token>`. Request it with the configured audience, for example
+`core.getIDToken("<audience>")` from a job with `permissions: id-token: write`. The token must be
+an RS256 JWT signed by a key in `https://token.actions.githubusercontent.com/.well-known/jwks`,
+issued by `https://token.actions.githubusercontent.com`, for the configured audience, unexpired,
+and for a repository that is both in `allowed_repositories` and registered through the admin API.
+
+Names can be reused: after a rename or deletion, someone else can create a repository with the old
+name and mint tokens for it. So the first accepted token for a registered repository pins it to that
+token's `repository_id` claim, GitHub's immutable numeric ID, and every later token must carry the
+same ID or get `403 repository_id_mismatch`. A rename or transfer keeps the ID, so it keeps working.
+If a registered name is deliberately recreated as a new repository, delete and re-register it
+through the admin API, which clears the pin.
+
+The issuer and key URL are fixed to GitHub.com's. GitHub Enterprise Server, whose tokens come from
+`https://<host>/_services/token`, and enterprises that customize their issuer (for example
+`https://token.actions.githubusercontent.com/<enterprise-slug>`) cannot use this endpoint yet, even
+though `GHE_GITHUB_API_BASE_URL` supports GitHub Enterprise Server elsewhere.
+Keys are cached for an hour. A token naming an unknown `kid` triggers a refetch, but at most
+one fetch is attempted a minute, whether or not it succeeds. While the last attempt has failed, a
+token whose key is not cached gets `503 jwks_unavailable`, because it may be signed by a key
+GitHub rotated in during the outage; once a fetch succeeds without its key, it gets
+`401 invalid_token`. Cached keys keep verifying while GitHub is unreachable; after a successful
+refresh only the new key set is trusted, so a retired key stops verifying at once. The fetch runs
+outside the cache lock, so posts whose key is cached are never held up by a refresh. The token is never
+logged.
+
+The checks run in a fixed order: token, repository registration, repository ID pin, content type,
+then body. A
+rejection reports the first check that failed.
+
+Attribution comes only from the verified claims: `repository`, `workflow`, `workflow_ref`,
+`job_workflow_ref`, `run_id`, `run_attempt`, `event_name`, and `sha`. The pull request is the one
+the run's stored `workflow_run` context is attributed to; when that delivery has not arrived yet,
+the entry has no pull request.
+
+The body is JSON, `Content-Type: application/json`, at most 64 KiB:
+
+```json
+{ "version": 1, "job": "run-evals", "entries": [
+  { "source": "anthropic", "origin": "custom", "model": "<model>", "task": "<task>",
+    "usd": 0.381, "input_tokens": 88400, "output_tokens": 9100 },
+  { "source": "daytona", "task": "<task>", "cpu_seconds": 1840, "ram_gb_seconds": 7360 }
+] }
+```
+
+| Field | Contract |
+| --- | --- |
+| `version` | Must be `1`. |
+| `job` | Optional. The job's `GITHUB_JOB`. |
+| `entries` | 1 to 100 entries. |
+| `source` | 1 to 32 lowercase ASCII letters, digits, `_` or `-`. `daytona` marks sandbox usage; `github_actions` is reserved. |
+| `usd` | Required for every non-`daytona` entry and forbidden on `daytona` entries. A finite number from 0 to 10,000. The exporter never prices tokens. |
+| `model`, `origin` | Optional on inference entries. |
+| `input_tokens`, `output_tokens` | Optional on inference entries; informational only. |
+| `cpu_seconds`, `ram_gb_seconds` | Both required on `daytona` entries, forbidden on others. Finite, from 0 to 10^9. |
+| `task` | Optional. |
+
+Unknown fields fail, so a body can never supply attribution such as `repository` or `run_id`.
+`job`, `task`, `model` and `origin` have control characters removed and keep at most 128
+characters. A `daytona` entry is priced as `cpu_seconds × usd_per_cpu_second + ram_gb_seconds ×
+usd_per_ram_gb_second`. Without Daytona rates it is recorded at 0 USD with
+`ci.price.fell_back=true`, so the seconds are kept and a missing rate never fails the job.
+
+| Status | `code` | Meaning |
+| --- | --- | --- |
+| `204 No Content` | | Every entry was stored, exported as one `ci.usage` span, and logged. |
+| `400 Bad Request` | `schema_invalid` | Malformed JSON, an unknown or misplaced field, or an out-of-range value. |
+| `401 Unauthorized` | `missing_token`, `invalid_token`, `token_expired`, `issuer_mismatch`, `audience_mismatch` | The token is absent or failed verification. |
+| `403 Forbidden` | `repository_not_allowed`, `repository_not_registered`, `repository_id_mismatch` | The token's repository is not allowlisted, not registered and enabled, or has a different GitHub repository ID than the one pinned for that name. |
+| `413 Payload Too Large` | `body_too_large` | Body exceeds 64 KiB. |
+| `415 Unsupported Media Type` | `unsupported_media_type` | Content type is not `application/json`. |
+| `422 Unprocessable Entity` | `unsupported_version`, `missing_usd` | `version` is not `1`, or an inference entry has no `usd`. |
+| `500 Internal Server Error` | `internal_error` | An unexpected SQLite failure that a retry will not fix. The body carries an `error_id` that matches one local `ci usage post failed` error log. |
+| `503 Service Unavailable` | `jwks_unavailable`, `storage_unavailable` | The signing keys could not be fetched, or SQLite was busy or locked. Retrying may succeed. |
+
+A post is all or nothing: one invalid entry rejects the post, and nothing from it is stored.
+The table's CHECK constraints repeat the bounds on `source`, `cpu_seconds` and `ram_gb_seconds`.
+`cost_usd` is checked only as non-negative, because Daytona costs are computed from the seconds and
+the table's rates; the 10,000 USD cap applies to the `usd` the caller sends.
+Stored entries are pruned on the processed-delivery cutoff, `GHE_DELIVERY_RETENTION_DAYS` (7 days
+by default), like the other correlation tables, so anything that totals usage per run or pull
+request can only see entries inside that window. Every
+rejection writes one parentless `ci usage post rejected` warning with the `code` as `reason`, plus
+`github.repository` once the token has been verified. A `500` instead writes one parentless
+`ci usage post failed` error log with the response's `error_id` and `github.repository`. Accepted
+posts are not deduplicated, so a
+client that retries after a timeout may record an entry twice.
+
 ## Admin API
 
 Requires `Authorization: Bearer <GHE_ADMIN_TOKEN>`. Never returns webhook secrets, including to the

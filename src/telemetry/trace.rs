@@ -80,14 +80,26 @@ const CI_PRICE_TABLE_VERSION_KEY: &str = "ci.price_table.version";
 const CI_PRICE_FELL_BACK_KEY: &str = "ci.price.fell_back";
 const CI_PRICE_LABEL_KEY: &str = "ci.price.label";
 const CI_PRICE_USD_PER_MINUTE_KEY: &str = "ci.price.usd_per_minute";
+const CI_JOB_KEY: &str = "ci.job";
+const CI_JOB_WORKFLOW_FILE_KEY: &str = "ci.job_workflow_file";
+const CI_TASK_KEY: &str = "ci.task";
+const CI_MODEL_KEY: &str = "ci.model";
+const CI_ORIGIN_KEY: &str = "ci.origin";
+const CI_INPUT_TOKENS_KEY: &str = "ci.input_tokens";
+const CI_OUTPUT_TOKENS_KEY: &str = "ci.output_tokens";
+const CI_CPU_SECONDS_KEY: &str = "ci.cpu_seconds";
+const CI_RAM_GB_SECONDS_KEY: &str = "ci.ram_gb_seconds";
 
 /// The `ci.source` of GitHub Actions runner minutes.
 pub(crate) const CI_SOURCE_GITHUB_ACTIONS: &str = "github_actions";
+/// The `ci.source` of Daytona sandbox usage reported from inside a job.
+pub(crate) const CI_SOURCE_DAYTONA: &str = "daytona";
 
 pub(super) const GITHUB_ACTIONS_PIPELINE_OPERATION: &str = "github.actions.pipeline";
 pub(super) const GITHUB_ACTIONS_PIPELINE_TASK_OPERATION: &str = "github.actions.pipeline.task";
 pub(super) const GITHUB_ACTIONS_JOB_OPERATION: &str = "github.actions.job";
 pub(super) const GITHUB_ACTIONS_STEP_OPERATION: &str = "github.actions.step";
+pub(super) const CI_USAGE_OPERATION: &str = "ci.usage";
 
 fn string_key_value(key: &'static str, value: impl Into<String>) -> KeyValue {
     KeyValue::new(key, value.into())
@@ -230,6 +242,66 @@ pub(crate) fn job_cost_attributes(cost: &WorkflowJobCost) -> [KeyValue; 4] {
         KeyValue::new(CI_COST_USD_KEY, cost.cost_usd),
         string_key_value(CI_PRICE_TABLE_VERSION_KEY, cost.price_table_version.clone()),
         KeyValue::new(CI_PRICE_FELL_BACK_KEY, cost.fell_back),
+    ]
+}
+
+/// Returns the `ci.source`, `ci.cost_usd` and `ci.price.fell_back` attributes of one usage entry.
+pub(crate) fn usage_cost_attributes(source: &str, cost_usd: f64, fell_back: bool) -> [KeyValue; 3] {
+    [
+        string_key_value(CI_SOURCE_KEY, source),
+        KeyValue::new(CI_COST_USD_KEY, cost_usd),
+        KeyValue::new(CI_PRICE_FELL_BACK_KEY, fell_back),
+    ]
+}
+
+/// Returns the price-table version attribute.
+pub(crate) fn price_table_version_attribute(version: &str) -> KeyValue {
+    string_key_value(CI_PRICE_TABLE_VERSION_KEY, version)
+}
+
+/// Returns the reusable workflow file attribute of a usage entry.
+pub(crate) fn job_workflow_file_attribute(file: &WorkflowFile) -> KeyValue {
+    string_key_value(CI_JOB_WORKFLOW_FILE_KEY, file.as_str())
+}
+
+/// Returns the `GITHUB_JOB` attribute of a usage entry.
+pub(crate) fn usage_job_attribute(job: &DisplayName) -> KeyValue {
+    string_key_value(CI_JOB_KEY, job.as_str())
+}
+
+/// Returns the caller-named task, model and origin attributes of a usage entry.
+pub(crate) fn usage_label_attributes<'label>(
+    task: Option<&'label DisplayName>,
+    model: Option<&'label DisplayName>,
+    origin: Option<&'label DisplayName>,
+) -> impl Iterator<Item = KeyValue> + 'label {
+    [
+        (CI_TASK_KEY, task),
+        (CI_MODEL_KEY, model),
+        (CI_ORIGIN_KEY, origin),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.map(|value| string_key_value(key, value.as_str())))
+}
+
+/// Returns the token-count attributes an inference entry reported.
+pub(crate) fn token_count_attributes(
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+) -> impl Iterator<Item = KeyValue> {
+    [
+        (CI_INPUT_TOKENS_KEY, input_tokens),
+        (CI_OUTPUT_TOKENS_KEY, output_tokens),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.map(|value| KeyValue::new(key, value)))
+}
+
+/// Returns the CPU-second and RAM-GB-second attributes of a Daytona entry.
+pub(crate) fn sandbox_usage_attributes(cpu_seconds: f64, ram_gb_seconds: f64) -> [KeyValue; 2] {
+    [
+        KeyValue::new(CI_CPU_SECONDS_KEY, cpu_seconds),
+        KeyValue::new(CI_RAM_GB_SECONDS_KEY, ram_gb_seconds),
     ]
 }
 
@@ -565,6 +637,14 @@ pub(crate) enum DatabaseOperation {
     RequiredCheckGet,
     /// Pruning cached branch-protection required checks.
     RequiredCheckPrune,
+    /// Resolving an enabled repository row by name.
+    RepositoryResolve,
+    /// Recording the entries of one usage post.
+    CiUsageRecord,
+    /// Pruning stored usage entries.
+    CiUsagePrune,
+    /// Pinning a repository to its GitHub repository ID.
+    CiUsagePin,
 }
 
 /// Creates a bounded tracing span for a high-level operation.
@@ -974,6 +1054,10 @@ impl DatabaseOperation {
             Self::RequiredCheckUpsert => "required_check.upsert",
             Self::RequiredCheckGet => "required_check.get",
             Self::RequiredCheckPrune => "required_check.prune",
+            Self::RepositoryResolve => "repository.resolve",
+            Self::CiUsageRecord => "ci_usage.record",
+            Self::CiUsagePrune => "ci_usage.prune",
+            Self::CiUsagePin => "ci_usage.pin",
         }
     }
 }
@@ -1212,6 +1296,10 @@ mod tests {
                 DatabaseOperation::WorkflowJobLinkPrune,
                 "workflow_job_link.prune",
             ),
+            (DatabaseOperation::RepositoryResolve, "repository.resolve"),
+            (DatabaseOperation::CiUsageRecord, "ci_usage.record"),
+            (DatabaseOperation::CiUsagePrune, "ci_usage.prune"),
+            (DatabaseOperation::CiUsagePin, "ci_usage.pin"),
         ];
         for (operation, expected) in database_operations {
             assert_eq!(operation.as_str(), expected);

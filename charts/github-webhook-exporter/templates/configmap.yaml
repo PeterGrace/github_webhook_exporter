@@ -13,6 +13,9 @@ data:
   {{- with .Values.costs }}
   GHE_COSTS_JSON: {{ toJson . | quote }}
   {{- end }}
+  {{- with .Values.ingest.oidc }}
+  GHE_INGEST_OIDC_JSON: {{ toJson . | quote }}
+  {{- end }}
   GHE_DELIVERY_RETENTION_DAYS: {{ .Values.retention.deliveryDays | int | quote }}
   GHE_MERGE_QUEUE_RETENTION_DAYS: {{ .Values.retention.mergeQueueDays | int | quote }}
   GHE_DELIVERY_PRUNE_INTERVAL_SECONDS: {{ .Values.retention.pruneIntervalSeconds | int | quote }}

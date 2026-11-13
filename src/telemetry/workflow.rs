@@ -43,7 +43,7 @@ const MAX_PULL_REQUEST_COUNT: usize = 20;
 pub(crate) const MAX_RUNNER_LABEL_COUNT: usize = 16;
 /// Maximum branch-protection required-check names retained for one repository branch.
 pub(crate) const MAX_REQUIRED_CHECK_COUNT: usize = 100;
-const UNKNOWN_WORKFLOW_NAME: &str = "workflow";
+pub(super) const UNKNOWN_WORKFLOW_NAME: &str = "workflow";
 const UNNAMED_JOB_NAME: &str = "job";
 const UNNAMED_STEP_NAME: &str = "step";
 const JOB_REQUIRED_ATTRIBUTE_COUNT: usize = 16;
@@ -482,12 +482,14 @@ pub(crate) enum WorkflowEvent {
     Schedule,
     /// A manually dispatched run.
     WorkflowDispatch,
+    /// A run started when another workflow's run completed.
+    WorkflowRun,
     /// Any trigger outside the approved vocabulary.
     Other,
 }
 
 impl WorkflowEvent {
-    const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::PullRequest,
         Self::PullRequestTarget,
         Self::PullRequestReview,
@@ -497,6 +499,7 @@ impl WorkflowEvent {
         Self::Push,
         Self::Schedule,
         Self::WorkflowDispatch,
+        Self::WorkflowRun,
         Self::Other,
     ];
 
@@ -510,12 +513,15 @@ impl WorkflowEvent {
         Self::ALL.into_iter().find(|event| event.as_str() == value)
     }
 
-    /// Returns whether the run was started by a comment or review, so its PR is not in the
-    /// run's `pull_requests` and is read from its run name instead.
-    pub(crate) const fn is_comment_triggered(self) -> bool {
+    /// Returns whether GitHub leaves the run's `pull_requests` empty for this trigger, so its PR
+    /// is read from its run name instead.
+    pub(crate) const fn reads_pull_request_from_run_name(self) -> bool {
         matches!(
             self,
-            Self::IssueComment | Self::PullRequestReview | Self::PullRequestReviewComment
+            Self::IssueComment
+                | Self::PullRequestReview
+                | Self::PullRequestReviewComment
+                | Self::WorkflowRun
         )
     }
 
@@ -531,6 +537,7 @@ impl WorkflowEvent {
             Self::Push => "push",
             Self::Schedule => "schedule",
             Self::WorkflowDispatch => "workflow_dispatch",
+            Self::WorkflowRun => "workflow_run",
             Self::Other => "other",
         }
     }

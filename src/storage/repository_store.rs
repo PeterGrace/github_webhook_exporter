@@ -199,6 +199,37 @@ impl RepositoryStore {
         })
     }
 
+    /// Returns the identifier of the enabled repository named `full_name`, if one is registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryStoreError::Unavailable`] when SQLite is busy or locked, and a redacted
+    /// internal error for other query failures.
+    pub(crate) async fn enabled_id(
+        &self,
+        full_name: &CanonicalRepositoryName,
+    ) -> Result<Option<RepositoryId>, RepositoryStoreError> {
+        trace::instrument_database_operation(
+            DatabaseOperation::RepositoryResolve,
+            self.enabled_id_inner(full_name),
+        )
+        .await
+    }
+
+    async fn enabled_id_inner(
+        &self,
+        full_name: &CanonicalRepositoryName,
+    ) -> Result<Option<RepositoryId>, RepositoryStoreError> {
+        let id: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM repositories WHERE full_name = ? AND enabled = 1")
+                .bind(full_name.as_str())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx_error)?;
+        id.map(|id| RepositoryId::from_database(id).ok_or(RepositoryStoreError::InternalData))
+            .transpose()
+    }
+
     /// Fetches repository metadata by identifier after authenticating its stored secret.
     ///
     /// # Errors

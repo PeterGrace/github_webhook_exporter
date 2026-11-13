@@ -28,6 +28,8 @@ githubApp:
   installationId: null
   apiBaseUrl: ""
 costs: {}
+ingest:
+  oidc: {}
 retention:
   deliveryDays: 7
   mergeQueueDays: 90

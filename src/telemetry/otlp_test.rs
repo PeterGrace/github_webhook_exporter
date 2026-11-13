@@ -45,6 +45,10 @@ use tracing_subscriber::{
     Registry,
 };
 
+use crate::security::{
+    oidc::test_support::{claims, StaticJwks, TestSigner, TEST_AUDIENCE},
+    IngestOidcConfig,
+};
 use crate::{
     app::{build_router, AppState},
     config::DEFAULT_WORKFLOW_JOB_MAX_STEPS,
@@ -195,6 +199,15 @@ const SPAN_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "ci.price.fell_back",
     "ci.price.label",
     "ci.price.usd_per_minute",
+    "ci.job",
+    "ci.job_workflow_file",
+    "ci.task",
+    "ci.model",
+    "ci.origin",
+    "ci.input_tokens",
+    "ci.output_tokens",
+    "ci.cpu_seconds",
+    "ci.ram_gb_seconds",
     "timing_source",
     "db.system.name",
     "db.operation.name",
@@ -934,6 +947,11 @@ async fn parent_spans_close_when_a_child_is_released_off_a_dispatcher_thread() {
     );
 }
 
+struct UsageFixture {
+    config: IngestOidcConfig,
+    jwks: StaticJwks,
+}
+
 struct WebhookTraceFixture {
     _otlp_guard: FixtureDispatchRegistration,
     receiver: RunningReceiver,
@@ -955,6 +973,7 @@ impl WebhookTraceFixture {
             "github_webhook_exporter=info",
             None,
             None,
+            None,
         )
         .await
     }
@@ -969,6 +988,7 @@ impl WebhookTraceFixture {
             "github_webhook_exporter=info",
             Some(factory),
             None,
+            None,
         )
         .await;
         (fixture, transport)
@@ -982,6 +1002,65 @@ impl WebhookTraceFixture {
             "github_webhook_exporter=info",
             None,
             Some(costs),
+            None,
+        )
+        .await
+    }
+
+    async fn new_with_usage(
+        costs: Option<CostsConfig>,
+        allowed_repositories: &[&str],
+        signer: &TestSigner,
+    ) -> Self {
+        Self::new_with_usage_source(
+            costs,
+            allowed_repositories,
+            StaticJwks::serving(signer.jwks()),
+        )
+        .await
+    }
+
+    async fn new_with_usage_source(
+        costs: Option<CostsConfig>,
+        allowed_repositories: &[&str],
+        jwks: StaticJwks,
+    ) -> Self {
+        let config = IngestOidcConfig::from_json(
+            &serde_json::json!({
+                "audience": TEST_AUDIENCE,
+                "allowed_repositories": allowed_repositories,
+            })
+            .to_string(),
+        )
+        .expect("ingest config is valid");
+        Self::new_with_exporter_timeout_and_step_limit(
+            2_000,
+            DEFAULT_WORKFLOW_JOB_MAX_STEPS,
+            false,
+            "github_webhook_exporter=info",
+            None,
+            costs,
+            Some(UsageFixture { config, jwks }),
+        )
+        .await
+    }
+
+    async fn usage(&self, authorization: Option<&str>, body: Vec<u8>) -> axum::response::Response {
+        self.usage_as(authorization, "application/json", body).await
+    }
+
+    async fn usage_as(
+        &self,
+        authorization: Option<&str>,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> axum::response::Response {
+        self.request(
+            Method::POST,
+            "/ci-cost/usage",
+            authorization,
+            Some(content_type),
+            Body::from(body),
         )
         .await
     }
@@ -992,6 +1071,7 @@ impl WebhookTraceFixture {
             DEFAULT_WORKFLOW_JOB_MAX_STEPS,
             false,
             "github_webhook_exporter=debug",
+            None,
             None,
             None,
         )
@@ -1006,6 +1086,7 @@ impl WebhookTraceFixture {
             "github_webhook_exporter=info",
             None,
             None,
+            None,
         )
         .await
     }
@@ -1016,6 +1097,7 @@ impl WebhookTraceFixture {
             DEFAULT_WORKFLOW_JOB_MAX_STEPS,
             false,
             "github_webhook_exporter=info",
+            None,
             None,
             None,
         )
@@ -1029,6 +1111,7 @@ impl WebhookTraceFixture {
         rust_log: &str,
         sentry_transport: Option<Arc<dyn TransportFactory>>,
         costs: Option<CostsConfig>,
+        usage: Option<UsageFixture>,
     ) -> Self {
         let otlp_guard = otlp_test_lock().lock_owned().await;
         let receiver = RunningReceiver::start_released().await;
@@ -1088,17 +1171,19 @@ impl WebhookTraceFixture {
         tokio::task::block_in_place(|| runtime.force_flush().expect("setup telemetry flushes"));
         receiver.clear_captured_requests();
         let admin_token = AdminToken::new(ADMIN_TOKEN.to_owned()).expect("test token is valid");
-        let router = build_router(
-            AppState::new(
-                store,
-                AdminAuthenticator::new(&admin_token),
-                2_097_152,
-                workflow_job_max_steps,
-            )
-            .with_metrics(metrics)
-            .with_workflow_trace_emitter(runtime.workflow_trace_emitter())
-            .with_costs(costs),
-        );
+        let mut state = AppState::new(
+            store,
+            AdminAuthenticator::new(&admin_token),
+            2_097_152,
+            workflow_job_max_steps,
+        )
+        .with_metrics(metrics)
+        .with_workflow_trace_emitter(runtime.workflow_trace_emitter())
+        .with_costs(costs);
+        if let Some(usage) = usage {
+            state = state.with_jwks_source(usage.config, Box::new(usage.jwks));
+        }
+        let router = build_router(state);
         Self {
             _otlp_guard: otlp_guard,
             receiver,
@@ -6135,6 +6220,7 @@ async fn integrated_core_trace_privacy() {
     assert_eq!(
         retention_children,
         [
+            ("sqlite.query", Some("ci_usage.prune"), Some("success")),
             ("sqlite.query", Some("delivery.prune"), Some("success")),
             ("sqlite.query", Some("merge_queue.prune"), Some("success")),
             (
@@ -7514,4 +7600,423 @@ async fn an_unpriced_deployment_logs_no_job_cost() {
     assert!(!captured.has_log_body("ci cost recorded"));
     assert!(!captured.has_trace_attribute_key("ci.cost_usd"));
     assert!(captured.has_trace_i64_attribute("ci.billable_minutes", 5));
+}
+
+const USAGE_SIGNER_KID: &str = "usage-test-key";
+
+fn usage_claims() -> Value {
+    let mut claims = claims(WEBHOOK_REPOSITORY);
+    claims["workflow"] = serde_json::json!("Evals");
+    claims["run_id"] = serde_json::json!("61");
+    claims["run_attempt"] = serde_json::json!("1");
+    claims["event_name"] = serde_json::json!("workflow_run");
+    claims
+}
+
+fn usage_body() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "job": "run-evals",
+        "entries": [
+            {"source": "anthropic", "origin": "custom", "model": "claude-sonnet-5-5",
+             "task": "grade", "usd": 0.381, "input_tokens": 88400, "output_tokens": 9100},
+            {"source": "daytona", "task": "sandbox", "cpu_seconds": 1840, "ram_gb_seconds": 7360}
+        ]
+    }))
+    .expect("usage body serializes")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn usage_is_not_served_without_ingest_oidc() {
+    let fixture = WebhookTraceFixture::new().await;
+
+    let response = fixture.usage(Some("Bearer anything"), usage_body()).await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_accepted_usage_post_exports_one_span_and_one_cost_log_per_entry() {
+    let costs = CostsConfig::from_json(
+        r#"{"runners": {"default_usd_per_minute": 0.006},
+            "daytona": {"usd_per_cpu_second": 0.00002, "usd_per_ram_gb_second": 0.000005}}"#,
+    )
+    .expect("costs are valid");
+    let version = costs.version().to_owned();
+    let signer = TestSigner::new(USAGE_SIGNER_KID);
+    let fixture =
+        WebhookTraceFixture::new_with_usage(Some(costs), &[WEBHOOK_REPOSITORY], &signer).await;
+    let workflow_run_body = serde_json::to_vec(&serde_json::json!({
+        "action": "requested",
+        "workflow_run": {
+            "id": 61,
+            "run_attempt": 1,
+            "event": "workflow_run",
+            "display_title": "PR Intent Check on PR #8553",
+            "path": ".github/workflows/evals.yml",
+            "head_branch": "master",
+            "pull_requests": []
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("workflow-run payload serializes");
+    let response = fixture
+        .webhook(
+            &workflow_run_body,
+            "workflow_run",
+            "550e8400-e29b-41d4-a716-446655440401",
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+    let token = signer.sign(&usage_claims());
+
+    let response = fixture
+        .usage(Some(&format!("Bearer {token}")), usage_body())
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    let captured = fixture.force_flush();
+    captured.assert_approved_attribute_keys();
+    captured.assert_absent(&token);
+    captured.assert_logs_absent(&token);
+    assert!(!fixture.output.text().contains(&token));
+    let usage_spans = captured
+        .spans
+        .iter()
+        .filter(|span| span.name == "ci.usage")
+        .collect::<Vec<_>>();
+    assert_eq!(usage_spans.len(), 2);
+    for span in &usage_spans {
+        assert!(span.parent_span_id.is_empty(), "usage spans are roots");
+        assert_attribute(span, "github.repository.name", WEBHOOK_REPOSITORY);
+        assert_attribute(span, "github.workflow", "Evals");
+        assert_attribute(span, "github.workflow_file", "ci.yml");
+        assert_attribute(span, "ci.job_workflow_file", "evals.yml");
+        assert_attribute(span, "github.workflow.event", "workflow_run");
+        assert_attribute(span, "cicd.pipeline.run.id", "61");
+        assert_attribute(span, "ci.job", "run-evals");
+        assert_i64_array_attribute(span, "github.pull_request.number", &[8553]);
+    }
+    let inference = usage_spans
+        .iter()
+        .find(|span| string_attribute(span, "ci.source") == Some("anthropic"))
+        .expect("inference span exported");
+    assert_attribute(inference, "ci.model", "claude-sonnet-5-5");
+    assert_attribute(inference, "ci.task", "grade");
+    assert_i64_attribute(inference, "ci.input_tokens", 88_400);
+    assert_eq!(bool_attribute(inference, "ci.price.fell_back"), Some(false));
+    let sandbox = usage_spans
+        .iter()
+        .find(|span| string_attribute(span, "ci.source") == Some("daytona"))
+        .expect("sandbox span exported");
+    assert_attribute(sandbox, "ci.price_table.version", &version);
+    let expected_sandbox_cost = 1_840.0 * 0.00002 + 7_360.0 * 0.000005;
+    assert!(sandbox.attributes.iter().any(|attribute| {
+        attribute.key == "ci.cost_usd"
+            && attribute
+                .value
+                .as_ref()
+                .and_then(|value| value.value.as_ref())
+                == Some(&AttributeValue::DoubleValue(expected_sandbox_cost))
+    }));
+
+    let cost_logs = captured
+        .log_records
+        .iter()
+        .filter(|record| {
+            record.body.as_ref().and_then(string_any_value) == Some("ci cost recorded")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(cost_logs.len(), 2);
+    for log in &cost_logs {
+        assert_eq!(
+            log_attribute(log, "github.pull_request.number"),
+            Some(&AttributeValue::IntValue(8553))
+        );
+        assert_eq!(
+            log_attribute(log, "github.repository"),
+            Some(&AttributeValue::StringValue(WEBHOOK_REPOSITORY.to_owned()))
+        );
+        assert_eq!(
+            log_attribute(log, "cicd.pipeline.run.id"),
+            Some(&AttributeValue::IntValue(61))
+        );
+    }
+
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ci_usage_entries WHERE workflow_run_id = 61 AND workflow_run_attempt = 1",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("usage entries are countable");
+    assert_eq!(stored, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_rejected_usage_post_logs_one_warning_with_its_reason() {
+    let signer = TestSigner::new(USAGE_SIGNER_KID);
+    let fixture = WebhookTraceFixture::new_with_usage(
+        None,
+        &[WEBHOOK_REPOSITORY, "owner/unregistered"],
+        &signer,
+    )
+    .await;
+    let valid = signer.sign(&usage_claims());
+    let mut wrong_audience = usage_claims();
+    wrong_audience["aud"] = serde_json::json!("https://other.example.test");
+    let mut expired = usage_claims();
+    expired["exp"] = serde_json::json!(1_000);
+    expired["nbf"] = serde_json::json!(900);
+    let mut wrong_issuer = usage_claims();
+    wrong_issuer["iss"] = serde_json::json!("https://issuer.example.test");
+    let mut not_allowed = usage_claims();
+    not_allowed["repository"] = serde_json::json!("owner/other");
+    let mut unregistered = usage_claims();
+    unregistered["repository"] = serde_json::json!("owner/unregistered");
+    let impostor = TestSigner::new(USAGE_SIGNER_KID).sign(&usage_claims());
+    let mut reused_name = usage_claims();
+    reused_name["repository_id"] = serde_json::json!("9999");
+    let body = |value: Value| serde_json::to_vec(&value).expect("body serializes");
+
+    let cases: Vec<(Option<String>, Vec<u8>, StatusCode, &str)> = vec![
+        (
+            None,
+            usage_body(),
+            StatusCode::UNAUTHORIZED,
+            "missing_token",
+        ),
+        (
+            Some(impostor),
+            usage_body(),
+            StatusCode::UNAUTHORIZED,
+            "invalid_token",
+        ),
+        (
+            Some(signer.sign(&expired)),
+            usage_body(),
+            StatusCode::UNAUTHORIZED,
+            "token_expired",
+        ),
+        (
+            Some(signer.sign(&wrong_issuer)),
+            usage_body(),
+            StatusCode::UNAUTHORIZED,
+            "issuer_mismatch",
+        ),
+        (
+            Some(signer.sign(&wrong_audience)),
+            usage_body(),
+            StatusCode::UNAUTHORIZED,
+            "audience_mismatch",
+        ),
+        (
+            Some(signer.sign(&not_allowed)),
+            usage_body(),
+            StatusCode::FORBIDDEN,
+            "repository_not_allowed",
+        ),
+        (
+            Some(signer.sign(&unregistered)),
+            usage_body(),
+            StatusCode::FORBIDDEN,
+            "repository_not_registered",
+        ),
+        (
+            Some(signer.sign(&unregistered)),
+            b"{not json".to_vec(),
+            StatusCode::FORBIDDEN,
+            "repository_not_registered",
+        ),
+        (
+            Some(valid.clone()),
+            body(serde_json::json!({"version": 1, "entries": [{"source": "anthropic"}]})),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "missing_usd",
+        ),
+        (
+            Some(valid.clone()),
+            body(serde_json::json!({"version": 2, "entries": []})),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_version",
+        ),
+        (
+            Some(valid.clone()),
+            b"{not json".to_vec(),
+            StatusCode::BAD_REQUEST,
+            "schema_invalid",
+        ),
+        (
+            Some(valid.clone()),
+            body(
+                serde_json::json!({"version": 1, "repository": "owner/other",
+                                    "entries": [{"source": "anthropic", "usd": 1}]}),
+            ),
+            StatusCode::BAD_REQUEST,
+            "schema_invalid",
+        ),
+        (
+            Some(valid.clone()),
+            vec![b' '; crate::api::MAX_USAGE_BODY_BYTES + 1],
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+        ),
+        (
+            Some(signer.sign(&reused_name)),
+            usage_body(),
+            StatusCode::FORBIDDEN,
+            "repository_id_mismatch",
+        ),
+    ];
+
+    for (index, (token, request_body, expected_status, reason)) in cases.into_iter().enumerate() {
+        let authorization = token.as_ref().map(|token| format!("Bearer {token}"));
+        let response = fixture.usage(authorization.as_deref(), request_body).await;
+        assert_eq!(response.status(), expected_status, "{reason}");
+        let response_body = to_bytes(response.into_body(), 10_000)
+            .await
+            .expect("rejection body is readable");
+        let response_body: Value =
+            serde_json::from_slice(&response_body).expect("rejection body is JSON");
+        assert_eq!(response_body["code"], reason);
+
+        let captured = fixture.force_flush();
+        let warnings = captured
+            .log_records
+            .iter()
+            .filter(|record| {
+                record.body.as_ref().and_then(string_any_value) == Some("ci usage post rejected")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), index + 1, "{reason}");
+        assert_eq!(
+            log_attribute(warnings[index], "reason"),
+            Some(&AttributeValue::StringValue(reason.to_owned())),
+            "{reason}"
+        );
+        if let Some(token) = &token {
+            captured.assert_absent(token);
+            captured.assert_logs_absent(token);
+            assert!(!fixture.output.text().contains(token.as_str()));
+        }
+    }
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ci_usage_entries")
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("usage entries are countable");
+    assert_eq!(stored, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn usage_content_type_is_checked_after_the_token_and_registration() {
+    let signer = TestSigner::new(USAGE_SIGNER_KID);
+    let fixture = WebhookTraceFixture::new_with_usage(
+        None,
+        &[WEBHOOK_REPOSITORY, "owner/unregistered"],
+        &signer,
+    )
+    .await;
+    let mut unregistered = usage_claims();
+    unregistered["repository"] = serde_json::json!("owner/unregistered");
+
+    for (claims, expected_status, reason) in [
+        (
+            usage_claims(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+        ),
+        (
+            unregistered,
+            StatusCode::FORBIDDEN,
+            "repository_not_registered",
+        ),
+    ] {
+        let authorization = format!("Bearer {}", signer.sign(&claims));
+        let response = fixture
+            .usage_as(Some(&authorization), "text/plain", usage_body())
+            .await;
+        assert_eq!(response.status(), expected_status, "{reason}");
+        let body = to_bytes(response.into_body(), 10_000)
+            .await
+            .expect("rejection body is readable");
+        let body: Value = serde_json::from_slice(&body).expect("rejection body is JSON");
+        assert_eq!(body["code"], reason);
+    }
+    let response = fixture
+        .usage_as(
+            Some(&format!("Bearer {}", signer.sign(&usage_claims()))),
+            "application/json; charset=utf-8",
+            usage_body(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_jwks_outage_rejects_usage_posts_as_retryable() {
+    let signer = TestSigner::new(USAGE_SIGNER_KID);
+    let outage = WebhookTraceFixture::new_with_usage_source(
+        None,
+        &[WEBHOOK_REPOSITORY],
+        StaticJwks::failing(),
+    )
+    .await;
+    let response = outage
+        .usage(
+            Some(&format!("Bearer {}", signer.sign(&usage_claims()))),
+            usage_body(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), 10_000)
+        .await
+        .expect("rejection body is readable");
+    let body: Value = serde_json::from_slice(&body).expect("rejection body is JSON");
+    assert_eq!(body["code"], "jwks_unavailable");
+    let captured = outage.force_flush();
+    assert_eq!(
+        log_attribute(
+            captured.one_log_with_body("ci usage post rejected"),
+            "reason"
+        ),
+        Some(&AttributeValue::StringValue("jwks_unavailable".to_owned()))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_internal_storage_failure_is_a_correlated_500_not_a_retryable_503() {
+    let signer = TestSigner::new(USAGE_SIGNER_KID);
+    let fixture = WebhookTraceFixture::new_with_usage(None, &[WEBHOOK_REPOSITORY], &signer).await;
+    sqlx::query("DROP TABLE ci_usage_entries")
+        .execute(&fixture.pool)
+        .await
+        .expect("usage table drops");
+
+    let response = fixture
+        .usage(
+            Some(&format!("Bearer {}", signer.sign(&usage_claims()))),
+            usage_body(),
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = to_bytes(response.into_body(), 10_000)
+        .await
+        .expect("error body is readable");
+    let body: Value = serde_json::from_slice(&body).expect("error body is JSON");
+    assert_eq!(body["code"], "internal_error");
+    let error_id = body["error_id"]
+        .as_str()
+        .expect("the response carries an error_id")
+        .to_owned();
+    let captured = fixture.force_flush();
+    let failure = captured.one_log_with_body("ci usage post failed");
+    assert_eq!(
+        log_attribute(failure, "error_id"),
+        Some(&AttributeValue::StringValue(error_id))
+    );
+    assert!(!captured.has_log_body("ci cost recorded"));
+    assert!(!captured.has_log_body("ci usage post rejected"));
 }

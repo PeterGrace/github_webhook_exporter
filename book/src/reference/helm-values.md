@@ -13,6 +13,7 @@ This table is only a map of the value groups, so you know where to look.
 | `application.*` | Shutdown deadline, webhook body limit, workflow-job step cap, required-check cache lifetime, `RUST_LOG`. |
 | `githubApp.*` | Optional GitHub App identifiers and API base URL enabling branch-protection required-check lookups. |
 | `costs.*` | Optional CI cost unit-price table, rendered as `GHE_COSTS_JSON`; empty disables cost features. See [CI cost price table](costs.md). |
+| `ingest.oidc.*` | Optional `audience` and `allowed_repositories` for in-job usage reports, rendered as `GHE_INGEST_OIDC_JSON`; also routes `/ci-cost/usage` through `webhookIngress`. Empty leaves the endpoint off. See [HTTP API](http-api.md#post-ci-costusage). |
 | `retention.*` | Delivery and merge-queue retention windows and the prune interval. |
 | `telemetry.*` | OTLP endpoints, timeouts, service name, queue capacity, batch size, shutdown deadline. |
 | `persistence.*` | Storage class, fixed `ReadWriteOnce` access mode, PVC size. |
