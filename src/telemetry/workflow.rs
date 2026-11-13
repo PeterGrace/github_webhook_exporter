@@ -17,21 +17,21 @@ use crate::{
 use super::{
     pipeline::WorkflowJobTraceIdentity,
     trace::{
-        billable_minutes_attribute, delivery_id_attribute, github_workflow_attribute,
-        job_cost_attributes, price_label_attribute, price_usd_per_minute_attribute,
-        pull_request_numbers_attribute, runner_group_attribute, runner_labels_attribute,
-        runner_name_attribute, sentry_description_attribute, sentry_operation_attribute,
-        timing_source_attribute, workflow_conclusion_attribute, workflow_error_type_attribute,
-        workflow_event_attribute, workflow_file_attribute, workflow_head_revision_attribute,
-        workflow_name_attribute, workflow_pipeline_run_id_attribute,
-        workflow_pipeline_run_url_attribute, workflow_pipeline_step_task_run_id_attribute,
-        workflow_pipeline_task_run_id_attribute, workflow_pipeline_task_run_result_attribute,
-        workflow_repository_name_attribute, workflow_repository_url_attribute,
-        workflow_required_attribute, workflow_run_attempt_attribute,
-        workflow_source_branch_attribute, workflow_step_task_run_url_attribute,
-        workflow_target_branch_attribute, workflow_task_name_attribute,
-        workflow_task_run_url_attribute, CommitSha, GITHUB_ACTIONS_JOB_OPERATION,
-        GITHUB_ACTIONS_STEP_OPERATION,
+        attributed_pull_request_attribute, billable_minutes_attribute, delivery_id_attribute,
+        github_workflow_attribute, job_cost_attributes, price_label_attribute,
+        price_usd_per_minute_attribute, pull_request_numbers_attribute, runner_group_attribute,
+        runner_labels_attribute, runner_name_attribute, sentry_description_attribute,
+        sentry_operation_attribute, timing_source_attribute, workflow_conclusion_attribute,
+        workflow_error_type_attribute, workflow_event_attribute, workflow_file_attribute,
+        workflow_head_revision_attribute, workflow_name_attribute,
+        workflow_pipeline_run_id_attribute, workflow_pipeline_run_url_attribute,
+        workflow_pipeline_step_task_run_id_attribute, workflow_pipeline_task_run_id_attribute,
+        workflow_pipeline_task_run_result_attribute, workflow_repository_name_attribute,
+        workflow_repository_url_attribute, workflow_required_attribute,
+        workflow_run_attempt_attribute, workflow_source_branch_attribute,
+        workflow_step_task_run_url_attribute, workflow_target_branch_attribute,
+        workflow_task_name_attribute, workflow_task_run_url_attribute, CommitSha,
+        GITHUB_ACTIONS_JOB_OPERATION, GITHUB_ACTIONS_STEP_OPERATION,
     },
     workflow_error::{SyntheticWorkflowError, WorkflowErrorReporter},
 };
@@ -898,7 +898,7 @@ fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
     let mut attributes = Vec::with_capacity(
         JOB_REQUIRED_ATTRIBUTE_COUNT
             + usize::from(job.head_sha().is_some())
-            + usize::from(!job.attributed_pull_requests().is_empty())
+            + 2 * usize::from(!job.attributed_pull_requests().is_empty())
             + usize::from(job.conclusion().error_type().is_some())
             + usize::from(job.required().is_some())
             + workflow_run_context_attribute_count(job.workflow_run_context())
@@ -923,6 +923,9 @@ fn job_attributes(job: &WorkflowJobTrace) -> Vec<KeyValue> {
         pull_request_numbers_attribute(job.attributed_pull_requests())
     {
         attributes.push(pull_request_numbers);
+    }
+    if let Some(attributed) = attributed_pull_request_attribute(job.attributed_pull_requests()) {
+        attributes.push(attributed);
     }
     append_workflow_run_context(&mut attributes, job.workflow_run_context());
     attributes.push(github_workflow_attribute(workflow_name(job)));
@@ -2344,6 +2347,11 @@ mod tests {
         assert_string_attribute(job, "sentry.op", "github.actions.job");
         assert_string_attribute(job, "sentry.description", "Linux Job");
         assert_i64_array_attribute(job, "github.pull_request.number", &[7, 11]);
+        assert_eq!(
+            attribute(job, "ci.pull_request.number"),
+            None,
+            "two distinct PRs attribute the job to neither"
+        );
         assert_string_attribute(job, "timing_source", "reported");
 
         let expected_successful_step_keys = BTreeSet::from([
@@ -2743,6 +2751,10 @@ mod tests {
         assert_string_attribute(span, "github.workflow_file", "claude.yml");
         assert_string_attribute(span, "github.workflow.event", "issue_comment");
         assert_i64_array_attribute(span, "github.pull_request.number", &[9201]);
+        assert_eq!(
+            attribute(span, "ci.pull_request.number"),
+            Some(&Value::I64(9201))
+        );
     }
 
     #[test]

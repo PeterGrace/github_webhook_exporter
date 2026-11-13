@@ -76,18 +76,30 @@ pub(super) fn project_context(body: &[u8]) -> Option<WorkflowRunContext> {
         &pull_request.base
     });
 
-    let pull_request = unique_pull_request(&workflow_run.pull_requests).or_else(|| {
-        event
-            .is_comment_triggered()
-            .then(|| {
-                workflow_run
-                    .display_title
-                    .as_ref()
-                    .and_then(Value::as_str)
-                    .and_then(pull_request_from_run_name)
-            })
-            .flatten()
-    });
+    let pull_request = unique_pull_request(&workflow_run.pull_requests)
+        .or_else(|| {
+            event
+                .is_comment_triggered()
+                .then(|| {
+                    workflow_run
+                        .display_title
+                        .as_ref()
+                        .and_then(Value::as_str)
+                        .and_then(pull_request_from_run_name)
+                })
+                .flatten()
+        })
+        .or_else(|| {
+            (event == WorkflowEvent::MergeGroup)
+                .then(|| {
+                    workflow_run
+                        .head_branch
+                        .as_ref()
+                        .and_then(Value::as_str)
+                        .and_then(pull_request_from_merge_queue_branch)
+                })
+                .flatten()
+        });
     let workflow_file = workflow_run
         .path
         .as_ref()
@@ -109,6 +121,22 @@ fn unique_pull_request(pull_requests: &[PullRequestProjection]) -> Option<PullRe
         .filter_map(|number| PullRequestNumber::new(number).ok());
     let first = numbers.next()?;
     numbers.all(|number| number == first).then_some(first)
+}
+
+/// Reads the pull request a merge-queue run is testing from its temporary branch,
+/// `gh-readonly-queue/<base>/pr-<number>-<head sha>`.
+///
+/// GitHub sends no `pull_requests` for `merge_group` runs, but every queue entry gets a branch of
+/// this shape. The base may itself contain `/`, so only the last segment is parsed.
+fn pull_request_from_merge_queue_branch(branch: &str) -> Option<PullRequestNumber> {
+    let (_, entry) = branch
+        .strip_prefix("gh-readonly-queue/")?
+        .rsplit_once('/')?;
+    let (number, head_sha) = entry.strip_prefix("pr-")?.split_once('-')?;
+    if head_sha.is_empty() || !head_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    PullRequestNumber::new(number.parse().ok()?).ok()
 }
 
 /// Reads the pull request from a run name that contains `PR #<number>`.
@@ -393,6 +421,38 @@ mod tests {
                 "{title}"
             );
         }
+    }
+
+    #[test]
+    fn merge_queue_runs_read_their_pull_request_from_the_queue_branch() {
+        for (branch, expected) in [
+            (
+                "gh-readonly-queue/master/pr-9458-0123456789abcdef0123456789abcdef01234567",
+                Some(9458),
+            ),
+            ("gh-readonly-queue/release/2026/pr-12-0123abc", Some(12)),
+            ("gh-readonly-queue/master/pr-0-0123abc", None),
+            ("gh-readonly-queue/master/pr-x-0123abc", None),
+            ("gh-readonly-queue/master/pr-12-", None),
+            ("gh-readonly-queue/master/pr-12-not-a-sha", None),
+            ("feature/pr-12-0123abc", None),
+        ] {
+            assert_eq!(
+                pull_request_of(json!({
+                    "id": 31, "run_attempt": 1, "event": "merge_group",
+                    "head_branch": branch, "pull_requests": []
+                })),
+                expected,
+                "{branch}"
+            );
+        }
+        assert_eq!(
+            pull_request_of(json!({
+                "id": 31, "run_attempt": 1, "event": "push",
+                "head_branch": "gh-readonly-queue/master/pr-12-0123abc"
+            })),
+            None
+        );
     }
 
     #[test]

@@ -163,6 +163,7 @@ const SPAN_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "github.repository.id",
     "github.delivery.id",
     "github.pull_request.number",
+    "ci.pull_request.number",
     "github.commit.sha",
     "cicd.pipeline.name",
     "cicd.pipeline.run.id",
@@ -7384,6 +7385,7 @@ async fn a_priced_job_exports_its_cost_on_the_span_and_one_cost_log() {
             "runner_id": 7,
             "runner_name": "GitHub Actions 7",
             "runner_group_name": "Larger runners",
+            "head_sha": "0123456789abcdef0123456789abcdef01234567",
             "steps": []
         },
         "repository": {"full_name": WEBHOOK_REPOSITORY}
@@ -7423,6 +7425,7 @@ async fn a_priced_job_exports_its_cost_on_the_span_and_one_cost_log() {
     assert_attribute(job, "github.workflow_file", "claude.yml");
     assert_attribute(job, "github.workflow.event", "issue_comment");
     assert_i64_array_attribute(job, "github.pull_request.number", &[9201]);
+    assert_i64_attribute(job, "ci.pull_request.number", 9201);
     assert!(job.attributes.iter().any(|attribute| {
         attribute.key == "ci.cost_usd"
             && attribute
@@ -7476,6 +7479,12 @@ async fn a_priced_job_exports_its_cost_on_the_span_and_one_cost_log() {
     assert_eq!(
         log_attribute(log, "cicd.pipeline.run.id"),
         Some(&AttributeValue::IntValue(31))
+    );
+    assert_eq!(
+        log_attribute(log, "vcs.ref.head.revision"),
+        Some(&AttributeValue::StringValue(
+            "0123456789abcdef0123456789abcdef01234567".to_owned()
+        ))
     );
 }
 

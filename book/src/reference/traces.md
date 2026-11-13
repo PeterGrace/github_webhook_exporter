@@ -153,9 +153,16 @@ The same delivery also attributes the run to at most one pull request. That is t
 distinct number in the run's `pull_requests`. A run started by `issue_comment`,
 `pull_request_review`, or `pull_request_review_comment` has an empty `pull_requests`, so its PR is
 read from the first `PR #<number>` in the run name (`display_title`, set by the workflow's
-`run-name`) that starts the name or follows a non-alphanumeric character. Other events never read the run name, because squash-merge commit titles contain
-`(#<number>)`. GitHub's `workflow_job` payload carries no pull requests, so a job root whose own
+`run-name`) that starts the name or follows a non-alphanumeric character. A `merge_group` run also has an empty `pull_requests`; its PR is read
+from its temporary queue branch, `gh-readonly-queue/<base>/pr-<number>-<head sha>`, so
+merge-queue CI is charged to the PR being merged. Other events never read the run name, because
+squash-merge commit titles contain `(#<number>)`. GitHub's `workflow_job` payload carries no pull requests, so a job root whose own
 list is empty uses the run's attributed PR for `github.pull_request.number`.
+
+`github.pull_request.number` is an array on job and pipeline roots, and span stores such as
+Sentry don't index array attributes. So the same roots also carry `ci.pull_request.number`, a
+single integer, when their pull requests name exactly one distinct PR. Group span cost by it;
+it is omitted when there is no PR or more than one.
 
 The job root also carries `github.workflow`, the workflow name. It repeats `cicd.pipeline.name` so
 job spans and in-job usage spans group spend by the same key.
@@ -190,7 +197,8 @@ export is enabled. It carries `ci.source`, `ci.cost_usd`, `ci.billable_minutes`,
 `ci.price_table.version`, `ci.price.fell_back`, `ci.price.usd_per_minute`, `ci.price.label`,
 `ci.job` (the sanitized job name), `cicd.runner.labels` (comma-joined), `cicd.runner.name`, `github.workflow`, `github.workflow_file`,
 `github.workflow.event`, `github.pull_request.number` (the job's first PR or the run's attributed
-PR), `github.repository` (the canonical repository name), `cicd.pipeline.run.id`,
+PR), `github.repository` (the canonical repository name), `vcs.ref.head.revision` (the job's
+commit, when valid), `cicd.pipeline.run.id`,
 `github.workflow.run.attempt`, and `cicd.pipeline.task.run.id`. Optional fields are omitted when
 unknown. Without a `costs` table the log is never written.
 
