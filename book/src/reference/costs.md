@@ -79,7 +79,8 @@ Runner labels, app slugs and reviewer logins match regardless of ASCII case, as 
 them. The table stores them lowercased.
 
 Each completed job is priced at its billable minutes times its runner rate. The job span then
-carries `ci.cost_usd`, and the exporter writes a `ci cost recorded` log; see
+carries `ci.cost_usd`, the rate as `ci.price.usd_per_minute`, and the matched label as
+`ci.price.label`, and the exporter writes a `ci cost recorded` log; see
 [Runner and cost attributes](traces.md#runner-and-cost-attributes). A job that billed 0 minutes,
 such as a skipped job, is priced at 0 without a rate lookup.
 

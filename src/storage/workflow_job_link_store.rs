@@ -669,6 +669,7 @@ mod tests {
         let billing = |cost| WorkflowJobBilling {
             runner_labels: Vec::new(),
             runner_group: None,
+            runner_name: None,
             billable_minutes: 5,
             cost,
         };
@@ -677,6 +678,8 @@ mod tests {
                 cost_usd: 0.4,
                 price_table_version: "0123456789ab".to_owned(),
                 fell_back: false,
+                usd_per_minute: Some(0.08),
+                price_label: Some("ubuntu-24.04-xl".to_owned()),
             })),
         );
         let unpriced =

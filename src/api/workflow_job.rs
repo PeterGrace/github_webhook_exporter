@@ -113,6 +113,7 @@ struct WorkflowJobProjection {
     labels: Option<Value>,
     runner_id: Option<Value>,
     runner_group_name: Option<Value>,
+    runner_name: Option<Value>,
     #[serde(default)]
     pull_requests: Vec<PullRequestProjection>,
     #[serde(default)]
@@ -242,6 +243,7 @@ pub(crate) fn project_completed_job(
         labels,
         runner_id,
         runner_group_name,
+        runner_name,
         pull_requests,
         steps,
     } = envelope.workflow_job;
@@ -281,7 +283,10 @@ pub(crate) fn project_completed_job(
         .is_some_and(|id| id > 0);
     let billing = project_billing(
         labels.as_ref(),
-        runner_group_name.as_ref(),
+        RunnerIdentity {
+            group: runner_group_name.as_ref(),
+            name: runner_name.as_ref(),
+        },
         billable_minutes(conclusion, ran_on_runner, &timing),
         costs,
     );
@@ -318,9 +323,15 @@ pub(crate) fn project_completed_job(
     )
 }
 
+/// The runner group and runner name a job reported.
+struct RunnerIdentity<'payload> {
+    group: Option<&'payload Value>,
+    name: Option<&'payload Value>,
+}
+
 fn project_billing(
     labels: Option<&Value>,
-    runner_group: Option<&Value>,
+    runner: RunnerIdentity<'_>,
     billable_minutes: i64,
     costs: Option<&CostsConfig>,
 ) -> WorkflowJobBilling {
@@ -335,23 +346,30 @@ fn project_billing(
     let cost = costs.map(|costs| {
         // A job that billed nothing has no rate to look up, which also keeps skipped jobs, whose
         // labels are often empty, from logging `ci price missing`.
-        let (usd_per_minute, fell_back) = if billable_minutes == 0 {
-            (0.0, false)
-        } else {
-            let labels: Vec<&str> = runner_labels.iter().map(DisplayName::as_str).collect();
-            let rate = costs.runner_rate(&labels);
-            (rate.usd_per_minute.usd(), rate.fell_back)
-        };
+        if billable_minutes == 0 {
+            return WorkflowJobCost {
+                cost_usd: 0.0,
+                price_table_version: costs.version().to_owned(),
+                fell_back: false,
+                usd_per_minute: None,
+                price_label: None,
+            };
+        }
+        let labels: Vec<&str> = runner_labels.iter().map(DisplayName::as_str).collect();
+        let rate = costs.runner_rate(&labels);
         WorkflowJobCost {
-            cost_usd: billable_minutes as f64 * usd_per_minute,
+            cost_usd: billable_minutes as f64 * rate.usd_per_minute.usd(),
             price_table_version: costs.version().to_owned(),
-            fell_back,
+            fell_back: rate.fell_back,
+            usd_per_minute: Some(rate.usd_per_minute.usd()),
+            price_label: rate.label.map(str::to_owned),
         }
     });
 
     WorkflowJobBilling {
         runner_labels,
-        runner_group: sanitize_display_name(runner_group),
+        runner_group: sanitize_display_name(runner.group),
+        runner_name: sanitize_display_name(runner.name),
         billable_minutes,
         cost,
     }
@@ -1124,6 +1142,7 @@ mod tests {
             "labels": labels,
             "runner_id": 7,
             "runner_group_name": "Larger\nrunners",
+            "runner_name": "GitHub Actions 7",
             "steps": []
         })
     }
@@ -1145,6 +1164,10 @@ mod tests {
         assert_eq!(
             billing.runner_group.as_ref().map(DisplayName::as_str),
             Some("Largerrunners")
+        );
+        assert_eq!(
+            billing.runner_name.as_ref().map(DisplayName::as_str),
+            Some("GitHub Actions 7")
         );
         assert_eq!(billing.cost, None);
     }
@@ -1185,10 +1208,20 @@ mod tests {
                 cost_usd: 6.0 * 0.08,
                 price_table_version: costs.version().to_owned(),
                 fell_back: false,
+                usd_per_minute: Some(0.08),
+                price_label: Some("ubuntu-24.04-xl".to_owned()),
             })
         );
         let cost = fallback.billing().and_then(|billing| billing.cost.clone());
         assert_eq!(cost.as_ref().map(|cost| cost.cost_usd), Some(6.0 * 0.01));
+        assert_eq!(
+            cost.as_ref().and_then(|cost| cost.usd_per_minute),
+            Some(0.01)
+        );
+        assert_eq!(
+            cost.as_ref().and_then(|cost| cost.price_label.clone()),
+            None
+        );
         assert_eq!(cost.map(|cost| cost.fell_back), Some(true));
     }
 
@@ -1200,6 +1233,11 @@ mod tests {
 
         let cost = trace.billing().and_then(|billing| billing.cost.clone());
         assert_eq!(cost.as_ref().map(|cost| cost.cost_usd), Some(0.0));
+        assert_eq!(cost.as_ref().and_then(|cost| cost.usd_per_minute), None);
+        assert_eq!(
+            cost.as_ref().and_then(|cost| cost.price_label.clone()),
+            None
+        );
         assert_eq!(cost.map(|cost| cost.fell_back), Some(false));
     }
 
