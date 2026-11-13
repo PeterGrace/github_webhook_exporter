@@ -175,6 +175,7 @@ Every job root carries the runner and the minutes GitHub bills for the job:
 | --- | --- |
 | `cicd.runner.labels` | The job's runner labels in job order: at most 16, each sanitized like display names. Omitted when the job reported none. |
 | `cicd.runner.group` | The sanitized runner group name, when reported. |
+| `cicd.runner.name` | The sanitized name of the runner that ran the job, such as `GitHub Actions 1234`, when reported. It names a runner instance, not a machine size. A self-hosted runner's name is whatever its operator registered, often a hostname or pod name, and it is exported on spans and the `ci cost recorded` log. |
 | `ci.billable_minutes` | The job's run time rounded up to a whole minute. `0` for a skipped job, a job that never got a runner (no positive `runner_id`, such as one cancelled while queued), and a job without valid reported start and end times. |
 
 When a [`costs`](costs.md) table is configured, the root also carries the job's price:
@@ -185,14 +186,16 @@ When a [`costs`](costs.md) table is configured, the root also carries the job's 
 | `ci.cost_usd` | `ci.billable_minutes` times the runner rate. |
 | `ci.price_table.version` | The version of the table that supplied the rate. |
 | `ci.price.fell_back` | `true` when no runner label had a price and the default rate was used. |
+| `ci.price.usd_per_minute` | The rate applied, so `ci.cost_usd = ci.billable_minutes × ci.price.usd_per_minute`. Omitted when the job billed 0 minutes. |
+| `ci.price.label` | The `runners.labels` key that supplied the rate, lowercased. A single string, so queries can group by it, unlike the `cicd.runner.labels` array. Omitted when the default rate was used or the job billed 0 minutes. |
 
 A job that billed 0 minutes is priced at 0 without a rate lookup, so it never logs
 `ci price missing`. Step spans carry none of these attributes.
 
 Each priced job also writes one parentless `ci cost recorded` info log, whether or not trace
 export is enabled. It carries `ci.source`, `ci.cost_usd`, `ci.billable_minutes`,
-`ci.price_table.version`, `ci.price.fell_back`, `ci.job` (the sanitized job name),
-`cicd.runner.labels` (comma-joined), `github.workflow`, `github.workflow_file`,
+`ci.price_table.version`, `ci.price.fell_back`, `ci.price.usd_per_minute`, `ci.price.label`,
+`ci.job` (the sanitized job name), `cicd.runner.labels` (comma-joined), `cicd.runner.name`, `github.workflow`, `github.workflow_file`,
 `github.workflow.event`, `github.pull_request.number` (the job's first PR or the run's attributed
 PR), `github.repository` (the canonical repository name), `vcs.ref.head.revision` (the job's
 commit, when valid), `cicd.pipeline.run.id`,

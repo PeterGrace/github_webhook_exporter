@@ -188,11 +188,14 @@ const SPAN_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "github.workflow_file",
     "cicd.runner.labels",
     "cicd.runner.group",
+    "cicd.runner.name",
     "ci.billable_minutes",
     "ci.source",
     "ci.cost_usd",
     "ci.price_table.version",
     "ci.price.fell_back",
+    "ci.price.label",
+    "ci.price.usd_per_minute",
     "timing_source",
     "db.system.name",
     "db.operation.name",
@@ -7380,6 +7383,7 @@ async fn a_priced_job_exports_its_cost_on_the_span_and_one_cost_log() {
             "completed_at": "2026-08-06T10:05:00.5Z",
             "labels": ["ubuntu-24.04-xl"],
             "runner_id": 7,
+            "runner_name": "GitHub Actions 7",
             "runner_group_name": "Larger runners",
             "head_sha": "0123456789abcdef0123456789abcdef01234567",
             "steps": []
@@ -7407,6 +7411,16 @@ async fn a_priced_job_exports_its_cost_on_the_span_and_one_cost_log() {
     assert_attribute(job, "ci.source", "github_actions");
     assert_attribute(job, "ci.price_table.version", &version);
     assert_attribute(job, "cicd.runner.group", "Larger runners");
+    assert_attribute(job, "cicd.runner.name", "GitHub Actions 7");
+    assert_attribute(job, "ci.price.label", "ubuntu-24.04-xl");
+    assert!(job.attributes.iter().any(|attribute| {
+        attribute.key == "ci.price.usd_per_minute"
+            && attribute
+                .value
+                .as_ref()
+                .and_then(|value| value.value.as_ref())
+                == Some(&AttributeValue::DoubleValue(0.08))
+    }));
     assert_attribute(job, "github.workflow", "Claude");
     assert_attribute(job, "github.workflow_file", "claude.yml");
     assert_attribute(job, "github.workflow.event", "issue_comment");
@@ -7437,6 +7451,18 @@ async fn a_priced_job_exports_its_cost_on_the_span_and_one_cost_log() {
     assert_eq!(
         log_attribute(log, "ci.price.fell_back"),
         Some(&AttributeValue::BoolValue(false))
+    );
+    assert_eq!(
+        log_attribute(log, "ci.price.usd_per_minute"),
+        Some(&AttributeValue::DoubleValue(0.08))
+    );
+    assert_eq!(
+        log_attribute(log, "ci.price.label"),
+        Some(&AttributeValue::StringValue("ubuntu-24.04-xl".to_owned()))
+    );
+    assert_eq!(
+        log_attribute(log, "cicd.runner.name"),
+        Some(&AttributeValue::StringValue("GitHub Actions 7".to_owned()))
     );
     assert_eq!(
         log_attribute(log, "ci.job"),

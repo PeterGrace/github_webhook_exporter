@@ -73,11 +73,14 @@ const GITHUB_WORKFLOW_KEY: &str = "github.workflow";
 const GITHUB_WORKFLOW_FILE_KEY: &str = "github.workflow_file";
 const CICD_RUNNER_LABELS_KEY: &str = "cicd.runner.labels";
 const CICD_RUNNER_GROUP_KEY: &str = "cicd.runner.group";
+const CICD_RUNNER_NAME_KEY: &str = "cicd.runner.name";
 const CI_BILLABLE_MINUTES_KEY: &str = "ci.billable_minutes";
 const CI_SOURCE_KEY: &str = "ci.source";
 const CI_COST_USD_KEY: &str = "ci.cost_usd";
 const CI_PRICE_TABLE_VERSION_KEY: &str = "ci.price_table.version";
 const CI_PRICE_FELL_BACK_KEY: &str = "ci.price.fell_back";
+const CI_PRICE_LABEL_KEY: &str = "ci.price.label";
+const CI_PRICE_USD_PER_MINUTE_KEY: &str = "ci.price.usd_per_minute";
 
 /// The `ci.source` of GitHub Actions runner minutes.
 pub(crate) const CI_SOURCE_GITHUB_ACTIONS: &str = "github_actions";
@@ -211,6 +214,21 @@ pub(crate) fn runner_labels_attribute(labels: &[DisplayName]) -> Option<KeyValue
 /// Returns the runner-group attribute.
 pub(crate) fn runner_group_attribute(group: &DisplayName) -> KeyValue {
     string_key_value(CICD_RUNNER_GROUP_KEY, group.as_str())
+}
+
+/// Returns the runner-name attribute.
+pub(crate) fn runner_name_attribute(name: &DisplayName) -> KeyValue {
+    string_key_value(CICD_RUNNER_NAME_KEY, name.as_str())
+}
+
+/// Returns the priced runner-label attribute.
+pub(crate) fn price_label_attribute(label: &str) -> KeyValue {
+    string_key_value(CI_PRICE_LABEL_KEY, label)
+}
+
+/// Returns the applied USD-per-minute rate attribute.
+pub(crate) fn price_usd_per_minute_attribute(rate: f64) -> KeyValue {
+    KeyValue::new(CI_PRICE_USD_PER_MINUTE_KEY, rate)
 }
 
 /// Returns the billable-minutes attribute.

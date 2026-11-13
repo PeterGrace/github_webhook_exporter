@@ -345,8 +345,11 @@ fn log_job_cost(job: &WorkflowJobTrace) {
         ci.billable_minutes = billing.billable_minutes,
         ci.price_table.version = cost.price_table_version.as_str(),
         ci.price.fell_back = cost.fell_back,
+        ci.price.usd_per_minute = cost.usd_per_minute,
+        ci.price.label = cost.price_label.as_deref(),
         ci.job = job.job_name().map(DisplayName::as_str),
         cicd.runner.labels = runner_labels.as_str(),
+        cicd.runner.name = billing.runner_name.as_ref().map(DisplayName::as_str),
         github.workflow = job.workflow_name().map(DisplayName::as_str),
         github.workflow_file = context
             .and_then(WorkflowRunContext::workflow_file)
