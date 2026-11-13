@@ -208,9 +208,10 @@ with `sentry.op=ci.usage` and an instant timestamp at receipt. It carries:
   `job_workflow_ref`);
 - `github.pull_request.number`, from the run's stored `workflow_run` context, when known;
 - `ci.job`, `ci.task`, `ci.model` and `ci.origin` when the body supplied them;
-- `ci.source`, `ci.cost_usd` and `ci.price.fell_back`, plus `ci.price_table.version` whenever a
-  `costs` table is configured, including Daytona entries recorded at 0 USD because the table has no
-  `daytona` block;
+- `ci.source`, `ci.cost_usd` and `ci.price.fell_back`, plus, on Daytona entries only,
+  `ci.price_table.version` whenever a `costs` table is configured, including entries recorded at
+  0 USD because the table has no `daytona` block. Inference entries carry the caller's USD and are
+  never priced from the table, so they have no version;
 - `ci.input_tokens` and `ci.output_tokens` for inference entries, or `ci.cpu_seconds` and
   `ci.ram_gb_seconds` for Daytona entries.
 

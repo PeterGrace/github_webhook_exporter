@@ -72,6 +72,13 @@ an RS256 JWT signed by a key in `https://token.actions.githubusercontent.com/.we
 issued by `https://token.actions.githubusercontent.com`, for the configured audience, unexpired,
 and for a repository that is both in `allowed_repositories` and registered through the admin API.
 
+Names can be reused: after a rename or deletion, someone else can create a repository with the old
+name and mint tokens for it. So the first accepted token for a registered repository pins it to that
+token's `repository_id` claim, GitHub's immutable numeric ID, and every later token must carry the
+same ID or get `403 repository_id_mismatch`. A rename or transfer keeps the ID, so it keeps working.
+If a registered name is deliberately recreated as a new repository, delete and re-register it
+through the admin API, which clears the pin.
+
 The issuer and key URL are fixed to GitHub.com's. GitHub Enterprise Server, whose tokens come from
 `https://<host>/_services/token`, and enterprises that customize their issuer (for example
 `https://token.actions.githubusercontent.com/<enterprise-slug>`) cannot use this endpoint yet, even
@@ -85,7 +92,8 @@ refresh only the new key set is trusted, so a retired key stops verifying at onc
 outside the cache lock, so posts whose key is cached are never held up by a refresh. The token is never
 logged.
 
-The checks run in a fixed order: token, repository registration, content type, then body. A
+The checks run in a fixed order: token, repository registration, repository ID pin, content type,
+then body. A
 rejection reports the first check that failed.
 
 Attribution comes only from the verified claims: `repository`, `workflow`, `workflow_ref`,
@@ -126,7 +134,7 @@ usd_per_ram_gb_second`. Without Daytona rates it is recorded at 0 USD with
 | `204 No Content` | | Every entry was stored, exported as one `ci.usage` span, and logged. |
 | `400 Bad Request` | `schema_invalid` | Malformed JSON, an unknown or misplaced field, or an out-of-range value. |
 | `401 Unauthorized` | `missing_token`, `invalid_token`, `token_expired`, `issuer_mismatch`, `audience_mismatch` | The token is absent or failed verification. |
-| `403 Forbidden` | `repository_not_allowed`, `repository_not_registered` | The token's repository is not allowlisted, or not registered and enabled. |
+| `403 Forbidden` | `repository_not_allowed`, `repository_not_registered`, `repository_id_mismatch` | The token's repository is not allowlisted, not registered and enabled, or has a different GitHub repository ID than the one pinned for that name. |
 | `413 Payload Too Large` | `body_too_large` | Body exceeds 64 KiB. |
 | `415 Unsupported Media Type` | `unsupported_media_type` | Content type is not `application/json`. |
 | `422 Unprocessable Entity` | `unsupported_version`, `missing_usd` | `version` is not `1`, or an inference entry has no `usd`. |

@@ -18,9 +18,14 @@ Date: 2026-11-13T21:00:00Z
   cached for an hour. At most one JWKS fetch is attempted a minute, successful or not, with
   redirects disabled and a 64 KiB response cap. While the last attempt failed, a token whose key is
   not cached gets a retryable `503 jwks_unavailable`. The token is never logged or printed.
+- The first accepted token for a registered repository pins it to the token's `repository_id`, GitHub's
+  immutable numeric ID. A later token for the same name with a different ID, such as one from a
+  repository recreated under a freed name, gets `403 repository_id_mismatch`. Deleting and
+  re-registering the repository through the admin API clears the pin.
 - Daytona entries are priced from `costs.daytona`. Without those rates they are recorded at 0 USD
   with `ci.price.fell_back=true`.
-- Each accepted entry is stored in the new `ci_usage_entries` table (migration `202611130002`),
+- Each accepted entry is stored in the new `ci_usage_entries` table, and pins in
+  `ci_usage_repository_pins` (both migration `202611130002`). Each entry is
   exported as one `ci.usage` root span, and logged as one `ci cost recorded` info log. The PR comes
   from the run's stored `workflow_run` context when it has arrived.
 - Each rejection returns a fixed JSON error and writes one `ci usage post rejected` warning with a

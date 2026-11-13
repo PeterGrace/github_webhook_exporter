@@ -643,6 +643,8 @@ pub(crate) enum DatabaseOperation {
     CiUsageRecord,
     /// Pruning stored usage entries.
     CiUsagePrune,
+    /// Pinning a repository to its GitHub repository ID.
+    CiUsagePin,
 }
 
 /// Creates a bounded tracing span for a high-level operation.
@@ -1055,6 +1057,7 @@ impl DatabaseOperation {
             Self::RepositoryResolve => "repository.resolve",
             Self::CiUsageRecord => "ci_usage.record",
             Self::CiUsagePrune => "ci_usage.prune",
+            Self::CiUsagePin => "ci_usage.pin",
         }
     }
 }
@@ -1296,6 +1299,7 @@ mod tests {
             (DatabaseOperation::RepositoryResolve, "repository.resolve"),
             (DatabaseOperation::CiUsageRecord, "ci_usage.record"),
             (DatabaseOperation::CiUsagePrune, "ci_usage.prune"),
+            (DatabaseOperation::CiUsagePin, "ci_usage.pin"),
         ];
         for (operation, expected) in database_operations {
             assert_eq!(operation.as_str(), expected);

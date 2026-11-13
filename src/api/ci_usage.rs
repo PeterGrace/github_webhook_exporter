@@ -38,7 +38,7 @@ pub(crate) const USAGE_ROUTE: &str = "/ci-cost/usage";
 pub(crate) const MAX_USAGE_BODY_BYTES: usize = 65_536;
 /// Most entries one post may carry.
 pub(crate) const MAX_USAGE_ENTRIES: usize = 100;
-/// Largest USD amount, CPU-seconds or RAM-GB-seconds one entry may report.
+/// Largest CPU-seconds or RAM-GB-seconds one Daytona entry may report.
 const MAX_ENTRY_QUANTITY: f64 = 1_000_000_000.0;
 const MAX_ENTRY_USD: f64 = 10_000.0;
 const SUPPORTED_VERSION: u64 = 1;
@@ -56,6 +56,7 @@ pub(crate) enum UsageRejection {
     MissingToken,
     Token(OidcRejection),
     RepositoryNotRegistered,
+    RepositoryIdMismatch,
     UnsupportedMediaType,
     BodyTooLarge,
     UnsupportedVersion,
@@ -77,6 +78,7 @@ impl UsageRejection {
             Self::MissingToken => "missing_token",
             Self::Token(rejection) => rejection.as_str(),
             Self::RepositoryNotRegistered => "repository_not_registered",
+            Self::RepositoryIdMismatch => "repository_id_mismatch",
             Self::UnsupportedMediaType => "unsupported_media_type",
             Self::BodyTooLarge => "body_too_large",
             Self::UnsupportedVersion => "unsupported_version",
@@ -95,9 +97,9 @@ impl UsageRejection {
                 | OidcRejection::IssuerMismatch
                 | OidcRejection::AudienceMismatch,
             ) => StatusCode::UNAUTHORIZED,
-            Self::Token(OidcRejection::RepositoryNotAllowed) | Self::RepositoryNotRegistered => {
-                StatusCode::FORBIDDEN
-            }
+            Self::Token(OidcRejection::RepositoryNotAllowed)
+            | Self::RepositoryNotRegistered
+            | Self::RepositoryIdMismatch => StatusCode::FORBIDDEN,
             Self::Token(OidcRejection::JwksUnavailable) | Self::StorageUnavailable => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -355,6 +357,20 @@ async fn usage_handler(State(state): State<AppState>, request: Request) -> Respo
         }
         Err(_) => return storage_failure(StorageFailure::Internal, &claims.repository),
     };
+    match state
+        .ci_usage_store()
+        .pin_repository(repository_id, claims.github_repository_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return reject(UsageRejection::RepositoryIdMismatch, repository),
+        Err(CiUsageStoreError::Unavailable) => {
+            return storage_failure(StorageFailure::Unavailable, &claims.repository);
+        }
+        Err(CiUsageStoreError::Internal) => {
+            return storage_failure(StorageFailure::Internal, &claims.repository);
+        }
+    }
 
     let is_json = parts
         .headers

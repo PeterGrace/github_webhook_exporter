@@ -7777,6 +7777,8 @@ async fn each_rejected_usage_post_logs_one_warning_with_its_reason() {
     let mut unregistered = usage_claims();
     unregistered["repository"] = serde_json::json!("owner/unregistered");
     let impostor = TestSigner::new(USAGE_SIGNER_KID).sign(&usage_claims());
+    let mut reused_name = usage_claims();
+    reused_name["repository_id"] = serde_json::json!("9999");
     let body = |value: Value| serde_json::to_vec(&value).expect("body serializes");
 
     let cases: Vec<(Option<String>, Vec<u8>, StatusCode, &str)> = vec![
@@ -7860,6 +7862,12 @@ async fn each_rejected_usage_post_logs_one_warning_with_its_reason() {
             vec![b' '; crate::api::MAX_USAGE_BODY_BYTES + 1],
             StatusCode::PAYLOAD_TOO_LARGE,
             "body_too_large",
+        ),
+        (
+            Some(signer.sign(&reused_name)),
+            usage_body(),
+            StatusCode::FORBIDDEN,
+            "repository_id_mismatch",
         ),
     ];
 

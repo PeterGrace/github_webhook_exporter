@@ -86,7 +86,7 @@ and sets the variable for you — see [Helm values](helm-values.md).
 
 | Variable | Default | Contract |
 | --- | --- | --- |
-| `GHE_INGEST_OIDC_JSON` | unset | `{"audience": "<aud>", "allowed_repositories": ["owner/repo", ...]}`; unset leaves `POST /ci-cost/usage` unregistered. The audience is 1 to 255 bytes; the list holds 1 to 256 distinct `owner/repo` names, compared case-insensitively. Invalid JSON or an unknown field fails startup naming only the variable. See [HTTP API](http-api.md#post-ci-costusage). |
+| `GHE_INGEST_OIDC_JSON` | unset | `{"audience": "<aud>", "allowed_repositories": ["owner/repo", ...]}`; unset leaves `POST /ci-cost/usage` unregistered. The audience is 1 to 255 bytes; the list holds 1 to 256 `owner/repo` names, compared case-insensitively; names that differ only in case count as one. Invalid JSON or an unknown field fails startup naming only the variable. See [HTTP API](http-api.md#post-ci-costusage). |
 
 Structured logging to stderr is always on, independent of OTLP configuration.
 

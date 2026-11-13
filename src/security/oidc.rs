@@ -69,7 +69,8 @@ impl IngestOidcConfig {
     ///
     /// Returns [`ConfigError::Invalid`] naming [`INGEST_OIDC_VARIABLE`] when the JSON is malformed
     /// or has an unknown field, the audience is empty or longer than 255 bytes, or the repository
-    /// list is empty, too long, holds an invalid `owner/repo` name, or names one repository twice.
+    /// list is empty, too long, or holds an invalid `owner/repo` name. Names that differ only in
+    /// case are one repository, as GitHub treats them, so they are merged rather than rejected.
     /// Parser messages are discarded because they can quote configured values.
     pub fn from_json(json: &str) -> Result<Self, ConfigError> {
         let invalid = || ConfigError::Invalid {
@@ -86,10 +87,7 @@ impl IngestOidcConfig {
         }
         let mut allowed_repositories = HashSet::new();
         for name in &wire.allowed_repositories {
-            let name = CanonicalRepositoryName::new(name).map_err(|_| invalid())?;
-            if !allowed_repositories.insert(name) {
-                return Err(invalid());
-            }
+            allowed_repositories.insert(CanonicalRepositoryName::new(name).map_err(|_| invalid())?);
         }
         Ok(Self {
             audience: wire.audience,
@@ -141,6 +139,9 @@ impl fmt::Debug for OidcToken {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GitHubActionsClaims {
     pub(crate) repository: CanonicalRepositoryName,
+    /// GitHub's immutable numeric repository ID. Unlike the name, it survives renames and
+    /// transfers and is never reused, so usage is pinned to it.
+    pub(crate) github_repository_id: i64,
     pub(crate) workflow: Option<DisplayName>,
     pub(crate) workflow_file: Option<WorkflowFile>,
     pub(crate) job_workflow_file: Option<WorkflowFile>,
@@ -150,10 +151,11 @@ pub(crate) struct GitHubActionsClaims {
     pub(crate) sha: Option<CommitSha>,
 }
 
-/// The claims this service reads. GitHub encodes the run ID and attempt as strings.
+/// The claims this service reads. GitHub encodes the IDs and attempt as strings.
 #[derive(Deserialize)]
 struct RawClaims {
     repository: String,
+    repository_id: String,
     #[serde(default)]
     workflow: Option<String>,
     #[serde(default)]
@@ -172,6 +174,7 @@ impl RawClaims {
     fn into_claims(self) -> Option<GitHubActionsClaims> {
         Some(GitHubActionsClaims {
             repository: CanonicalRepositoryName::new(&self.repository).ok()?,
+            github_repository_id: self.repository_id.parse().ok().filter(|id: &i64| *id > 0)?,
             workflow: self.workflow.as_deref().and_then(DisplayName::sanitize),
             workflow_file: self
                 .workflow_ref
@@ -550,6 +553,7 @@ pub(crate) mod test_support {
             "nbf": now,
             "exp": now + 300,
             "repository": repository,
+            "repository_id": "4242",
             "workflow": "CI",
             "workflow_ref": format!("{repository}/.github/workflows/ci.yml@refs/heads/main"),
             "job_workflow_ref":
@@ -663,6 +667,7 @@ mod tests {
             .expect("token verifies");
 
         assert_eq!(claims.repository.as_str(), "owner/repo");
+        assert_eq!(claims.github_repository_id, 4242);
         assert_eq!(
             claims.workflow.as_ref().map(|name| name.as_str()),
             Some("CI")
@@ -698,6 +703,11 @@ mod tests {
         wrong_audience["aud"] = json!("https://other.example.test");
         let mut bad_run_id = claims("owner/repo");
         bad_run_id["run_id"] = json!("not-a-number");
+        let mut no_repository_id = claims("owner/repo");
+        no_repository_id
+            .as_object_mut()
+            .expect("claims are an object")
+            .remove("repository_id");
         let hs256 = signer.sign_with_header(
             &json!({"alg": "HS256", "kid": "key-1"}),
             &claims("owner/repo"),
@@ -719,6 +729,7 @@ mod tests {
                 OidcRejection::RepositoryNotAllowed,
             ),
             (signer.sign(&bad_run_id), OidcRejection::InvalidToken),
+            (signer.sign(&no_repository_id), OidcRejection::InvalidToken),
             (hs256, OidcRejection::InvalidToken),
             ("not.a.jwt".to_owned(), OidcRejection::InvalidToken),
         ] {
@@ -910,6 +921,8 @@ mod tests {
         }
     }
 
+    static_assertions::assert_not_impl_any!(OidcToken: serde::Serialize, std::fmt::Display);
+
     #[test]
     fn bearer_tokens_are_parsed_and_never_printed() {
         let token = OidcToken::from_authorization("bearer secret-token-value").expect("parses");
@@ -929,7 +942,6 @@ mod tests {
             r#"{"audience": "", "allowed_repositories": ["o/r"]}"#,
             r#"{"audience": "a", "allowed_repositories": []}"#,
             r#"{"audience": "a", "allowed_repositories": ["not a repo"]}"#,
-            r#"{"audience": "a", "allowed_repositories": ["o/r", "O/R"]}"#,
             r#"{"audience": "a", "allowed_repositories": ["o/r"], "extra": 1}"#,
         ] {
             assert_eq!(
@@ -938,6 +950,11 @@ mod tests {
                 "{json}"
             );
         }
+        let merged = IngestOidcConfig::from_json(
+            r#"{"audience": "a", "allowed_repositories": ["o/r", "O/R"]}"#,
+        )
+        .expect("names differing only in case are one repository");
+        assert_eq!(merged.allowed_repository_count(), 1);
         let rendered = format!("{:?}", config());
         assert!(!rendered.contains(TEST_AUDIENCE));
         assert!(!rendered.contains("owner/repo"));

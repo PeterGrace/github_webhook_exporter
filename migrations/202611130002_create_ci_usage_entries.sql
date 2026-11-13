@@ -26,3 +26,11 @@ CREATE INDEX ci_usage_entries_run_idx
     ON ci_usage_entries(repository_id, workflow_run_id, workflow_run_attempt);
 CREATE INDEX ci_usage_entries_updated_at_idx
     ON ci_usage_entries(updated_at);
+
+-- The GitHub repository ID first seen for each registered repository. A name can be reused after a
+-- rename or deletion; the ID cannot, so later posts must present the same one.
+CREATE TABLE ci_usage_repository_pins (
+    repository_id INTEGER PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,
+    github_repository_id INTEGER NOT NULL CHECK (github_repository_id > 0),
+    pinned_at TEXT NOT NULL
+);

@@ -31,6 +31,50 @@ impl CiUsageStore {
         Self { pool }
     }
 
+    /// Pins `repository_id` to the GitHub repository ID in its first usage token, and reports
+    /// whether `github_repository_id` matches the pinned one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CiUsageStoreError::Unavailable`] when SQLite is busy or locked, and
+    /// [`CiUsageStoreError::Internal`] for any other persistence failure.
+    pub(crate) async fn pin_repository(
+        &self,
+        repository_id: RepositoryId,
+        github_repository_id: i64,
+    ) -> Result<bool, CiUsageStoreError> {
+        trace::instrument_database_operation(
+            DatabaseOperation::CiUsagePin,
+            self.pin_repository_inner(repository_id, github_repository_id),
+        )
+        .await
+    }
+
+    async fn pin_repository_inner(
+        &self,
+        repository_id: RepositoryId,
+        github_repository_id: i64,
+    ) -> Result<bool, CiUsageStoreError> {
+        sqlx::query(
+            "INSERT INTO ci_usage_repository_pins (repository_id, github_repository_id, pinned_at) \
+             VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+             ON CONFLICT(repository_id) DO NOTHING",
+        )
+        .bind(repository_id.get())
+        .bind(github_repository_id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        let pinned: i64 = sqlx::query_scalar(
+            "SELECT github_repository_id FROM ci_usage_repository_pins WHERE repository_id = ?",
+        )
+        .bind(repository_id.get())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(pinned == github_repository_id)
+    }
+
     /// Inserts every entry of one accepted post in a single transaction.
     ///
     /// # Errors
@@ -208,6 +252,7 @@ mod tests {
         UsageReport {
             claims: GitHubActionsClaims {
                 repository: CanonicalRepositoryName::new("owner/repo").expect("name is valid"),
+                github_repository_id: 4242,
                 workflow: DisplayName::sanitize("CI"),
                 workflow_file: None,
                 job_workflow_file: None,
@@ -335,6 +380,24 @@ mod tests {
             .await;
             assert!(inserted.is_err(), "{source} {cpu_seconds:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_first_repository_id_seen_is_pinned() {
+        let (_directory, _pool, store, repository_id) = store_with_repository().await;
+
+        assert!(store
+            .pin_repository(repository_id, 4242)
+            .await
+            .expect("pins"));
+        assert!(store
+            .pin_repository(repository_id, 4242)
+            .await
+            .expect("matches"));
+        assert!(!store
+            .pin_repository(repository_id, 9999)
+            .await
+            .expect("lookup succeeds"));
     }
 
     #[tokio::test]
