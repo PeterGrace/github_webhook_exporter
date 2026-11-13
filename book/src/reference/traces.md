@@ -168,7 +168,7 @@ Every job root carries the runner and the minutes GitHub bills for the job:
 | --- | --- |
 | `cicd.runner.labels` | The job's runner labels in job order: at most 16, each sanitized like display names. Omitted when the job reported none. |
 | `cicd.runner.group` | The sanitized runner group name, when reported. |
-| `cicd.runner.name` | The sanitized name of the runner that ran the job, such as `GitHub Actions 1234`, when reported. It names a runner instance, not a machine size. |
+| `cicd.runner.name` | The sanitized name of the runner that ran the job, such as `GitHub Actions 1234`, when reported. It names a runner instance, not a machine size. A self-hosted runner's name is whatever its operator registered, often a hostname or pod name, and it is exported on spans and the `ci cost recorded` log. |
 | `ci.billable_minutes` | The job's run time rounded up to a whole minute. `0` for a skipped job, a job that never got a runner (no positive `runner_id`, such as one cancelled while queued), and a job without valid reported start and end times. |
 
 When a [`costs`](costs.md) table is configured, the root also carries the job's price:

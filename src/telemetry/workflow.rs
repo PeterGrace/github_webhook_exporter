@@ -2746,6 +2746,34 @@ mod tests {
     }
 
     #[test]
+    fn a_fallback_priced_job_span_carries_the_default_rate_but_no_label() {
+        let job = billed_job(
+            &[],
+            None,
+            Some(WorkflowJobCost {
+                cost_usd: 0.06,
+                price_table_version: "0123456789ab".to_owned(),
+                fell_back: true,
+                usd_per_minute: Some(0.01),
+                price_label: None,
+            }),
+        );
+
+        let (spans, _) = emitted_spans_and_errors(&job);
+        let span = &spans[0];
+
+        assert_eq!(
+            attribute(span, "ci.price.fell_back"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            attribute(span, "ci.price.usd_per_minute"),
+            Some(&Value::F64(0.01))
+        );
+        assert!(!attribute_keys(span).contains("ci.price.label"));
+    }
+
+    #[test]
     fn an_unpriced_job_span_has_minutes_but_no_cost_and_keeps_its_own_pull_requests() {
         let job = billed_job(&[7], Some(attributed_context()), None);
 

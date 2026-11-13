@@ -7411,6 +7411,14 @@ async fn a_priced_job_exports_its_cost_on_the_span_and_one_cost_log() {
     assert_attribute(job, "cicd.runner.group", "Larger runners");
     assert_attribute(job, "cicd.runner.name", "GitHub Actions 7");
     assert_attribute(job, "ci.price.label", "ubuntu-24.04-xl");
+    assert!(job.attributes.iter().any(|attribute| {
+        attribute.key == "ci.price.usd_per_minute"
+            && attribute
+                .value
+                .as_ref()
+                .and_then(|value| value.value.as_ref())
+                == Some(&AttributeValue::DoubleValue(0.08))
+    }));
     assert_attribute(job, "github.workflow", "Claude");
     assert_attribute(job, "github.workflow_file", "claude.yml");
     assert_attribute(job, "github.workflow.event", "issue_comment");
