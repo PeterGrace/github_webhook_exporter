@@ -1009,6 +1009,19 @@ impl WebhookTraceFixture {
         allowed_repositories: &[&str],
         signer: &TestSigner,
     ) -> Self {
+        Self::new_with_usage_source(
+            costs,
+            allowed_repositories,
+            StaticJwks::serving(signer.jwks()),
+        )
+        .await
+    }
+
+    async fn new_with_usage_source(
+        costs: Option<CostsConfig>,
+        allowed_repositories: &[&str],
+        jwks: StaticJwks,
+    ) -> Self {
         let config = IngestOidcConfig::from_json(
             &serde_json::json!({
                 "audience": TEST_AUDIENCE,
@@ -1024,20 +1037,26 @@ impl WebhookTraceFixture {
             "github_webhook_exporter=info",
             None,
             costs,
-            Some(UsageFixture {
-                config,
-                jwks: StaticJwks::serving(signer.jwks()),
-            }),
+            Some(UsageFixture { config, jwks }),
         )
         .await
     }
 
     async fn usage(&self, authorization: Option<&str>, body: Vec<u8>) -> axum::response::Response {
+        self.usage_as(authorization, "application/json", body).await
+    }
+
+    async fn usage_as(
+        &self,
+        authorization: Option<&str>,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> axum::response::Response {
         self.request(
             Method::POST,
             "/ci-cost/usage",
             authorization,
-            Some("application/json"),
+            Some(content_type),
             Body::from(body),
         )
         .await
@@ -7854,4 +7873,80 @@ async fn each_rejected_usage_post_logs_one_warning_with_its_reason() {
         .await
         .expect("usage entries are countable");
     assert_eq!(stored, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn usage_content_type_is_checked_after_the_token_and_registration() {
+    let signer = TestSigner::new(USAGE_SIGNER_KID);
+    let fixture = WebhookTraceFixture::new_with_usage(
+        None,
+        &[WEBHOOK_REPOSITORY, "owner/unregistered"],
+        &signer,
+    )
+    .await;
+    let mut unregistered = usage_claims();
+    unregistered["repository"] = serde_json::json!("owner/unregistered");
+
+    for (claims, expected_status, reason) in [
+        (
+            usage_claims(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+        ),
+        (
+            unregistered,
+            StatusCode::FORBIDDEN,
+            "repository_not_registered",
+        ),
+    ] {
+        let authorization = format!("Bearer {}", signer.sign(&claims));
+        let response = fixture
+            .usage_as(Some(&authorization), "text/plain", usage_body())
+            .await;
+        assert_eq!(response.status(), expected_status, "{reason}");
+        let body = to_bytes(response.into_body(), 10_000)
+            .await
+            .expect("rejection body is readable");
+        let body: Value = serde_json::from_slice(&body).expect("rejection body is JSON");
+        assert_eq!(body["code"], reason);
+    }
+    let response = fixture
+        .usage_as(
+            Some(&format!("Bearer {}", signer.sign(&usage_claims()))),
+            "application/json; charset=utf-8",
+            usage_body(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_jwks_outage_rejects_usage_posts_as_retryable() {
+    let signer = TestSigner::new(USAGE_SIGNER_KID);
+    let outage = WebhookTraceFixture::new_with_usage_source(
+        None,
+        &[WEBHOOK_REPOSITORY],
+        StaticJwks::failing(),
+    )
+    .await;
+    let response = outage
+        .usage(
+            Some(&format!("Bearer {}", signer.sign(&usage_claims()))),
+            usage_body(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), 10_000)
+        .await
+        .expect("rejection body is readable");
+    let body: Value = serde_json::from_slice(&body).expect("rejection body is JSON");
+    assert_eq!(body["code"], "jwks_unavailable");
+    let captured = outage.force_flush();
+    assert_eq!(
+        log_attribute(
+            captured.one_log_with_body("ci usage post rejected"),
+            "reason"
+        ),
+        Some(&AttributeValue::StringValue("jwks_unavailable".to_owned()))
+    );
 }

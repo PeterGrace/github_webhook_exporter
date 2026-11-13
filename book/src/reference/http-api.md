@@ -75,7 +75,9 @@ Keys are cached for an hour. A token naming an unknown `kid` triggers a refetch,
 one fetch is attempted a minute, whether or not it succeeds. While the last attempt has failed, a
 token whose key is not cached gets `503 jwks_unavailable`, because it may be signed by a key
 GitHub rotated in during the outage; once a fetch succeeds without its key, it gets
-`401 invalid_token`. Cached keys keep verifying while GitHub is unreachable. The token is never
+`401 invalid_token`. Cached keys keep verifying while GitHub is unreachable; after a successful
+refresh only the new key set is trusted, so a retired key stops verifying at once. The fetch runs
+outside the cache lock, so posts whose key is cached are never held up by a refresh. The token is never
 logged.
 
 The checks run in a fixed order: token, repository registration, content type, then body. A

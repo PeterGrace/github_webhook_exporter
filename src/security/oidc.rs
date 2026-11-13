@@ -19,6 +19,8 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use tokio::{sync::Mutex, time::Instant};
 
+type KeyLookup = Result<Arc<DecodingKey>, OidcRejection>;
+
 use crate::{
     config::ConfigError,
     security::CanonicalRepositoryName,
@@ -315,6 +317,14 @@ impl KeyCache {
         })
     }
 
+    fn lookup(&self, kid: &str) -> KeyLookup {
+        match self.keys.get(kid) {
+            Some(key) => Ok(Arc::clone(key)),
+            None if self.last_attempt_failed => Err(OidcRejection::JwksUnavailable),
+            None => Err(OidcRejection::InvalidToken),
+        }
+    }
+
     fn replace(&mut self, set: &JwkSet, now: Instant) {
         self.keys = set
             .keys
@@ -333,7 +343,10 @@ impl KeyCache {
 pub(crate) struct OidcVerifier {
     config: IngestOidcConfig,
     source: Box<dyn JwksSource>,
-    cache: Mutex<KeyCache>,
+    cache: std::sync::Mutex<KeyCache>,
+    /// Held for the length of one JWKS fetch, so at most one runs and the cache lock is never
+    /// held across the network call.
+    refresh: Mutex<()>,
 }
 
 impl OidcVerifier {
@@ -342,7 +355,8 @@ impl OidcVerifier {
         Self {
             config,
             source,
-            cache: Mutex::new(KeyCache::default()),
+            cache: std::sync::Mutex::new(KeyCache::default()),
+            refresh: Mutex::new(()),
         }
     }
 
@@ -389,30 +403,60 @@ impl OidcVerifier {
     /// Returns the key for `kid`, refetching when the cache is stale or lacks it.
     ///
     /// At most one fetch is attempted per [`JWKS_MIN_REFETCH_INTERVAL`], whether or not it
-    /// succeeds, so the cache lock is held across a fetch at most that often. A failed refetch
-    /// keeps serving cached keys. A missing key is [`OidcRejection::JwksUnavailable`] while the
-    /// last attempt failed, since it may be a rotated key the cache has not seen, and
-    /// [`OidcRejection::InvalidToken`] once a fetch has succeeded without it.
-    async fn key(&self, kid: &str) -> Result<Arc<DecodingKey>, OidcRejection> {
-        let mut cache = self.cache.lock().await;
-        let now = Instant::now();
-        let cached = cache.keys.get(kid).cloned();
-        let wanted = cached.is_none() || cache.is_stale(now);
-        if wanted && cache.may_attempt(now) {
-            cache.attempted_at = Some(now);
-            match self.source.fetch().await {
-                Ok(set) => {
-                    cache.replace(&set, now);
-                    cache.last_attempt_failed = false;
-                }
-                Err(JwksFetchError) => cache.last_attempt_failed = true,
+    /// succeeds. The fetch runs outside the cache lock: a request whose key is cached is answered
+    /// from the cache while a refresh is in flight, and only a request that needs the refresh
+    /// waits for it. A failed refetch keeps serving cached keys. After a successful refetch only
+    /// the new key set is trusted, so a key GitHub retired stops verifying at once. A missing key
+    /// is [`OidcRejection::JwksUnavailable`] while the last attempt failed, since it may be a
+    /// rotated key the cache has not seen, and [`OidcRejection::InvalidToken`] otherwise.
+    async fn key(&self, kid: &str) -> KeyLookup {
+        let cached = {
+            let cache = self.lock_cache();
+            let now = Instant::now();
+            let cached = cache.keys.get(kid).cloned();
+            let wanted = cached.is_none() || cache.is_stale(now);
+            if !wanted || !cache.may_attempt(now) {
+                return cache.lookup(kid);
             }
+            cached
+        };
+        let _refresh = match (self.refresh.try_lock(), cached) {
+            (Ok(guard), _) => guard,
+            (Err(_), Some(key)) => return Ok(key),
+            (Err(_), None) => {
+                let guard = self.refresh.lock().await;
+                let cache = self.lock_cache();
+                if !cache.may_attempt(Instant::now()) {
+                    return cache.lookup(kid);
+                }
+                drop(cache);
+                guard
+            }
+        };
+        {
+            let mut cache = self.lock_cache();
+            let now = Instant::now();
+            if !cache.may_attempt(now) {
+                return cache.lookup(kid);
+            }
+            cache.attempted_at = Some(now);
         }
-        match cache.keys.get(kid).cloned().or(cached) {
-            Some(key) => Ok(key),
-            None if cache.last_attempt_failed => Err(OidcRejection::JwksUnavailable),
-            None => Err(OidcRejection::InvalidToken),
+        let fetched = self.source.fetch().await;
+        let mut cache = self.lock_cache();
+        match fetched {
+            Ok(set) => {
+                cache.replace(&set, Instant::now());
+                cache.last_attempt_failed = false;
+            }
+            Err(JwksFetchError) => cache.last_attempt_failed = true,
         }
+        cache.lookup(kid)
+    }
+
+    fn lock_cache(&self) -> std::sync::MutexGuard<'_, KeyCache> {
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -544,8 +588,26 @@ pub(crate) mod test_support {
             *self.set.lock().expect("test JWKS lock") = None;
         }
 
+        pub(crate) fn start_serving(&self, set: JwkSet) {
+            *self.set.lock().expect("test JWKS lock") = Some(set);
+        }
+
         pub(crate) fn fetches(&self) -> usize {
             self.fetches.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A JWKS source whose fetches wait until the test releases them, to hold a refresh open.
+    pub(crate) struct GatedJwks {
+        pub(crate) inner: StaticJwks,
+        pub(crate) gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl JwksSource for GatedJwks {
+        async fn fetch(&self) -> Result<JwkSet, JwksFetchError> {
+            let _permit = self.gate.acquire().await.map_err(|_| JwksFetchError)?;
+            self.inner.fetch().await
         }
     }
 
@@ -738,6 +800,69 @@ mod tests {
             .verify(&bearer(&signer.sign(&claims("owner/repo"))))
             .await
             .expect("cached key still verifies during the outage");
+        assert_eq!(source.fetches(), 2);
+    }
+
+    #[tokio::test]
+    async fn cached_keys_verify_while_a_refresh_is_in_flight() {
+        let signer = TestSigner::new("key-1");
+        let stranger = TestSigner::new("key-2");
+        let inner = StaticJwks::serving(signer.jwks());
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let verifier = std::sync::Arc::new(OidcVerifier::new(
+            config(),
+            Box::new(super::test_support::GatedJwks {
+                inner: inner.clone(),
+                gate: gate.clone(),
+            }),
+        ));
+        let token = bearer(&signer.sign(&claims("owner/repo")));
+        verifier.verify(&token).await.expect("first key verifies");
+        verifier.lock_cache().fetched_at = None;
+        verifier.lock_cache().attempted_at = None;
+        let held = gate.clone().acquire_owned().await.expect("gate is open");
+
+        let refreshing = {
+            let verifier = verifier.clone();
+            let token = bearer(&stranger.sign(&claims("owner/repo")));
+            tokio::spawn(async move { verifier.verify(&token).await })
+        };
+        while verifier.refresh.try_lock().is_ok() {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), verifier.verify(&token))
+            .await
+            .expect("a cached key does not wait for the refresh")
+            .expect("cached key verifies");
+
+        drop(held);
+        assert_eq!(
+            refreshing.await.expect("refresh task completes"),
+            Err(OidcRejection::InvalidToken)
+        );
+        assert_eq!(inner.fetches(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_key_retired_by_a_refresh_stops_verifying_immediately() {
+        let retired = TestSigner::new("key-1");
+        let current = TestSigner::new("key-2");
+        let source = StaticJwks::serving(retired.jwks());
+        let verifier = verifier(source.clone());
+        let token = bearer(&retired.sign(&claims("owner/repo")));
+        verifier.verify(&token).await.expect("first key verifies");
+
+        tokio::time::advance(std::time::Duration::from_secs(3_601)).await;
+        source.start_serving(current.jwks());
+
+        assert_eq!(
+            verifier.verify(&token).await,
+            Err(OidcRejection::InvalidToken)
+        );
+        verifier
+            .verify(&bearer(&current.sign(&claims("owner/repo"))))
+            .await
+            .expect("new key verifies");
         assert_eq!(source.fetches(), 2);
     }
 
