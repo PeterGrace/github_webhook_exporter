@@ -43,6 +43,7 @@ const REPOSITORY_NAME_KEY: &str = "github.repository.name";
 const REPOSITORY_ID_KEY: &str = "github.repository.id";
 const DELIVERY_ID_KEY: &str = "github.delivery.id";
 const PULL_REQUEST_NUMBER_KEY: &str = "github.pull_request.number";
+const CI_PULL_REQUEST_NUMBER_KEY: &str = "ci.pull_request.number";
 const COMMIT_SHA_KEY: &str = "github.commit.sha";
 const DB_SYSTEM_NAME_KEY: &str = "db.system.name";
 const DB_OPERATION_NAME_KEY: &str = "db.operation.name";
@@ -126,6 +127,18 @@ pub(crate) fn pull_request_numbers_attribute(numbers: &[PullRequestNumber]) -> O
             )),
         ))
     }
+}
+
+/// Returns `ci.pull_request.number`, the single pull request a run's cost is attributed to.
+///
+/// It is a scalar so span queries can group by it; `github.pull_request.number` is an array that
+/// span stores such as Sentry do not index. `None` when `numbers` is empty or names more than one
+/// distinct pull request.
+pub(crate) fn attributed_pull_request_attribute(numbers: &[PullRequestNumber]) -> Option<KeyValue> {
+    let (first, rest) = numbers.split_first()?;
+    rest.iter()
+        .all(|number| number == first)
+        .then(|| KeyValue::new(CI_PULL_REQUEST_NUMBER_KEY, first.get()))
 }
 
 /// Returns the commit-SHA attribute.
@@ -982,12 +995,12 @@ mod tests {
     use crate::security::CanonicalRepositoryName;
 
     use super::{
-        add_failure_event, commit_sha_attribute, database_span, delivery_id_attribute,
-        operation_outcome_attribute, operation_span, pull_request_number_attribute,
-        pull_request_numbers_attribute, repository_name_attribute, set_commit_sha,
-        set_config_operation, set_delivery_id, set_http_method, set_http_response, set_http_route,
-        set_pull_request_number, set_repository_id, set_repository_name, set_result_status,
-        set_status, timing_source_attribute, workflow_conclusion_attribute,
+        add_failure_event, attributed_pull_request_attribute, commit_sha_attribute, database_span,
+        delivery_id_attribute, operation_outcome_attribute, operation_span,
+        pull_request_number_attribute, pull_request_numbers_attribute, repository_name_attribute,
+        set_commit_sha, set_config_operation, set_delivery_id, set_http_method, set_http_response,
+        set_http_route, set_pull_request_number, set_repository_id, set_repository_name,
+        set_result_status, set_status, timing_source_attribute, workflow_conclusion_attribute,
         workflow_error_type_attribute, workflow_head_revision_attribute, workflow_name_attribute,
         workflow_pipeline_run_id_attribute, workflow_pipeline_run_url_attribute,
         workflow_pipeline_step_task_run_id_attribute, workflow_pipeline_task_run_id_attribute,
@@ -1583,6 +1596,17 @@ mod tests {
             opentelemetry::Value::Array(opentelemetry::Array::I64(vec![17, 23]))
         );
         assert!(pull_request_numbers_attribute(&[]).is_none());
+        let attributed_kv =
+            attributed_pull_request_attribute(&[pull_request_number, pull_request_number])
+                .expect("one distinct pull request is attributed");
+        assert_eq!(attributed_kv.key.as_str(), "ci.pull_request.number");
+        assert_eq!(attributed_kv.value, opentelemetry::Value::I64(17));
+        assert!(attributed_pull_request_attribute(&[]).is_none());
+        assert!(attributed_pull_request_attribute(&[
+            pull_request_number,
+            PullRequestNumber::new(23).expect("test pull request number is positive"),
+        ])
+        .is_none());
 
         let commit_sha_kv = commit_sha_attribute(&commit_sha);
         assert_eq!(commit_sha_kv.key.as_str(), COMMIT_SHA_KEY);

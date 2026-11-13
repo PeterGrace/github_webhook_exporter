@@ -21,9 +21,9 @@ use crate::{
 
 use super::{
     trace::{
-        delivery_id_attribute, github_workflow_attribute, pull_request_numbers_attribute,
-        sentry_description_attribute, sentry_operation_attribute, timing_source_attribute,
-        workflow_conclusion_attribute, workflow_error_type_attribute,
+        attributed_pull_request_attribute, delivery_id_attribute, github_workflow_attribute,
+        pull_request_numbers_attribute, sentry_description_attribute, sentry_operation_attribute,
+        timing_source_attribute, workflow_conclusion_attribute, workflow_error_type_attribute,
         workflow_pipeline_task_run_id_attribute, workflow_pipeline_task_run_result_attribute,
         workflow_run_attempt_attribute, workflow_task_name_attribute,
         workflow_task_run_url_attribute, CommitSha, GITHUB_ACTIONS_PIPELINE_OPERATION,
@@ -428,7 +428,7 @@ fn pipeline_root_attributes(pipeline: &PipelineRunTrace) -> Vec<KeyValue> {
         PIPELINE_ROOT_REQUIRED_ATTRIBUTE_COUNT
             + usize::from(pipeline.head_sha.is_some())
             + usize::from(pipeline.conclusion.error_type().is_some())
-            + usize::from(!pipeline.pull_requests().is_empty())
+            + 2 * usize::from(!pipeline.pull_requests().is_empty())
             + workflow_run_context_attribute_count(Some(&pipeline.run_context)),
     );
     append_pipeline_context(&mut attributes, pipeline);
@@ -442,6 +442,9 @@ fn pipeline_root_attributes(pipeline: &PipelineRunTrace) -> Vec<KeyValue> {
     }
     if let Some(pull_request_numbers) = pull_request_numbers_attribute(pipeline.pull_requests()) {
         attributes.push(pull_request_numbers);
+    }
+    if let Some(attributed) = attributed_pull_request_attribute(pipeline.pull_requests()) {
+        attributes.push(attributed);
     }
     append_workflow_run_context(&mut attributes, Some(&pipeline.run_context));
     attributes.push(github_workflow_attribute(pipeline.workflow_name()));
@@ -792,6 +795,10 @@ mod tests {
         assert_eq!(
             attribute(root, "github.pull_request.number"),
             Some(&Value::Array(Array::I64(vec![9201])))
+        );
+        assert_eq!(
+            attribute(root, "ci.pull_request.number"),
+            Some(&Value::I64(9201))
         );
         assert_eq!(
             string_attribute(root, "github.workflow").as_deref(),

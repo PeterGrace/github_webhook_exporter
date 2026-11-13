@@ -30,7 +30,9 @@ use crate::{
     storage::DeliveryClaim,
     telemetry::{
         pipeline::{PipelineRunTrace, PipelineRunTraceParts, MAX_PIPELINE_JOB_SPANS},
-        trace::{self, Operation, OperationOutcome, QueueEntity, CI_SOURCE_GITHUB_ACTIONS},
+        trace::{
+            self, CommitSha, Operation, OperationOutcome, QueueEntity, CI_SOURCE_GITHUB_ACTIONS,
+        },
         workflow::{
             DisplayName, RequiredChecks, WorkflowFile, WorkflowJobTrace, WorkflowRunContext,
         },
@@ -355,6 +357,7 @@ fn log_job_cost(job: &WorkflowJobTrace) {
             .first()
             .map(|number| number.get()),
         github.repository = job.repository_name().as_str(),
+        vcs.ref.head.revision = job.head_sha().map(CommitSha::as_str),
         cicd.pipeline.run.id = job.run_id().get(),
         github.workflow.run.attempt = job.run_attempt().get(),
         cicd.pipeline.task.run.id = job.job_id().get(),
