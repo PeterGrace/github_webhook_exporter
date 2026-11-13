@@ -143,7 +143,7 @@ An earlier authenticated `workflow_run` delivery supplies the authoritative norm
 `github.workflow.target_branch`, and `github.workflow_file`. Correlation uses repository, run ID,
 and run attempt. The event is `pull_request`, `pull_request_target`, `pull_request_review`,
 `pull_request_review_comment`, `issue_comment`, `merge_group`, `push`, `schedule`,
-`workflow_dispatch`, or `other`; branches remove control characters and retain at most 255 Unicode
+`workflow_dispatch`, `workflow_run`, or `other`; branches remove control characters and retain at most 255 Unicode
 scalar values. Missing or ambiguous branches are omitted. `github.workflow_file` is the last
 segment of the run's workflow `path`, such as `ci.yaml`, kept only when it is 1 to 128 ASCII
 letters, digits, `.`, `_`, or `-`. The same available context is attached to the job root and
@@ -151,10 +151,11 @@ every step.
 
 The same delivery also attributes the run to at most one pull request. That is the single
 distinct number in the run's `pull_requests`. A run started by `issue_comment`,
-`pull_request_review`, or `pull_request_review_comment` has an empty `pull_requests`, so its PR is
-read from the first `PR #<number>` in the run name (`display_title`, set by the workflow's
-`run-name`) that starts the name or follows a non-alphanumeric character. Other events never read the run name, because squash-merge commit titles contain
-`(#<number>)`. GitHub's `workflow_job` payload carries no pull requests, so a job root whose own
+`pull_request_review`, `pull_request_review_comment`, or `workflow_run` has an empty
+`pull_requests`, so its PR is read from the first `PR #<number>` in the run name
+(`display_title`, set by the workflow's `run-name`) that starts the name or follows a
+non-alphanumeric character. Other events never read the run name, because squash-merge commit
+titles contain `(#<number>)`. GitHub's `workflow_job` payload carries no pull requests, so a job root whose own
 list is empty uses the run's attributed PR for `github.pull_request.number`.
 
 The job root also carries `github.workflow`, the workflow name. It repeats `cicd.pipeline.name` so
