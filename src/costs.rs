@@ -119,9 +119,12 @@ pub struct VendorRate<'table> {
 
 /// The rate chosen for one workflow job.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RunnerRate {
+pub struct RunnerRate<'table> {
     /// USD per billable minute.
     pub usd_per_minute: UsdRate,
+    /// The `runners.labels` key that supplied the rate, lowercased; `None` when the default
+    /// rate was used.
+    pub label: Option<&'table str>,
     /// Whether no job label matched and the default rate was used.
     pub fell_back: bool,
 }
@@ -205,14 +208,16 @@ impl CostsConfig {
     /// With no match the default rate is returned. When `runners.labels` is non-empty, one
     /// `ci price missing` warning is also logged with the bounded job labels; an empty map is a
     /// deliberate flat rate and logs nothing.
-    pub fn runner_rate(&self, labels: &[&str]) -> RunnerRate {
+    pub fn runner_rate(&self, labels: &[&str]) -> RunnerRate<'_> {
         let runners = &self.table.runners;
-        if let Some(rate) = labels
-            .iter()
-            .find_map(|label| runners.labels.get(ascii_lowercase(label).as_ref()))
-        {
+        if let Some((label, rate)) = labels.iter().find_map(|label| {
+            runners
+                .labels
+                .get_key_value(ascii_lowercase(label).as_ref())
+        }) {
             return RunnerRate {
                 usd_per_minute: *rate,
+                label: Some(label.as_str()),
                 fell_back: false,
             };
         }
@@ -223,6 +228,7 @@ impl CostsConfig {
         }
         RunnerRate {
             usd_per_minute: runners.default_usd_per_minute,
+            label: None,
             fell_back: true,
         }
     }
@@ -405,6 +411,7 @@ mod tests {
             rate,
             RunnerRate {
                 usd_per_minute: UsdRate(0.082),
+                label: Some("ubuntu-24.04-xl"),
                 fell_back: false
             }
         );
@@ -430,6 +437,7 @@ mod tests {
             rate,
             RunnerRate {
                 usd_per_minute: UsdRate(0.012),
+                label: None,
                 fell_back: true
             }
         );
@@ -490,6 +498,7 @@ mod tests {
             rate,
             RunnerRate {
                 usd_per_minute: UsdRate(0.0),
+                label: None,
                 fell_back: true
             }
         );

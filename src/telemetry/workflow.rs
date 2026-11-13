@@ -18,8 +18,9 @@ use super::{
     pipeline::WorkflowJobTraceIdentity,
     trace::{
         billable_minutes_attribute, delivery_id_attribute, github_workflow_attribute,
-        job_cost_attributes, pull_request_numbers_attribute, runner_group_attribute,
-        runner_labels_attribute, sentry_description_attribute, sentry_operation_attribute,
+        job_cost_attributes, price_label_attribute, price_usd_per_minute_attribute,
+        pull_request_numbers_attribute, runner_group_attribute, runner_labels_attribute,
+        runner_name_attribute, sentry_description_attribute, sentry_operation_attribute,
         timing_source_attribute, workflow_conclusion_attribute, workflow_error_type_attribute,
         workflow_event_attribute, workflow_file_attribute, workflow_head_revision_attribute,
         workflow_name_attribute, workflow_pipeline_run_id_attribute,
@@ -946,16 +947,28 @@ fn append_job_billing(attributes: &mut Vec<KeyValue>, billing: &WorkflowJobBilli
     if let Some(group) = &billing.runner_group {
         attributes.push(runner_group_attribute(group));
     }
+    if let Some(name) = &billing.runner_name {
+        attributes.push(runner_name_attribute(name));
+    }
     attributes.push(billable_minutes_attribute(billing.billable_minutes));
     if let Some(cost) = &billing.cost {
         attributes.extend(job_cost_attributes(cost));
+        if let Some(rate) = cost.usd_per_minute {
+            attributes.push(price_usd_per_minute_attribute(rate));
+        }
+        if let Some(label) = &cost.price_label {
+            attributes.push(price_label_attribute(label));
+        }
     }
 }
 
 fn job_billing_attribute_count(billing: &WorkflowJobBilling) -> usize {
     1 + usize::from(!billing.runner_labels.is_empty())
         + usize::from(billing.runner_group.is_some())
-        + billing.cost.as_ref().map_or(0, |_| 4)
+        + usize::from(billing.runner_name.is_some())
+        + billing.cost.as_ref().map_or(0, |cost| {
+            4 + usize::from(cost.usd_per_minute.is_some()) + usize::from(cost.price_label.is_some())
+        })
 }
 
 /// Returns how many attributes [`append_workflow_run_context`] adds for `context`.
@@ -1312,6 +1325,8 @@ pub(crate) struct WorkflowJobBilling {
     pub(crate) runner_labels: Vec<DisplayName>,
     /// The runner group name, when reported.
     pub(crate) runner_group: Option<DisplayName>,
+    /// The name of the runner that ran the job, when reported.
+    pub(crate) runner_name: Option<DisplayName>,
     /// Whole minutes GitHub bills for the job.
     pub(crate) billable_minutes: i64,
     /// The job's price, when a `costs` table is configured.
@@ -1327,6 +1342,12 @@ pub(crate) struct WorkflowJobCost {
     pub(crate) price_table_version: String,
     /// Whether no runner label had a price and the default rate was used.
     pub(crate) fell_back: bool,
+    /// The USD-per-minute rate applied; `None` when the job billed 0 minutes and no rate was
+    /// looked up.
+    pub(crate) usd_per_minute: Option<f64>,
+    /// The priced runner label that supplied the rate; `None` for the default rate or when no
+    /// rate was looked up.
+    pub(crate) price_label: Option<String>,
 }
 
 // `cost_usd` is a finite rate times a bounded minute count, so it is never NaN.
@@ -2661,6 +2682,7 @@ mod tests {
                 .filter_map(DisplayName::sanitize)
                 .collect(),
             runner_group: DisplayName::sanitize("Larger runners"),
+            runner_name: DisplayName::sanitize("GitHub Actions 7"),
             billable_minutes: 6,
             cost,
         })
@@ -2686,7 +2708,9 @@ mod tests {
             Some(WorkflowJobCost {
                 cost_usd: 0.48,
                 price_table_version: "0123456789ab".to_owned(),
-                fell_back: true,
+                fell_back: false,
+                usd_per_minute: Some(0.08),
+                price_label: Some("ubuntu-24.04-xl".to_owned()),
             }),
         );
 
@@ -2707,7 +2731,13 @@ mod tests {
         assert_string_attribute(span, "ci.price_table.version", "0123456789ab");
         assert_eq!(
             attribute(span, "ci.price.fell_back"),
-            Some(&Value::Bool(true))
+            Some(&Value::Bool(false))
+        );
+        assert_string_attribute(span, "cicd.runner.name", "GitHub Actions 7");
+        assert_string_attribute(span, "ci.price.label", "ubuntu-24.04-xl");
+        assert_eq!(
+            attribute(span, "ci.price.usd_per_minute"),
+            Some(&Value::F64(0.08))
         );
         assert_string_attribute(span, "github.workflow", "Build Workflow");
         assert_string_attribute(span, "github.workflow_file", "claude.yml");
@@ -2728,6 +2758,8 @@ mod tests {
             "ci.cost_usd",
             "ci.price_table.version",
             "ci.price.fell_back",
+            "ci.price.usd_per_minute",
+            "ci.price.label",
         ] {
             assert!(!keys.contains(key), "{key} needs a price table");
         }
