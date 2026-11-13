@@ -427,7 +427,7 @@ mod tests {
     fn merge_queue_runs_read_their_pull_request_from_the_queue_branch() {
         for (branch, expected) in [
             (
-                "gh-readonly-queue/master/pr-9458-cdeb357b03e48cbbbf96b3ac8fec7e7db6b78361",
+                "gh-readonly-queue/master/pr-9458-0123456789abcdef0123456789abcdef01234567",
                 Some(9458),
             ),
             ("gh-readonly-queue/release/2026/pr-12-0123abc", Some(12)),
