@@ -1,10 +1,12 @@
 mod admin_auth;
+pub(crate) mod oidc;
 mod secret_cipher;
 mod webhook_auth;
 
 use std::fmt;
 
 pub use admin_auth::{AdminAuthenticator, AuthenticationError};
+pub use oidc::{IngestOidcConfig, INGEST_OIDC_VARIABLE};
 pub use secret_cipher::RepositorySecretCipher;
 pub use webhook_auth::{WebhookAuthenticationError, WebhookAuthenticator, WebhookSignature};
 

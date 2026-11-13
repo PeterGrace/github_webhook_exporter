@@ -1,0 +1,32 @@
+# Accept OIDC-authenticated in-job usage reports
+
+Date: 2026-11-13T21:00:00Z
+
+## What changed
+
+- New optional `POST /ci-cost/usage`. A GitHub Actions job reports inference spend (already priced
+  in USD) and Daytona sandbox seconds, authenticated by the job's GitHub Actions OIDC token. All
+  attribution comes from the verified claims: repository, workflow, workflow file, reusable
+  workflow file, run, attempt, event and SHA. Unknown body fields fail, so a body cannot override
+  them.
+- Configure it with `GHE_INGEST_OIDC_JSON`, or `ingest.oidc` in Helm values: an audience and a list
+  of allowlisted repositories. The repository must also be registered and enabled. When unset, the
+  route is not registered and returns 404. The chart routes `/ci-cost/usage` through the webhook
+  Ingress when configured.
+- Tokens must be RS256, signed by a key in GitHub's published JWKS, issued by
+  `https://token.actions.githubusercontent.com`, for the configured audience and unexpired. Keys are
+  cached for an hour and refetched at most once a minute for an unknown `kid`, with redirects
+  disabled and a 64 KiB response cap. The token is never logged or printed.
+- Daytona entries are priced from `costs.daytona`. Without those rates they are recorded at 0 USD
+  with `ci.price.fell_back=true`.
+- Each accepted entry is stored in the new `ci_usage_entries` table (migration `202611130002`),
+  exported as one `ci.usage` root span, and logged as one `ci cost recorded` info log. The PR comes
+  from the run's stored `workflow_run` context when it has arrived.
+- Each rejection returns a fixed JSON error and writes one `ci usage post rejected` warning with a
+  closed `reason`.
+- Usage entries are pruned on the processed-delivery retention cutoff.
+
+## Upgrade note
+
+With NetworkPolicy egress enabled, the pod must reach `token.actions.githubusercontent.com:443` for
+the endpoint to verify tokens.

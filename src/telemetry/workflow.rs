@@ -42,7 +42,7 @@ const MAX_PULL_REQUEST_COUNT: usize = 20;
 pub(crate) const MAX_RUNNER_LABEL_COUNT: usize = 16;
 /// Maximum branch-protection required-check names retained for one repository branch.
 pub(crate) const MAX_REQUIRED_CHECK_COUNT: usize = 100;
-const UNKNOWN_WORKFLOW_NAME: &str = "workflow";
+pub(super) const UNKNOWN_WORKFLOW_NAME: &str = "workflow";
 const UNNAMED_JOB_NAME: &str = "job";
 const UNNAMED_STEP_NAME: &str = "step";
 const JOB_REQUIRED_ATTRIBUTE_COUNT: usize = 16;

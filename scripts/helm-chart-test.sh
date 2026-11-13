@@ -1218,6 +1218,73 @@ expect_failure_contains \
     helm template github-webhook-exporter "${CHART_DIRECTORY}" \
         --set-json 'costs.runners={"default_usd_per_minute":0.01,"labels":{"":0.02}}'
 
+cat >"${TEMPORARY_DIRECTORY}/ingest-values.yaml" <<'VALUES'
+webhookIngress:
+  enabled: true
+  host: exporter.example.test
+ingest:
+  oidc:
+    audience: https://exporter.example.test
+    allowed_repositories:
+      - owner/repo
+VALUES
+helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+    --values "${TEMPORARY_DIRECTORY}/ingest-values.yaml" \
+    >"${TEMPORARY_DIRECTORY}/ingest.yaml"
+yq eval-all '[.] | flatten | map(select(. != null))' \
+    "${TEMPORARY_DIRECTORY}/ingest.yaml" \
+    >"${TEMPORARY_DIRECTORY}/ingest-manifests.yaml"
+yq '[.[] | select(.kind == "ConfigMap")][0].data.GHE_INGEST_OIDC_JSON' \
+    "${TEMPORARY_DIRECTORY}/ingest-manifests.yaml" \
+    >"${TEMPORARY_DIRECTORY}/ingest.json"
+python3 -I - "${TEMPORARY_DIRECTORY}/ingest.json" <<'PYTHON' ||
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as rendered:
+    ingest = json.load(rendered)
+assert ingest == {
+    "audience": "https://exporter.example.test",
+    "allowed_repositories": ["owner/repo"],
+}
+PYTHON
+    fail 'a configured ingest.oidc block must render as valid JSON in GHE_INGEST_OIDC_JSON'
+assert_yq \
+    '([.[] | select(.kind == "Ingress")][0].spec.rules[0].http.paths | length) == 2 and
+     ([.[] | select(.kind == "Ingress")][0].spec.rules[0].http.paths[1].path) ==
+       "/ci-cost/usage" and
+     ([.[] | select(.kind == "Ingress")][0].spec.rules[0].http.paths[1].pathType) == "Exact"' \
+    "${TEMPORARY_DIRECTORY}/ingest-manifests.yaml" \
+    'a configured ingest.oidc block must route /ci-cost/usage through the webhook ingress'
+assert_yq \
+    '([.[] | select(.kind == "ConfigMap")][0].data | has("GHE_INGEST_OIDC_JSON")) == false' \
+    "${TEMPORARY_DIRECTORY}/default-manifests.yaml" \
+    'an unconfigured ingest.oidc block must add no configuration'
+expect_failure_contains \
+    'ingest.oidc without an allowlist' \
+    "missing property 'allowed_repositories'" \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set ingest.oidc.audience=https://exporter.example.test
+expect_failure_contains \
+    'ingest.oidc with an empty allowlist' \
+    'minItems: got 0, want 1' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set ingest.oidc.audience=https://exporter.example.test \
+        --set-json 'ingest.oidc.allowed_repositories=[]'
+expect_failure_contains \
+    'ingest.oidc with an invalid repository name' \
+    'does not match pattern' \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set ingest.oidc.audience=https://exporter.example.test \
+        --set-json 'ingest.oidc.allowed_repositories=["not a repo"]'
+expect_failure_contains \
+    'unknown ingest.oidc field' \
+    "additional properties 'issuer' not allowed" \
+    helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+        --set ingest.oidc.audience=https://exporter.example.test \
+        --set-json 'ingest.oidc.allowed_repositories=["owner/repo"]' \
+        --set ingest.oidc.issuer=https://issuer.example.test
+
 assert_contains \
     '## Webhook ingress example' \
     "${CHART_DIRECTORY}/README.md" \

@@ -682,6 +682,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "async-trait",
+ "aws-lc-rs",
  "axum",
  "base64 0.22.1",
  "hex",

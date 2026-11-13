@@ -82,6 +82,12 @@ and sets the variable for you — see [Helm values](helm-values.md).
 | --- | --- | --- |
 | `GHE_COSTS_JSON` | unset | Unit-price table as JSON; unset disables every cost feature. Invalid JSON, an unknown field, a negative rate, or an ambiguous vendor match fails startup. See [CI cost price table](costs.md). |
 
+## In-job usage reports
+
+| Variable | Default | Contract |
+| --- | --- | --- |
+| `GHE_INGEST_OIDC_JSON` | unset | `{"audience": "<aud>", "allowed_repositories": ["owner/repo", ...]}`; unset leaves `POST /ci-cost/usage` unregistered. The audience is 1 to 255 bytes; the list holds 1 to 256 distinct `owner/repo` names, compared case-insensitively. Invalid JSON or an unknown field fails startup naming only the variable. See [HTTP API](http-api.md#post-ci-costusage). |
+
 Structured logging to stderr is always on, independent of OTLP configuration.
 
 Do not place secret values (`GHE_MASTER_KEY`, `GHE_ADMIN_TOKEN`, `SENTRY_DSN`, OTLP header values) in image

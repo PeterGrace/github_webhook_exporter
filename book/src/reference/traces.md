@@ -192,6 +192,32 @@ PR), `github.repository` (the canonical repository name), `cicd.pipeline.run.id`
 `github.workflow.run.attempt`, and `cicd.pipeline.task.run.id`. Optional fields are omitted when
 unknown. Without a `costs` table the log is never written.
 
+### In-job usage spans
+
+Each entry accepted by `POST /ci-cost/usage` exports one independent root span named `ci.usage`,
+with `sentry.op=ci.usage` and an instant timestamp at receipt. It carries:
+
+- the claim attributes `cicd.pipeline.name`, `cicd.pipeline.run.id`,
+  `cicd.pipeline.run.url.full`, `vcs.repository.url.full`, `vcs.repository.name`,
+  `vcs.ref.head.revision` (when the token has a valid `sha`), `github.repository.name`,
+  `github.workflow.run.attempt`, `github.workflow.event`, `github.workflow`,
+  `github.workflow_file` and `ci.job_workflow_file` (the reusable workflow's file, from
+  `job_workflow_ref`);
+- `github.pull_request.number`, from the run's stored `workflow_run` context, when known;
+- `ci.job`, `ci.task`, `ci.model` and `ci.origin` when the body supplied them;
+- `ci.source`, `ci.cost_usd`, `ci.price.fell_back`, and `ci.price_table.version` when the table
+  priced the entry;
+- `ci.input_tokens` and `ci.output_tokens` for inference entries, or `ci.cpu_seconds` and
+  `ci.ram_gb_seconds` for Daytona entries.
+
+Each entry also writes one parentless `ci cost recorded` info log, whether or not trace export is
+enabled, with the same cost, label and measure fields plus `ci.job_workflow_file`,
+`github.workflow`, `github.workflow_file`, `github.workflow.event`, `github.pull_request.number`,
+`github.repository`, `cicd.pipeline.run.id`, and `github.workflow.run.attempt`.
+
+Accepted entries are stored per repository, run and attempt for run totals, and pruned on the
+processed-delivery retention cutoff.
+
 ### Branch-protection required checks
 
 `github.workflow.required` is a boolean reporting whether a job is a **branch-protection required
@@ -236,8 +262,10 @@ never enter workflow telemetry, in traces, logs, or metrics. Workflow identifier
 out of logs with two exceptions. One is a parentless structured warning on a newly claimed
 `too_many_steps` rejection, which may contain only `repository_name`, `delivery_id`,
 `workflow_run_id`, `workflow_run_attempt`, `workflow_job_id`, `step_count`, and `step_limit`. The
-other is the `ci cost recorded` log described above, which exists only when a `costs` table is
-configured and carries only the listed fields, so cost can be charted from the logs dataset. Operators can query
+other is the `ci cost recorded` log described above, written for priced jobs when a `costs`
+table is configured and for accepted usage entries, and carrying only the listed fields, so cost
+can be charted from the logs dataset. The `ci usage post rejected` warning carries only its
+`reason` and, after token verification, `github.repository`. Operators can query
 `GET /repos/{owner}/{repo}/actions/jobs/{job_id}` with the canonical repository name and
 `workflow_job_id`, and correlate against the delivery UUID for the original webhook delivery.
 
