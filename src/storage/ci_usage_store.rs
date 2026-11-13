@@ -318,6 +318,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_table_rejects_values_the_handler_would_refuse() {
+        let (_directory, pool, _store, repository_id) = store_with_repository().await;
+        for (source, cpu_seconds) in [("Anthropic", None), ("a b", None), ("daytona", Some(2e9))] {
+            let inserted = sqlx::query(
+                "INSERT INTO ci_usage_entries (repository_id, workflow_run_id, \
+                 workflow_run_attempt, source, cost_usd, price_fell_back, cpu_seconds, \
+                 ram_gb_seconds, updated_at) \
+                 VALUES (?, 31, 1, ?, 0, 0, ?, ?, '2026-11-13T10:00:00.000Z')",
+            )
+            .bind(repository_id.get())
+            .bind(source)
+            .bind(cpu_seconds)
+            .bind(cpu_seconds.map(|_| 1.0))
+            .execute(&pool)
+            .await;
+            assert!(inserted.is_err(), "{source} {cpu_seconds:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn prune_removes_only_entries_older_than_the_cutoff() {
         let (_directory, pool, store, repository_id) = store_with_repository().await;
         store

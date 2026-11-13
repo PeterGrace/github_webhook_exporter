@@ -25,6 +25,11 @@ Date: 2026-11-13T21:00:00Z
   from the run's stored `workflow_run` context when it has arrived.
 - Each rejection returns a fixed JSON error and writes one `ci usage post rejected` warning with a
   closed `reason`.
+- A busy or locked database returns a retryable `503 storage_unavailable`. Any other storage
+  failure returns `500 internal_error` with an `error_id` that matches one `ci usage post failed`
+  error log.
+- The issuer is fixed to GitHub.com's. GitHub Enterprise Server and customized enterprise issuers
+  are not supported yet.
 - Usage entries are pruned on the processed-delivery retention cutoff (`GHE_DELIVERY_RETENTION_DAYS`,
   7 days by default).
 

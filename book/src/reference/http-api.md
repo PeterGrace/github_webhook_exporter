@@ -71,6 +71,11 @@ The caller authenticates with the OIDC token GitHub minted for the job, as
 an RS256 JWT signed by a key in `https://token.actions.githubusercontent.com/.well-known/jwks`,
 issued by `https://token.actions.githubusercontent.com`, for the configured audience, unexpired,
 and for a repository that is both in `allowed_repositories` and registered through the admin API.
+
+The issuer and key URL are fixed to GitHub.com's. GitHub Enterprise Server, whose tokens come from
+`https://<host>/_services/token`, and enterprises that customize their issuer (for example
+`https://token.actions.githubusercontent.com/<enterprise-slug>`) cannot use this endpoint yet, even
+though `GHE_GITHUB_API_BASE_URL` supports GitHub Enterprise Server elsewhere.
 Keys are cached for an hour. A token naming an unknown `kid` triggers a refetch, but at most
 one fetch is attempted a minute, whether or not it succeeds. While the last attempt has failed, a
 token whose key is not cached gets `503 jwks_unavailable`, because it may be signed by a key
@@ -125,14 +130,20 @@ usd_per_ram_gb_second`. Without Daytona rates it is recorded at 0 USD with
 | `413 Payload Too Large` | `body_too_large` | Body exceeds 64 KiB. |
 | `415 Unsupported Media Type` | `unsupported_media_type` | Content type is not `application/json`. |
 | `422 Unprocessable Entity` | `unsupported_version`, `missing_usd` | `version` is not `1`, or an inference entry has no `usd`. |
-| `503 Service Unavailable` | `jwks_unavailable`, `storage_unavailable` | The signing keys or SQLite could not be reached. Retrying may succeed. |
+| `500 Internal Server Error` | `internal_error` | An unexpected SQLite failure that a retry will not fix. The body carries an `error_id` that matches one local `ci usage post failed` error log. |
+| `503 Service Unavailable` | `jwks_unavailable`, `storage_unavailable` | The signing keys could not be fetched, or SQLite was busy or locked. Retrying may succeed. |
 
 A post is all or nothing: one invalid entry rejects the post, and nothing from it is stored.
+The table's CHECK constraints repeat the bounds on `source`, `cpu_seconds` and `ram_gb_seconds`.
+`cost_usd` is checked only as non-negative, because Daytona costs are computed from the seconds and
+the table's rates; the 10,000 USD cap applies to the `usd` the caller sends.
 Stored entries are pruned on the processed-delivery cutoff, `GHE_DELIVERY_RETENTION_DAYS` (7 days
 by default), like the other correlation tables, so anything that totals usage per run or pull
 request can only see entries inside that window. Every
 rejection writes one parentless `ci usage post rejected` warning with the `code` as `reason`, plus
-`github.repository` once the token has been verified. Accepted posts are not deduplicated, so a
+`github.repository` once the token has been verified. A `500` instead writes one parentless
+`ci usage post failed` error log with the response's `error_id` and `github.repository`. Accepted
+posts are not deduplicated, so a
 client that retries after a timeout may record an entry twice.
 
 ## Admin API

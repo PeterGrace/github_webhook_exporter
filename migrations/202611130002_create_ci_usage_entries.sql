@@ -3,7 +3,9 @@ CREATE TABLE ci_usage_entries (
     repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
     workflow_run_id INTEGER NOT NULL CHECK (workflow_run_id > 0),
     workflow_run_attempt INTEGER NOT NULL CHECK (workflow_run_attempt > 0),
-    source TEXT NOT NULL CHECK (length(source) BETWEEN 1 AND 32),
+    source TEXT NOT NULL CHECK (
+        length(source) BETWEEN 1 AND 32 AND source NOT GLOB '*[^a-z0-9_-]*'
+    ),
     job TEXT CHECK (job IS NULL OR length(job) BETWEEN 1 AND 128),
     task TEXT CHECK (task IS NULL OR length(task) BETWEEN 1 AND 128),
     model TEXT CHECK (model IS NULL OR length(model) BETWEEN 1 AND 128),
@@ -15,8 +17,8 @@ CREATE TABLE ci_usage_entries (
     ),
     input_tokens INTEGER CHECK (input_tokens IS NULL OR input_tokens >= 0),
     output_tokens INTEGER CHECK (output_tokens IS NULL OR output_tokens >= 0),
-    cpu_seconds REAL CHECK (cpu_seconds IS NULL OR cpu_seconds >= 0),
-    ram_gb_seconds REAL CHECK (ram_gb_seconds IS NULL OR ram_gb_seconds >= 0),
+    cpu_seconds REAL CHECK (cpu_seconds IS NULL OR cpu_seconds BETWEEN 0 AND 1000000000),
+    ram_gb_seconds REAL CHECK (ram_gb_seconds IS NULL OR ram_gb_seconds BETWEEN 0 AND 1000000000),
     updated_at TEXT NOT NULL
 );
 

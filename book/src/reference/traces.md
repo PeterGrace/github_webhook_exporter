@@ -208,8 +208,9 @@ with `sentry.op=ci.usage` and an instant timestamp at receipt. It carries:
   `job_workflow_ref`);
 - `github.pull_request.number`, from the run's stored `workflow_run` context, when known;
 - `ci.job`, `ci.task`, `ci.model` and `ci.origin` when the body supplied them;
-- `ci.source`, `ci.cost_usd`, `ci.price.fell_back`, and `ci.price_table.version` when the table
-  priced the entry;
+- `ci.source`, `ci.cost_usd` and `ci.price.fell_back`, plus `ci.price_table.version` whenever a
+  `costs` table is configured, including Daytona entries recorded at 0 USD because the table has no
+  `daytona` block;
 - `ci.input_tokens` and `ci.output_tokens` for inference entries, or `ci.cpu_seconds` and
   `ci.ram_gb_seconds` for Daytona entries.
 
@@ -268,7 +269,8 @@ out of logs with two exceptions. One is a parentless structured warning on a new
 other is the `ci cost recorded` log described above, written for priced jobs when a `costs`
 table is configured and for accepted usage entries, and carrying only the listed fields, so cost
 can be charted from the logs dataset. The `ci usage post rejected` warning carries only its
-`reason` and, after token verification, `github.repository`. Operators can query
+`reason` and, after token verification, `github.repository`; the `ci usage post failed` error
+carries only `outcome`, `error_id` and `github.repository`. Operators can query
 `GET /repos/{owner}/{repo}/actions/jobs/{job_id}` with the canonical repository name and
 `workflow_job_id`, and correlate against the delivery UUID for the original webhook delivery.
 

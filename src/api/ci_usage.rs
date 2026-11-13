@@ -16,7 +16,7 @@ use axum::{
 };
 use opentelemetry::Context;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::{
     app::{AppState, RequestRepositoryContext},
@@ -25,6 +25,7 @@ use crate::{
         oidc::{GitHubActionsClaims, OidcRejection, OidcToken},
         CanonicalRepositoryName,
     },
+    storage::{CiUsageStoreError, RepositoryStoreError},
     telemetry::{
         usage::{log_usage_costs, UsageEntry, UsageMeasure, UsageReport, UsageSource},
         workflow::{DisplayName, WorkflowRunContext},
@@ -61,6 +62,13 @@ pub(crate) enum UsageRejection {
     SchemaInvalid,
     MissingUsd,
     StorageUnavailable,
+}
+
+/// A storage failure: retryable when SQLite is busy or locked, internal otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageFailure {
+    Unavailable,
+    Internal,
 }
 
 impl UsageRejection {
@@ -105,6 +113,40 @@ impl UsageRejection {
 struct RejectionBody {
     code: &'static str,
     message: &'static str,
+}
+
+/// Answers a storage failure. A busy or locked database is a retryable
+/// `503 storage_unavailable`. Anything else will fail the same way on retry, so it is a
+/// `500 internal_error` whose `error_id` matches one local error log.
+fn storage_failure(failure: StorageFailure, repository: &CanonicalRepositoryName) -> Response {
+    if failure == StorageFailure::Unavailable {
+        return reject(UsageRejection::StorageUnavailable, Some(repository));
+    }
+    let error_id = crate::error::ErrorCorrelationId::new();
+    let _parentless_context = Context::new().attach();
+    error!(
+        parent: None,
+        outcome = "internal_error",
+        %error_id,
+        github.repository = repository.as_str(),
+        "ci usage post failed"
+    );
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(InternalErrorBody {
+            code: "internal_error",
+            message: "internal server error",
+            error_id,
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Serialize)]
+struct InternalErrorBody {
+    code: &'static str,
+    message: &'static str,
+    error_id: crate::error::ErrorCorrelationId,
 }
 
 /// Logs the rejection and builds its response. The token and body never reach either.
@@ -308,7 +350,10 @@ async fn usage_handler(State(state): State<AppState>, request: Request) -> Respo
     {
         Ok(Some(repository_id)) => repository_id,
         Ok(None) => return reject(UsageRejection::RepositoryNotRegistered, repository),
-        Err(_) => return reject(UsageRejection::StorageUnavailable, repository),
+        Err(RepositoryStoreError::Unavailable) => {
+            return storage_failure(StorageFailure::Unavailable, &claims.repository);
+        }
+        Err(_) => return storage_failure(StorageFailure::Internal, &claims.repository),
     };
 
     let is_json = parts
@@ -340,16 +385,12 @@ async fn usage_handler(State(state): State<AppState>, request: Request) -> Respo
         received_at,
         entries: post.entries,
     };
-    if state
-        .ci_usage_store()
-        .record(repository_id, &report)
-        .await
-        .is_err()
-    {
-        return reject(
-            UsageRejection::StorageUnavailable,
-            Some(&report.claims.repository),
-        );
+    if let Err(failure) = state.ci_usage_store().record(repository_id, &report).await {
+        let failure = match failure {
+            CiUsageStoreError::Unavailable => StorageFailure::Unavailable,
+            CiUsageStoreError::Internal => StorageFailure::Internal,
+        };
+        return storage_failure(failure, &report.claims.repository);
     }
     log_usage_costs(&report);
     state.workflow_trace_emitter().emit_usage(&report);

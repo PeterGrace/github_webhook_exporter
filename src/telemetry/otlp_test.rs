@@ -7976,3 +7976,39 @@ async fn a_jwks_outage_rejects_usage_posts_as_retryable() {
         Some(&AttributeValue::StringValue("jwks_unavailable".to_owned()))
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_internal_storage_failure_is_a_correlated_500_not_a_retryable_503() {
+    let signer = TestSigner::new(USAGE_SIGNER_KID);
+    let fixture = WebhookTraceFixture::new_with_usage(None, &[WEBHOOK_REPOSITORY], &signer).await;
+    sqlx::query("DROP TABLE ci_usage_entries")
+        .execute(&fixture.pool)
+        .await
+        .expect("usage table drops");
+
+    let response = fixture
+        .usage(
+            Some(&format!("Bearer {}", signer.sign(&usage_claims()))),
+            usage_body(),
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = to_bytes(response.into_body(), 10_000)
+        .await
+        .expect("error body is readable");
+    let body: Value = serde_json::from_slice(&body).expect("error body is JSON");
+    assert_eq!(body["code"], "internal_error");
+    let error_id = body["error_id"]
+        .as_str()
+        .expect("the response carries an error_id")
+        .to_owned();
+    let captured = fixture.force_flush();
+    let failure = captured.one_log_with_body("ci usage post failed");
+    assert_eq!(
+        log_attribute(failure, "error_id"),
+        Some(&AttributeValue::StringValue(error_id))
+    );
+    assert!(!captured.has_log_body("ci cost recorded"));
+    assert!(!captured.has_log_body("ci usage post rejected"));
+}
