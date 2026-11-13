@@ -301,6 +301,15 @@ async fn usage_handler(State(state): State<AppState>, request: Request) -> Respo
         context.authenticate(&claims.repository);
     }
     let repository = Some(&claims.repository);
+    let repository_id = match state
+        .repository_store()
+        .enabled_id(&claims.repository)
+        .await
+    {
+        Ok(Some(repository_id)) => repository_id,
+        Ok(None) => return reject(UsageRejection::RepositoryNotRegistered, repository),
+        Err(_) => return reject(UsageRejection::StorageUnavailable, repository),
+    };
 
     let is_json = parts
         .headers
@@ -323,15 +332,6 @@ async fn usage_handler(State(state): State<AppState>, request: Request) -> Respo
         Err(rejection) => return reject(rejection, repository),
     };
 
-    let repository_id = match state
-        .repository_store()
-        .enabled_id(&claims.repository)
-        .await
-    {
-        Ok(Some(repository_id)) => repository_id,
-        Ok(None) => return reject(UsageRejection::RepositoryNotRegistered, repository),
-        Err(_) => return reject(UsageRejection::StorageUnavailable, repository),
-    };
     let pull_request = attributed_pull_request(&state, repository_id, &claims).await;
     let report = UsageReport {
         claims,

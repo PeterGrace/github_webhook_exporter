@@ -15,8 +15,9 @@ Date: 2026-11-13T21:00:00Z
   Ingress when configured.
 - Tokens must be RS256, signed by a key in GitHub's published JWKS, issued by
   `https://token.actions.githubusercontent.com`, for the configured audience and unexpired. Keys are
-  cached for an hour and refetched at most once a minute for an unknown `kid`, with redirects
-  disabled and a 64 KiB response cap. The token is never logged or printed.
+  cached for an hour. At most one JWKS fetch is attempted a minute, successful or not, with
+  redirects disabled and a 64 KiB response cap. While the last attempt failed, a token whose key is
+  not cached gets a retryable `503 jwks_unavailable`. The token is never logged or printed.
 - Daytona entries are priced from `costs.daytona`. Without those rates they are recorded at 0 USD
   with `ci.price.fell_back=true`.
 - Each accepted entry is stored in the new `ci_usage_entries` table (migration `202611130002`),
@@ -24,7 +25,8 @@ Date: 2026-11-13T21:00:00Z
   from the run's stored `workflow_run` context when it has arrived.
 - Each rejection returns a fixed JSON error and writes one `ci usage post rejected` warning with a
   closed `reason`.
-- Usage entries are pruned on the processed-delivery retention cutoff.
+- Usage entries are pruned on the processed-delivery retention cutoff (`GHE_DELIVERY_RETENTION_DAYS`,
+  7 days by default).
 
 ## Upgrade note
 

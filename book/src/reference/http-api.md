@@ -71,8 +71,15 @@ The caller authenticates with the OIDC token GitHub minted for the job, as
 an RS256 JWT signed by a key in `https://token.actions.githubusercontent.com/.well-known/jwks`,
 issued by `https://token.actions.githubusercontent.com`, for the configured audience, unexpired,
 and for a repository that is both in `allowed_repositories` and registered through the admin API.
-Keys are cached for an hour and refetched at most once a minute when a token names an unknown
-`kid`. The token is never logged.
+Keys are cached for an hour. A token naming an unknown `kid` triggers a refetch, but at most
+one fetch is attempted a minute, whether or not it succeeds. While the last attempt has failed, a
+token whose key is not cached gets `503 jwks_unavailable`, because it may be signed by a key
+GitHub rotated in during the outage; once a fetch succeeds without its key, it gets
+`401 invalid_token`. Cached keys keep verifying while GitHub is unreachable. The token is never
+logged.
+
+The checks run in a fixed order: token, repository registration, content type, then body. A
+rejection reports the first check that failed.
 
 Attribution comes only from the verified claims: `repository`, `workflow`, `workflow_ref`,
 `job_workflow_ref`, `run_id`, `run_attempt`, `event_name`, and `sha`. The pull request is the one
@@ -118,7 +125,10 @@ usd_per_ram_gb_second`. Without Daytona rates it is recorded at 0 USD with
 | `422 Unprocessable Entity` | `unsupported_version`, `missing_usd` | `version` is not `1`, or an inference entry has no `usd`. |
 | `503 Service Unavailable` | `jwks_unavailable`, `storage_unavailable` | The signing keys or SQLite could not be reached. Retrying may succeed. |
 
-A post is all or nothing: one invalid entry rejects the post, and nothing from it is stored. Every
+A post is all or nothing: one invalid entry rejects the post, and nothing from it is stored.
+Stored entries are pruned on the processed-delivery cutoff, `GHE_DELIVERY_RETENTION_DAYS` (7 days
+by default), like the other correlation tables, so anything that totals usage per run or pull
+request can only see entries inside that window. Every
 rejection writes one parentless `ci usage post rejected` warning with the `code` as `reason`, plus
 `github.repository` once the token has been verified. Accepted posts are not deduplicated, so a
 client that retries after a timeout may record an entry twice.

@@ -8,7 +8,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -17,7 +17,7 @@ use jsonwebtoken::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::Instant};
 
 use crate::{
     config::ConfigError,
@@ -297,6 +297,10 @@ impl JwksSource for GitHubJwksClient {
 struct KeyCache {
     keys: HashMap<String, Arc<DecodingKey>>,
     fetched_at: Option<Instant>,
+    /// When the last fetch was attempted, successful or not. The refetch interval applies to
+    /// attempts, so an unreachable JWKS is not retried on every request.
+    attempted_at: Option<Instant>,
+    last_attempt_failed: bool,
 }
 
 impl KeyCache {
@@ -305,9 +309,10 @@ impl KeyCache {
             .is_none_or(|fetched_at| now.duration_since(fetched_at) >= JWKS_MAX_AGE)
     }
 
-    fn may_refetch(&self, now: Instant) -> bool {
-        self.fetched_at
-            .is_none_or(|fetched_at| now.duration_since(fetched_at) >= JWKS_MIN_REFETCH_INTERVAL)
+    fn may_attempt(&self, now: Instant) -> bool {
+        self.attempted_at.is_none_or(|attempted_at| {
+            now.duration_since(attempted_at) >= JWKS_MIN_REFETCH_INTERVAL
+        })
     }
 
     fn replace(&mut self, set: &JwkSet, now: Instant) {
@@ -383,32 +388,31 @@ impl OidcVerifier {
 
     /// Returns the key for `kid`, refetching when the cache is stale or lacks it.
     ///
-    /// A failed refetch keeps serving cached keys. A token whose key is missing after a refetch,
-    /// or within the refetch interval, is invalid.
+    /// At most one fetch is attempted per [`JWKS_MIN_REFETCH_INTERVAL`], whether or not it
+    /// succeeds, so the cache lock is held across a fetch at most that often. A failed refetch
+    /// keeps serving cached keys. A missing key is [`OidcRejection::JwksUnavailable`] while the
+    /// last attempt failed, since it may be a rotated key the cache has not seen, and
+    /// [`OidcRejection::InvalidToken`] once a fetch has succeeded without it.
     async fn key(&self, kid: &str) -> Result<Arc<DecodingKey>, OidcRejection> {
         let mut cache = self.cache.lock().await;
         let now = Instant::now();
         let cached = cache.keys.get(kid).cloned();
-        let refetch = if cached.is_some() {
-            cache.is_stale(now) && cache.may_refetch(now)
-        } else {
-            cache.may_refetch(now)
-        };
-        if refetch {
+        let wanted = cached.is_none() || cache.is_stale(now);
+        if wanted && cache.may_attempt(now) {
+            cache.attempted_at = Some(now);
             match self.source.fetch().await {
-                Ok(set) => cache.replace(&set, now),
-                Err(JwksFetchError) if cached.is_none() && cache.fetched_at.is_none() => {
-                    return Err(OidcRejection::JwksUnavailable);
+                Ok(set) => {
+                    cache.replace(&set, now);
+                    cache.last_attempt_failed = false;
                 }
-                Err(JwksFetchError) => {}
+                Err(JwksFetchError) => cache.last_attempt_failed = true,
             }
         }
-        cache
-            .keys
-            .get(kid)
-            .cloned()
-            .or(cached)
-            .ok_or(OidcRejection::InvalidToken)
+        match cache.keys.get(kid).cloned().or(cached) {
+            Some(key) => Ok(key),
+            None if cache.last_attempt_failed => Err(OidcRejection::JwksUnavailable),
+            None => Err(OidcRejection::InvalidToken),
+        }
     }
 }
 
@@ -513,26 +517,31 @@ pub(crate) mod test_support {
         })
     }
 
-    /// A JWKS source that serves fixed keys, or fails, and counts its fetches.
+    /// A JWKS source that serves fixed keys, or fails, and counts its fetches. Clones share
+    /// state, so a test can make the source fail after handing it to a verifier.
     #[derive(Clone)]
     pub(crate) struct StaticJwks {
-        set: Option<JwkSet>,
+        set: Arc<std::sync::Mutex<Option<JwkSet>>>,
         fetches: Arc<AtomicUsize>,
     }
 
     impl StaticJwks {
         pub(crate) fn serving(set: JwkSet) -> Self {
             Self {
-                set: Some(set),
+                set: Arc::new(std::sync::Mutex::new(Some(set))),
                 fetches: Arc::default(),
             }
         }
 
         pub(crate) fn failing() -> Self {
             Self {
-                set: None,
+                set: Arc::default(),
                 fetches: Arc::default(),
             }
+        }
+
+        pub(crate) fn start_failing(&self) {
+            *self.set.lock().expect("test JWKS lock") = None;
         }
 
         pub(crate) fn fetches(&self) -> usize {
@@ -544,7 +553,11 @@ pub(crate) mod test_support {
     impl JwksSource for StaticJwks {
         async fn fetch(&self) -> Result<JwkSet, JwksFetchError> {
             self.fetches.fetch_add(1, Ordering::SeqCst);
-            self.set.clone().ok_or(JwksFetchError)
+            self.set
+                .lock()
+                .expect("test JWKS lock")
+                .clone()
+                .ok_or(JwksFetchError)
         }
     }
 }
@@ -679,17 +692,72 @@ mod tests {
         assert_eq!(source.fetches(), 1);
     }
 
-    #[tokio::test]
-    async fn an_unreachable_jwks_is_reported_as_unavailable() {
+    #[tokio::test(start_paused = true)]
+    async fn an_unreachable_jwks_is_unavailable_and_retried_at_most_once_per_interval() {
         let signer = TestSigner::new("key-1");
-        let verifier = verifier(StaticJwks::failing());
+        let source = StaticJwks::failing();
+        let verifier = verifier(source.clone());
+        let token = bearer(&signer.sign(&claims("owner/repo")));
 
+        for _ in 0..3 {
+            assert_eq!(
+                verifier.verify(&token).await,
+                Err(OidcRejection::JwksUnavailable)
+            );
+        }
+        assert_eq!(source.fetches(), 1);
+
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        assert_eq!(
+            verifier.verify(&token).await,
+            Err(OidcRejection::JwksUnavailable)
+        );
+        assert_eq!(source.fetches(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rotated_key_during_a_jwks_outage_is_unavailable_not_invalid() {
+        let signer = TestSigner::new("key-1");
+        let rotated = TestSigner::new("key-2");
+        let source = StaticJwks::serving(signer.jwks());
+        let verifier = verifier(source.clone());
+        verifier
+            .verify(&bearer(&signer.sign(&claims("owner/repo"))))
+            .await
+            .expect("first key verifies");
+
+        source.start_failing();
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
         assert_eq!(
             verifier
-                .verify(&bearer(&signer.sign(&claims("owner/repo"))))
+                .verify(&bearer(&rotated.sign(&claims("owner/repo"))))
                 .await,
             Err(OidcRejection::JwksUnavailable)
         );
+        verifier
+            .verify(&bearer(&signer.sign(&claims("owner/repo"))))
+            .await
+            .expect("cached key still verifies during the outage");
+        assert_eq!(source.fetches(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_keys_are_refreshed_once_and_kept_when_the_refresh_fails() {
+        let signer = TestSigner::new("key-1");
+        let source = StaticJwks::serving(signer.jwks());
+        let verifier = verifier(source.clone());
+        let token = bearer(&signer.sign(&claims("owner/repo")));
+        verifier.verify(&token).await.expect("token verifies");
+
+        source.start_failing();
+        tokio::time::advance(std::time::Duration::from_secs(3_601)).await;
+        for _ in 0..3 {
+            verifier
+                .verify(&token)
+                .await
+                .expect("stale cached key keeps verifying");
+        }
+        assert_eq!(source.fetches(), 2);
     }
 
     #[test]

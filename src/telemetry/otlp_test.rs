@@ -7778,6 +7778,12 @@ async fn each_rejected_usage_post_logs_one_warning_with_its_reason() {
             "repository_not_registered",
         ),
         (
+            Some(signer.sign(&unregistered)),
+            b"{not json".to_vec(),
+            StatusCode::FORBIDDEN,
+            "repository_not_registered",
+        ),
+        (
             Some(valid.clone()),
             body(serde_json::json!({"version": 1, "entries": [{"source": "anthropic"}]})),
             StatusCode::UNPROCESSABLE_ENTITY,
