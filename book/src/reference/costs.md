@@ -84,6 +84,11 @@ carries `ci.cost_usd`, the rate as `ci.price.usd_per_minute`, and the matched la
 [Runner and cost attributes](traces.md#runner-and-cost-attributes). A job that billed 0 minutes,
 such as a skipped job, is priced at 0 without a rate lookup.
 
+Daytona usage that a job reports to `POST /ci-cost/usage` is priced at `cpu_seconds ×
+daytona.usd_per_cpu_second + ram_gb_seconds × daytona.usd_per_ram_gb_second`. Without a
+`daytona` block it is recorded at 0 USD with `ci.price.fell_back=true`. Inference entries carry
+their own USD amount and never use the table; see [HTTP API](http-api.md#post-ci-costusage).
+
 A job whose labels have no price is charged at `runners.default_usd_per_minute`. Self-hosted
 runners are included: price their label, for example `self-hosted: 0`, if their minutes should
 cost nothing.

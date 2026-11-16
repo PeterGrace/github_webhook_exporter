@@ -68,7 +68,15 @@ async fn run_service(
     .with_metrics(metrics)
     .with_workflow_trace_emitter(workflow_trace_emitter)
     .with_required_check_ttl(config.required_check_ttl())
-    .with_costs(config.costs().cloned());
+    .with_costs(config.costs().cloned())
+    .with_ingest_oidc(config.ingest_oidc().cloned())
+    .context("failed to initialize OIDC usage ingestion")?;
+    if let Some(ingest_oidc) = config.ingest_oidc() {
+        info!(
+            allowed_repositories = ingest_oidc.allowed_repository_count(),
+            "OIDC usage ingestion enabled"
+        );
+    }
 
     // Without GitHub App credentials the required-check cache is never filled, and every workflow
     // job reports its required status as unknown. That is a supported deployment, not a failure.

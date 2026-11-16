@@ -481,6 +481,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_event_round_trips_through_storage() {
+        let directory = tempfile::tempdir().expect("temporary directory exists");
+        let pool = open_database(&directory.path().join("exporter.sqlite3"))
+            .await
+            .expect("database opens");
+        let repository_id = insert_repository(&pool).await;
+        let store = WorkflowRunStore::new(pool);
+
+        for (run_id, event) in (1..).zip(WorkflowEvent::ALL) {
+            let context = WorkflowRunContext::new(
+                WorkflowRunId::new(run_id).expect("run id is positive"),
+                WorkflowRunAttempt::new(1).expect("attempt is positive"),
+                event,
+                None,
+                None,
+            );
+            store
+                .upsert(repository_id, &context)
+                .await
+                .unwrap_or_else(|_| panic!("{} context persists", event.as_str()));
+            let stored = store
+                .get(repository_id, context.run_id(), context.run_attempt())
+                .await
+                .expect("lookup succeeds");
+            assert_eq!(stored, Some(context), "{}", event.as_str());
+        }
+    }
+
+    #[tokio::test]
+    async fn accepting_workflow_run_events_keeps_attributed_contexts() {
+        const WIDENING_VERSION: i64 = 202_611_130_001;
+        let directory = tempfile::tempdir().expect("temporary directory exists");
+        let path = directory.path().join("exporter.sqlite3");
+        let pool = SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .expect("database opens");
+        let mut earlier = sqlx::migrate!();
+        earlier.migrations = earlier
+            .migrations
+            .iter()
+            .filter(|migration| migration.version < WIDENING_VERSION)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        earlier.run(&pool).await.expect("earlier migrations apply");
+        let repository_id = insert_repository(&pool).await;
+        sqlx::query(
+            "INSERT INTO workflow_run_contexts (repository_id, workflow_run_id, \
+             workflow_run_attempt, event, source_branch, target_branch, pull_request_number, \
+             workflow_file, updated_at) \
+             VALUES (?, 31, 1, 'issue_comment', 'master', NULL, 9201, 'claude.yml', \
+             '2026-11-12T10:00:00.000Z')",
+        )
+        .bind(repository_id.get())
+        .execute(&pool)
+        .await
+        .expect("attributed context inserts");
+        pool.close().await;
+
+        let migrated = open_database(&path)
+            .await
+            .expect("remaining migrations apply");
+        let stored = WorkflowRunStore::new(migrated)
+            .get(
+                repository_id,
+                WorkflowRunId::new(31).expect("run id is positive"),
+                WorkflowRunAttempt::new(1).expect("attempt is positive"),
+            )
+            .await
+            .expect("lookup succeeds");
+
+        assert_eq!(
+            stored,
+            Some(
+                WorkflowRunContext::new(
+                    WorkflowRunId::new(31).expect("run id is positive"),
+                    WorkflowRunAttempt::new(1).expect("attempt is positive"),
+                    WorkflowEvent::IssueComment,
+                    WorkflowBranch::sanitize("master"),
+                    None,
+                )
+                .with_pull_request(Some(PullRequestNumber::new(9201).expect("PR is positive")))
+                .with_workflow_file(WorkflowFile::from_path("claude.yml"))
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn tampered_pull_request_or_workflow_file_fails_the_lookup() {
         let directory = tempfile::tempdir().expect("temporary directory exists");
         let pool = open_database(&directory.path().join("exporter.sqlite3"))
