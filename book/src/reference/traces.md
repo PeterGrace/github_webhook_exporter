@@ -214,7 +214,8 @@ with `sentry.op=ci.usage` and an instant timestamp at receipt. It carries:
   `github.workflow.run.attempt`, `github.workflow.event`, `github.workflow`,
   `github.workflow_file` and `ci.job_workflow_file` (the reusable workflow's file, from
   `job_workflow_ref`);
-- `github.pull_request.number`, from the run's stored `workflow_run` context, when known;
+- `github.pull_request.number` and the groupable `ci.pull_request.number`, from the run's stored
+  `workflow_run` context, when known;
 - `ci.job`, `ci.task`, `ci.model` and `ci.origin` when the body supplied them;
 - `ci.source`, `ci.cost_usd` and `ci.price.fell_back`, plus, on Daytona entries only,
   `ci.price_table.version` whenever a `costs` table is configured, including entries recorded at

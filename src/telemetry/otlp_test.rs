@@ -7708,6 +7708,7 @@ async fn an_accepted_usage_post_exports_one_span_and_one_cost_log_per_entry() {
         assert_attribute(span, "cicd.pipeline.run.id", "61");
         assert_attribute(span, "ci.job", "run-evals");
         assert_i64_array_attribute(span, "github.pull_request.number", &[8553]);
+        assert_i64_attribute(span, "ci.pull_request.number", 8553);
     }
     let inference = usage_spans
         .iter()

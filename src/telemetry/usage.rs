@@ -13,7 +13,8 @@ use crate::{
     security::oidc::GitHubActionsClaims,
     telemetry::{
         trace::{
-            github_workflow_attribute, job_workflow_file_attribute, price_table_version_attribute,
+            attributed_pull_request_attribute, github_workflow_attribute,
+            job_workflow_file_attribute, price_table_version_attribute,
             pull_request_numbers_attribute, repository_name_attribute, sandbox_usage_attributes,
             sentry_description_attribute, sentry_operation_attribute, token_count_attributes,
             usage_cost_attributes, usage_job_attribute, usage_label_attributes,
@@ -150,6 +151,9 @@ fn usage_attributes(report: &UsageReport, entry: &UsageEntry) -> Vec<KeyValue> {
     }
     if let Some(pull_requests) = pull_request_numbers_attribute(report.pull_requests()) {
         attributes.push(pull_requests);
+    }
+    if let Some(attributed) = attributed_pull_request_attribute(report.pull_requests()) {
+        attributes.push(attributed);
     }
     if let Some(job) = &report.job {
         attributes.push(usage_job_attribute(job));
