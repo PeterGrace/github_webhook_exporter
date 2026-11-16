@@ -119,6 +119,7 @@ The chart never reads or copies Secret data into its ConfigMap.
 | `githubApp.installationId` | `null` | GitHub App installation identifier; null disables required-check lookups. |
 | `githubApp.apiBaseUrl` | `""` | REST API base URL; empty selects `https://api.github.com`. |
 | `costs` | `{}` | Optional CI cost unit-price table rendered as `GHE_COSTS_JSON`; empty disables cost features. Requires `runners.default_usd_per_minute`; rates are non-negative numbers and each vendor has exactly one `match` rule. See the book's CI cost price table reference. |
+| `ingest.oidc` | `{}` | Optional `audience` and `allowed_repositories` (1 to 256 `owner/repo` names) for GitHub Actions OIDC-authenticated usage reports, rendered as `GHE_INGEST_OIDC_JSON`. When set, `webhookIngress` also routes `/ci-cost/usage`, and the pod must reach `token.actions.githubusercontent.com` over HTTPS to fetch signing keys. Empty leaves the endpoint unregistered. |
 | `retention.deliveryDays` | `7` | Authenticated delivery-claim retention in days. |
 | `retention.mergeQueueDays` | `90` | Completed merge-queue-attempt retention in days. |
 | `retention.pruneIntervalSeconds` | `3600` | Shared retention pruning interval in seconds. |
@@ -511,7 +512,9 @@ networkPolicy:
 `networkPolicy.egress.github` is only needed when `githubApp` is configured. GitHub's API is
 outside the cluster, so its peers are normally an `ipBlock` for an egress gateway or proxy rather
 than a pod selector. NetworkPolicy matches addresses, not hostnames: point it at whatever
-egress path your platform provides, not at `api.github.com`.
+egress path your platform provides, not at `api.github.com`. With `ingest.oidc` configured, the
+same egress path must also reach `token.actions.githubusercontent.com` on port 443, where the
+signing keys for usage tokens are published.
 
 DNS labels vary by distribution; inspect the cluster's DNS pods before enabling the rule. For an
 external collector, use an `ipBlock.cidr` peer instead of selectors. NetworkPolicy cannot allow a

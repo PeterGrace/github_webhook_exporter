@@ -11,8 +11,8 @@ use crate::{
     error::ErrorCorrelationId,
     lifecycle,
     storage::{
-        DeliveryStore, DeliveryStoreError, MergeQueueStore, MergeQueueStoreError,
-        RequiredCheckStore, RequiredCheckStoreError, WorkflowJobLinkStore,
+        CiUsageStore, CiUsageStoreError, DeliveryStore, DeliveryStoreError, MergeQueueStore,
+        MergeQueueStoreError, RequiredCheckStore, RequiredCheckStoreError, WorkflowJobLinkStore,
         WorkflowJobLinkStoreError, WorkflowRunStore, WorkflowRunStoreError,
     },
     telemetry::trace::{self, Operation, OperationOutcome},
@@ -129,6 +129,7 @@ struct DerivedRetentionStores {
     workflow_run: WorkflowRunStore,
     workflow_job_link: WorkflowJobLinkStore,
     required_check: RequiredCheckStore,
+    ci_usage: CiUsageStore,
 }
 
 impl DerivedRetentionStores {
@@ -142,6 +143,7 @@ impl DerivedRetentionStores {
                 pool.clone(),
                 Duration::from_secs(DEFAULT_REQUIRED_CHECK_TTL_SECONDS),
             ),
+            ci_usage: CiUsageStore::new(pool.clone()),
         }
     }
 }
@@ -175,7 +177,7 @@ async fn prune_retention_pass(
     let pass_started_at = OffsetDateTime::now_utc();
     let delivery_cutoff = pass_started_at.checked_sub(config.delivery_retention);
     let merge_queue_cutoff = pass_started_at.checked_sub(config.merge_queue_retention);
-    // Workflow correlation and required-check rows are short-lived caches keyed to deliveries, so
+    // Workflow correlation, required-check and usage rows are keyed to deliveries and runs, so
     // they share the delivery cutoff rather than carrying retention settings of their own.
     prune_retention_workloads(
         &[
@@ -184,6 +186,7 @@ async fn prune_retention_pass(
             (&derived_stores.workflow_run, delivery_cutoff),
             (&derived_stores.workflow_job_link, delivery_cutoff),
             (&derived_stores.required_check, delivery_cutoff),
+            (&derived_stores.ci_usage, delivery_cutoff),
         ],
         shutdown,
     )
@@ -337,6 +340,19 @@ impl PrunableStore for WorkflowJobLinkStore {
         WorkflowJobLinkStore::prune_batch(self, cutoff)
             .await
             .map_err(|_: WorkflowJobLinkStoreError| StorePruneFailure)
+    }
+}
+
+#[async_trait]
+impl PrunableStore for CiUsageStore {
+    fn workload(&self) -> &'static str {
+        "ci_usage"
+    }
+
+    async fn prune_batch_erased(&self, cutoff: OffsetDateTime) -> Result<u64, StorePruneFailure> {
+        CiUsageStore::prune_batch(self, cutoff)
+            .await
+            .map_err(|_: CiUsageStoreError| StorePruneFailure)
     }
 }
 
@@ -822,6 +838,35 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("workflow contexts are countable");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn retention_prunes_usage_entries_with_the_delivery_cutoff() {
+        let (_directory, pool, delivery_store, queue_store) = retention_stores().await;
+        sqlx::query(
+            "INSERT INTO ci_usage_entries \
+             (repository_id, workflow_run_id, workflow_run_attempt, source, cost_usd, \
+              price_fell_back, updated_at) \
+             VALUES (1, 31, 1, 'anthropic', 0.5, 0, '2020-01-01T00:00:00.000Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("expired usage entry inserts");
+        let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let config = RetentionConfig::new(
+            Duration::from_millis(10),
+            Duration::from_secs(86_400),
+            Duration::from_secs(90 * 86_400),
+        )
+        .expect("retention configuration is valid");
+
+        run_retention_once(&delivery_store, &queue_store, config, &shutdown_receiver).await;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ci_usage_entries")
+            .fetch_one(&pool)
+            .await
+            .expect("usage entries are countable");
         assert_eq!(count, 0);
     }
 

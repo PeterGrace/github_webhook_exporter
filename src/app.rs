@@ -24,10 +24,13 @@ use crate::{
     health, lifecycle,
     metrics::{self, Metrics},
     retention::{run_retention, RetentionConfig},
-    security::{AdminAuthenticator, CanonicalRepositoryName},
+    security::{
+        oidc::{GitHubJwksClient, JwksFetchError, JwksSource, OidcVerifier},
+        AdminAuthenticator, CanonicalRepositoryName, IngestOidcConfig,
+    },
     storage::{
-        DeliveryStore, MergeQueueStore, RepositoryStore, RequiredCheckStore, WorkflowJobLinkStore,
-        WorkflowRunStore,
+        CiUsageStore, DeliveryStore, MergeQueueStore, RepositoryStore, RequiredCheckStore,
+        WorkflowJobLinkStore, WorkflowRunStore,
     },
     telemetry::{
         trace::{self, Operation},
@@ -69,7 +72,14 @@ pub struct AppState {
     webhook_body_limit_bytes: usize,
     workflow_job_max_steps: usize,
     costs: Option<Arc<CostsConfig>>,
+    ci_usage_store: CiUsageStore,
+    oidc_verifier: Option<Arc<OidcVerifier>>,
 }
+
+/// The JWKS client for `ingest.oidc` could not be built.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to build the GitHub Actions JWKS client")]
+pub struct IngestOidcError;
 
 impl AppState {
     /// Creates application state from initialized repository and authentication services.
@@ -84,6 +94,7 @@ impl AppState {
         let merge_queue_store = MergeQueueStore::new(database_pool.clone());
         let workflow_run_store = WorkflowRunStore::new(database_pool.clone());
         let workflow_job_link_store = WorkflowJobLinkStore::new(database_pool.clone());
+        let ci_usage_store = CiUsageStore::new(database_pool.clone());
         let required_check_store = RequiredCheckStore::new(
             database_pool.clone(),
             Duration::from_secs(DEFAULT_REQUIRED_CHECK_TTL_SECONDS),
@@ -103,7 +114,39 @@ impl AppState {
             webhook_body_limit_bytes,
             workflow_job_max_steps,
             costs: None,
+            ci_usage_store,
+            oidc_verifier: None,
         }
+    }
+
+    /// Returns application state that serves `POST /ci-cost/usage` for `ingest_oidc`.
+    ///
+    /// # Parameters
+    ///
+    /// * `ingest_oidc` - The validated audience and repository allowlist, or `None` to leave the
+    ///   route unregistered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestOidcError`] when the outbound JWKS client cannot be built.
+    pub fn with_ingest_oidc(
+        self,
+        ingest_oidc: Option<IngestOidcConfig>,
+    ) -> Result<Self, IngestOidcError> {
+        let Some(config) = ingest_oidc else {
+            return Ok(self);
+        };
+        let source = GitHubJwksClient::new().map_err(|_: JwksFetchError| IngestOidcError)?;
+        Ok(self.with_jwks_source(config, Box::new(source)))
+    }
+
+    pub(crate) fn with_jwks_source(
+        mut self,
+        config: IngestOidcConfig,
+        source: Box<dyn JwksSource>,
+    ) -> Self {
+        self.oidc_verifier = Some(Arc::new(OidcVerifier::new(config, source)));
+        self
     }
 
     /// Returns application state that prices completed jobs with `costs`.
@@ -238,6 +281,16 @@ impl AppState {
         self.costs.as_deref()
     }
 
+    /// Returns durable in-job usage entry persistence.
+    pub(crate) fn ci_usage_store(&self) -> &CiUsageStore {
+        &self.ci_usage_store
+    }
+
+    /// Returns the OIDC verifier, when `ingest.oidc` is configured.
+    pub(crate) fn oidc_verifier(&self) -> Option<&OidcVerifier> {
+        self.oidc_verifier.as_deref()
+    }
+
     /// Returns the maximum reported steps accepted for one completed workflow-job trace.
     pub fn workflow_job_max_steps(&self) -> usize {
         self.workflow_job_max_steps
@@ -248,9 +301,10 @@ impl AppState {
 pub fn build_router(state: AppState) -> Router {
     let webhook_body_limit_bytes = state.webhook_body_limit_bytes;
     let webhook_metrics = state.metrics.clone();
+    let usage_enabled = state.oidc_verifier.is_some();
     health::router(state.database_pool.clone())
         .merge(
-            api::router(webhook_body_limit_bytes, webhook_metrics)
+            api::router(webhook_body_limit_bytes, webhook_metrics, usage_enabled)
                 .merge(metrics::router())
                 .with_state(state),
         )

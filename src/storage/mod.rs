@@ -1,3 +1,4 @@
+mod ci_usage_store;
 mod delivery_store;
 mod merge_queue_store;
 mod repository_store;
@@ -10,6 +11,7 @@ use std::{fs::OpenOptions, io, path::Path, time::Duration};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+pub(crate) use ci_usage_store::{CiUsageStore, CiUsageStoreError};
 pub use delivery_store::{DeliveryClaim, DeliveryStore, DeliveryStoreError};
 pub use merge_queue_store::{
     CompletionTransition, EnqueueTransition, MergeQueueStore, MergeQueueStoreError,

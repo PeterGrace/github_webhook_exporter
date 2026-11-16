@@ -79,7 +79,7 @@ pub(super) fn project_context(body: &[u8]) -> Option<WorkflowRunContext> {
     let pull_request = unique_pull_request(&workflow_run.pull_requests)
         .or_else(|| {
             event
-                .is_comment_triggered()
+                .reads_pull_request_from_run_name()
                 .then(|| {
                     workflow_run
                         .display_title
@@ -141,8 +141,8 @@ fn pull_request_from_merge_queue_branch(branch: &str) -> Option<PullRequestNumbe
 
 /// Reads the pull request from a run name that contains `PR #<number>`.
 ///
-/// Comment-triggered workflows set `run-name` this way because GitHub leaves their
-/// `pull_requests` empty. The marker must start the name or follow a non-alphanumeric character,
+/// Comment- and `workflow_run`-triggered workflows set `run-name` this way because GitHub leaves
+/// their `pull_requests` empty. The marker must start the name or follow a non-alphanumeric character,
 /// so `APR #3` does not match. The first marker followed by a positive number wins.
 fn pull_request_from_run_name(run_name: &str) -> Option<PullRequestNumber> {
     const MARKER: &str = "PR #";
@@ -375,11 +375,12 @@ mod tests {
     }
 
     #[test]
-    fn comment_triggered_runs_read_their_pull_request_from_the_run_name() {
+    fn comment_and_workflow_run_triggered_runs_read_their_pull_request_from_the_run_name() {
         for event in [
             "issue_comment",
             "pull_request_review",
             "pull_request_review_comment",
+            "workflow_run",
         ] {
             assert_eq!(
                 pull_request_of(json!({

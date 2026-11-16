@@ -19,6 +19,7 @@ use tracing_subscriber::EnvFilter;
 use crate::{
     costs::{CostsConfig, COSTS_VARIABLE},
     security::{AdminToken, MasterKey},
+    security::{IngestOidcConfig, INGEST_OIDC_VARIABLE},
 };
 
 const DEFAULT_BIND_ADDRESS: &str = "[::]:8080";
@@ -249,6 +250,7 @@ pub struct RuntimeConfig {
     required_check_ttl: Duration,
     github_app: Option<GitHubAppConfig>,
     costs: Option<CostsConfig>,
+    ingest_oidc: Option<IngestOidcConfig>,
     rust_log: String,
     telemetry: TelemetryConfig,
 }
@@ -327,6 +329,11 @@ impl RuntimeConfig {
     /// Returns the optional unit-price table; `None` disables every cost feature.
     pub fn costs(&self) -> Option<&CostsConfig> {
         self.costs.as_ref()
+    }
+
+    /// Returns the optional `ingest.oidc` block; `None` leaves `POST /ci-cost/usage` unserved.
+    pub fn ingest_oidc(&self) -> Option<&IngestOidcConfig> {
+        self.ingest_oidc.as_ref()
     }
 
     /// Returns the validated tracing filter directive.
@@ -472,6 +479,9 @@ impl RuntimeConfig {
         let costs = optional_string(&mut lookup, COSTS_VARIABLE)?
             .map(|json| CostsConfig::from_json(&json))
             .transpose()?;
+        let ingest_oidc = optional_string(&mut lookup, INGEST_OIDC_VARIABLE)?
+            .map(|json| IngestOidcConfig::from_json(&json))
+            .transpose()?;
 
         let rust_log = optional_string(&mut lookup, "RUST_LOG")?
             .unwrap_or_else(|| DEFAULT_RUST_LOG.to_owned());
@@ -495,6 +505,7 @@ impl RuntimeConfig {
             required_check_ttl: Duration::from_secs(required_check_ttl_seconds),
             github_app,
             costs,
+            ingest_oidc,
             rust_log,
             telemetry,
         })
@@ -617,6 +628,7 @@ impl fmt::Debug for RuntimeConfig {
                 "costs_version",
                 &self.costs.as_ref().map(CostsConfig::version),
             )
+            .field("ingest_oidc_enabled", &self.ingest_oidc.is_some())
             .field("rust_log", &self.rust_log)
             .field("telemetry", &self.telemetry)
             .finish()
@@ -955,6 +967,43 @@ mod tests {
             RuntimeConfig::from_map(variables).err(),
             Some(ConfigError::Invalid {
                 variable: "GHE_COSTS_JSON"
+            })
+        );
+    }
+
+    #[test]
+    fn ingest_oidc_loads_only_when_configured_and_never_prints_its_values() {
+        let config = RuntimeConfig::from_map(required_variables()).expect("configuration is valid");
+        assert!(config.ingest_oidc().is_none());
+        assert!(format!("{config:?}").contains("ingest_oidc_enabled: false"));
+
+        let mut variables = required_variables();
+        variables.insert(
+            "GHE_INGEST_OIDC_JSON".to_owned(),
+            OsString::from(
+                r#"{"audience":"https://exporter.example.test","allowed_repositories":["o/r"]}"#,
+            ),
+        );
+        let config = RuntimeConfig::from_map(variables).expect("configuration is valid");
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("ingest_oidc_enabled: true"));
+        assert!(!rendered.contains("exporter.example.test"));
+        assert_eq!(
+            config
+                .ingest_oidc()
+                .map(crate::security::IngestOidcConfig::allowed_repository_count),
+            Some(1)
+        );
+
+        let mut variables = required_variables();
+        variables.insert(
+            "GHE_INGEST_OIDC_JSON".to_owned(),
+            OsString::from(r#"{"audience":"","allowed_repositories":["o/r"]}"#),
+        );
+        assert_eq!(
+            RuntimeConfig::from_map(variables).err(),
+            Some(ConfigError::Invalid {
+                variable: "GHE_INGEST_OIDC_JSON"
             })
         );
     }
