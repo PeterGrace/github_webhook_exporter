@@ -29,7 +29,9 @@ use crate::{
     },
     storage::DeliveryClaim,
     telemetry::{
-        pipeline::{PipelineRunTrace, PipelineRunTraceParts, MAX_PIPELINE_JOB_SPANS},
+        pipeline::{
+            run_trace_context, PipelineRunTrace, PipelineRunTraceParts, MAX_PIPELINE_JOB_SPANS,
+        },
         trace::{
             self, CommitSha, Operation, OperationOutcome, QueueEntity, CI_SOURCE_GITHUB_ACTIONS,
         },
@@ -321,8 +323,9 @@ async fn webhook_handler(
 
 /// Logs `ci cost recorded` for one priced job, with the attributes of its job span.
 ///
-/// The log is independent of span export, so cost data reaches the logs dataset even when the
-/// trace emitter is off.
+/// The log carries the run's pipeline trace identifier, so it appears in that run's trace. It is
+/// independent of span export, so cost data reaches the logs dataset even when the trace emitter
+/// is off.
 fn log_job_cost(job: &WorkflowJobTrace) {
     let Some(billing) = job.billing() else {
         return;
@@ -337,7 +340,8 @@ fn log_job_cost(job: &WorkflowJobTrace) {
         .map(DisplayName::as_str)
         .collect::<Vec<_>>()
         .join(",");
-    let _parentless_context = Context::new().attach();
+    let _run_trace_context =
+        run_trace_context(job.repository_name(), job.run_id(), job.run_attempt()).attach();
     info!(
         parent: None,
         ci.source = CI_SOURCE_GITHUB_ACTIONS,

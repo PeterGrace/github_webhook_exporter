@@ -193,8 +193,10 @@ When a [`costs`](costs.md) table is configured, the root also carries the job's 
 A job that billed 0 minutes is priced at 0 without a rate lookup, so it never logs
 `ci price missing`. Step spans carry none of these attributes.
 
-Each priced job also writes one parentless `ci cost recorded` info log, whether or not trace
-export is enabled. It carries `ci.source`, `ci.cost_usd`, `ci.billable_minutes`,
+Each priced job also writes one `ci cost recorded` info log, whether or not trace export is
+enabled. The log carries the run's [pipeline trace ID](#pipeline-run-summary-traces) and no span ID, so it
+appears in that run's trace at the top level, next to the pipeline root rather than under it. It
+carries `ci.source`, `ci.cost_usd`, `ci.billable_minutes`,
 `ci.price_table.version`, `ci.price.fell_back`, `ci.price.usd_per_minute`, `ci.price.label`,
 `ci.job` (the sanitized job name), `cicd.runner.labels` (comma-joined), `cicd.runner.name`, `github.workflow`, `github.workflow_file`,
 `github.workflow.event`, `github.pull_request.number` (the job's first PR or the run's attributed
@@ -205,8 +207,11 @@ unknown. Without a `costs` table the log is never written.
 
 ### In-job usage spans
 
-Each entry accepted by `POST /ci-cost/usage` exports one independent root span named `ci.usage`,
-with `sentry.op=ci.usage` and an instant timestamp at receipt. It carries:
+Each entry accepted by `POST /ci-cost/usage` exports one span named `ci.usage`, with
+`sentry.op=ci.usage` and an instant timestamp at receipt. It is exported into the run's
+[pipeline trace](#pipeline-run-summary-traces), derived from the token's repository, `run_id` and
+`run_attempt`, as a root with no parent span: it appears at the top level of that trace, next
+to the pipeline root. It carries:
 
 - the claim attributes `cicd.pipeline.name`, `cicd.pipeline.run.id`,
   `cicd.pipeline.run.url.full`, `vcs.repository.url.full`, `vcs.repository.name`,
@@ -224,8 +229,8 @@ with `sentry.op=ci.usage` and an instant timestamp at receipt. It carries:
 - `ci.input_tokens` and `ci.output_tokens` for inference entries, or `ci.cpu_seconds` and
   `ci.ram_gb_seconds` for Daytona entries.
 
-Each entry also writes one parentless `ci cost recorded` info log, whether or not trace export is
-enabled, with the same cost, label and measure fields plus `ci.job_workflow_file`,
+Each entry also writes one `ci cost recorded` info log, whether or not trace export is enabled.
+It carries the same pipeline trace ID and no span ID, along with the same cost, label and measure fields plus `ci.job_workflow_file`,
 `github.workflow`, `github.workflow_file`, `github.workflow.event`, `github.pull_request.number`,
 `github.repository`, `cicd.pipeline.run.id`, and `github.workflow.run.attempt`.
 
@@ -347,6 +352,12 @@ reports for that attempt. Only runs completed after this behaviour was deployed 
 identifiers; traces exported before it keep their random ones and cannot be joined. And in the
 theoretical case where the truncated digest is all zeroes, which is not a valid trace ID, the root
 falls back to a randomly generated identifier and simply loses in-job association for that one run.
+
+The exporter itself joins this trace from the records it emits before the run completes: every
+`ci cost recorded` log and every `ci.usage` span carries the run's derived trace ID, with no
+parent span, because the root's span ID is random. Until `workflow_run.completed` arrives, the
+run's trace holds only those records; the pipeline root and its task spans join them when it
+does. When the digest is all zeroes, they fall back to no trace context, as the root does.
 
 Only the pipeline root is derived. Job traces keep independent random identifiers, and the
 `github.actions.pipeline.task` child span IDs are random too, so an in-job emitter can attach to

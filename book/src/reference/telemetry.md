@@ -91,4 +91,5 @@ Canonical repository names additionally appear on repository-scoped Prometheus s
 these identifiers appears in local or OTLP application logs, except the bounded
 workflow-rejection warning, the `ci cost recorded` log, and the `ci usage post rejected`
 warning and `ci usage post failed` error, all documented in
-[Traces](traces.md#completed-workflow-traces).
+[Traces](traces.md#completed-workflow-traces). `ci cost recorded` logs carry their workflow
+run's derived pipeline trace ID, so they appear in that run's trace.

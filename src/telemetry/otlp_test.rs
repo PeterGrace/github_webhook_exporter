@@ -951,6 +951,7 @@ async fn parent_spans_close_when_a_child_is_released_off_a_dispatcher_thread() {
 struct UsageFixture {
     config: IngestOidcConfig,
     jwks: StaticJwks,
+    workflow_traces: bool,
 }
 
 struct WebhookTraceFixture {
@@ -1026,6 +1027,15 @@ impl WebhookTraceFixture {
         allowed_repositories: &[&str],
         jwks: StaticJwks,
     ) -> Self {
+        Self::new_with_usage_options(costs, allowed_repositories, jwks, true).await
+    }
+
+    async fn new_with_usage_options(
+        costs: Option<CostsConfig>,
+        allowed_repositories: &[&str],
+        jwks: StaticJwks,
+        workflow_traces: bool,
+    ) -> Self {
         let config = IngestOidcConfig::from_json(
             &serde_json::json!({
                 "audience": TEST_AUDIENCE,
@@ -1041,7 +1051,11 @@ impl WebhookTraceFixture {
             "github_webhook_exporter=info",
             None,
             costs,
-            Some(UsageFixture { config, jwks }),
+            Some(UsageFixture {
+                config,
+                jwks,
+                workflow_traces,
+            }),
         )
         .await
     }
@@ -1179,8 +1193,11 @@ impl WebhookTraceFixture {
             workflow_job_max_steps,
         )
         .with_metrics(metrics)
-        .with_workflow_trace_emitter(runtime.workflow_trace_emitter())
         .with_costs(costs);
+        let workflow_traces = usage.as_ref().is_none_or(|usage| usage.workflow_traces);
+        if workflow_traces {
+            state = state.with_workflow_trace_emitter(runtime.workflow_trace_emitter());
+        }
         if let Some(usage) = usage {
             state = state.with_jwks_source(usage.config, Box::new(usage.jwks));
         }
@@ -8029,4 +8046,180 @@ async fn an_internal_storage_failure_is_a_correlated_500_not_a_retryable_503() {
     );
     assert!(!captured.has_log_body("ci cost recorded"));
     assert!(!captured.has_log_body("ci usage post rejected"));
+}
+
+fn expected_run_trace_id(repository: &str, run_id: i64, run_attempt: i64) -> Vec<u8> {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(format!("gha-pipeline:{repository}:{run_id}:{run_attempt}").as_bytes())
+        [..16]
+        .to_vec()
+}
+
+fn assert_no_span_id(span_id: &[u8], what: &str) {
+    assert!(
+        span_id.iter().all(|byte| *byte == 0),
+        "{what} carries no span id: {span_id:?}"
+    );
+}
+
+/// Sends the run's `requested` delivery, one usage post and one priced job for run 71 attempt 1.
+async fn post_usage_and_priced_job(fixture: &WebhookTraceFixture, signer: &TestSigner) {
+    let workflow_run_body = |action: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "action": action,
+            "workflow_run": {
+                "id": 71,
+                "run_attempt": 1,
+                "name": "Evals",
+                "event": "pull_request",
+                "head_branch": "feature/evals",
+                "path": ".github/workflows/evals.yml",
+                "pull_requests": [{"number": 42}]
+            },
+            "repository": {"full_name": WEBHOOK_REPOSITORY}
+        }))
+        .expect("workflow-run payload serializes")
+    };
+    let response = fixture
+        .webhook(
+            &workflow_run_body("requested"),
+            "workflow_run",
+            "550e8400-e29b-41d4-a716-446655440501",
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    let mut claims = usage_claims();
+    claims["run_id"] = serde_json::json!("71");
+    claims["run_attempt"] = serde_json::json!("1");
+    let response = fixture
+        .usage(
+            Some(&format!("Bearer {}", signer.sign(&claims))),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "job": "run-evals",
+                "entries": [{"source": "anthropic", "model": "m", "task": "grade", "usd": 0.25}]
+            }))
+            .expect("usage body serializes"),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    let job_body = serde_json::to_vec(&serde_json::json!({
+        "action": "completed",
+        "workflow_job": {
+            "id": 81,
+            "run_id": 71,
+            "run_attempt": 1,
+            "workflow_name": "Evals",
+            "name": "run-evals",
+            "conclusion": "success",
+            "started_at": "2026-08-06T10:00:00Z",
+            "completed_at": "2026-08-06T10:02:00Z",
+            "labels": ["ubuntu-latest"],
+            "runner_id": 7,
+            "steps": []
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("workflow-job payload serializes");
+    let response = fixture
+        .webhook(
+            &job_body,
+            "workflow_job",
+            "550e8400-e29b-41d4-a716-446655440502",
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    let response = fixture
+        .webhook(
+            &workflow_run_body("completed"),
+            "workflow_run",
+            "550e8400-e29b-41d4-a716-446655440503",
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+}
+
+fn cost_logs(captured: &CapturedSpans) -> Vec<&LogRecord> {
+    captured
+        .log_records
+        .iter()
+        .filter(|record| {
+            record.body.as_ref().and_then(string_any_value) == Some("ci cost recorded")
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cost_logs_usage_spans_and_the_pipeline_root_share_the_run_trace() {
+    let costs = CostsConfig::from_json(r#"{"runners": {"default_usd_per_minute": 0.006}}"#)
+        .expect("costs are valid");
+    let signer = TestSigner::new(USAGE_SIGNER_KID);
+    let fixture =
+        WebhookTraceFixture::new_with_usage(Some(costs), &[WEBHOOK_REPOSITORY], &signer).await;
+
+    post_usage_and_priced_job(&fixture, &signer).await;
+
+    let captured = fixture.force_flush();
+    captured.assert_approved_attribute_keys();
+    let expected = expected_run_trace_id(WEBHOOK_REPOSITORY, 71, 1);
+    let pipeline = captured.one_named("Evals");
+    assert_eq!(
+        pipeline.trace_id, expected,
+        "the pipeline root keeps its derived trace"
+    );
+    let usage = captured.one_named("ci.usage");
+    assert_eq!(
+        usage.trace_id, expected,
+        "the usage span joins the run trace"
+    );
+    assert!(
+        usage.parent_span_id.is_empty(),
+        "the usage span stays a root within the run trace"
+    );
+    let logs = cost_logs(&captured);
+    assert_eq!(logs.len(), 2, "one runner cost log and one usage cost log");
+    for log in logs {
+        assert_eq!(log.trace_id, expected, "cost logs join the run trace");
+        assert_no_span_id(&log.span_id, "a cost log");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cost_logs_carry_the_run_trace_when_trace_export_is_off() {
+    let costs = CostsConfig::from_json(r#"{"runners": {"default_usd_per_minute": 0.006}}"#)
+        .expect("costs are valid");
+    let signer = TestSigner::new(USAGE_SIGNER_KID);
+    let fixture = WebhookTraceFixture::new_with_usage_options(
+        Some(costs),
+        &[WEBHOOK_REPOSITORY],
+        StaticJwks::serving(signer.jwks()),
+        false,
+    )
+    .await;
+
+    post_usage_and_priced_job(&fixture, &signer).await;
+
+    let captured = fixture.force_flush();
+    assert!(!captured.spans.iter().any(|span| span.name == "ci.usage"));
+    let expected = expected_run_trace_id(WEBHOOK_REPOSITORY, 71, 1);
+    let logs = cost_logs(&captured);
+    assert_eq!(
+        logs.len(),
+        2,
+        "both cost logs are written without trace export"
+    );
+    for log in logs {
+        assert_eq!(log.trace_id, expected);
+        assert_no_span_id(&log.span_id, "a cost log");
+    }
 }
