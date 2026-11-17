@@ -305,7 +305,9 @@ against that pull request. An attempt is stored under at most one pull request: 
 again, for example after retention removed its schedule and `completed` was redelivered, its new
 total replaces any stored one.
 
-A job delivery or usage post that arrives after its attempt was totalled still writes its own
+An attempt's job and usage sums are read in the same transaction that marks it final, after taking
+SQLite's write lock, so a job or usage record is either counted or written after the attempt is
+final. A job delivery or usage post that arrives after its attempt was totalled still writes its own
 `ci cost recorded` log but is left out of the total. Each such record also logs a
 `ci cost after finalize` warning in the run's trace, with `ci.source`, `ci.cost_usd`,
 `github.repository`, `cicd.pipeline.run.id` and `github.workflow.run.attempt`. Deliveries GitHub
@@ -325,7 +327,8 @@ stored, so they count toward the total and still log `ci cost recorded`. Their l
 run's stored context.
 
 Schedules, totals, the commit map and per-pull-request totals are pruned on the
-processed-delivery retention cutoff.
+processed-delivery retention cutoff. A pull request's stored totals therefore cover only the runs
+finalized within that window.
 
 ### Branch-protection required checks
 

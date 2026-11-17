@@ -10,8 +10,8 @@ use crate::{
     error::ErrorCorrelationId,
     lifecycle,
     storage::{
-        CiUsageStore, DueRunCost, FinalizedRunCost, JobCostTotals, PullRequestCommitStore,
-        RunCostStore, UsageTotals, WorkflowJobLinkStore,
+        DueRunCost, FinalizedRunCost, JobCostTotals, PullRequestCommitStore, RunCostStore,
+        UsageTotals,
     },
     telemetry::{
         run_cost::{
@@ -36,8 +36,6 @@ const RUN_COST_BATCH_SIZE: i64 = 100;
 #[derive(Clone)]
 pub(crate) struct RunCostFinalizer {
     run_costs: RunCostStore,
-    job_links: WorkflowJobLinkStore,
-    usage: CiUsageStore,
     commits: PullRequestCommitStore,
     emitter: WorkflowTraceEmitter,
 }
@@ -73,8 +71,6 @@ impl RunCostFinalizer {
     pub(crate) fn new(pool: &SqlitePool, emitter: WorkflowTraceEmitter) -> Self {
         Self {
             run_costs: RunCostStore::new(pool.clone()),
-            job_links: WorkflowJobLinkStore::new(pool.clone()),
-            usage: CiUsageStore::new(pool.clone()),
             commits: PullRequestCommitStore::new(pool.clone()),
             emitter,
         }
@@ -160,38 +156,34 @@ impl RunCostFinalizer {
 
     async fn finalize(&self, run: &DueRunCost) -> Result<bool, FinalizeFailure> {
         let pending = &run.pending;
-        let jobs = self
-            .job_links
-            .run_totals(run.repository_id, pending.run_id, pending.run_attempt)
-            .await
-            .map_err(|_| FinalizeFailure)?;
-        let usage = self
-            .usage
-            .run_totals(run.repository_id, pending.run_id, pending.run_attempt)
-            .await
-            .map_err(|_| FinalizeFailure)?;
         let (pull_request, resolution) = self.resolve_pull_request(run).await?;
-        let total = run_cost_total(run, jobs, usage, pull_request, resolution);
-        let finalized = self
+        let total = self
             .run_costs
             .finalize(
                 run.repository_id,
-                &FinalizedRunCost {
-                    run_id: pending.run_id,
-                    run_attempt: pending.run_attempt,
-                    pull_request,
-                    resolution,
-                    total_usd: total.total_usd,
-                    price_table_version: total.price_table_version.as_deref(),
+                pending.run_id,
+                pending.run_attempt,
+                |jobs, usage| {
+                    let total = run_cost_total(run, jobs, usage, pull_request, resolution);
+                    (
+                        FinalizedRunCost {
+                            pull_request,
+                            resolution,
+                            total_usd: total.total_usd,
+                            price_table_version: total.price_table_version.clone(),
+                        },
+                        total,
+                    )
                 },
             )
             .await
             .map_err(|_| FinalizeFailure)?;
-        if finalized {
-            self.emitter.emit_run_cost(&total);
-            log_run_cost_finalized(&total);
-        }
-        Ok(finalized)
+        let Some(total) = total else {
+            return Ok(false);
+        };
+        self.emitter.emit_run_cost(&total);
+        log_run_cost_finalized(&total);
+        Ok(true)
     }
 
     /// Uses the pull request the completed delivery resolved, falling back to the commit map.

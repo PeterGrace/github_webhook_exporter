@@ -36,4 +36,5 @@ Date: 2026-11-17T22:00:00Z
   hour, and a pending row that no longer parses is set aside rather than retried.
 - Migration `202611180002` rebuilds `workflow_job_links` (nullable trace and span IDs, new
   `runner_label`) and adds `run_cost_finalizations`, `pull_request_run_costs` and
-  `pull_request_commits`. All three new tables are pruned on the delivery-retention cutoff.
+  `pull_request_commits`. All three new tables are pruned on the delivery-retention cutoff, so a
+  pull request's stored totals cover only runs finalized within that window.

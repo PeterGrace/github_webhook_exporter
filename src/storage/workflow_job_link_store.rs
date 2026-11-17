@@ -4,7 +4,7 @@ use std::{
 };
 
 use opentelemetry::trace::{SpanId, TraceId};
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{FromRow, SqliteConnection, SqlitePool};
 use thiserror::Error;
 use time::{format_description::FormatItem, macros::format_description, OffsetDateTime, UtcOffset};
 
@@ -202,25 +202,27 @@ impl WorkflowJobLinkStore {
     ///
     /// Returns [`WorkflowJobLinkStoreError::Unavailable`] when SQLite is busy or locked, and
     /// [`WorkflowJobLinkStoreError::Internal`] for any other persistence failure.
+    #[cfg(test)]
     pub(crate) async fn run_totals(
         &self,
         repository_id: RepositoryId,
         run_id: WorkflowRunId,
         run_attempt: WorkflowRunAttempt,
     ) -> Result<JobCostTotals, WorkflowJobLinkStoreError> {
-        trace::instrument_database_operation(
-            DatabaseOperation::WorkflowJobLinkTotals,
-            self.run_totals_inner(repository_id, run_id, run_attempt),
-        )
-        .await
+        let mut connection = self.pool.acquire().await.map_err(map_sqlx_error)?;
+        Self::run_totals_in(&mut connection, repository_id, run_id, run_attempt)
+            .await
+            .map_err(map_sqlx_error)
     }
 
-    async fn run_totals_inner(
-        &self,
+    /// Runs the sums of [`Self::run_totals`] on `connection`, so a caller can read them inside its
+    /// own transaction.
+    pub(crate) async fn run_totals_in(
+        connection: &mut SqliteConnection,
         repository_id: RepositoryId,
         run_id: WorkflowRunId,
         run_attempt: WorkflowRunAttempt,
-    ) -> Result<JobCostTotals, WorkflowJobLinkStoreError> {
+    ) -> Result<JobCostTotals, sqlx::Error> {
         let (cost_usd, priced_jobs): (f64, i64) = sqlx::query_as(
             "SELECT TOTAL(cost_usd), COUNT(cost_usd) FROM workflow_job_links \
              WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ?",
@@ -228,9 +230,8 @@ impl WorkflowJobLinkStore {
         .bind(repository_id.get())
         .bind(run_id.get())
         .bind(run_attempt.get())
-        .fetch_one(&self.pool)
-        .await
-        .map_err(map_sqlx_error)?;
+        .fetch_one(&mut *connection)
+        .await?;
         let minutes_by_label: Vec<(String, i64)> = sqlx::query_as(
             "SELECT CASE WHEN cost_usd IS NULL THEN ? ELSE coalesce(runner_label, ?) END \
              AS label, SUM(billable_minutes) FROM workflow_job_links \
@@ -242,9 +243,8 @@ impl WorkflowJobLinkStore {
         .bind(repository_id.get())
         .bind(run_id.get())
         .bind(run_attempt.get())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx_error)?;
+        .fetch_all(&mut *connection)
+        .await?;
         // Two versions are enough to tell that the attempt was priced by more than one table.
         let price_table_versions: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT price_table_version FROM workflow_job_links \
@@ -254,9 +254,8 @@ impl WorkflowJobLinkStore {
         .bind(repository_id.get())
         .bind(run_id.get())
         .bind(run_attempt.get())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx_error)?;
+        .fetch_all(&mut *connection)
+        .await?;
         Ok(JobCostTotals {
             cost_usd: (priced_jobs > 0).then_some(cost_usd),
             minutes_by_label,

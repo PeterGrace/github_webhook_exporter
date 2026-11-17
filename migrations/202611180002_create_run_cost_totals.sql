@@ -111,6 +111,8 @@ CREATE TABLE pull_request_run_costs (
 
 CREATE INDEX pull_request_run_costs_updated_at_idx
     ON pull_request_run_costs(updated_at);
+CREATE INDEX pull_request_run_costs_attempt_idx
+    ON pull_request_run_costs(repository_id, workflow_run_id, workflow_run_attempt);
 
 -- Commits seen on `pull_request` deliveries, so a run whose payload names no pull request can
 -- still be attributed by its head commit.

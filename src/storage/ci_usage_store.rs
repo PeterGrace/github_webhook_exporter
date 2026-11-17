@@ -1,6 +1,6 @@
 use std::fmt;
 
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 use thiserror::Error;
 use time::{format_description::FormatItem, macros::format_description, OffsetDateTime, UtcOffset};
 
@@ -147,25 +147,27 @@ impl CiUsageStore {
     ///
     /// Returns [`CiUsageStoreError::Unavailable`] when SQLite is busy or locked, and
     /// [`CiUsageStoreError::Internal`] for any other persistence failure.
+    #[cfg(test)]
     pub(crate) async fn run_totals(
         &self,
         repository_id: RepositoryId,
         run_id: WorkflowRunId,
         run_attempt: WorkflowRunAttempt,
     ) -> Result<UsageTotals, CiUsageStoreError> {
-        trace::instrument_database_operation(
-            DatabaseOperation::CiUsageTotals,
-            self.run_totals_inner(repository_id, run_id, run_attempt),
-        )
-        .await
+        let mut connection = self.pool.acquire().await.map_err(map_sqlx_error)?;
+        Self::run_totals_in(&mut connection, repository_id, run_id, run_attempt)
+            .await
+            .map_err(map_sqlx_error)
     }
 
-    async fn run_totals_inner(
-        &self,
+    /// Runs the sums of [`Self::run_totals`] on `connection`, so a caller can read them inside its
+    /// own transaction.
+    pub(crate) async fn run_totals_in(
+        connection: &mut SqliteConnection,
         repository_id: RepositoryId,
         run_id: WorkflowRunId,
         run_attempt: WorkflowRunAttempt,
-    ) -> Result<UsageTotals, CiUsageStoreError> {
+    ) -> Result<UsageTotals, sqlx::Error> {
         let by_source: Vec<(String, f64, i64)> = sqlx::query_as(
             "SELECT source, TOTAL(cost_usd), COUNT(*) FROM ci_usage_entries \
              WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ? \
@@ -174,9 +176,8 @@ impl CiUsageStore {
         .bind(repository_id.get())
         .bind(run_id.get())
         .bind(run_attempt.get())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx_error)?;
+        .fetch_all(&mut *connection)
+        .await?;
         // Two versions are enough to tell that the attempt was priced by more than one table.
         let price_table_versions: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT price_table_version FROM ci_usage_entries \
@@ -186,9 +187,8 @@ impl CiUsageStore {
         .bind(repository_id.get())
         .bind(run_id.get())
         .bind(run_attempt.get())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx_error)?;
+        .fetch_all(&mut *connection)
+        .await?;
         Ok(UsageTotals {
             entries: by_source.iter().map(|(_, _, entries)| entries).sum(),
             cost_by_source: by_source

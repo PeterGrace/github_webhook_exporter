@@ -1,6 +1,6 @@
 use std::fmt;
 
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{FromRow, SqliteConnection, SqlitePool};
 use thiserror::Error;
 use time::{format_description::FormatItem, macros::format_description, OffsetDateTime, UtcOffset};
 
@@ -17,7 +17,9 @@ use crate::{
     },
 };
 
-use super::sqlite_is_busy_or_locked;
+use super::{
+    sqlite_is_busy_or_locked, CiUsageStore, JobCostTotals, UsageTotals, WorkflowJobLinkStore,
+};
 
 const RUN_COST_PRUNE_BATCH_SIZE: i64 = 1_000;
 const RUN_COST_TIMESTAMP_FORMAT: &[FormatItem<'static>] =
@@ -55,13 +57,11 @@ pub(crate) struct DueRunCosts {
 
 /// The total and attribution a run attempt is finalized with.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct FinalizedRunCost<'total> {
-    pub(crate) run_id: WorkflowRunId,
-    pub(crate) run_attempt: WorkflowRunAttempt,
+pub(crate) struct FinalizedRunCost {
     pub(crate) pull_request: Option<PullRequestNumber>,
     pub(crate) resolution: PullRequestResolution,
     pub(crate) total_usd: f64,
-    pub(crate) price_table_version: Option<&'total str>,
+    pub(crate) price_table_version: Option<String>,
 }
 
 /// Durable run-cost finalizations and the finalized totals attributed to pull requests.
@@ -227,92 +227,87 @@ impl RunCostStore {
         .await
     }
 
-    /// Finalizes one pending attempt and, when it has a pull request, stores its total against
-    /// that pull request.
+    /// Sums one pending attempt's job and usage costs, then finalizes it with what `build` makes of
+    /// those sums and, when it has a pull request, stores its total against that pull request.
+    ///
+    /// The sums and the finalization share one transaction that takes SQLite's write lock before
+    /// reading, so a job link or usage entry either commits before the sums and is counted, or
+    /// commits after the attempt is final and sees it as final.
     ///
     /// # Returns
     ///
-    /// `true` when this call finalized the attempt, `false` when it was already final.
+    /// The value `build` returned when this call finalized the attempt, or `None` when it was
+    /// already final.
     ///
     /// # Errors
     ///
     /// Returns [`RunCostStoreError::Unavailable`] when SQLite is busy or locked, and
     /// [`RunCostStoreError::Internal`] for any other persistence failure. On error nothing is
     /// stored and the attempt stays pending.
-    pub(crate) async fn finalize(
+    pub(crate) async fn finalize<T>(
         &self,
         repository_id: RepositoryId,
-        finalized: &FinalizedRunCost<'_>,
-    ) -> Result<bool, RunCostStoreError> {
-        trace::instrument_database_operation(
-            DatabaseOperation::RunCostFinalize,
-            self.finalize_inner(repository_id, finalized),
-        )
+        run_id: WorkflowRunId,
+        run_attempt: WorkflowRunAttempt,
+        build: impl FnOnce(JobCostTotals, UsageTotals) -> (FinalizedRunCost, T),
+    ) -> Result<Option<T>, RunCostStoreError> {
+        trace::instrument_database_operation(DatabaseOperation::RunCostFinalize, async {
+            let mut transaction = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(map_sqlx_error)?;
+            let jobs = trace::instrument_database_operation(
+                DatabaseOperation::WorkflowJobLinkTotals,
+                WorkflowJobLinkStore::run_totals_in(
+                    &mut transaction,
+                    repository_id,
+                    run_id,
+                    run_attempt,
+                ),
+            )
+            .await
+            .map_err(map_sqlx_error)?;
+            let usage = trace::instrument_database_operation(
+                DatabaseOperation::CiUsageTotals,
+                CiUsageStore::run_totals_in(&mut transaction, repository_id, run_id, run_attempt),
+            )
+            .await
+            .map_err(map_sqlx_error)?;
+            let (finalized, value) = build(jobs, usage);
+            if !finalize_in(
+                &mut transaction,
+                repository_id,
+                run_id,
+                run_attempt,
+                &finalized,
+            )
+            .await
+            .map_err(map_sqlx_error)?
+            {
+                return Ok(None);
+            }
+            transaction.commit().await.map_err(map_sqlx_error)?;
+            Ok(Some(value))
+        })
         .await
     }
 
-    async fn finalize_inner(
+    #[cfg(test)]
+    pub(crate) async fn finalize_pending(
         &self,
         repository_id: RepositoryId,
-        finalized: &FinalizedRunCost<'_>,
+        pending: &PendingRunCost,
+        finalized: FinalizedRunCost,
     ) -> Result<bool, RunCostStoreError> {
-        let mut transaction = self.pool.begin().await.map_err(map_sqlx_error)?;
-        let updated = sqlx::query(
-            "UPDATE run_cost_finalizations SET \
-             finalized_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), total_usd = ?, \
-             pull_request_number = ?, pull_request_resolution = ?, \
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-             WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ? \
-             AND finalized_at IS NULL",
+        self.finalize(
+            repository_id,
+            pending.run_id,
+            pending.run_attempt,
+            |_, _| (finalized, ()),
         )
-        .bind(finalized.total_usd)
-        .bind(finalized.pull_request.map(PullRequestNumber::get))
-        .bind(finalized.resolution.as_str())
-        .bind(repository_id.get())
-        .bind(finalized.run_id.get())
-        .bind(finalized.run_attempt.get())
-        .execute(&mut *transaction)
         .await
-        .map_err(map_sqlx_error)?;
-        if updated.rows_affected() != 1 {
-            return Ok(false);
-        }
-        sqlx::query(
-            "DELETE FROM pull_request_run_costs \
-             WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ? \
-             AND pull_request_number IS NOT ?",
-        )
-        .bind(repository_id.get())
-        .bind(finalized.run_id.get())
-        .bind(finalized.run_attempt.get())
-        .bind(finalized.pull_request.map(PullRequestNumber::get))
-        .execute(&mut *transaction)
-        .await
-        .map_err(map_sqlx_error)?;
-        if let Some(pull_request) = finalized.pull_request {
-            sqlx::query(
-                "INSERT INTO pull_request_run_costs \
-                 (repository_id, pull_request_number, workflow_run_id, workflow_run_attempt, \
-                  total_usd, price_table_version, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
-                 ON CONFLICT(repository_id, pull_request_number, workflow_run_id, \
-                             workflow_run_attempt) \
-                 DO UPDATE SET total_usd = excluded.total_usd, \
-                 price_table_version = excluded.price_table_version, \
-                 updated_at = excluded.updated_at",
-            )
-            .bind(repository_id.get())
-            .bind(pull_request.get())
-            .bind(finalized.run_id.get())
-            .bind(finalized.run_attempt.get())
-            .bind(finalized.total_usd)
-            .bind(finalized.price_table_version)
-            .execute(&mut *transaction)
-            .await
-            .map_err(map_sqlx_error)?;
-        }
-        transaction.commit().await.map_err(map_sqlx_error)?;
-        Ok(true)
+        .map(|finalized| finalized.is_some())
     }
 
     /// Returns whether one run attempt's total is already final.
@@ -397,6 +392,67 @@ impl RunCostStore {
         .map_err(map_sqlx_error)?;
         Ok(result.rows_affected())
     }
+}
+
+async fn finalize_in(
+    connection: &mut SqliteConnection,
+    repository_id: RepositoryId,
+    run_id: WorkflowRunId,
+    run_attempt: WorkflowRunAttempt,
+    finalized: &FinalizedRunCost,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(
+        "UPDATE run_cost_finalizations SET \
+             finalized_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), total_usd = ?, \
+             pull_request_number = ?, pull_request_resolution = ?, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ? \
+             AND finalized_at IS NULL",
+    )
+    .bind(finalized.total_usd)
+    .bind(finalized.pull_request.map(PullRequestNumber::get))
+    .bind(finalized.resolution.as_str())
+    .bind(repository_id.get())
+    .bind(run_id.get())
+    .bind(run_attempt.get())
+    .execute(&mut *connection)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Ok(false);
+    }
+    sqlx::query(
+        "DELETE FROM pull_request_run_costs \
+             WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ? \
+             AND pull_request_number IS NOT ?",
+    )
+    .bind(repository_id.get())
+    .bind(run_id.get())
+    .bind(run_attempt.get())
+    .bind(finalized.pull_request.map(PullRequestNumber::get))
+    .execute(&mut *connection)
+    .await?;
+    if let Some(pull_request) = finalized.pull_request {
+        sqlx::query(
+            "INSERT INTO pull_request_run_costs \
+                 (repository_id, pull_request_number, workflow_run_id, workflow_run_attempt, \
+                  total_usd, price_table_version, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+                 ON CONFLICT(repository_id, pull_request_number, workflow_run_id, \
+                             workflow_run_attempt) \
+                 DO UPDATE SET total_usd = excluded.total_usd, \
+                 price_table_version = excluded.price_table_version, \
+                 updated_at = excluded.updated_at",
+        )
+        .bind(repository_id.get())
+        .bind(pull_request.get())
+        .bind(run_id.get())
+        .bind(run_attempt.get())
+        .bind(finalized.total_usd)
+        .bind(finalized.price_table_version.as_deref())
+        .execute(&mut *connection)
+        .await?;
+    }
+    Ok(true)
 }
 
 #[derive(FromRow)]
@@ -547,14 +603,12 @@ mod tests {
         }
     }
 
-    fn finalized(pending: &PendingRunCost, total_usd: f64) -> FinalizedRunCost<'static> {
+    fn finalized(pending: &PendingRunCost, total_usd: f64) -> FinalizedRunCost {
         FinalizedRunCost {
-            run_id: pending.run_id,
-            run_attempt: pending.run_attempt,
             pull_request: pending.pull_request.map(|(number, _)| number),
             resolution: PullRequestResolution::PullRequests,
             total_usd,
-            price_table_version: Some("0123456789ab"),
+            price_table_version: Some("0123456789ab".to_owned()),
         }
     }
 
@@ -607,11 +661,11 @@ mod tests {
             .await
             .expect("check succeeds"));
         assert!(store
-            .finalize(repository_id, &finalized(&pending(1), 0.5))
+            .finalize_pending(repository_id, &pending(1), finalized(&pending(1), 0.5))
             .await
             .expect("finalize succeeds"));
         assert!(!store
-            .finalize(repository_id, &finalized(&pending(1), 9.0))
+            .finalize_pending(repository_id, &pending(1), finalized(&pending(1), 9.0))
             .await
             .expect("a second finalize is a no-op"));
 
@@ -747,7 +801,7 @@ mod tests {
             .await
             .expect("schedule succeeds");
         store
-            .finalize(repository_id, &finalized(&pending(1), 0.5))
+            .finalize_pending(repository_id, &pending(1), finalized(&pending(1), 0.5))
             .await
             .expect("finalize succeeds");
         sqlx::query("DELETE FROM run_cost_finalizations")
@@ -760,7 +814,7 @@ mod tests {
             .await
             .expect("the attempt is scheduled again");
         assert!(store
-            .finalize(repository_id, &finalized(&pending(1), 0.75))
+            .finalize_pending(repository_id, &pending(1), finalized(&pending(1), 0.75))
             .await
             .expect("finalizing over a surviving total succeeds"));
         let stored: Vec<(i64, f64)> =
@@ -787,7 +841,7 @@ mod tests {
             ..finalized(&pending(1), 0.25)
         };
         assert!(store
-            .finalize(repository_id, &other_pull_request)
+            .finalize_pending(repository_id, &pending(1), other_pull_request)
             .await
             .expect("finalizing under another pull request succeeds"));
         let stored: Vec<(i64, f64)> =
@@ -802,6 +856,86 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_written_while_finalizing_waits_and_then_sees_the_attempt_final() {
+        let (_directory, pool, store, repository_id) = store_with_repository().await;
+        let due_at = datetime!(2026-11-18 10:05:00 UTC);
+        store
+            .schedule(repository_id, &pending(1), due_at)
+            .await
+            .expect("schedule succeeds");
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let finalizing = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .finalize(
+                        repository_id,
+                        pending(1).run_id,
+                        pending(1).run_attempt,
+                        move |jobs, _| {
+                            locked_tx.send(()).expect("test waits for the lock");
+                            release_rx.recv().expect("test releases the lock");
+                            (finalized(&pending(1), jobs.cost_usd.unwrap_or(0.0)), ())
+                        },
+                    )
+                    .await
+            }
+        });
+        tokio::task::spawn_blocking(move || locked_rx.recv())
+            .await
+            .expect("lock wait joins")
+            .expect("finalize takes the lock");
+
+        let late_job = tokio::spawn({
+            let pool = pool.clone();
+            let repository_id = repository_id.get();
+            async move {
+                sqlx::query(
+                    "INSERT INTO workflow_job_links (repository_id, workflow_run_id, \
+                     workflow_run_attempt, workflow_job_id, conclusion, started_at_nanos, \
+                     completed_at_nanos, timing_source, updated_at, billable_minutes, cost_usd, \
+                     price_table_version, runner_label) \
+                     VALUES (?, ?, ?, 81, 'success', 0, 1, 'reported', \
+                     '2026-11-18T10:00:00.000Z', 2, 0.5, '0123456789ab', 'default')",
+                )
+                .bind(repository_id)
+                .bind(pending(1).run_id.get())
+                .bind(pending(1).run_attempt.get())
+                .execute(&pool)
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !late_job.is_finished(),
+            "the job write waits for the finalize transaction"
+        );
+        release_tx.send(()).expect("finalize is waiting");
+
+        assert_eq!(
+            finalizing
+                .await
+                .expect("finalize joins")
+                .expect("finalize succeeds"),
+            Some(())
+        );
+        late_job
+            .await
+            .expect("job write joins")
+            .expect("job write succeeds after the commit");
+        assert!(store
+            .is_finalized(repository_id, pending(1).run_id, pending(1).run_attempt)
+            .await
+            .expect("check succeeds"));
+        let total: f64 = sqlx::query_scalar("SELECT total_usd FROM run_cost_finalizations")
+            .fetch_one(&pool)
+            .await
+            .expect("total loads");
+        assert_eq!(total, 0.0, "the late job is not in the total");
+    }
+
     #[tokio::test]
     async fn prune_removes_old_finalizations_and_pull_request_totals() {
         let (_directory, pool, store, repository_id) = store_with_repository().await;
@@ -814,7 +948,7 @@ mod tests {
             .await
             .expect("schedule succeeds");
         store
-            .finalize(repository_id, &finalized(&pending(1), 0.5))
+            .finalize_pending(repository_id, &pending(1), finalized(&pending(1), 0.5))
             .await
             .expect("finalize succeeds");
         for table in ["run_cost_finalizations", "pull_request_run_costs"] {
