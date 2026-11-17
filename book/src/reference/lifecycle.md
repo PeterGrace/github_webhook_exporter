@@ -28,8 +28,9 @@ once, then each SQLite operation deletes at most 1,000 eligible rows, repeating 
 fewer than 1,000. Delivery pruning preserves fresh claims; queue pruning deletes only attempts with
 a non-null completion time older than its cutoff, preserving fresh completed and all pending
 attempts. Pruning runs in a fixed order: deliveries, merge-queue attempts, workflow-run contexts,
-workflow-job trace links, the branch-protection required-check cache, then in-job usage entries.
-The last four are keyed to deliveries and runs and share the delivery cutoff; the required-check cache
+workflow-job trace links, the branch-protection required-check cache, in-job usage entries, then
+vendor runs. The last five are keyed to deliveries, runs and pull requests and share the delivery
+cutoff; the required-check cache
 additionally expires on read after `GHE_REQUIRED_CHECK_TTL_SECONDS`, so pruning only reclaims
 space rather than governing correctness.
 

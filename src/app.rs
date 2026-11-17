@@ -30,7 +30,7 @@ use crate::{
     },
     storage::{
         CiUsageStore, DeliveryStore, MergeQueueStore, RepositoryStore, RequiredCheckStore,
-        WorkflowJobLinkStore, WorkflowRunStore,
+        VendorRunStore, WorkflowJobLinkStore, WorkflowRunStore,
     },
     telemetry::{
         trace::{self, Operation},
@@ -73,6 +73,7 @@ pub struct AppState {
     workflow_job_max_steps: usize,
     costs: Option<Arc<CostsConfig>>,
     ci_usage_store: CiUsageStore,
+    vendor_run_store: VendorRunStore,
     oidc_verifier: Option<Arc<OidcVerifier>>,
 }
 
@@ -95,6 +96,7 @@ impl AppState {
         let workflow_run_store = WorkflowRunStore::new(database_pool.clone());
         let workflow_job_link_store = WorkflowJobLinkStore::new(database_pool.clone());
         let ci_usage_store = CiUsageStore::new(database_pool.clone());
+        let vendor_run_store = VendorRunStore::new(database_pool.clone());
         let required_check_store = RequiredCheckStore::new(
             database_pool.clone(),
             Duration::from_secs(DEFAULT_REQUIRED_CHECK_TTL_SECONDS),
@@ -115,6 +117,7 @@ impl AppState {
             workflow_job_max_steps,
             costs: None,
             ci_usage_store,
+            vendor_run_store,
             oidc_verifier: None,
         }
     }
@@ -284,6 +287,11 @@ impl AppState {
     /// Returns durable in-job usage entry persistence.
     pub(crate) fn ci_usage_store(&self) -> &CiUsageStore {
         &self.ci_usage_store
+    }
+
+    /// Returns durable priced vendor-run persistence.
+    pub(crate) fn vendor_run_store(&self) -> &VendorRunStore {
+        &self.vendor_run_store
     }
 
     /// Returns the OIDC verifier, when `ingest.oidc` is configured.

@@ -14,6 +14,7 @@ pub(crate) mod pipeline;
 mod queue;
 pub(crate) mod trace;
 pub(crate) mod usage;
+pub(crate) mod vendor;
 pub(crate) mod workflow;
 mod workflow_error;
 
