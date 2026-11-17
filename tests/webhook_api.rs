@@ -382,7 +382,8 @@ async fn a_completed_run_is_scheduled_once_per_attempt_without_waiting() {
         .await;
     }
 
-    let pending: Vec<(i64, String, Option<i64>, String, Option<String>)> = sqlx::query_as(
+    type PendingRow = (i64, String, Option<i64>, String, Option<String>);
+    let pending: Vec<PendingRow> = sqlx::query_as(
         "SELECT workflow_run_attempt, conclusion, pull_request_number, \
          pull_request_resolution, finalized_at FROM run_cost_finalizations \
          ORDER BY workflow_run_attempt",
