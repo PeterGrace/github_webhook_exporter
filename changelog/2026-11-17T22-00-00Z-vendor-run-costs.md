@@ -22,6 +22,9 @@ Date: 2026-11-17T22:00:00Z
 - A storage failure keeps the `204 No Content` response, increments the new
   `github_webhook_processing_failures_total{stage="vendor_run"}` series, and logs one redacted
   `vendor-run persistence failed` error.
+- `GHE_COSTS_JSON` now fails startup when a `costs.vendors` name is longer than 128 characters or
+  contains a control character, because vendor names are exported and stored unchanged. The Helm
+  chart schema rejects the same names.
 - New span attribute keys `ci.vendor` and `ci.vendor.trigger`, and new database operations
   `vendor_run.record` and `vendor_run.prune`.
 

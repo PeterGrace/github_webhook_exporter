@@ -39,6 +39,7 @@ as `0.01` as strings, and the schema rejects them.
 | `runners.default_usd_per_minute` | yes | USD per billable minute for a job whose labels match no entry in `runners.labels`. |
 | `runners.labels` | no | Map of runner label to USD per billable minute. |
 | `daytona.usd_per_cpu_second`, `daytona.usd_per_ram_gb_second` | no; both or neither | Daytona sandbox rates. |
+| `vendors.<name>` | no | Vendor name, exported as `ci.vendor`: 1 to 128 characters with no control characters. |
 | `vendors.<name>.match` | yes, per vendor | Exactly one of `check_suite_app` (a GitHub App slug) or `review_login` (a reviewer login), non-empty. |
 | `vendors.<name>.usd_per_run` | yes, per vendor | USD charged for one run. |
 
@@ -51,7 +52,9 @@ invalid when:
 
 - the JSON is malformed or has an unknown field;
 - a rate is negative or not a number;
-- a runner label or vendor name is empty;
+- a runner label is empty;
+- a vendor name is empty, longer than 128 characters, or contains a control character, since it is
+  exported and stored unchanged;
 - a vendor has no match rule, two match rules, or an empty one;
 - two runner labels, two app slugs, or two reviewer logins differ only in case, or two vendors
   claim the same app slug or the same reviewer login.

@@ -12,7 +12,6 @@ use crate::{
     telemetry::{
         trace::CommitSha,
         vendor::{VendorRun, VendorTrigger},
-        workflow::DisplayName,
     },
 };
 
@@ -25,18 +24,12 @@ struct CheckSuiteEnvelope {
 struct CheckSuiteProjection {
     head_sha: Option<Value>,
     app: Option<AppProjection>,
-    #[serde(default)]
-    pull_requests: Option<Vec<PullRequestNumberProjection>>,
+    pull_requests: Option<Value>,
 }
 
 #[derive(Deserialize)]
 struct AppProjection {
     slug: Option<Value>,
-}
-
-#[derive(Deserialize)]
-struct PullRequestNumberProjection {
-    number: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -109,7 +102,7 @@ pub(super) fn project_vendor_run(
     };
     Some(VendorRun {
         repository_name: repository_name.clone(),
-        vendor: DisplayName::sanitize(fields.vendor.name)?,
+        vendor: fields.vendor.name.clone(),
         trigger,
         cost_usd: fields.vendor.usd_per_run.usd(),
         price_table_version: costs.version().to_owned(),
@@ -135,9 +128,11 @@ fn check_suite_fields<'costs>(
         pull_request: unique_pull_request_number(
             check_suite
                 .pull_requests
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|pull_request| pull_request.number),
+                .as_ref()
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|pull_request| pull_request.get("number")?.as_i64()),
         ),
         head_sha: parse_sha(check_suite.head_sha.as_ref()),
     })
@@ -281,6 +276,31 @@ mod tests {
             )
             .expect("the run is still priced");
             assert_eq!(run.pull_request, None, "{pull_requests}");
+        }
+    }
+
+    #[test]
+    fn a_check_suite_with_malformed_pull_request_entries_is_still_priced() {
+        for (pull_requests, expected) in [
+            (json!([{"number": "7"}, 3, null, {"number": 7.5}]), None),
+            (json!([{"number": 7}, "7", {"number": -1}, {}]), Some(7)),
+            (
+                json!([{"number": 7}, {"number": "8"}, {"number": 7}]),
+                Some(7),
+            ),
+            (json!([{"number": 7}, [8], {"number": 9}]), None),
+            (json!("7"), None),
+        ] {
+            let run = project(
+                VendorTrigger::CheckSuite,
+                check_suite("visual-tests", pull_requests.clone()),
+            )
+            .expect("the run is still priced");
+            assert_eq!(
+                run.pull_request.map(|number| number.get()),
+                expected,
+                "{pull_requests}"
+            );
         }
     }
 
