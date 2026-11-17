@@ -310,7 +310,15 @@ never sent are not recovered.
 A storage failure while scheduling or totalling never changes a response. Scheduling and
 commit-map failures log `ci run cost enrichment failed` errors, and totalling failures log
 `ci run cost finalization failed` warnings, each with only an `outcome` and an opaque
-`error_correlation_id`. A failed total stays pending and is retried on the next poll.
+`error_correlation_id`. A failed total (`finalize_failed`) stays pending and is retried after a
+delay that starts at 30 seconds and doubles with each failure up to one hour; an attempt that
+never succeeds is removed by retention. A pending row whose stored values no longer parse is set
+aside for good (`unreadable_abandoned`) and never totalled.
+
+Jobs rejected by `GHE_WORKFLOW_JOB_MAX_STEPS` emit no job trace, but their billing is still
+stored, so they count toward the total and still log `ci cost recorded`. Their log carries no
+`github.workflow_file` or `github.workflow.event`, since the rejected path does not read the
+run's stored context.
 
 Schedules, totals, the commit map and per-pull-request totals are pruned on the
 processed-delivery retention cutoff.
@@ -356,12 +364,14 @@ or metrics.
 Commands, output, logs, actors, payload-provided URLs, request bodies, arbitrary payload fragments,
 secrets, signatures, authorization/other headers, unsupported actions, and raw unknown conclusions
 never enter workflow telemetry, in traces, logs, or metrics. Workflow identifiers and names stay
-out of logs with two exceptions. One is a parentless structured warning on a newly claimed
+out of logs with five exceptions. One is a parentless structured warning on a newly claimed
 `too_many_steps` rejection, which may contain only `repository_name`, `delivery_id`,
 `workflow_run_id`, `workflow_run_attempt`, `workflow_job_id`, `step_count`, and `step_limit`. The
-other is the `ci cost recorded` log described above, written for priced jobs when a `costs`
+second is the `ci cost recorded` log described above, written for priced jobs when a `costs`
 table is configured and for accepted usage entries, and carrying only the listed fields, so cost
-can be charted from the logs dataset. The `ci usage post rejected` warning carries only its
+can be charted from the logs dataset. The other three are the `ci run cost finalized` log and the
+`ci run unattributed` and `ci cost after finalize` warnings, each carrying only the fields listed
+under [Run cost totals](#run-cost-totals). The `ci usage post rejected` warning carries only its
 `reason` and, after token verification, `github.repository`; the `ci usage post failed` error
 carries only `outcome`, `error_id` and `github.repository`. Operators can query
 `GET /repos/{owner}/{repo}/actions/jobs/{job_id}` with the canonical repository name and
@@ -493,12 +503,15 @@ and every child carry `github.workflow_file` when known. Each child additionally
 
 **Persistence.** Linking requires the job trace identities to outlive the delivery that produced
 them, so each emitted job trace durably records its trace ID, span ID, sanitized job name, bounded
-conclusion, selected interval, billable minutes, and, when priced, its USD cost and price-table
-version, keyed by repository, run ID, run attempt, and job ID. The cost columns are what a later
-run total sums. Nothing else is retained: no payload data, logs, commands, output, secrets, actors, or raw URLs. These
-records use the processed-delivery retention cutoff and are pruned in the same scheduled pass as
-workflow-run context. Identities are recorded only when remote telemetry is enabled, since a
-disabled emitter exports no job trace to link to.
+conclusion, selected interval, billable minutes, and, when priced, its USD cost, price-table
+version and normalized price-table label, keyed by repository, run ID, run attempt, and job ID.
+The cost columns are what a later [run total](#run-cost-totals) sums. Nothing else is retained: no
+payload data, logs, commands, output, secrets, actors, or raw URLs. These records use the
+processed-delivery retention cutoff and are pruned in the same scheduled pass as workflow-run
+context. A row is written when remote telemetry is enabled, and also when a `costs` table or
+`ingest.oidc` is configured; a job with no exported trace, including one rejected by
+`GHE_WORKFLOW_JOB_MAX_STEPS`, is stored with null trace and span IDs and is never linked into a
+pipeline trace.
 
 **Omissions and limits.** A run attempt with no recorded job traces emits no pipeline trace at
 all — this covers runs whose jobs were all rejected by `GHE_WORKFLOW_JOB_MAX_STEPS`, and runs

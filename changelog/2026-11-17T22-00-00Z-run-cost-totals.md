@@ -26,8 +26,12 @@ Date: 2026-11-17T22:00:00Z
   aggregation.
 - A job or usage post that arrives after its run was totalled still logs `ci cost recorded`, is
   left out of the stored total, and logs a `ci cost after finalize` warning.
-- Job billing is now stored even when trace export is off, so job costs count toward run totals
-  either way. Job links also record the normalized price-table label each job was billed under.
+- Job billing is now stored even when trace export is off, and for jobs rejected by
+  `GHE_WORKFLOW_JOB_MAX_STEPS`, so job costs count toward run totals either way. Rejected jobs
+  still emit no job trace but now log `ci cost recorded` when priced. Job links also record the
+  normalized price-table label each job was billed under.
+- A run total that fails to write is retried after a delay that doubles from 30 seconds up to one
+  hour, and a pending row that no longer parses is set aside rather than retried.
 - Migration `202611180002` rebuilds `workflow_job_links` (nullable trace and span IDs, new
   `runner_label`) and adds `run_cost_finalizations`, `pull_request_run_costs` and
   `pull_request_commits`. All three new tables are pruned on the delivery-retention cutoff.
