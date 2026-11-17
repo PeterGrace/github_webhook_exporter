@@ -402,26 +402,19 @@ async fn usage_handler(State(state): State<AppState>, request: Request) -> Respo
         received_at,
         entries: post.entries,
     };
-    if let Err(failure) = state.ci_usage_store().record(repository_id, &report).await {
-        let failure = match failure {
-            CiUsageStoreError::Unavailable => StorageFailure::Unavailable,
-            CiUsageStoreError::Internal => StorageFailure::Internal,
-        };
-        return storage_failure(failure, &report.claims.repository);
-    }
+    let attempt_final = match state.ci_usage_store().record(repository_id, &report).await {
+        Ok(attempt_final) => attempt_final,
+        Err(failure) => {
+            let failure = match failure {
+                CiUsageStoreError::Unavailable => StorageFailure::Unavailable,
+                CiUsageStoreError::Internal => StorageFailure::Internal,
+            };
+            return storage_failure(failure, &report.claims.repository);
+        }
+    };
     log_usage_costs(&report);
     state.workflow_trace_emitter().emit_usage(&report);
-    // A failed lookup is treated as not final, so a storage error never invents the warning.
-    if state
-        .run_cost_store()
-        .is_finalized(
-            repository_id,
-            report.claims.run_id,
-            report.claims.run_attempt,
-        )
-        .await
-        .unwrap_or(false)
-    {
+    if attempt_final {
         for entry in &report.entries {
             warn_cost_after_finalize(
                 &report.claims.repository,

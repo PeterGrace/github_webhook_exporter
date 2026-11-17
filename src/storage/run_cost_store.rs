@@ -53,6 +53,8 @@ pub(crate) struct DueRunCosts {
     pub(crate) runs: Vec<DueRunCost>,
     /// Rows that no longer parsed and were set aside for good.
     pub(crate) abandoned: usize,
+    /// Rows that no longer parsed but could not be set aside, so a later poll reads them again.
+    pub(crate) abandon_failed: usize,
 }
 
 /// The total and attribution a run attempt is finalized with.
@@ -176,15 +178,17 @@ impl RunCostStore {
             match row.into_due() {
                 Some(run) => due.runs.push(run),
                 None => {
-                    sqlx::query(
+                    let abandoned = sqlx::query(
                         "UPDATE run_cost_finalizations SET \
                          abandoned_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE rowid = ?",
                     )
                     .bind(row_id)
                     .execute(&self.pool)
-                    .await
-                    .map_err(map_sqlx_error)?;
-                    due.abandoned += 1;
+                    .await;
+                    match abandoned {
+                        Ok(_) => due.abandoned += 1,
+                        Err(_) => due.abandon_failed += 1,
+                    }
                 }
             }
         }
@@ -310,33 +314,17 @@ impl RunCostStore {
         .map(|finalized| finalized.is_some())
     }
 
-    /// Returns whether one run attempt's total is already final.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RunCostStoreError::Unavailable`] when SQLite is busy or locked, and
-    /// [`RunCostStoreError::Internal`] for any other persistence failure.
+    #[cfg(test)]
     pub(crate) async fn is_finalized(
         &self,
         repository_id: RepositoryId,
         run_id: WorkflowRunId,
         run_attempt: WorkflowRunAttempt,
     ) -> Result<bool, RunCostStoreError> {
-        trace::instrument_database_operation(DatabaseOperation::RunCostFinalized, async {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT 1 FROM run_cost_finalizations \
-                 WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ? \
-                 AND finalized_at IS NOT NULL",
-            )
-            .bind(repository_id.get())
-            .bind(run_id.get())
-            .bind(run_attempt.get())
-            .fetch_optional(&self.pool)
+        let mut connection = self.pool.acquire().await.map_err(map_sqlx_error)?;
+        attempt_is_final(&mut connection, repository_id, run_id, run_attempt)
             .await
-            .map(|row| row.is_some())
             .map_err(map_sqlx_error)
-        })
-        .await
     }
 
     /// Deletes at most 1,000 finalizations last updated before `cutoff`.
@@ -392,6 +380,27 @@ impl RunCostStore {
         .map_err(map_sqlx_error)?;
         Ok(result.rows_affected())
     }
+}
+
+/// Returns whether one run attempt's total is already final, read on `connection` so a writer can
+/// check inside its own transaction.
+pub(crate) async fn attempt_is_final(
+    connection: &mut SqliteConnection,
+    repository_id: RepositoryId,
+    run_id: WorkflowRunId,
+    run_attempt: WorkflowRunAttempt,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM run_cost_finalizations \
+         WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ? \
+         AND finalized_at IS NOT NULL",
+    )
+    .bind(repository_id.get())
+    .bind(run_id.get())
+    .bind(run_attempt.get())
+    .fetch_optional(&mut *connection)
+    .await
+    .map(|row| row.is_some())
 }
 
 async fn finalize_in(
@@ -778,8 +787,26 @@ mod tests {
             .expect("check constraints are restored");
         drop(connection);
 
+        sqlx::query(
+            "CREATE TRIGGER refuse_abandon BEFORE UPDATE OF abandoned_at \
+             ON run_cost_finalizations BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("trigger installs");
+        let due = store
+            .due(due_at, 10)
+            .await
+            .expect("a failed abandon does not fail the poll");
+        assert_eq!((due.abandoned, due.abandon_failed), (0, 1));
+        assert_eq!(due.runs.len(), 1, "valid rows are still returned");
+        sqlx::query("DROP TRIGGER refuse_abandon")
+            .execute(&pool)
+            .await
+            .expect("trigger drops");
+
         let due = store.due(due_at, 10).await.expect("due query succeeds");
-        assert_eq!(due.abandoned, 1);
+        assert_eq!((due.abandoned, due.abandon_failed), (1, 0));
         assert_eq!(due.runs.len(), 1);
         assert_eq!(due.runs[0].pending, pending(2));
 

@@ -117,6 +117,9 @@ impl RunCostFinalizer {
         for _ in 0..due.abandoned {
             warn_finalization_failed("unreadable_abandoned");
         }
+        for _ in 0..due.abandon_failed {
+            warn_finalization_failed("abandon_failed");
+        }
         let mut finalized = 0;
         for run in due.runs {
             if *shutdown.borrow() {

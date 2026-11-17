@@ -24,7 +24,7 @@ use crate::{
     },
 };
 
-use super::sqlite_is_busy_or_locked;
+use super::{run_cost_store::attempt_is_final, sqlite_is_busy_or_locked};
 
 const WORKFLOW_JOB_LINK_PRUNE_BATCH_SIZE: i64 = 1_000;
 const WORKFLOW_JOB_LINK_TIMESTAMP_FORMAT: &[FormatItem<'static>] =
@@ -57,6 +57,12 @@ impl WorkflowJobLinkStore {
     /// * `identity` - The exported identity of the job trace's root span, or `None` when no job
     ///   trace was exported; such a row counts toward run totals but never links a pipeline span.
     ///
+    /// # Returns
+    ///
+    /// Whether the run attempt was already final when the write committed. The check runs in the
+    /// write's own transaction, under SQLite's write lock, so `true` means the record is not in
+    /// the attempt's total and `false` means it will be.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkflowJobLinkStoreError::Unavailable`] when SQLite is busy or locked, and
@@ -67,7 +73,7 @@ impl WorkflowJobLinkStore {
         repository_id: RepositoryId,
         job: &WorkflowJobTrace,
         identity: Option<WorkflowJobTraceIdentity>,
-    ) -> Result<(), WorkflowJobLinkStoreError> {
+    ) -> Result<bool, WorkflowJobLinkStoreError> {
         trace::instrument_database_operation(
             DatabaseOperation::WorkflowJobLinkRecord,
             self.record_inner(repository_id, job, identity),
@@ -80,7 +86,7 @@ impl WorkflowJobLinkStore {
         repository_id: RepositoryId,
         job: &WorkflowJobTrace,
         identity: Option<WorkflowJobTraceIdentity>,
-    ) -> Result<(), WorkflowJobLinkStoreError> {
+    ) -> Result<bool, WorkflowJobLinkStoreError> {
         if identity.is_some_and(|identity| !identity.is_valid()) {
             return Err(WorkflowJobLinkStoreError::Internal);
         }
@@ -97,6 +103,11 @@ impl WorkflowJobLinkStore {
                 .unwrap_or_else(|| DEFAULT_RUNNER_LABEL_KEY.to_owned())
         });
 
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_sqlx_error)?;
         sqlx::query(
             "INSERT INTO workflow_job_links \
              (repository_id, workflow_run_id, workflow_run_attempt, workflow_job_id, job_name, \
@@ -129,10 +140,19 @@ impl WorkflowJobLinkStore {
         .bind(cost.map(|cost| cost.cost_usd))
         .bind(cost.map(|cost| cost.price_table_version.as_str()))
         .bind(runner_label)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(map_sqlx_error)?;
-        Ok(())
+        let attempt_final = attempt_is_final(
+            &mut transaction,
+            repository_id,
+            job.run_id(),
+            job.run_attempt(),
+        )
+        .await
+        .map_err(map_sqlx_error)?;
+        transaction.commit().await.map_err(map_sqlx_error)?;
+        Ok(attempt_final)
     }
 
     /// Lists the emitted job traces of one run attempt, oldest job start first.

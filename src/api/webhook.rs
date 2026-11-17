@@ -354,17 +354,22 @@ async fn record_job_billing(
     if identity.is_none() && !state.run_costs_enabled() {
         return;
     }
-    if state
+    let Ok(attempt_final) = state
         .workflow_job_link_store()
         .record(repository_id, job, identity)
         .await
-        .is_err()
-    {
+    else {
         record_workflow_link_failure(state, job.repository_name());
         return;
-    }
-    if let Some(cost_usd) = job_cost {
-        warn_if_job_cost_after_finalize(state, repository_id, job, cost_usd).await;
+    };
+    if let Some(cost_usd) = job_cost.filter(|_| attempt_final) {
+        warn_cost_after_finalize(
+            job.repository_name(),
+            job.run_id(),
+            job.run_attempt(),
+            CI_SOURCE_GITHUB_ACTIONS,
+            cost_usd,
+        );
     }
 }
 
@@ -423,28 +428,6 @@ fn log_job_cost(job: &WorkflowJobTrace) -> Option<f64> {
 /// Warns `ci cost after finalize` when a priced job arrives after its run's total is final.
 ///
 /// A failed lookup is treated as not final, so a storage error never invents the warning.
-async fn warn_if_job_cost_after_finalize(
-    state: &AppState,
-    repository_id: RepositoryId,
-    job: &WorkflowJobTrace,
-    cost_usd: f64,
-) {
-    if state
-        .run_cost_store()
-        .is_finalized(repository_id, job.run_id(), job.run_attempt())
-        .await
-        .unwrap_or(false)
-    {
-        warn_cost_after_finalize(
-            job.repository_name(),
-            job.run_id(),
-            job.run_attempt(),
-            CI_SOURCE_GITHUB_ACTIONS,
-            cost_usd,
-        );
-    }
-}
-
 /// Schedules the run attempt's cost total for after the grace period, without waiting for it.
 ///
 /// A redelivered `completed` for the same attempt is a no-op. Like pipeline traces this is

@@ -13,7 +13,7 @@ use crate::{
     },
 };
 
-use super::sqlite_is_busy_or_locked;
+use super::{run_cost_store::attempt_is_final, sqlite_is_busy_or_locked};
 
 const CI_USAGE_PRUNE_BATCH_SIZE: i64 = 1_000;
 const CI_USAGE_TIMESTAMP_FORMAT: &[FormatItem<'static>] =
@@ -77,6 +77,12 @@ impl CiUsageStore {
 
     /// Inserts every entry of one accepted post in a single transaction.
     ///
+    /// # Returns
+    ///
+    /// Whether the run attempt was already final when the write committed. The check runs in the
+    /// write's own transaction, under SQLite's write lock, so `true` means the record is not in
+    /// the attempt's total and `false` means it will be.
+    ///
     /// # Errors
     ///
     /// Returns [`CiUsageStoreError::Unavailable`] when SQLite is busy or locked, and
@@ -86,7 +92,7 @@ impl CiUsageStore {
         &self,
         repository_id: RepositoryId,
         report: &UsageReport,
-    ) -> Result<(), CiUsageStoreError> {
+    ) -> Result<bool, CiUsageStoreError> {
         trace::instrument_database_operation(
             DatabaseOperation::CiUsageRecord,
             self.record_inner(repository_id, report),
@@ -98,8 +104,12 @@ impl CiUsageStore {
         &self,
         repository_id: RepositoryId,
         report: &UsageReport,
-    ) -> Result<(), CiUsageStoreError> {
-        let mut transaction = self.pool.begin().await.map_err(map_sqlx_error)?;
+    ) -> Result<bool, CiUsageStoreError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_sqlx_error)?;
         for entry in &report.entries {
             let (input_tokens, output_tokens, cpu_seconds, ram_gb_seconds) = match entry.measure {
                 UsageMeasure::Inference {
@@ -138,7 +148,16 @@ impl CiUsageStore {
             .await
             .map_err(map_sqlx_error)?;
         }
-        transaction.commit().await.map_err(map_sqlx_error)
+        let attempt_final = attempt_is_final(
+            &mut transaction,
+            repository_id,
+            report.claims.run_id,
+            report.claims.run_attempt,
+        )
+        .await
+        .map_err(map_sqlx_error)?;
+        transaction.commit().await.map_err(map_sqlx_error)?;
+        Ok(attempt_final)
     }
 
     /// Sums the usage entries of one run attempt per source.
@@ -410,6 +429,31 @@ mod tests {
             Some("0123456789ab")
         );
         assert_eq!(rows[1].get::<Option<f64>, _>("cpu_seconds"), Some(1_840.0));
+    }
+
+    #[tokio::test]
+    async fn a_post_reports_whether_its_attempt_was_already_final() {
+        let (_directory, pool, store, repository_id) = store_with_repository().await;
+        assert!(!store
+            .record(repository_id, &report(vec![inference(0.1)]))
+            .await
+            .expect("entries persist"));
+
+        sqlx::query(
+            "INSERT INTO run_cost_finalizations (repository_id, workflow_run_id, \
+             workflow_run_attempt, event, conclusion, pull_request_resolution, due_at, \
+             finalized_at, total_usd, updated_at) \
+             VALUES (?, 31, 2, 'pull_request', 'success', 'none', '2026-11-18T10:05:00.000Z', \
+             '2026-11-18T10:05:01.000Z', 0.1, '2026-11-18T10:05:01.000Z')",
+        )
+        .bind(repository_id.get())
+        .execute(&pool)
+        .await
+        .expect("finalized attempt inserts");
+        assert!(store
+            .record(repository_id, &report(vec![inference(0.2)]))
+            .await
+            .expect("entries persist"));
     }
 
     #[tokio::test]

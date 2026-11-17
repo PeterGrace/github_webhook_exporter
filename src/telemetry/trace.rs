@@ -705,8 +705,6 @@ pub(crate) enum DatabaseOperation {
     RunCostFinalize,
     /// Pushing back one run attempt's cost finalization after it failed.
     RunCostDefer,
-    /// Checking whether one run attempt's cost total is final.
-    RunCostFinalized,
     /// Pruning run cost finalizations.
     RunCostPrune,
     /// Pruning finalized pull-request run totals.
@@ -1139,7 +1137,6 @@ impl DatabaseOperation {
             Self::RunCostSchedule => "run_cost.schedule",
             Self::RunCostFinalize => "run_cost.finalize",
             Self::RunCostDefer => "run_cost.defer",
-            Self::RunCostFinalized => "run_cost.finalized",
             Self::RunCostPrune => "run_cost.prune",
             Self::PullRequestRunCostPrune => "pull_request_run_cost.prune",
             Self::PullRequestCommitRecord => "pull_request_commit.record",
@@ -1396,7 +1393,6 @@ mod tests {
             (DatabaseOperation::RunCostSchedule, "run_cost.schedule"),
             (DatabaseOperation::RunCostFinalize, "run_cost.finalize"),
             (DatabaseOperation::RunCostDefer, "run_cost.defer"),
-            (DatabaseOperation::RunCostFinalized, "run_cost.finalized"),
             (DatabaseOperation::RunCostPrune, "run_cost.prune"),
             (
                 DatabaseOperation::PullRequestRunCostPrune,

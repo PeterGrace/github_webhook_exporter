@@ -303,13 +303,16 @@ warning with `ci.cost.total_usd`, `github.workflow`, `github.workflow.event`, `g
 `cicd.pipeline.run.id` and `github.workflow.run.attempt`. A run that resolves one stores its total
 against that pull request. An attempt is stored under at most one pull request: if it is totalled
 again, for example after retention removed its schedule and `completed` was redelivered, its new
-total replaces any stored one.
+total replaces any stored one. Its job links and usage entries share the same retention cutoff
+and may already be gone, so such a re-total can be lower than the one it replaces.
 
 An attempt's job and usage sums are read in the same transaction that marks it final, after taking
-SQLite's write lock, so a job or usage record is either counted or written after the attempt is
-final. A job delivery or usage post that arrives after its attempt was totalled still writes its own
-`ci cost recorded` log but is left out of the total. Each such record also logs a
-`ci cost after finalize` warning in the run's trace, with `ci.source`, `ci.cost_usd`,
+SQLite's write lock. Each job link or usage write checks whether its attempt is final inside its
+own transaction, also under the write lock, so a record is either counted in the total or warned
+about as late, never neither. The one overlap is a job that GitHub delivers again under a new
+delivery ID after it was counted: its row is rewritten and it is warned about as well. A job delivery or usage post that arrives after its
+attempt was totalled still writes its own `ci cost recorded` log but is left out of the total, and
+logs a `ci cost after finalize` warning in the run's trace, with `ci.source`, `ci.cost_usd`,
 `github.repository`, `cicd.pipeline.run.id` and `github.workflow.run.attempt`. Deliveries GitHub
 never sent are not recovered.
 
@@ -319,7 +322,8 @@ commit-map failures log `ci run cost enrichment failed` errors, and totalling fa
 `error_correlation_id`. A failed total (`finalize_failed`) stays pending and is retried after a
 delay that starts at 30 seconds and doubles with each failure up to one hour; an attempt that
 never succeeds is removed by retention. A pending row whose stored values no longer parse is set
-aside for good (`unreadable_abandoned`) and never totalled.
+aside for good (`unreadable_abandoned`) and never totalled; if setting it aside fails
+(`abandon_failed`), the rest of the poll goes on and a later poll tries again.
 
 Jobs rejected by `GHE_WORKFLOW_JOB_MAX_STEPS` emit no job trace, but their billing is still
 stored, so they count toward the total and still log `ci cost recorded`. Their log carries no

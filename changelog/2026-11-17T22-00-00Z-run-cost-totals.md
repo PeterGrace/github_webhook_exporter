@@ -27,7 +27,8 @@ Date: 2026-11-17T22:00:00Z
 - Totals attributed to a pull request are stored per pull request, run and attempt for later
   aggregation. An attempt is stored under at most one pull request.
 - A job or usage post that arrives after its run was totalled still logs `ci cost recorded`, is
-  left out of the stored total, and logs a `ci cost after finalize` warning.
+  left out of the stored total, and logs a `ci cost after finalize` warning. A record is warned
+  about whenever it is left out of the total.
 - Job billing is now stored even when trace export is off, and for jobs rejected by
   `GHE_WORKFLOW_JOB_MAX_STEPS`, so job costs count toward run totals either way. Rejected jobs
   still emit no job trace but now log `ci cost recorded` when priced. Job links also record the
