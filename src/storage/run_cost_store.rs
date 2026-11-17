@@ -277,6 +277,18 @@ impl RunCostStore {
         if updated.rows_affected() != 1 {
             return Ok(false);
         }
+        sqlx::query(
+            "DELETE FROM pull_request_run_costs \
+             WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ? \
+             AND pull_request_number IS NOT ?",
+        )
+        .bind(repository_id.get())
+        .bind(finalized.run_id.get())
+        .bind(finalized.run_attempt.get())
+        .bind(finalized.pull_request.map(PullRequestNumber::get))
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_sqlx_error)?;
         if let Some(pull_request) = finalized.pull_request {
             sqlx::query(
                 "INSERT INTO pull_request_run_costs \
@@ -760,6 +772,33 @@ mod tests {
             stored,
             [(1, 0.75)],
             "the pull-request total matches the finalization"
+        );
+
+        sqlx::query("DELETE FROM run_cost_finalizations")
+            .execute(&pool)
+            .await
+            .expect("finalization row is pruned again");
+        store
+            .schedule(repository_id, &pending(1), due_at)
+            .await
+            .expect("the attempt is scheduled a third time");
+        let other_pull_request = FinalizedRunCost {
+            pull_request: Some(PullRequestNumber::new(99).expect("pull request is positive")),
+            ..finalized(&pending(1), 0.25)
+        };
+        assert!(store
+            .finalize(repository_id, &other_pull_request)
+            .await
+            .expect("finalizing under another pull request succeeds"));
+        let stored: Vec<(i64, f64)> =
+            sqlx::query_as("SELECT pull_request_number, total_usd FROM pull_request_run_costs")
+                .fetch_all(&pool)
+                .await
+                .expect("totals load");
+        assert_eq!(
+            stored,
+            [(99, 0.25)],
+            "the attempt counts under one pull request only"
         );
     }
 

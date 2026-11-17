@@ -12,7 +12,10 @@ use crate::{
     domain::repository::RepositoryId,
     telemetry::{
         pipeline::{PipelineJobSummary, WorkflowJobTraceIdentity},
-        run_cost::breakdown_key,
+        run_cost::{
+            breakdown_key, DEFAULT_RUNNER_LABEL_KEY, UNLABELLED_RUNNER_LABEL_KEY,
+            UNPRICED_RUNNER_LABEL_KEY,
+        },
         trace::{self, DatabaseOperation},
         workflow::{
             DisplayName, HistoricalTiming, TimingSource, WorkflowConclusion, WorkflowJobId,
@@ -87,9 +90,12 @@ impl WorkflowJobLinkStore {
             system_time_to_nanos(job.timing().end()).ok_or(WorkflowJobLinkStoreError::Internal)?;
         let billing = job.billing();
         let cost = billing.and_then(|billing| billing.cost.as_ref());
-        let runner_label = cost
-            .and_then(|cost| cost.price_label.as_deref())
-            .and_then(breakdown_key);
+        let runner_label = cost.map(|cost| {
+            cost.price_label
+                .as_deref()
+                .and_then(breakdown_key)
+                .unwrap_or_else(|| DEFAULT_RUNNER_LABEL_KEY.to_owned())
+        });
 
         sqlx::query(
             "INSERT INTO workflow_job_links \
@@ -225,11 +231,14 @@ impl WorkflowJobLinkStore {
         .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx_error)?;
-        let minutes_by_label: Vec<(Option<String>, i64)> = sqlx::query_as(
-            "SELECT runner_label, SUM(billable_minutes) FROM workflow_job_links \
+        let minutes_by_label: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT CASE WHEN cost_usd IS NULL THEN ? ELSE coalesce(runner_label, ?) END \
+             AS label, SUM(billable_minutes) FROM workflow_job_links \
              WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ? \
-             AND billable_minutes IS NOT NULL GROUP BY runner_label",
+             AND billable_minutes IS NOT NULL GROUP BY label",
         )
+        .bind(UNPRICED_RUNNER_LABEL_KEY)
+        .bind(UNLABELLED_RUNNER_LABEL_KEY)
         .bind(repository_id.get())
         .bind(run_id.get())
         .bind(run_attempt.get())
@@ -301,7 +310,7 @@ pub(crate) struct JobCostTotals {
     /// The summed job cost, or `None` when no job of the attempt was priced.
     pub(crate) cost_usd: Option<f64>,
     /// Billable minutes per normalized price-table label; `None` is the default rate.
-    pub(crate) minutes_by_label: Vec<(Option<String>, i64)>,
+    pub(crate) minutes_by_label: Vec<(String, i64)>,
     /// At most two distinct price-table versions of the attempt's priced jobs.
     pub(crate) price_table_versions: Vec<String>,
 }
@@ -548,7 +557,7 @@ mod tests {
             .await
             .expect("totals succeed");
         assert_eq!(totals.cost_usd, Some(0.012));
-        assert_eq!(totals.minutes_by_label, [(None, 2)]);
+        assert_eq!(totals.minutes_by_label, [("unlabelled".to_owned(), 2)]);
         assert_eq!(totals.price_table_versions, ["0123456789ab"]);
         let summaries = store
             .list(repository_id, run_id(), run_attempt(), 10)
@@ -936,6 +945,22 @@ mod tests {
             .await
             .expect("untraced job persists");
         store
+            .record(
+                repository_id,
+                &job(44, None, WorkflowConclusion::Success, timing.clone()).with_billing(
+                    WorkflowJobBilling {
+                        runner_labels: Vec::new(),
+                        runner_group: None,
+                        runner_name: None,
+                        billable_minutes: 4,
+                        cost: None,
+                    },
+                ),
+                None,
+            )
+            .await
+            .expect("unpriced job persists");
+        store
             .record(repository_id, &priced(43, 7, 0.07, None), None)
             .await
             .expect("other attempt persists");
@@ -959,7 +984,11 @@ mod tests {
         minutes.sort();
         assert_eq!(
             minutes,
-            [(None, 3), (Some("ubuntu_24_04_xl".to_owned()), 5)]
+            [
+                ("default".to_owned(), 3),
+                ("ubuntu_24_04_xl".to_owned(), 5),
+                ("unpriced".to_owned(), 4),
+            ]
         );
         assert!((totals.cost_usd.expect("jobs are priced") - 0.43).abs() < 1e-9);
         assert_eq!(totals.price_table_versions, ["0123456789ab"]);

@@ -17,13 +17,15 @@ Date: 2026-11-17T22:00:00Z
   per-label `ci.minutes.<label>`, `ci.usage.entries`, `cicd.pipeline.result`,
   `github.pr_resolution` and the run's workflow, event, identifiers and pull request. The log
   carries the breakdowns as `ci.cost.by_source` and `ci.minutes.by_label` lists, since log field
-  names are fixed. Each breakdown is capped at 16 keys.
+  names are fixed. Each breakdown is capped at 16 keys. Minutes no price table priced count under
+  `unpriced`, and priced minutes stored before runner labels were recorded count under
+  `unlabelled`.
 - The pull request comes from webhook state only: the run's `pull_requests`, a merge-queue branch,
   `PR #<N>` in a comment-triggered run's name, or a new commit-to-pull-request map filled from
   `pull_request` deliveries (head commit on opened, synchronize and reopened; merge commit on
   closed). A run with none logs a `ci run unattributed` warning and still emits its total.
 - Totals attributed to a pull request are stored per pull request, run and attempt for later
-  aggregation.
+  aggregation. An attempt is stored under at most one pull request.
 - A job or usage post that arrives after its run was totalled still logs `ci cost recorded`, is
   left out of the stored total, and logs a `ci cost after finalize` warning.
 - Job billing is now stored even when trace export is off, and for jobs rejected by

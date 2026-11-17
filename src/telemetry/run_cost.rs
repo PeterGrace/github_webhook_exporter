@@ -38,6 +38,10 @@ pub(crate) const MAX_BREAKDOWN_KEYS: usize = 16;
 pub(crate) const OTHER_BREAKDOWN_KEY: &str = "other";
 /// The `ci.minutes.<label>` key of jobs billed at the default rate.
 pub(crate) const DEFAULT_RUNNER_LABEL_KEY: &str = "default";
+/// The `ci.minutes.<label>` key of jobs no price table priced.
+pub(crate) const UNPRICED_RUNNER_LABEL_KEY: &str = "unpriced";
+/// The `ci.minutes.<label>` key of priced jobs stored before runner labels were recorded.
+pub(crate) const UNLABELLED_RUNNER_LABEL_KEY: &str = "unlabelled";
 const MAX_BREAKDOWN_KEY_LENGTH: usize = 32;
 
 /// Which webhook-state rule attributed a run to its pull request: the closed

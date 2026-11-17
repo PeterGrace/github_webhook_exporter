@@ -16,7 +16,7 @@ use crate::{
     telemetry::{
         run_cost::{
             bounded_breakdown, breakdown_key, log_run_cost_finalized, PullRequestResolution,
-            RunCostTotal, DEFAULT_RUNNER_LABEL_KEY,
+            RunCostTotal,
         },
         trace::{self, Operation, OperationOutcome, CI_SOURCE_GITHUB_ACTIONS},
         WorkflowTraceEmitter,
@@ -242,13 +242,7 @@ fn run_cost_total(
                     .filter_map(|(source, cost_usd)| Some((breakdown_key(&source)?, cost_usd))),
             ),
     );
-    let minutes_by_label =
-        bounded_breakdown(jobs.minutes_by_label.into_iter().map(|(label, minutes)| {
-            (
-                label.unwrap_or_else(|| DEFAULT_RUNNER_LABEL_KEY.to_owned()),
-                minutes,
-            )
-        }));
+    let minutes_by_label = bounded_breakdown(jobs.minutes_by_label);
     let versions = jobs
         .price_table_versions
         .into_iter()
@@ -540,7 +534,7 @@ mod tests {
             )
             .await
             .expect("attempt schedules");
-        insert_job(&pool, repository_id.get(), 1, 81, 0.012, None).await;
+        insert_job(&pool, repository_id.get(), 1, 81, 0.012, Some("default")).await;
         pool.close().await;
 
         let reopened = open_database(&path).await.expect("database reopens");
@@ -614,12 +608,12 @@ mod tests {
                 .expect("attempt schedules");
         }
         insert_job(&pool, repository_id.get(), 2, 81, 0.5, Some("ubuntu_xl")).await;
-        insert_job(&pool, repository_id.get(), 2, 82, 0.25, None).await;
+        insert_job(&pool, repository_id.get(), 2, 82, 0.25, Some("default")).await;
         insert_usage(&pool, repository_id.get(), 2, "anthropic", 0.125).await;
         insert_usage(&pool, repository_id.get(), 2, "open-router", 0.0625).await;
-        insert_job(&pool, repository_id.get(), 1, 83, 4.0, None).await;
+        insert_job(&pool, repository_id.get(), 1, 83, 4.0, Some("default")).await;
         insert_usage(&pool, repository_id.get(), 1, "anthropic", 8.0).await;
-        insert_job(&pool, other_repository, 2, 84, 16.0, None).await;
+        insert_job(&pool, other_repository, 2, 84, 16.0, Some("default")).await;
         insert_usage(&pool, other_repository, 2, "anthropic", 32.0).await;
         let logs = CapturedLogs::default();
 

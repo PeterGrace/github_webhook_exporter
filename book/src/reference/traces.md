@@ -268,7 +268,9 @@ instant timestamp. Like `ci.usage` spans it is a root in the run's
   for runner minutes and each usage `source`, with `-` written as `_`;
 - one `ci.minutes.<label>` per price-table label the jobs were billed under, normalized to
   lowercase letters, digits and `_` and cut to 32 characters, with `default` for jobs billed at
-  the default rate;
+  the default rate, `unpriced` for jobs no price table priced (for example when only
+  `ingest.oidc` is configured), and `unlabelled` for priced jobs stored before the exporter
+  recorded runner labels;
 - `ci.usage.entries`, the number of usage entries counted;
 - `ci.price_table.version`, when every priced record of the attempt used the same table.
 
@@ -299,7 +301,9 @@ breakdowns are written as `key=value` lists in `ci.cost.by_source` (for example
 A run with no resolved pull request still exports its total and also logs a `ci run unattributed`
 warning with `ci.cost.total_usd`, `github.workflow`, `github.workflow.event`, `github.repository`,
 `cicd.pipeline.run.id` and `github.workflow.run.attempt`. A run that resolves one stores its total
-against that pull request.
+against that pull request. An attempt is stored under at most one pull request: if it is totalled
+again, for example after retention removed its schedule and `completed` was redelivered, its new
+total replaces any stored one.
 
 A job delivery or usage post that arrives after its attempt was totalled still writes its own
 `ci cost recorded` log but is left out of the total. Each such record also logs a
