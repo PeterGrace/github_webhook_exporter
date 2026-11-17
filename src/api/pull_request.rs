@@ -29,6 +29,7 @@ pub(super) struct PullRequestProjection {
     updated_at: Option<String>,
     merged: Option<bool>,
     head: Option<HeadProjection>,
+    merge_commit_sha: Option<Value>,
 }
 
 impl PullRequestProjection {
@@ -38,6 +39,25 @@ impl PullRequestProjection {
             .and_then(|head| head.sha.as_ref())
             .and_then(Value::as_str)
             .and_then(|sha| CommitSha::parse(sha).ok())
+    }
+
+    /// Returns the commit a run attributed to this pull request can be found by: the head commit
+    /// when the pull request is opened, synchronized or reopened, and the merge commit when it is
+    /// closed.
+    pub(super) fn attributable_commit(
+        &self,
+        action: Action,
+    ) -> Option<(PullRequestNumber, CommitSha)> {
+        let commit = match action {
+            Action::Opened | Action::Synchronize | Action::Reopened => self.head_sha(),
+            Action::Closed => self
+                .merge_commit_sha
+                .as_ref()
+                .and_then(Value::as_str)
+                .and_then(|sha| CommitSha::parse(sha).ok()),
+            _ => None,
+        }?;
+        Some((PullRequestNumber::new(self.number).ok()?, commit))
     }
 }
 
@@ -222,6 +242,43 @@ impl QueueProcessor<'_> {
                 );
                 Ok(OperationOutcome::NoOp)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::PullRequestProjection;
+    use crate::metrics::Action;
+
+    const HEAD_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    const MERGE_SHA: &str = "1123456789abcdef0123456789abcdef01234567";
+
+    fn attributable(action: Action) -> Option<(i64, String)> {
+        let projection: PullRequestProjection = serde_json::from_value(json!({
+            "number": 42,
+            "head": {"sha": HEAD_SHA},
+            "merge_commit_sha": MERGE_SHA
+        }))
+        .expect("projection parses");
+        projection
+            .attributable_commit(action)
+            .map(|(number, sha)| (number.get(), sha.as_str().to_owned()))
+    }
+
+    #[test]
+    fn head_commits_map_while_open_and_the_merge_commit_maps_on_close() {
+        for action in [Action::Opened, Action::Synchronize, Action::Reopened] {
+            assert_eq!(attributable(action), Some((42, HEAD_SHA.to_owned())));
+        }
+        assert_eq!(
+            attributable(Action::Closed),
+            Some((42, MERGE_SHA.to_owned()))
+        );
+        for action in [Action::Edited, Action::Labeled, Action::Enqueued] {
+            assert_eq!(attributable(action), None);
         }
     }
 }

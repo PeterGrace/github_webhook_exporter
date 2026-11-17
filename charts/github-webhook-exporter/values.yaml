@@ -22,6 +22,7 @@ application:
   webhookBodyLimitBytes: 2097152
   workflowJobMaxSteps: 256
   requiredCheckTtlSeconds: 300
+  runGraceSeconds: 300
   rustLog: info
 githubApp:
   appId: null

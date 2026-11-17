@@ -4,10 +4,11 @@ use serde_json::Value;
 use crate::{
     domain::merge_queue::PullRequestNumber,
     telemetry::{
+        run_cost::PullRequestResolution,
         trace::CommitSha,
         workflow::{
-            DisplayName, WorkflowBranch, WorkflowEvent, WorkflowFile, WorkflowPullRequests,
-            WorkflowRunAttempt, WorkflowRunContext, WorkflowRunId,
+            DisplayName, WorkflowBranch, WorkflowConclusion, WorkflowEvent, WorkflowFile,
+            WorkflowPullRequests, WorkflowRunAttempt, WorkflowRunContext, WorkflowRunId,
         },
     },
 };
@@ -27,6 +28,7 @@ struct WorkflowRunProjection {
     head_sha: Option<Value>,
     path: Option<Value>,
     display_title: Option<Value>,
+    conclusion: Option<Value>,
     #[serde(default)]
     pull_requests: Vec<PullRequestProjection>,
 }
@@ -47,6 +49,9 @@ pub(super) struct WorkflowRunSummary {
     pub(super) workflow_name: Option<DisplayName>,
     pub(super) head_sha: Option<CommitSha>,
     pub(super) pull_requests: WorkflowPullRequests,
+    pub(super) conclusion: WorkflowConclusion,
+    /// The attributed pull request and the rule that matched, as in [`project_context`].
+    pub(super) pull_request: Option<(PullRequestNumber, PullRequestResolution)>,
 }
 
 #[derive(Deserialize)]
@@ -76,30 +81,7 @@ pub(super) fn project_context(body: &[u8]) -> Option<WorkflowRunContext> {
         &pull_request.base
     });
 
-    let pull_request = unique_pull_request(&workflow_run.pull_requests)
-        .or_else(|| {
-            event
-                .reads_pull_request_from_run_name()
-                .then(|| {
-                    workflow_run
-                        .display_title
-                        .as_ref()
-                        .and_then(Value::as_str)
-                        .and_then(pull_request_from_run_name)
-                })
-                .flatten()
-        })
-        .or_else(|| {
-            (event == WorkflowEvent::MergeGroup)
-                .then(|| {
-                    workflow_run
-                        .head_branch
-                        .as_ref()
-                        .and_then(Value::as_str)
-                        .and_then(pull_request_from_merge_queue_branch)
-                })
-                .flatten()
-        });
+    let pull_request = resolve_pull_request(&workflow_run, event).map(|(number, _)| number);
     let workflow_file = workflow_run
         .path
         .as_ref()
@@ -111,6 +93,44 @@ pub(super) fn project_context(body: &[u8]) -> Option<WorkflowRunContext> {
             .with_pull_request(pull_request)
             .with_workflow_file(workflow_file),
     )
+}
+
+/// Attributes a run to one pull request from its payload alone, naming the rule that matched.
+///
+/// The run name and merge-queue branch rules are each gated to the triggers they apply to, so a
+/// `push` run's squash-merge title never matches. Their gates never overlap, so their relative
+/// order does not change any result.
+fn resolve_pull_request(
+    workflow_run: &WorkflowRunProjection,
+    event: WorkflowEvent,
+) -> Option<(PullRequestNumber, PullRequestResolution)> {
+    unique_pull_request(&workflow_run.pull_requests)
+        .map(|number| (number, PullRequestResolution::PullRequests))
+        .or_else(|| {
+            (event == WorkflowEvent::MergeGroup)
+                .then(|| {
+                    workflow_run
+                        .head_branch
+                        .as_ref()
+                        .and_then(Value::as_str)
+                        .and_then(pull_request_from_merge_queue_branch)
+                })
+                .flatten()
+                .map(|number| (number, PullRequestResolution::MergeQueueBranch))
+        })
+        .or_else(|| {
+            event
+                .reads_pull_request_from_run_name()
+                .then(|| {
+                    workflow_run
+                        .display_title
+                        .as_ref()
+                        .and_then(Value::as_str)
+                        .and_then(pull_request_from_run_name)
+                })
+                .flatten()
+                .map(|number| (number, PullRequestResolution::RunName))
+        })
 }
 
 /// Returns the run's pull request when its `pull_requests` name exactly one distinct number.
@@ -178,8 +198,13 @@ fn pull_request_from_run_name(run_name: &str) -> Option<PullRequestNumber> {
 pub(super) fn project_run_summary(body: &[u8]) -> Option<WorkflowRunSummary> {
     let envelope: WorkflowRunEnvelope = serde_json::from_slice(body).ok()?;
     let workflow_run = envelope.workflow_run;
+    let event = WorkflowEvent::normalize(workflow_run.event.as_ref().and_then(Value::as_str));
 
     Some(WorkflowRunSummary {
+        conclusion: WorkflowConclusion::normalize(
+            workflow_run.conclusion.as_ref().and_then(Value::as_str),
+        ),
+        pull_request: resolve_pull_request(&workflow_run, event),
         workflow_name: workflow_run
             .name
             .as_ref()
@@ -495,7 +520,7 @@ mod run_summary_tests {
     use serde_json::json;
 
     use super::project_run_summary;
-    use crate::telemetry::workflow::DisplayName;
+    use crate::telemetry::workflow::{DisplayName, WorkflowConclusion};
 
     const HEAD_SHA: &str = "0123456789ABCDEF0123456789abcdef01234567";
 
@@ -546,5 +571,63 @@ mod run_summary_tests {
         assert!(summary.head_sha.is_none());
         assert!(summary.pull_requests.is_empty());
         assert!(project_run_summary(b"{").is_none());
+    }
+
+    fn summary_of(workflow_run: serde_json::Value) -> super::WorkflowRunSummary {
+        let body = serde_json::to_vec(&json!({ "workflow_run": workflow_run }))
+            .expect("fixture serializes");
+        project_run_summary(&body).expect("summary projects")
+    }
+
+    fn resolution_of(workflow_run: serde_json::Value) -> Option<(i64, &'static str)> {
+        summary_of(workflow_run)
+            .pull_request
+            .map(|(number, resolution)| (number.get(), resolution.as_str()))
+    }
+
+    #[test]
+    fn summaries_name_the_rule_that_attributed_the_run() {
+        assert_eq!(
+            resolution_of(json!({
+                "id": 31, "run_attempt": 1, "event": "pull_request",
+                "pull_requests": [{"number": 5}]
+            })),
+            Some((5, "pull_requests"))
+        );
+        assert_eq!(
+            resolution_of(json!({
+                "id": 31, "run_attempt": 1, "event": "merge_group",
+                "head_branch": "gh-readonly-queue/main/pr-6-0123abc"
+            })),
+            Some((6, "merge_queue_branch"))
+        );
+        assert_eq!(
+            resolution_of(json!({
+                "id": 31, "run_attempt": 1, "event": "issue_comment",
+                "display_title": "Claude on PR #7"
+            })),
+            Some((7, "run_name"))
+        );
+        assert_eq!(
+            resolution_of(json!({
+                "id": 31, "run_attempt": 1, "event": "push",
+                "display_title": "fix(api): handle errors PR #9088 (#9088)"
+            })),
+            None,
+            "a push run's squash-merge title never attributes it"
+        );
+    }
+
+    #[test]
+    fn summaries_carry_the_bounded_run_conclusion() {
+        assert_eq!(
+            summary_of(json!({"id": 31, "run_attempt": 1, "conclusion": "cancelled"})).conclusion,
+            WorkflowConclusion::Cancelled
+        );
+        assert_eq!(
+            summary_of(json!({"id": 31, "run_attempt": 1, "conclusion": "startup_failure"}))
+                .conclusion,
+            WorkflowConclusion::Other
+        );
     }
 }

@@ -1,8 +1,10 @@
 mod ci_usage_store;
 mod delivery_store;
 mod merge_queue_store;
+mod pull_request_commit_store;
 mod repository_store;
 mod required_check_store;
+mod run_cost_store;
 mod workflow_job_link_store;
 mod workflow_run_store;
 
@@ -11,20 +13,26 @@ use std::{fs::OpenOptions, io, path::Path, time::Duration};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-pub(crate) use ci_usage_store::{CiUsageStore, CiUsageStoreError};
+pub(crate) use ci_usage_store::{CiUsageStore, CiUsageStoreError, UsageTotals};
 pub use delivery_store::{DeliveryClaim, DeliveryStore, DeliveryStoreError};
 pub use merge_queue_store::{
     CompletionTransition, EnqueueTransition, MergeQueueStore, MergeQueueStoreError,
 };
+pub(crate) use pull_request_commit_store::{PullRequestCommitStore, PullRequestCommitStoreError};
 pub use repository_store::{RepositoryStore, RepositoryStoreError};
 pub(crate) use required_check_store::{RequiredCheckStore, RequiredCheckStoreError};
+pub(crate) use run_cost_store::{
+    DueRunCost, FinalizedRunCost, PendingRunCost, RunCostStore, RunCostStoreError,
+};
 use sqlx::{
     migrate::MigrateError,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     SqlitePool,
 };
 use thiserror::Error;
-pub(crate) use workflow_job_link_store::{WorkflowJobLinkStore, WorkflowJobLinkStoreError};
+pub(crate) use workflow_job_link_store::{
+    JobCostTotals, WorkflowJobLinkStore, WorkflowJobLinkStoreError,
+};
 pub(crate) use workflow_run_store::{WorkflowRunStore, WorkflowRunStoreError};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();

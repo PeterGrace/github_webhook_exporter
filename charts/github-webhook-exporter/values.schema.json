@@ -235,6 +235,7 @@
         "webhookBodyLimitBytes",
         "workflowJobMaxSteps",
         "requiredCheckTtlSeconds",
+        "runGraceSeconds",
         "rustLog"
       ],
       "properties": {
@@ -257,6 +258,11 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 86400
+        },
+        "runGraceSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600
         },
         "rustLog": {
           "type": "string",

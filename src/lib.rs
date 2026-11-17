@@ -22,6 +22,8 @@ pub mod lifecycle;
 pub mod metrics;
 /// Scheduled delivery, workflow-run context, and completed merge-queue-attempt retention.
 pub mod retention;
+/// Background finalization of per-run cost totals after each run's grace period.
+pub(crate) mod run_costs;
 /// Cryptographic and administrative-authentication security primitives.
 pub mod security;
 /// SQLite startup, migrations, probes, and durable repository, delivery, workflow, and queue state.

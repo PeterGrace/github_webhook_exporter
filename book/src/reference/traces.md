@@ -27,6 +27,10 @@ Each scheduled delivery/merge-queue pruning pass emits an independent `retention
 `delivery.prune` and `merge_queue.prune` as children — independent even when the retention task
 starts from a context carrying another span.
 
+Each background run-cost finalization emits an independent `run_cost.finalize` root whose
+`sqlite.query` children sum the run and write its total. The poll that looks for due runs records
+no span, so an idle finalizer exports nothing.
+
 `http.route` carries the Axum route template (for example `/api/v1/repositories/{id}`); unmatched
 requests use the fixed value `unmatched`. Raw paths, query strings, and URLs are never trace
 attributes. HTTP methods, response classes, repository operations, webhook event/action values,
@@ -235,6 +239,80 @@ It carries the same pipeline trace ID and no span ID, along with the same cost, 
 `github.repository`, `cicd.pipeline.run.id`, and `github.workflow.run.attempt`.
 
 Accepted entries are stored per repository, run and attempt for run totals, and pruned on the
+processed-delivery retention cutoff.
+
+### Run cost totals
+
+When a `costs` table or `ingest.oidc` is configured, each `workflow_run` delivery whose action is
+`completed` schedules its run attempt to be totalled after `GHE_RUN_GRACE_SECONDS` (default
+`300`). The delivery returns `204 No Content` at once. The schedule is stored in SQLite, so an
+attempt whose grace period spans a restart is totalled by the next process, and a redelivered
+`completed` for the same attempt, with the same or a different delivery ID, schedules nothing
+more. Each attempt of a re-run is totalled on its own, and cancelled runs are totalled too.
+
+The total is the sum of the attempt's stored job costs and usage entries. Job costs are stored
+whether or not trace export is enabled. Once totalled, the attempt exports one span named
+`ci.run.cost`, with `sentry.op=ci.run.cost`, `sentry.description` `<workflow> cost` and an
+instant timestamp. Like `ci.usage` spans it is a root in the run's
+[pipeline trace](#pipeline-run-summary-traces). It carries:
+
+- `cicd.pipeline.name`, `cicd.pipeline.run.id`, `cicd.pipeline.run.url.full`,
+  `vcs.repository.url.full`, `vcs.repository.name`, `vcs.ref.head.revision` (when valid),
+  `github.repository.name`, `github.workflow.run.attempt`, `github.workflow.event`,
+  `github.workflow` and `github.workflow_file`;
+- `cicd.pipeline.result`, the run's conclusion as a semantic-convention result such as `success`,
+  `failure` or `cancellation`;
+- `github.pull_request.number` and the groupable `ci.pull_request.number`, when a pull request was
+  resolved, and `github.pr_resolution`, the rule that resolved it (below);
+- `ci.cost.total_usd`, the run total, and one `ci.cost.<source>_usd` per source: `github_actions`
+  for runner minutes and each usage `source`, with `-` written as `_`;
+- one `ci.minutes.<label>` per price-table label the jobs were billed under, normalized to
+  lowercase letters, digits and `_` and cut to 32 characters, with `default` for jobs billed at
+  the default rate;
+- `ci.usage.entries`, the number of usage entries counted;
+- `ci.price_table.version`, when every priced record of the attempt used the same table.
+
+At most 16 `ci.cost.<source>_usd` and 16 `ci.minutes.<label>` keys are exported per run; past that
+the smallest are summed into `ci.cost.other_usd` or `ci.minutes.other`, so the key set stays
+bounded and the breakdown still adds up to the total.
+
+The pull request is resolved from webhook state only, never from the GitHub API. The first rule
+that matches wins:
+
+| `github.pr_resolution` | Rule |
+| --- | --- |
+| `pull_requests` | The run's `pull_requests` name exactly one pull request. |
+| `merge_queue_branch` | A `merge_group` run's branch is `gh-readonly-queue/<base>/pr-<N>-<sha>`. |
+| `run_name` | A comment-, review- or `workflow_run`-triggered run's name contains `PR #<N>`. A `push` run's name, such as a squash-merge title, is never read. |
+| `commit_map` | The run's head commit was the head of a pull request when it was opened, synchronized or reopened, or its merge commit when it was closed, as seen on `pull_request` deliveries. |
+| `none` | Nothing matched. |
+
+The same attempt also writes one `ci run cost finalized` info log, whether or not trace export is
+enabled, with the span's trace ID and no span ID. It carries `ci.cost.total_usd`,
+`ci.usage.entries`, `ci.price_table.version`, `cicd.pipeline.result`, `github.workflow`,
+`github.workflow_file`, `github.workflow.event`, `github.pull_request.number`,
+`github.pr_resolution`, `github.repository`, `vcs.ref.head.revision`, `cicd.pipeline.run.id` and
+`github.workflow.run.attempt`. Log fields are fixed names, so the per-source and per-label
+breakdowns are written as `key=value` lists in `ci.cost.by_source` (for example
+`anthropic=0.25,github_actions=0.012`) and `ci.minutes.by_label` (for example `default=2`).
+
+A run with no resolved pull request still exports its total and also logs a `ci run unattributed`
+warning with `ci.cost.total_usd`, `github.workflow`, `github.workflow.event`, `github.repository`,
+`cicd.pipeline.run.id` and `github.workflow.run.attempt`. A run that resolves one stores its total
+against that pull request.
+
+A job delivery or usage post that arrives after its attempt was totalled still writes its own
+`ci cost recorded` log but is left out of the total. Each such record also logs a
+`ci cost after finalize` warning in the run's trace, with `ci.source`, `ci.cost_usd`,
+`github.repository`, `cicd.pipeline.run.id` and `github.workflow.run.attempt`. Deliveries GitHub
+never sent are not recovered.
+
+A storage failure while scheduling or totalling never changes a response. Scheduling and
+commit-map failures log `ci run cost enrichment failed` errors, and totalling failures log
+`ci run cost finalization failed` warnings, each with only an `outcome` and an opaque
+`error_correlation_id`. A failed total stays pending and is retried on the next poll.
+
+Schedules, totals, the commit map and per-pull-request totals are pruned on the
 processed-delivery retention cutoff.
 
 ### Branch-protection required checks

@@ -27,6 +27,7 @@ use crate::{
     },
     storage::{CiUsageStoreError, RepositoryStoreError},
     telemetry::{
+        run_cost::warn_cost_after_finalize,
         usage::{log_usage_costs, UsageEntry, UsageMeasure, UsageReport, UsageSource},
         workflow::{DisplayName, WorkflowRunContext},
     },
@@ -410,6 +411,27 @@ async fn usage_handler(State(state): State<AppState>, request: Request) -> Respo
     }
     log_usage_costs(&report);
     state.workflow_trace_emitter().emit_usage(&report);
+    // A failed lookup is treated as not final, so a storage error never invents the warning.
+    if state
+        .run_cost_store()
+        .is_finalized(
+            repository_id,
+            report.claims.run_id,
+            report.claims.run_attempt,
+        )
+        .await
+        .unwrap_or(false)
+    {
+        for entry in &report.entries {
+            warn_cost_after_finalize(
+                &report.claims.repository,
+                report.claims.run_id,
+                report.claims.run_attempt,
+                entry.source.as_str(),
+                entry.cost_usd,
+            );
+        }
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 

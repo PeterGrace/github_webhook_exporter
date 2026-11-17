@@ -114,6 +114,7 @@ The chart never reads or copies Secret data into its ConfigMap.
 | `application.webhookBodyLimitBytes` | `2097152` | Maximum webhook request body size. |
 | `application.workflowJobMaxSteps` | `256` | Maximum admitted steps in a completed workflow job. |
 | `application.requiredCheckTtlSeconds` | `300` | Branch-protection cache lifetime; range `1..=86400` seconds. |
+| `application.runGraceSeconds` | `300` | Wait after `workflow_run.completed` before a run's cost is totalled, so late job and usage records still count; range `1..=3600` seconds. Used only when `costs` or `ingest.oidc` is set. |
 | `application.rustLog` | `info` | Rust logging filter. |
 | `githubApp.appId` | `null` | GitHub App identifier; null disables required-check lookups. |
 | `githubApp.installationId` | `null` | GitHub App installation identifier; null disables required-check lookups. |

@@ -28,8 +28,10 @@ once, then each SQLite operation deletes at most 1,000 eligible rows, repeating 
 fewer than 1,000. Delivery pruning preserves fresh claims; queue pruning deletes only attempts with
 a non-null completion time older than its cutoff, preserving fresh completed and all pending
 attempts. Pruning runs in a fixed order: deliveries, merge-queue attempts, workflow-run contexts,
-workflow-job trace links, the branch-protection required-check cache, then in-job usage entries.
-The last four are keyed to deliveries and runs and share the delivery cutoff; the required-check cache
+workflow-job links, the branch-protection required-check cache, in-job usage entries, run-cost
+schedules and totals, per-pull-request run totals, then the commit-to-pull-request map.
+Everything after merge-queue attempts is keyed to deliveries and runs and shares the delivery
+cutoff; the required-check cache
 additionally expires on read after `GHE_REQUIRED_CHECK_TTL_SECONDS`, so pruning only reclaims
 space rather than governing correctness.
 
@@ -62,17 +64,35 @@ the outcome, and leaves the branch unknown. None of them can fail a webhook.
 Without configured credentials this task never starts, and every workflow job reports its required
 status as unknown. That is a supported deployment, not a degraded one.
 
+## Run cost finalization
+
+When a `costs` table or `ingest.oidc` is configured, a third background task totals each
+completed run once its `GHE_RUN_GRACE_SECONDS` grace period has elapsed (see
+[Run cost totals](traces.md#run-cost-totals)). It polls SQLite every 15 seconds, at once on
+startup, and totals at most 100 due run attempts per poll, so a run is totalled between the end of
+its grace period and one poll later. Missed polls are skipped.
+
+Pending runs are stored in SQLite rather than held in memory, so a restart during a grace period
+loses nothing: the next process totals every run that came due while it was down on its first
+poll. Each total is written once, in one transaction with its per-pull-request row, and its span
+and log are emitted only by the poll that wrote it. A storage failure leaves the run pending for
+the next poll. The task makes no GitHub API calls.
+
+Without a `costs` table or `ingest.oidc` the task never starts and completed runs are not
+scheduled.
+
 ## Graceful shutdown
 
 Tokio listens for both `SIGINT` and `SIGTERM`. Either signal follows the same sequence:
 
 1. Record the normalized signal in structured stderr logging.
-2. Notify Axum, the shared retention task, and the required-check refresher through one
-   cancellation signal.
-3. Stop accepting new connections, stop scheduling new prune batches, and stop serving new
-   required-check refresh requests.
-4. Allow active requests and active SQLite prune work to finish within one shared
-   `GHE_SHUTDOWN_TIMEOUT_SECONDS` deadline.
+2. Notify Axum, the shared retention task, the required-check refresher, and the run-cost
+   finalizer through one cancellation signal.
+3. Stop accepting new connections, stop scheduling new prune batches, stop serving new
+   required-check refresh requests, and stop starting new run totals.
+4. Allow active requests, active SQLite prune work, and a run total already being written to
+   finish within one shared `GHE_SHUTDOWN_TIMEOUT_SECONDS` deadline. Runs not yet totalled stay
+   pending for the next start.
 5. Record that telemetry provider shutdown is starting, close both telemetry admission boundaries,
    and begin trace and log provider shutdown concurrently.
 6. Wait at most the separate shared `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` deadline for both

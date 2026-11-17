@@ -90,6 +90,10 @@ const CI_INPUT_TOKENS_KEY: &str = "ci.input_tokens";
 const CI_OUTPUT_TOKENS_KEY: &str = "ci.output_tokens";
 const CI_CPU_SECONDS_KEY: &str = "ci.cpu_seconds";
 const CI_RAM_GB_SECONDS_KEY: &str = "ci.ram_gb_seconds";
+const CI_COST_TOTAL_USD_KEY: &str = "ci.cost.total_usd";
+const CI_USAGE_ENTRIES_KEY: &str = "ci.usage.entries";
+const CICD_PIPELINE_RESULT_KEY: &str = "cicd.pipeline.result";
+const GITHUB_PR_RESOLUTION_KEY: &str = "github.pr_resolution";
 
 /// The `ci.source` of GitHub Actions runner minutes.
 pub(crate) const CI_SOURCE_GITHUB_ACTIONS: &str = "github_actions";
@@ -101,6 +105,7 @@ pub(super) const GITHUB_ACTIONS_PIPELINE_TASK_OPERATION: &str = "github.actions.
 pub(super) const GITHUB_ACTIONS_JOB_OPERATION: &str = "github.actions.job";
 pub(super) const GITHUB_ACTIONS_STEP_OPERATION: &str = "github.actions.step";
 pub(super) const CI_USAGE_OPERATION: &str = "ci.usage";
+pub(super) const CI_RUN_COST_OPERATION: &str = "ci.run.cost";
 
 fn string_key_value(key: &'static str, value: impl Into<String>) -> KeyValue {
     KeyValue::new(key, value.into())
@@ -265,6 +270,36 @@ pub(crate) fn usage_cost_attributes(source: &str, cost_usd: f64, fell_back: bool
         KeyValue::new(CI_COST_USD_KEY, cost_usd),
         KeyValue::new(CI_PRICE_FELL_BACK_KEY, fell_back),
     ]
+}
+
+/// Returns the run total attribute of a finalized run attempt.
+pub(crate) fn run_cost_total_attribute(total_usd: f64) -> KeyValue {
+    KeyValue::new(CI_COST_TOTAL_USD_KEY, total_usd)
+}
+
+/// Returns the `ci.cost.<source>_usd` attribute for one already normalized source key.
+pub(crate) fn run_cost_source_attribute(source_key: &str, cost_usd: f64) -> KeyValue {
+    KeyValue::new(format!("ci.cost.{source_key}_usd"), cost_usd)
+}
+
+/// Returns the `ci.minutes.<runner label>` attribute for one already normalized label key.
+pub(crate) fn run_minutes_attribute(label_key: &str, minutes: i64) -> KeyValue {
+    KeyValue::new(format!("ci.minutes.{label_key}"), minutes)
+}
+
+/// Returns the number of usage entries counted in a run total.
+pub(crate) fn usage_entries_attribute(entries: i64) -> KeyValue {
+    KeyValue::new(CI_USAGE_ENTRIES_KEY, entries)
+}
+
+/// Returns the semantic-convention run result of a workflow run conclusion.
+pub(crate) fn pipeline_result_attribute(conclusion: WorkflowConclusion) -> KeyValue {
+    string_key_value(CICD_PIPELINE_RESULT_KEY, conclusion.semantic_result())
+}
+
+/// Returns the attribute naming which rule attributed a run to its pull request.
+pub(crate) fn pull_request_resolution_attribute(resolution: &'static str) -> KeyValue {
+    string_key_value(GITHUB_PR_RESOLUTION_KEY, resolution)
 }
 
 /// Returns the price-table version attribute.
@@ -483,6 +518,8 @@ pub(crate) enum Operation {
     MergeQueueUpdate,
     /// A retention job run.
     RetentionRun,
+    /// Finalizing one run attempt's cost total in the background.
+    RunCostFinalize,
 }
 
 /// A bounded terminal outcome recorded in tracing.
@@ -658,6 +695,26 @@ pub(crate) enum DatabaseOperation {
     CiUsagePrune,
     /// Pinning a repository to its GitHub repository ID.
     CiUsagePin,
+    /// Summing the job costs and minutes of one run attempt.
+    WorkflowJobLinkTotals,
+    /// Summing the usage entries of one run attempt.
+    CiUsageTotals,
+    /// Scheduling one run attempt's cost finalization.
+    RunCostSchedule,
+    /// Finalizing one run attempt's cost total.
+    RunCostFinalize,
+    /// Checking whether one run attempt's cost total is final.
+    RunCostFinalized,
+    /// Pruning run cost finalizations.
+    RunCostPrune,
+    /// Pruning finalized pull-request run totals.
+    PullRequestRunCostPrune,
+    /// Recording one pull-request commit.
+    PullRequestCommitRecord,
+    /// Looking up the pull request of one commit.
+    PullRequestCommitGet,
+    /// Pruning pull-request commits.
+    PullRequestCommitPrune,
 }
 
 /// Creates a bounded tracing span for a high-level operation.
@@ -681,6 +738,9 @@ pub(crate) fn operation_span(operation: Operation) -> Span {
         }
         Operation::RetentionRun => {
             info_span!(target: TELEMETRY_TARGET, parent: None, "retention.run")
+        }
+        Operation::RunCostFinalize => {
+            info_span!(target: TELEMETRY_TARGET, parent: None, "run_cost.finalize")
         }
     }
 }
@@ -934,6 +994,7 @@ impl Operation {
             Self::SqliteQuery => "sqlite.query",
             Self::MergeQueueUpdate => "merge_queue.update",
             Self::RetentionRun => "retention.run",
+            Self::RunCostFinalize => "run_cost.finalize",
         }
     }
 }
@@ -1071,6 +1132,16 @@ impl DatabaseOperation {
             Self::CiUsageRecord => "ci_usage.record",
             Self::CiUsagePrune => "ci_usage.prune",
             Self::CiUsagePin => "ci_usage.pin",
+            Self::WorkflowJobLinkTotals => "workflow_job_link.totals",
+            Self::CiUsageTotals => "ci_usage.totals",
+            Self::RunCostSchedule => "run_cost.schedule",
+            Self::RunCostFinalize => "run_cost.finalize",
+            Self::RunCostFinalized => "run_cost.finalized",
+            Self::RunCostPrune => "run_cost.prune",
+            Self::PullRequestRunCostPrune => "pull_request_run_cost.prune",
+            Self::PullRequestCommitRecord => "pull_request_commit.record",
+            Self::PullRequestCommitGet => "pull_request_commit.get",
+            Self::PullRequestCommitPrune => "pull_request_commit.prune",
         }
     }
 }
@@ -1213,6 +1284,7 @@ mod tests {
             (Operation::SqliteQuery, "sqlite.query"),
             (Operation::MergeQueueUpdate, "merge_queue.update"),
             (Operation::RetentionRun, "retention.run"),
+            (Operation::RunCostFinalize, "run_cost.finalize"),
         ];
         for (operation, expected) in operations {
             assert_eq!(operation.as_str(), expected);
@@ -1313,6 +1385,31 @@ mod tests {
             (DatabaseOperation::CiUsageRecord, "ci_usage.record"),
             (DatabaseOperation::CiUsagePrune, "ci_usage.prune"),
             (DatabaseOperation::CiUsagePin, "ci_usage.pin"),
+            (
+                DatabaseOperation::WorkflowJobLinkTotals,
+                "workflow_job_link.totals",
+            ),
+            (DatabaseOperation::CiUsageTotals, "ci_usage.totals"),
+            (DatabaseOperation::RunCostSchedule, "run_cost.schedule"),
+            (DatabaseOperation::RunCostFinalize, "run_cost.finalize"),
+            (DatabaseOperation::RunCostFinalized, "run_cost.finalized"),
+            (DatabaseOperation::RunCostPrune, "run_cost.prune"),
+            (
+                DatabaseOperation::PullRequestRunCostPrune,
+                "pull_request_run_cost.prune",
+            ),
+            (
+                DatabaseOperation::PullRequestCommitRecord,
+                "pull_request_commit.record",
+            ),
+            (
+                DatabaseOperation::PullRequestCommitGet,
+                "pull_request_commit.get",
+            ),
+            (
+                DatabaseOperation::PullRequestCommitPrune,
+                "pull_request_commit.prune",
+            ),
         ];
         for (operation, expected) in database_operations {
             assert_eq!(operation.as_str(), expected);

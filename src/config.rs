@@ -44,6 +44,9 @@ const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
 /// Default lifetime of a cached branch-protection required-check answer.
 pub(crate) const DEFAULT_REQUIRED_CHECK_TTL_SECONDS: u64 = 300;
 const MAX_REQUIRED_CHECK_TTL_SECONDS: u64 = 86_400;
+/// Default wait after `workflow_run.completed` before a run's cost is totalled.
+pub(crate) const DEFAULT_RUN_GRACE_SECONDS: u64 = 300;
+const MAX_RUN_GRACE_SECONDS: u64 = 3_600;
 
 type SensitiveHeaders = Vec<(String, Zeroizing<String>)>;
 
@@ -248,6 +251,7 @@ pub struct RuntimeConfig {
     merge_queue_retention: Duration,
     delivery_prune_interval: Duration,
     required_check_ttl: Duration,
+    run_grace: Duration,
     github_app: Option<GitHubAppConfig>,
     costs: Option<CostsConfig>,
     ingest_oidc: Option<IngestOidcConfig>,
@@ -319,6 +323,12 @@ impl RuntimeConfig {
     /// Returns how long a cached branch-protection required-check answer stays confident.
     pub fn required_check_ttl(&self) -> Duration {
         self.required_check_ttl
+    }
+
+    /// Returns how long a completed run waits for late job and usage records before its cost is
+    /// totalled.
+    pub fn run_grace(&self) -> Duration {
+        self.run_grace
     }
 
     /// Returns the optional GitHub App credentials that fill the required-check cache.
@@ -475,6 +485,16 @@ impl RuntimeConfig {
                 variable: "GHE_REQUIRED_CHECK_TTL_SECONDS",
             });
         }
+        let run_grace_seconds = optional_positive_u64(
+            &mut lookup,
+            "GHE_RUN_GRACE_SECONDS",
+            DEFAULT_RUN_GRACE_SECONDS,
+        )?;
+        if run_grace_seconds > MAX_RUN_GRACE_SECONDS {
+            return Err(ConfigError::Invalid {
+                variable: "GHE_RUN_GRACE_SECONDS",
+            });
+        }
         let github_app = GitHubAppConfig::from_lookup(&mut lookup)?;
         let costs = optional_string(&mut lookup, COSTS_VARIABLE)?
             .map(|json| CostsConfig::from_json(&json))
@@ -503,6 +523,7 @@ impl RuntimeConfig {
             merge_queue_retention: Duration::from_secs(merge_queue_retention_seconds),
             delivery_prune_interval: Duration::from_secs(delivery_prune_interval_seconds),
             required_check_ttl: Duration::from_secs(required_check_ttl_seconds),
+            run_grace: Duration::from_secs(run_grace_seconds),
             github_app,
             costs,
             ingest_oidc,
@@ -622,6 +643,7 @@ impl fmt::Debug for RuntimeConfig {
             .field("merge_queue_retention", &self.merge_queue_retention)
             .field("delivery_prune_interval", &self.delivery_prune_interval)
             .field("required_check_ttl", &self.required_check_ttl)
+            .field("run_grace", &self.run_grace)
             .field("github_app", &self.github_app)
             .field("costs_enabled", &self.costs.is_some())
             .field(
@@ -1429,6 +1451,30 @@ mod tests {
             OsString::from(STANDARD.encode(PRIVATE_KEY_PEM)),
         );
         variables
+    }
+
+    #[test]
+    fn run_grace_defaults_to_five_minutes_and_is_bounded_to_an_hour() {
+        let config = RuntimeConfig::from_map(required_variables()).expect("configuration is valid");
+        assert_eq!(config.run_grace(), Duration::from_secs(300));
+
+        let mut variables = required_variables();
+        variables.insert("GHE_RUN_GRACE_SECONDS".to_owned(), OsString::from("3600"));
+        let config = RuntimeConfig::from_map(variables).expect("configuration is valid");
+        assert_eq!(config.run_grace(), Duration::from_secs(3_600));
+        assert!(format!("{config:?}").contains("run_grace: 3600s"));
+
+        for value in ["0", "3601", "five"] {
+            let mut variables = required_variables();
+            variables.insert("GHE_RUN_GRACE_SECONDS".to_owned(), OsString::from(value));
+            assert_eq!(
+                RuntimeConfig::from_map(variables).expect_err("invalid grace is rejected"),
+                ConfigError::Invalid {
+                    variable: "GHE_RUN_GRACE_SECONDS"
+                },
+                "unexpected acceptance of {value:?}"
+            );
+        }
     }
 
     #[test]
