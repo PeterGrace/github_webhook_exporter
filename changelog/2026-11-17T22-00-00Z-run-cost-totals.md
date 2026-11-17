@@ -27,8 +27,7 @@ Date: 2026-11-17T22:00:00Z
 - Totals attributed to a pull request are stored per pull request, run and attempt for later
   aggregation. An attempt is stored under at most one pull request.
 - A job or usage post that arrives after its run was totalled still logs `ci cost recorded`, is
-  left out of the stored total, and logs a `ci cost after finalize` warning. A record is warned
-  about whenever it is left out of the total.
+  left out of the stored total, and logs a `ci cost after finalize` warning when it is priced.
 - Job billing is now stored even when trace export is off, and for jobs rejected by
   `GHE_WORKFLOW_JOB_MAX_STEPS`, so job costs count toward run totals either way. Rejected jobs
   still emit no job trace but now log `ci cost recorded` when priced. Job links also record the
@@ -39,3 +38,9 @@ Date: 2026-11-17T22:00:00Z
   `runner_label`) and adds `run_cost_finalizations`, `pull_request_run_costs` and
   `pull_request_commits`. All three new tables are pruned on the delivery-retention cutoff, so a
   pull request's stored totals cover only runs finalized within that window.
+
+## Operator action
+
+Back up the SQLite volume before upgrading. Migration `202611180002` is forward-only: earlier
+releases refuse to start on the migrated database and can't read the job rows it writes, so roll
+back by restoring that backup. The upgrade guide's "Rolling back" section has the details.

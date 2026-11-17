@@ -425,9 +425,6 @@ fn log_job_cost(job: &WorkflowJobTrace) -> Option<f64> {
     Some(cost.cost_usd)
 }
 
-/// Warns `ci cost after finalize` when a priced job arrives after its run's total is final.
-///
-/// A failed lookup is treated as not final, so a storage error never invents the warning.
 /// Schedules the run attempt's cost total for after the grace period, without waiting for it.
 ///
 /// A redelivered `completed` for the same attempt is a no-op. Like pipeline traces this is

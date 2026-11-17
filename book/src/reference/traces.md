@@ -308,13 +308,22 @@ and may already be gone, so such a re-total can be lower than the one it replace
 
 An attempt's job and usage sums are read in the same transaction that marks it final, after taking
 SQLite's write lock. Each job link or usage write checks whether its attempt is final inside its
-own transaction, also under the write lock, so a record is either counted in the total or warned
-about as late, never neither. The one overlap is a job that GitHub delivers again under a new
-delivery ID after it was counted: its row is rewritten and it is warned about as well. A job delivery or usage post that arrives after its
-attempt was totalled still writes its own `ci cost recorded` log but is left out of the total, and
-logs a `ci cost after finalize` warning in the run's trace, with `ci.source`, `ci.cost_usd`,
-`github.repository`, `cicd.pipeline.run.id` and `github.workflow.run.attempt`. Deliveries GitHub
-never sent are not recovered.
+own transaction, also under the write lock, so a priced record is either counted in the total or
+warned about as late. A priced job delivery or usage post that arrives after its attempt was
+totalled still writes its own `ci cost recorded` log but is left out of the total, and logs a
+`ci cost after finalize` warning in the run's trace, with `ci.source`, `ci.cost_usd`,
+`github.repository`, `cicd.pipeline.run.id` and `github.workflow.run.attempt`. A job that GitHub
+delivers again under a new delivery ID after it was counted rewrites its row and is warned about
+as well.
+
+Some records are left out of a total without that warning:
+
+- records for an attempt that is never totalled, because its `completed` delivery never arrived,
+  its pending row was abandoned, or retention removed its schedule;
+- a late job with no price, which adds no cost but whose minutes are missing from
+  `ci.minutes.<label>`.
+
+Deliveries GitHub never sent are not recovered.
 
 A storage failure while scheduling or totalling never changes a response. Scheduling and
 commit-map failures log `ci run cost enrichment failed` errors, and totalling failures log
@@ -544,4 +553,6 @@ failure along this path — link persistence, lookup, or export — degrades to
 `github_webhook_processing_failures_total{stage="workflow_link"}` plus one redacted correlated
 error log, and leaves the authenticated `204 No Content` response, readiness, and merge-queue
 state untouched. That stage is distinct from the generic `database` stage so operators can alert
-on link health without reading logs.
+on link health without reading logs. The same stage also counts a failed write of a billing-only
+job row, written when trace export is off or a job exceeds `GHE_WORKFLOW_JOB_MAX_STEPS`, since run
+cost totals read those rows.
