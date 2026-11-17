@@ -16,7 +16,7 @@ disabled by default.
 - Access to a compatible `linux/amd64` application image.
 
 The chart defaults to `ghcr.io/petergrace/github-webhook-exporter`. When `image.tag` is empty, the
-StatefulSet uses the chart `appVersion`, currently `0.1.14`.
+StatefulSet uses the chart `appVersion`, currently `0.1.15`.
 
 ## Release consumption
 
@@ -26,9 +26,9 @@ StatefulSet uses the chart `appVersion`, currently `0.1.14`.
 - Consume a release with matching versions on both sides:
 
 ```bash
-docker pull ghcr.io/petergrace/github-webhook-exporter:0.1.14
-helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.14
-helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.14
+docker pull ghcr.io/petergrace/github-webhook-exporter:0.1.15
+helm pull oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.15
+helm install github-webhook-exporter oci://ghcr.io/petergrace/charts/github-webhook-exporter --version 0.1.15
 ```
 
 - Published version tags are immutable. The workflow never publishes `latest`, branch, SHA, or prerelease tags.
@@ -530,9 +530,9 @@ From the repository root, run:
 just helm-static
 just image-smoke
 just helm-maintenance-unit
-helm show chart dist/github-webhook-exporter-0.1.14.tgz
-helm show values dist/github-webhook-exporter-0.1.14.tgz
-helm template archive dist/github-webhook-exporter-0.1.14.tgz --kube-version 1.35.0 >/dev/null
+helm show chart dist/github-webhook-exporter-0.1.15.tgz
+helm show values dist/github-webhook-exporter-0.1.15.tgz
+helm template archive dist/github-webhook-exporter-0.1.15.tgz --kube-version 1.35.0 >/dev/null
 just helm-kind-acceptance
 KIND_ARTIFACT_DIRECTORY=dist/kind-lifecycle just helm-kind-lifecycle
 ```
@@ -541,7 +541,7 @@ KIND_ARTIFACT_DIRECTORY=dist/kind-lifecycle just helm-kind-lifecycle
 archive contracts across the supported Kubernetes range 1.31.0 through 1.35.0
 (`>=1.31.0-0 <1.36.0-0`). `just image-smoke` builds the production image and checks the runtime
 and persistence contract locally. The packaged chart archive is always
-`dist/github-webhook-exporter-0.1.14.tgz`; use `helm show chart` and `helm show values` for local
+`dist/github-webhook-exporter-0.1.15.tgz`; use `helm show chart` and `helm show values` for local
 inspection before distributing or reusing it. `helm template archive` with `--kube-version
 1.35.0` inspects the packaged chart without talking to a cluster.
 
