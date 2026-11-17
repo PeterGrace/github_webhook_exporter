@@ -31,7 +31,8 @@ const RUN_COST_BATCH_SIZE: i64 = 100;
 /// Totals each completed run attempt once its grace period has elapsed.
 ///
 /// Pending attempts live in SQLite, so an attempt whose grace period spans a restart is finalized
-/// by the next process. A failed finalization leaves the attempt pending for the next poll.
+/// by the next process. A failed finalization leaves the attempt pending and pushes its due time
+/// back, doubling the delay up to one hour.
 #[derive(Clone)]
 pub(crate) struct RunCostFinalizer {
     run_costs: RunCostStore,
@@ -117,8 +118,11 @@ impl RunCostFinalizer {
                 return 0;
             }
         };
+        for _ in 0..due.abandoned {
+            warn_finalization_failed("unreadable_abandoned");
+        }
         let mut finalized = 0;
-        for run in due {
+        for run in due.runs {
             if *shutdown.borrow() {
                 break;
             }
@@ -135,7 +139,20 @@ impl RunCostFinalizer {
             match outcome {
                 Ok(true) => finalized += 1,
                 Ok(false) => {}
-                Err(FinalizeFailure) => warn_finalization_failed("finalize_failed"),
+                Err(FinalizeFailure) => {
+                    warn_finalization_failed("finalize_failed");
+                    // a failed deferral leaves the attempt due, so the next poll still retries it
+                    let _ = self
+                        .run_costs
+                        .defer(
+                            run.repository_id,
+                            run.pending.run_id,
+                            run.pending.run_attempt,
+                            now,
+                        )
+                        .instrument(span)
+                        .await;
+                }
             }
         }
         finalized
@@ -533,6 +550,51 @@ mod tests {
         assert_eq!(finalizer.finalize_due(due_at, &running()).await, 1);
         assert_eq!(finalizer.finalize_due(due_at + GRACE, &running()).await, 0);
         assert_eq!(stored_total(&reopened, 1).await, Some(0.012));
+    }
+
+    #[tokio::test]
+    async fn a_failing_attempt_backs_off_instead_of_retrying_every_poll() {
+        let directory = tempfile::tempdir().expect("temporary directory exists");
+        let (pool, repository_id) = database(&directory.path().join("exporter.sqlite3")).await;
+        let due_at = OffsetDateTime::now_utc();
+        RunCostStore::new(pool.clone())
+            .schedule(
+                repository_id,
+                &pending(1, Some((42, PullRequestResolution::PullRequests))),
+                due_at,
+            )
+            .await
+            .expect("attempt schedules");
+        sqlx::query(
+            "CREATE TRIGGER reject_pull_request_totals BEFORE INSERT ON pull_request_run_costs \
+             BEGIN SELECT RAISE(ABORT, 'rejected'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("trigger is created");
+        let logs = CapturedLogs::default();
+        let finalizer = RunCostFinalizer::new(&pool, WorkflowTraceEmitter::disabled());
+        let shutdown = running();
+        let poll = |now: OffsetDateTime| {
+            finalizer
+                .finalize_due(now, &shutdown)
+                .with_subscriber(logs.dispatch())
+        };
+
+        assert_eq!(poll(due_at).await, 0);
+        assert_eq!(poll(due_at + time::Duration::seconds(15)).await, 0);
+        assert_eq!(
+            logs.count("ci run cost finalization failed"),
+            1,
+            "the next poll skips the deferred attempt"
+        );
+
+        sqlx::query("DROP TRIGGER reject_pull_request_totals")
+            .execute(&pool)
+            .await
+            .expect("trigger is dropped");
+        assert_eq!(poll(due_at + time::Duration::seconds(30)).await, 1);
+        assert_eq!(stored_total(&pool, 1).await, Some(0.0));
     }
 
     #[tokio::test]

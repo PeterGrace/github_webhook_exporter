@@ -48,7 +48,8 @@ CREATE INDEX workflow_job_links_updated_at_idx
 
 -- One row per completed run attempt. A row is pending until `finalized_at` is set, so a restart
 -- during the grace period loses nothing, and a finalized row answers whether a late job or
--- usage post can still change the total.
+-- usage post can still change the total. A failed total pushes `due_at` back, and a row that no
+-- longer parses is set `abandoned_at` and never polled again.
 CREATE TABLE run_cost_finalizations (
     repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
     workflow_run_id INTEGER NOT NULL CHECK (workflow_run_id > 0),
@@ -78,16 +79,19 @@ CREATE TABLE run_cost_finalizations (
         )
     ),
     due_at TEXT NOT NULL,
+    failed_attempts INTEGER NOT NULL DEFAULT 0 CHECK (failed_attempts >= 0),
+    abandoned_at TEXT,
     finalized_at TEXT,
     total_usd REAL CHECK (total_usd IS NULL OR total_usd >= 0),
     updated_at TEXT NOT NULL,
     CHECK ((finalized_at IS NULL) = (total_usd IS NULL)),
+    CHECK (finalized_at IS NULL OR abandoned_at IS NULL),
     CHECK ((pull_request_number IS NULL) = (pull_request_resolution = 'none')),
     PRIMARY KEY (repository_id, workflow_run_id, workflow_run_attempt)
 );
 
 CREATE INDEX run_cost_finalizations_pending_idx
-    ON run_cost_finalizations(due_at) WHERE finalized_at IS NULL;
+    ON run_cost_finalizations(due_at) WHERE finalized_at IS NULL AND abandoned_at IS NULL;
 CREATE INDEX run_cost_finalizations_updated_at_idx
     ON run_cost_finalizations(updated_at);
 

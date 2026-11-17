@@ -75,8 +75,11 @@ its grace period and one poll later. Missed polls are skipped.
 Pending runs are stored in SQLite rather than held in memory, so a restart during a grace period
 loses nothing: the next process totals every run that came due while it was down on its first
 poll. Each total is written once, in one transaction with its per-pull-request row, and its span
-and log are emitted only by the poll that wrote it. A storage failure leaves the run pending for
-the next poll. The task makes no GitHub API calls.
+and log are emitted only by the poll that wrote it. A storage failure leaves the run pending and
+pushes its next try back, by 30 seconds after the first failure and doubling up to one hour, so a
+run that keeps failing cannot crowd others out of a poll; retention removes it if it never
+succeeds. A pending row that no longer parses is set aside and not polled again. The task makes
+no GitHub API calls.
 
 Without a `costs` table or `ingest.oidc` the task never starts and completed runs are not
 scheduled.

@@ -703,6 +703,8 @@ pub(crate) enum DatabaseOperation {
     RunCostSchedule,
     /// Finalizing one run attempt's cost total.
     RunCostFinalize,
+    /// Pushing back one run attempt's cost finalization after it failed.
+    RunCostDefer,
     /// Checking whether one run attempt's cost total is final.
     RunCostFinalized,
     /// Pruning run cost finalizations.
@@ -1136,6 +1138,7 @@ impl DatabaseOperation {
             Self::CiUsageTotals => "ci_usage.totals",
             Self::RunCostSchedule => "run_cost.schedule",
             Self::RunCostFinalize => "run_cost.finalize",
+            Self::RunCostDefer => "run_cost.defer",
             Self::RunCostFinalized => "run_cost.finalized",
             Self::RunCostPrune => "run_cost.prune",
             Self::PullRequestRunCostPrune => "pull_request_run_cost.prune",
@@ -1392,6 +1395,7 @@ mod tests {
             (DatabaseOperation::CiUsageTotals, "ci_usage.totals"),
             (DatabaseOperation::RunCostSchedule, "run_cost.schedule"),
             (DatabaseOperation::RunCostFinalize, "run_cost.finalize"),
+            (DatabaseOperation::RunCostDefer, "run_cost.defer"),
             (DatabaseOperation::RunCostFinalized, "run_cost.finalized"),
             (DatabaseOperation::RunCostPrune, "run_cost.prune"),
             (

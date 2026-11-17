@@ -500,6 +500,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn priced_links_survive_the_nullable_trace_rebuild() {
+        const REBUILD_VERSION: i64 = 202_611_180_002;
+        let directory = tempfile::tempdir().expect("temporary directory exists");
+        let path = directory.path().join("exporter.sqlite3");
+        let pool = SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .expect("database opens");
+        let mut earlier = sqlx::migrate!();
+        earlier.migrations = earlier
+            .migrations
+            .iter()
+            .filter(|migration| migration.version < REBUILD_VERSION)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        earlier.run(&pool).await.expect("earlier migrations apply");
+        let repository_id = insert_repository(&pool).await;
+        sqlx::query(
+            "INSERT INTO workflow_job_links (repository_id, workflow_run_id, \
+             workflow_run_attempt, workflow_job_id, job_name, conclusion, trace_id, span_id, \
+             started_at_nanos, completed_at_nanos, timing_source, updated_at, billable_minutes, \
+             cost_usd, price_table_version) \
+             VALUES (?, 31, 2, 7, 'build', 'success', ?, ?, 100, 220, 'reported', \
+             '2026-11-13T10:00:00.000Z', 2, 0.012, '0123456789ab')",
+        )
+        .bind(repository_id.get())
+        .bind(format!("{:032x}", 1_u128))
+        .bind(format!("{:016x}", 1_u64))
+        .execute(&pool)
+        .await
+        .expect("pre-rebuild link inserts");
+        pool.close().await;
+
+        let migrated = open_database(&path)
+            .await
+            .expect("remaining migrations apply");
+        let store = WorkflowJobLinkStore::new(migrated.clone());
+
+        let totals = store
+            .run_totals(repository_id, run_id(), run_attempt())
+            .await
+            .expect("totals succeed");
+        assert_eq!(totals.cost_usd, Some(0.012));
+        assert_eq!(totals.minutes_by_label, [(None, 2)]);
+        assert_eq!(totals.price_table_versions, ["0123456789ab"]);
+        let summaries = store
+            .list(repository_id, run_id(), run_attempt(), 10)
+            .await
+            .expect("lookup succeeds");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].conclusion(), WorkflowConclusion::Success);
+        let runner_label: Option<String> =
+            sqlx::query_scalar("SELECT runner_label FROM workflow_job_links")
+                .fetch_one(&migrated)
+                .await
+                .expect("link row loads");
+        assert_eq!(runner_label, None);
+    }
+
+    #[tokio::test]
     async fn migration_contains_only_bounded_link_fields() {
         let directory = tempfile::tempdir().expect("temporary directory exists");
         let pool = open_database(&directory.path().join("exporter.sqlite3"))

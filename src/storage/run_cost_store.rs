@@ -45,6 +45,14 @@ pub(crate) struct DueRunCost {
     pub(crate) pending: PendingRunCost,
 }
 
+/// The attempts one finalizer poll found due.
+#[derive(Debug, Default)]
+pub(crate) struct DueRunCosts {
+    pub(crate) runs: Vec<DueRunCost>,
+    /// Rows that no longer parsed and were set aside for good.
+    pub(crate) abandoned: usize,
+}
+
 /// The total and attribution a run attempt is finalized with.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FinalizedRunCost<'total> {
@@ -135,7 +143,7 @@ impl RunCostStore {
     ///
     /// This runs on every finalizer poll, so unlike the other operations it records no database
     /// span: an idle poll would otherwise export a root span every interval. Rows whose stored
-    /// values no longer satisfy the bounded vocabulary are skipped.
+    /// values no longer satisfy the bounded vocabulary are abandoned, so no later poll reads them.
     ///
     /// # Errors
     ///
@@ -145,15 +153,16 @@ impl RunCostStore {
         &self,
         now: OffsetDateTime,
         limit: i64,
-    ) -> Result<Vec<DueRunCost>, RunCostStoreError> {
+    ) -> Result<DueRunCosts, RunCostStoreError> {
         let rows = sqlx::query_as::<_, StoredPendingRunCost>(
-            "SELECT pending.repository_id, repositories.full_name, pending.workflow_run_id, \
-             pending.workflow_run_attempt, pending.event, pending.workflow_name, \
-             pending.workflow_file, pending.conclusion, pending.head_sha, \
+            "SELECT pending.rowid AS row_id, pending.repository_id, repositories.full_name, \
+             pending.workflow_run_id, pending.workflow_run_attempt, pending.event, \
+             pending.workflow_name, pending.workflow_file, pending.conclusion, pending.head_sha, \
              pending.pull_request_number, pending.pull_request_resolution \
              FROM run_cost_finalizations AS pending \
              JOIN repositories ON repositories.id = pending.repository_id \
-             WHERE pending.finalized_at IS NULL AND pending.due_at <= ? \
+             WHERE pending.finalized_at IS NULL AND pending.abandoned_at IS NULL \
+             AND pending.due_at <= ? \
              ORDER BY pending.due_at, pending.rowid LIMIT ?",
         )
         .bind(format_timestamp(now)?)
@@ -161,10 +170,61 @@ impl RunCostStore {
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx_error)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(StoredPendingRunCost::into_due)
-            .collect())
+        let mut due = DueRunCosts::default();
+        for row in rows {
+            let row_id = row.row_id;
+            match row.into_due() {
+                Some(run) => due.runs.push(run),
+                None => {
+                    sqlx::query(
+                        "UPDATE run_cost_finalizations SET \
+                         abandoned_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE rowid = ?",
+                    )
+                    .bind(row_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                    due.abandoned += 1;
+                }
+            }
+        }
+        Ok(due)
+    }
+
+    /// Pushes a pending attempt's due time back after a failed finalization.
+    ///
+    /// The delay doubles with each failure, from 30 seconds up to one hour. `updated_at` is left
+    /// unchanged, so retention still removes an attempt that never succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunCostStoreError::Unavailable`] when SQLite is busy or locked, and
+    /// [`RunCostStoreError::Internal`] for any other persistence failure.
+    pub(crate) async fn defer(
+        &self,
+        repository_id: RepositoryId,
+        run_id: WorkflowRunId,
+        run_attempt: WorkflowRunAttempt,
+        now: OffsetDateTime,
+    ) -> Result<(), RunCostStoreError> {
+        trace::instrument_database_operation(DatabaseOperation::RunCostDefer, async {
+            sqlx::query(
+                "UPDATE run_cost_finalizations SET failed_attempts = failed_attempts + 1, \
+                 due_at = strftime('%Y-%m-%dT%H:%M:%fZ', ?, \
+                     '+' || min(30 * (1 << min(failed_attempts, 7)), 3600) || ' seconds') \
+                 WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ? \
+                 AND finalized_at IS NULL",
+            )
+            .bind(format_timestamp(now)?)
+            .bind(repository_id.get())
+            .bind(run_id.get())
+            .bind(run_attempt.get())
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx_error)?;
+            Ok(())
+        })
+        .await
     }
 
     /// Finalizes one pending attempt and, when it has a pull request, stores its total against
@@ -222,7 +282,12 @@ impl RunCostStore {
                 "INSERT INTO pull_request_run_costs \
                  (repository_id, pull_request_number, workflow_run_id, workflow_run_attempt, \
                   total_usd, price_table_version, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                 VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+                 ON CONFLICT(repository_id, pull_request_number, workflow_run_id, \
+                             workflow_run_attempt) \
+                 DO UPDATE SET total_usd = excluded.total_usd, \
+                 price_table_version = excluded.price_table_version, \
+                 updated_at = excluded.updated_at",
             )
             .bind(repository_id.get())
             .bind(pull_request.get())
@@ -324,6 +389,7 @@ impl RunCostStore {
 
 #[derive(FromRow)]
 struct StoredPendingRunCost {
+    row_id: i64,
     repository_id: i64,
     full_name: String,
     workflow_run_id: i64,
@@ -498,8 +564,13 @@ mod tests {
             .due(due_at - Duration::milliseconds(1), 10)
             .await
             .expect("due query succeeds")
+            .runs
             .is_empty());
-        let due = store.due(due_at, 10).await.expect("due query succeeds");
+        let due = store
+            .due(due_at, 10)
+            .await
+            .expect("due query succeeds")
+            .runs;
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].repository_name.as_str(), "owner/repo");
         assert_eq!(due[0].pending, pending(1));
@@ -540,7 +611,11 @@ mod tests {
             .is_finalized(repository_id, run_id, pending(2).run_attempt)
             .await
             .expect("check succeeds"));
-        let due = store.due(due_at, 10).await.expect("due query succeeds");
+        let due = store
+            .due(due_at, 10)
+            .await
+            .expect("due query succeeds")
+            .runs;
         assert_eq!(due.len(), 1, "only the second attempt is still pending");
         let stored: Vec<(i64, i64, f64, Option<String>)> = sqlx::query_as(
             "SELECT pull_request_number, workflow_run_attempt, total_usd, price_table_version \
@@ -550,6 +625,142 @@ mod tests {
         .await
         .expect("totals load");
         assert_eq!(stored, [(42, 1, 0.5, Some("0123456789ab".to_owned()))]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_is_deferred_with_a_bounded_doubling_delay() {
+        let (_directory, pool, store, repository_id) = store_with_repository().await;
+        let due_at = datetime!(2026-11-18 10:05:00 UTC);
+        store
+            .schedule(repository_id, &pending(1), due_at)
+            .await
+            .expect("schedule succeeds");
+        store
+            .schedule(repository_id, &pending(2), due_at + Duration::seconds(1))
+            .await
+            .expect("schedule succeeds");
+        let first = pending(1);
+
+        let mut delays = Vec::new();
+        for _ in 0..9 {
+            store
+                .defer(repository_id, first.run_id, first.run_attempt, due_at)
+                .await
+                .expect("defer succeeds");
+            let deferred_to: String = sqlx::query_scalar(
+                "SELECT due_at FROM run_cost_finalizations WHERE workflow_run_attempt = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("due time loads");
+            let deferred_to = time::PrimitiveDateTime::parse(
+                deferred_to.trim_end_matches('Z'),
+                &time::format_description::well_known::Iso8601::DEFAULT,
+            )
+            .expect("due time parses")
+            .assume_utc();
+            delays.push((deferred_to - due_at).whole_seconds());
+        }
+        assert_eq!(delays, [30, 60, 120, 240, 480, 960, 1920, 3600, 3600]);
+
+        let due = store
+            .due(due_at + Duration::seconds(30), 10)
+            .await
+            .expect("due query succeeds")
+            .runs;
+        assert_eq!(
+            due.iter()
+                .map(|run| run.pending.run_attempt.get())
+                .collect::<Vec<_>>(),
+            [2],
+            "a deferred attempt no longer crowds out the next one"
+        );
+        let failed_attempts: i64 = sqlx::query_scalar(
+            "SELECT failed_attempts FROM run_cost_finalizations WHERE workflow_run_attempt = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("attempt count loads");
+        assert_eq!(failed_attempts, 9);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_row_is_abandoned_and_never_polled_again() {
+        let (_directory, pool, store, repository_id) = store_with_repository().await;
+        let due_at = datetime!(2026-11-18 10:05:00 UTC);
+        for attempt in [1, 2] {
+            store
+                .schedule(repository_id, &pending(attempt), due_at)
+                .await
+                .expect("schedule succeeds");
+        }
+        let mut connection = pool.acquire().await.expect("connection is available");
+        sqlx::query("PRAGMA ignore_check_constraints = ON")
+            .execute(&mut *connection)
+            .await
+            .expect("check constraints can be relaxed");
+        sqlx::query(
+            "UPDATE run_cost_finalizations SET conclusion = 'unknown' \
+             WHERE workflow_run_attempt = 1",
+        )
+        .execute(&mut *connection)
+        .await
+        .expect("fixture corrupts one row");
+        sqlx::query("PRAGMA ignore_check_constraints = OFF")
+            .execute(&mut *connection)
+            .await
+            .expect("check constraints are restored");
+        drop(connection);
+
+        let due = store.due(due_at, 10).await.expect("due query succeeds");
+        assert_eq!(due.abandoned, 1);
+        assert_eq!(due.runs.len(), 1);
+        assert_eq!(due.runs[0].pending, pending(2));
+
+        let due = store.due(due_at, 10).await.expect("due query succeeds");
+        assert_eq!(due.abandoned, 0, "an abandoned row is not read again");
+        assert_eq!(due.runs.len(), 1);
+        assert!(!store
+            .is_finalized(repository_id, pending(1).run_id, pending(1).run_attempt)
+            .await
+            .expect("check succeeds"));
+    }
+
+    #[tokio::test]
+    async fn a_rescheduled_attempt_replaces_a_surviving_pull_request_total() {
+        let (_directory, pool, store, repository_id) = store_with_repository().await;
+        let due_at = datetime!(2026-11-18 10:05:00 UTC);
+        store
+            .schedule(repository_id, &pending(1), due_at)
+            .await
+            .expect("schedule succeeds");
+        store
+            .finalize(repository_id, &finalized(&pending(1), 0.5))
+            .await
+            .expect("finalize succeeds");
+        sqlx::query("DELETE FROM run_cost_finalizations")
+            .execute(&pool)
+            .await
+            .expect("finalization row is pruned");
+
+        store
+            .schedule(repository_id, &pending(1), due_at)
+            .await
+            .expect("the attempt is scheduled again");
+        assert!(store
+            .finalize(repository_id, &finalized(&pending(1), 0.75))
+            .await
+            .expect("finalizing over a surviving total succeeds"));
+        let stored: Vec<(i64, f64)> =
+            sqlx::query_as("SELECT workflow_run_attempt, total_usd FROM pull_request_run_costs")
+                .fetch_all(&pool)
+                .await
+                .expect("totals load");
+        assert_eq!(
+            stored,
+            [(1, 0.75)],
+            "the pull-request total matches the finalization"
+        );
     }
 
     #[tokio::test]
