@@ -95,7 +95,9 @@ their own USD amount and never use the table; see [HTTP API](http-api.md#post-ci
 Each matched vendor run is priced at its vendor's `usd_per_run`: one run per `check_suite`
 delivery with action `completed` whose app slug matches `match.check_suite_app`, and one per
 `pull_request_review` delivery with action `submitted` whose reviewer login matches
-`match.review_login`. The run exports a `ci.vendor.run` span, writes a `ci cost recorded` log, and,
+`match.review_login`. Each matching delivery is charged once: a bot that submits several reviews
+on one pull request, or a check suite that is re-requested and completes again, is charged for
+each delivery. The run exports a `ci.vendor.run` span, writes a `ci cost recorded` log, and,
 when it is attributed to one pull request, is stored for per-PR totals; see
 [Vendor run spans](traces.md#vendor-run-spans). Vendors that bill per minute or per seat are not
 priced.

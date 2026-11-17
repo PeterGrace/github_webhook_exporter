@@ -49,7 +49,7 @@ impl VendorTrigger {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct VendorRun {
     pub(crate) repository_name: CanonicalRepositoryName,
-    /// The configured vendor name, sanitized like other display names.
+    /// The configured vendor name, validated as a display name at startup.
     pub(crate) vendor: DisplayName,
     pub(crate) trigger: VendorTrigger,
     pub(crate) cost_usd: f64,

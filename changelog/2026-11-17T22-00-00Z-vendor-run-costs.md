@@ -8,7 +8,10 @@ Date: 2026-11-17T22:00:00Z
   `costs.vendors` entry's `match.check_suite_app`, or a `pull_request_review` delivery with action
   `submitted` whose reviewer login matches `match.review_login`, now counts as one vendor run
   priced at that vendor's `usd_per_run`. Matching ignores ASCII case. Other actions, unmatched
-  deliveries, redeliveries and deployments without `GHE_COSTS_JSON` record nothing.
+  deliveries, redeliveries and deployments without `GHE_COSTS_JSON` record nothing. Each matching
+  delivery is one charge, so several reviews from one bot on a pull request are several runs. A
+  matched delivery with a missing or malformed pull request number or head SHA is still priced,
+  just unattributed.
 - Each run exports one instantaneous, parentless `ci.vendor.run` span and writes one
   `ci cost recorded` info log, with `ci.source=vendor`, `ci.vendor`, `ci.vendor.trigger`
   (`check_suite` or `pull_request_review`), `ci.cost_usd`, `ci.price_table.version`, the

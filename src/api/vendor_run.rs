@@ -35,7 +35,7 @@ struct AppProjection {
 #[derive(Deserialize)]
 struct ReviewEnvelope {
     review: ReviewProjection,
-    pull_request: ReviewPullRequestProjection,
+    pull_request: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -46,17 +46,6 @@ struct ReviewProjection {
 #[derive(Deserialize)]
 struct UserProjection {
     login: Option<Value>,
-}
-
-#[derive(Deserialize)]
-struct ReviewPullRequestProjection {
-    number: Option<i64>,
-    head: Option<HeadProjection>,
-}
-
-#[derive(Deserialize)]
-struct HeadProjection {
-    sha: Option<Value>,
 }
 
 /// The fields of a vendor delivery that identify and attribute the run.
@@ -145,11 +134,19 @@ fn review_fields<'costs>(
     let envelope = serde_json::from_slice::<ReviewEnvelope>(body).ok()?;
     let login = envelope.review.user?.login?;
     let vendor = costs.vendor_for_review_login(login.as_str()?)?;
-    let pull_request = envelope.pull_request;
+    let pull_request = envelope.pull_request.as_ref();
     Some(VendorRunFields {
         vendor,
-        pull_request: unique_pull_request_number(pull_request.number),
-        head_sha: parse_sha(pull_request.head.and_then(|head| head.sha).as_ref()),
+        pull_request: unique_pull_request_number(
+            pull_request
+                .and_then(|pull_request| pull_request.get("number"))
+                .and_then(Value::as_i64),
+        ),
+        head_sha: parse_sha(
+            pull_request
+                .and_then(|pull_request| pull_request.get("head"))
+                .and_then(|head| head.get("sha")),
+        ),
     })
 }
 
@@ -334,6 +331,29 @@ mod tests {
     }
 
     #[test]
+    fn a_review_with_a_malformed_pull_request_is_still_priced() {
+        for pull_request in [
+            json!({"number": "7", "head": {"sha": HEAD_SHA}}),
+            json!({"number": 7.5, "head": "not-an-object"}),
+            json!({"number": null, "head": null}),
+            json!("not-an-object"),
+            json!(null),
+        ] {
+            let mut payload = review("review-bot[bot]", json!(1));
+            payload["pull_request"] = pull_request.clone();
+            let run = project(VendorTrigger::PullRequestReview, payload)
+                .expect("the matched review is still priced");
+            assert_eq!(run.pull_request, None, "{pull_request}");
+        }
+        let run = project(
+            VendorTrigger::PullRequestReview,
+            json!({"review": {"user": {"login": "review-bot[bot]"}}}),
+        )
+        .expect("a review without a pull request is still priced");
+        assert_eq!(run.pull_request, None);
+    }
+
+    #[test]
     fn unmatched_or_malformed_deliveries_are_not_vendor_runs() {
         let cases = [
             (
@@ -363,10 +383,6 @@ mod tests {
             (
                 VendorTrigger::PullRequestReview,
                 json!({"review": {"user": null}, "pull_request": {"number": 1}}),
-            ),
-            (
-                VendorTrigger::PullRequestReview,
-                json!({"review": {"user": {"login": "review-bot[bot]"}}}),
             ),
         ];
         for (trigger, payload) in cases {
