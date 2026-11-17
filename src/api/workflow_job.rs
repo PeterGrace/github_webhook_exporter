@@ -95,12 +95,13 @@ struct WorkflowJobAdmissionProjection {
 }
 
 #[derive(Deserialize)]
-struct WorkflowJobEnvelope {
-    workflow_job: WorkflowJobProjection,
+#[serde(bound = "S: Deserialize<'de> + Default")]
+struct WorkflowJobEnvelope<S> {
+    workflow_job: WorkflowJobProjection<S>,
 }
 
 #[derive(Deserialize)]
-struct WorkflowJobProjection {
+struct WorkflowJobProjection<S> {
     id: i64,
     run_id: i64,
     run_attempt: i64,
@@ -117,7 +118,24 @@ struct WorkflowJobProjection {
     #[serde(default)]
     pull_requests: Vec<PullRequestProjection>,
     #[serde(default)]
-    steps: Vec<WorkflowStepProjection>,
+    steps: S,
+}
+
+/// The step payload a job projection keeps: every step, or none for a job over the step limit.
+trait ProjectedSteps {
+    fn into_steps(self) -> Vec<WorkflowStepProjection>;
+}
+
+impl ProjectedSteps for Vec<WorkflowStepProjection> {
+    fn into_steps(self) -> Vec<WorkflowStepProjection> {
+        self
+    }
+}
+
+impl ProjectedSteps for IgnoredAny {
+    fn into_steps(self) -> Vec<WorkflowStepProjection> {
+        Vec::new()
+    }
 }
 
 #[derive(Deserialize)]
@@ -228,8 +246,59 @@ pub(crate) fn project_completed_job(
     required_checks: Option<&RequiredChecks>,
     costs: Option<&CostsConfig>,
 ) -> Option<WorkflowJobTrace> {
+    project_job::<Vec<WorkflowStepProjection>>(
+        body,
+        repository_name,
+        delivery_id,
+        received_at,
+        workflow_run_context,
+        required_checks,
+        costs,
+    )
+}
+
+/// Projects a completed job over the step limit for its billing only, without reading its steps.
+///
+/// The result carries no steps and no required-check status, so it is fit for the job's billing
+/// link row but not for a job trace.
+///
+/// # Returns
+///
+/// A bounded step-free workflow job when the wrapper and required identifiers are valid;
+/// otherwise `None`.
+pub(crate) fn project_completed_job_billing(
+    body: &[u8],
+    repository_name: &CanonicalRepositoryName,
+    delivery_id: &DeliveryId,
+    received_at: OffsetDateTime,
+    workflow_run_context: Option<WorkflowRunContext>,
+    costs: Option<&CostsConfig>,
+) -> Option<WorkflowJobTrace> {
+    project_job::<IgnoredAny>(
+        body,
+        repository_name,
+        delivery_id,
+        received_at,
+        workflow_run_context,
+        None,
+        costs,
+    )
+}
+
+fn project_job<S>(
+    body: &[u8],
+    repository_name: &CanonicalRepositoryName,
+    delivery_id: &DeliveryId,
+    received_at: OffsetDateTime,
+    workflow_run_context: Option<WorkflowRunContext>,
+    required_checks: Option<&RequiredChecks>,
+    costs: Option<&CostsConfig>,
+) -> Option<WorkflowJobTrace>
+where
+    S: ProjectedSteps + Default + for<'de> Deserialize<'de>,
+{
     let received_at = offset_datetime_to_system_time(received_at)?;
-    let envelope: WorkflowJobEnvelope = serde_json::from_slice(body).ok()?;
+    let envelope: WorkflowJobEnvelope<S> = serde_json::from_slice(body).ok()?;
     let WorkflowJobProjection {
         id,
         run_id,
@@ -258,6 +327,7 @@ pub(crate) fn project_completed_job(
         parse_timestamp(completed_at.as_ref()),
         received_at,
     );
+    let steps = steps.into_steps();
     let mut projected_steps = Vec::with_capacity(steps.len());
     for step in steps {
         let step_timing = select_step_timing(

@@ -8530,6 +8530,54 @@ async fn a_completed_run_exports_one_run_cost_span_and_log_in_its_run_trace() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_late_job_whose_link_write_fails_does_not_warn_after_finalize() {
+    let costs = CostsConfig::from_json(r#"{"runners": {"default_usd_per_minute": 0.006}}"#)
+        .expect("costs are valid");
+    let signer = TestSigner::new(USAGE_SIGNER_KID);
+    let fixture =
+        WebhookTraceFixture::new_with_usage(Some(costs), &[WEBHOOK_REPOSITORY], &signer).await;
+    post_usage_and_priced_job(&fixture, &signer).await;
+    let emitter = fixture.runtime.workflow_trace_emitter();
+    assert_eq!(finalize_run_costs(&fixture, emitter).await, 1);
+    sqlx::query(
+        "CREATE TRIGGER reject_job_links BEFORE INSERT ON workflow_job_links \
+         BEGIN SELECT RAISE(ABORT, 'rejected'); END",
+    )
+    .execute(&fixture.pool)
+    .await
+    .expect("trigger is created");
+
+    let late_job = serde_json::to_vec(&serde_json::json!({
+        "action": "completed",
+        "workflow_job": {
+            "id": 83, "run_id": 71, "run_attempt": 1, "workflow_name": "Evals",
+            "name": "late", "conclusion": "success",
+            "started_at": "2026-08-06T10:00:00Z", "completed_at": "2026-08-06T10:05:00Z",
+            "labels": ["ubuntu-latest"], "runner_id": 7, "steps": []
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("workflow-job payload serializes");
+    let response = fixture
+        .webhook(
+            &late_job,
+            "workflow_job",
+            "550e8400-e29b-41d4-a716-446655440506",
+            WEBHOOK_SECRET,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    drop(response);
+
+    let captured = fixture.force_flush();
+    assert!(captured.has_log_body("workflow-job link persistence failed"));
+    assert!(
+        !captured.has_log_body("ci cost after finalize"),
+        "a job that was never stored is not reported as arriving late"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn job_costs_join_the_run_total_when_trace_export_is_off() {
     let costs = CostsConfig::from_json(r#"{"runners": {"default_usd_per_minute": 0.006}}"#)
         .expect("costs are valid");

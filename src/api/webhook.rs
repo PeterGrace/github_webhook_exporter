@@ -34,7 +34,8 @@ use crate::{
     storage::{DeliveryClaim, PendingRunCost},
     telemetry::{
         pipeline::{
-            run_trace_context, PipelineRunTrace, PipelineRunTraceParts, MAX_PIPELINE_JOB_SPANS,
+            run_trace_context, PipelineRunTrace, PipelineRunTraceParts, WorkflowJobTraceIdentity,
+            MAX_PIPELINE_JOB_SPANS,
         },
         run_cost::warn_cost_after_finalize,
         trace::{
@@ -216,6 +217,21 @@ async fn webhook_handler(
                                 &admission,
                                 step_limit,
                             );
+                            if state.run_costs_enabled() {
+                                if let Some(workflow_job) =
+                                    workflow_job::project_completed_job_billing(
+                                        request.body.as_ref(),
+                                        &request.repository_name,
+                                        &request.delivery_id,
+                                        received_at,
+                                        None,
+                                        state.costs(),
+                                    )
+                                {
+                                    record_job_billing(&state, repository_id, &workflow_job, None)
+                                        .await;
+                                }
+                            }
                         } else {
                             let workflow_run_context = state
                                 .workflow_run_store()
@@ -244,28 +260,14 @@ async fn webhook_handler(
                                 required_checks.as_ref(),
                                 state.costs(),
                             ) {
-                                let job_cost = log_job_cost(&workflow_trace);
                                 let identity = state.workflow_trace_emitter().emit(&workflow_trace);
-                                // Run totals read job billing from the link row, so it is kept
-                                // even when no job trace was exported.
-                                if (identity.is_some() || state.run_costs_enabled())
-                                    && state
-                                        .workflow_job_link_store()
-                                        .record(repository_id, &workflow_trace, identity)
-                                        .await
-                                        .is_err()
-                                {
-                                    record_workflow_link_failure(&state, &request.repository_name);
-                                }
-                                if let Some(cost_usd) = job_cost {
-                                    warn_if_job_cost_after_finalize(
-                                        &state,
-                                        repository_id,
-                                        &workflow_trace,
-                                        cost_usd,
-                                    )
-                                    .await;
-                                }
+                                record_job_billing(
+                                    &state,
+                                    repository_id,
+                                    &workflow_trace,
+                                    identity,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -334,6 +336,35 @@ async fn webhook_handler(
             trace::set_status(&process_span, OperationOutcome::Failure);
             Err(error)
         }
+    }
+}
+
+/// Logs a completed job's cost and keeps its billing link row, then warns when the job's run
+/// attempt was already totalled.
+///
+/// Run totals read job billing from the link row, so it is kept even when no job trace was
+/// exported.
+async fn record_job_billing(
+    state: &AppState,
+    repository_id: RepositoryId,
+    job: &WorkflowJobTrace,
+    identity: Option<WorkflowJobTraceIdentity>,
+) {
+    let job_cost = log_job_cost(job);
+    if identity.is_none() && !state.run_costs_enabled() {
+        return;
+    }
+    if state
+        .workflow_job_link_store()
+        .record(repository_id, job, identity)
+        .await
+        .is_err()
+    {
+        record_workflow_link_failure(state, job.repository_name());
+        return;
+    }
+    if let Some(cost_usd) = job_cost {
+        warn_if_job_cost_after_finalize(state, repository_id, job, cost_usd).await;
     }
 }
 

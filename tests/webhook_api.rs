@@ -258,6 +258,10 @@ async fn workflow_run_context_is_persisted_once_per_new_delivery() {
 
 /// Rebuilds `app`'s router over the same database with a price table, so run costs are on.
 fn with_costs(app: &TestApp) -> Router {
+    with_costs_and_step_limit(app, DEFAULT_WORKFLOW_JOB_MAX_STEPS)
+}
+
+fn with_costs_and_step_limit(app: &TestApp, workflow_job_max_steps: usize) -> Router {
     let cipher = RepositorySecretCipher::new(
         &MasterKey::from_slice(&[7_u8; 32]).expect("test master key is valid"),
     )
@@ -271,7 +275,7 @@ fn with_costs(app: &TestApp) -> Router {
             RepositoryStore::new(app.pool.clone(), cipher),
             AdminAuthenticator::new(&admin_token),
             2_097_152,
-            DEFAULT_WORKFLOW_JOB_MAX_STEPS,
+            workflow_job_max_steps,
         )
         .with_costs(Some(costs)),
     )
@@ -356,6 +360,31 @@ async fn pull_request_deliveries_map_head_and_merge_commits_only_when_costs_are_
             (MERGE_SHA.to_owned(), 42),
         ]
     );
+}
+
+#[tokio::test]
+async fn a_job_over_the_step_limit_still_records_its_billing_without_a_trace() {
+    let app = test_app(2_097_152, Some(true)).await;
+    let router = with_costs_and_step_limit(&app, 1);
+    let body = br#"{"action":"completed","workflow_job":{"id":61,"run_id":51,"run_attempt":1,"name":"build","conclusion":"success","started_at":"2026-08-06T10:00:00Z","completed_at":"2026-08-06T10:02:00Z","labels":["ubuntu-latest"],"runner_id":7,"steps":[{"number":1},{"number":2}]},"repository":{"full_name":"owner/repository"}}"#;
+
+    send(
+        &router,
+        body,
+        "550e8400-e29b-41d4-a716-446655440097",
+        "workflow_job",
+    )
+    .await;
+
+    type LinkRow = (Option<String>, Option<String>, Option<i64>, Option<f64>);
+    let links: Vec<LinkRow> = sqlx::query_as(
+        "SELECT trace_id, span_id, billable_minutes, cost_usd FROM workflow_job_links \
+         WHERE workflow_run_id = 51 AND workflow_job_id = 61",
+    )
+    .fetch_all(&app.pool)
+    .await
+    .expect("job links load");
+    assert_eq!(links, [(None, None, Some(2), Some(2.0 * 0.006))]);
 }
 
 #[tokio::test]
