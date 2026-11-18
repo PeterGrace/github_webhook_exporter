@@ -68,6 +68,7 @@ async fn run_service(
     .with_metrics(metrics)
     .with_workflow_trace_emitter(workflow_trace_emitter)
     .with_required_check_ttl(config.required_check_ttl())
+    .with_run_grace_period(config.run_grace())
     .with_costs(config.costs().cloned())
     .with_ingest_oidc(config.ingest_oidc().cloned())
     .context("failed to initialize OIDC usage ingestion")?;

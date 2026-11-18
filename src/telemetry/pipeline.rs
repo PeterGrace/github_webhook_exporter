@@ -327,31 +327,57 @@ impl WorkflowTraceEmitter {
 
 /// Returns the parent context that pins one pipeline-run root span to its derived trace.
 ///
+/// # Parameters
+///
+/// * `pipeline` - The bounded pipeline-run summary trace about to be exported.
+fn pipeline_root_context(pipeline: &PipelineRunTrace) -> Context {
+    run_trace_context(
+        &pipeline.repository_name,
+        pipeline.run_context.run_id(),
+        pipeline.run_context.run_attempt(),
+    )
+}
+
+/// Returns a context that places a record in one workflow run's pipeline trace.
+///
+/// The pipeline root, the run's `ci cost recorded` logs and its `ci.usage` spans all use it, so
+/// they share the run's derived trace even though they are emitted at different times.
+///
 /// `SpanBuilder` exposes no trace identifier of its own and `IdGenerator::new_trace_id` receives
 /// no per-span context, so the only way to preset a root's trace is through the parent context
 /// passed to `build_with_context`. Two details of that context are load bearing:
 ///
 /// * The span identifier is [`SpanId::INVALID`]. The SDK copies the parent's span identifier into
-///   `parent_span_id`, so an invalid one leaves the emitted span a true root, byte-for-byte as it
-///   was when built from an empty context.
+///   `parent_span_id`, so an invalid one leaves an emitted span a true root, byte-for-byte as it
+///   was when built from an empty context. A log emitted under the context carries the trace
+///   identifier and an all-zero span identifier.
 /// * The trace flags are [`TraceFlags::SAMPLED`]. The default `ParentBased` sampler follows any
 ///   parent present in the context, so an unsampled synthetic parent would drop the whole trace.
 ///
-/// Falls back to an empty context, and therefore to a randomly generated trace identifier, when
-/// the digest cannot address a real trace.
+/// Falls back to an empty context, and therefore to a randomly generated trace identifier or no
+/// trace at all, when the digest cannot address a real trace.
 ///
 /// # Parameters
 ///
-/// * `pipeline` - The bounded pipeline-run summary trace about to be exported.
-fn pipeline_root_context(pipeline: &PipelineRunTrace) -> Context {
-    let Some(trace_id) = derive_pipeline_trace_id(
-        &pipeline.repository_name,
-        pipeline.run_context.run_id(),
-        pipeline.run_context.run_attempt(),
-    ) else {
+/// * `repository_name` - The canonical repository name.
+/// * `run_id` - The validated workflow run identifier.
+/// * `run_attempt` - The validated workflow run attempt.
+pub(crate) fn run_trace_context(
+    repository_name: &CanonicalRepositoryName,
+    run_id: WorkflowRunId,
+    run_attempt: WorkflowRunAttempt,
+) -> Context {
+    context_for_trace_id(derive_pipeline_trace_id(
+        repository_name,
+        run_id,
+        run_attempt,
+    ))
+}
+
+fn context_for_trace_id(trace_id: Option<TraceId>) -> Context {
+    let Some(trace_id) = trace_id else {
         return Context::new();
     };
-
     // `is_remote` is false: this context stands in for the absent parent of a locally built root,
     // not for a span context received from another service.
     Context::new().with_remote_span_context(SpanContext::new(
@@ -570,9 +596,9 @@ mod tests {
     };
 
     use super::{
-        addressable_trace_id, derive_pipeline_trace_id, PipelineJobSummary, PipelineRunTrace,
-        PipelineRunTraceParts, SyntheticWorkflowError, WorkflowJobTraceIdentity,
-        MAX_PIPELINE_JOB_SPANS, TRACE_ID_BYTES,
+        addressable_trace_id, context_for_trace_id, derive_pipeline_trace_id, run_trace_context,
+        PipelineJobSummary, PipelineRunTrace, PipelineRunTraceParts, SyntheticWorkflowError,
+        WorkflowJobTraceIdentity, MAX_PIPELINE_JOB_SPANS, TRACE_ID_BYTES,
     };
     use crate::{
         domain::{delivery::DeliveryId, merge_queue::PullRequestNumber},
@@ -916,6 +942,36 @@ mod tests {
         assert_eq!(degraded.timing().start(), instant(50));
         assert_eq!(degraded.timing().end(), instant(400));
         assert_eq!(degraded.timing().source(), TimingSource::Fallback);
+    }
+
+    #[test]
+    fn the_run_trace_context_carries_the_derived_trace_and_no_span() {
+        use opentelemetry::trace::TraceContextExt as _;
+
+        let repository = CanonicalRepositoryName::new("owner/repository").expect("name is valid");
+        let run_id = WorkflowRunId::new(31).expect("run id is positive");
+        let run_attempt = WorkflowRunAttempt::new(2).expect("attempt is positive");
+
+        let context = run_trace_context(&repository, run_id, run_attempt);
+        let span = context.span();
+        let span_context = span.span_context();
+
+        assert_eq!(
+            Some(span_context.trace_id()),
+            derive_pipeline_trace_id(&repository, run_id, run_attempt)
+        );
+        assert_eq!(span_context.span_id(), SpanId::INVALID);
+        assert!(span_context.is_sampled());
+        assert!(!span_context.is_remote());
+    }
+
+    #[test]
+    fn an_unaddressable_digest_falls_back_to_an_empty_context() {
+        use opentelemetry::trace::TraceContextExt as _;
+
+        let context = context_for_trace_id(addressable_trace_id([0; 16]));
+
+        assert!(!context.has_active_span());
     }
 
     /// The shared fixture both this exporter and any in-job emitter must reproduce.

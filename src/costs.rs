@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use crate::config::ConfigError;
+use crate::{config::ConfigError, telemetry::workflow::DisplayName};
 
 /// Environment variable carrying the JSON price table.
 pub const COSTS_VARIABLE: &str = "GHE_COSTS_JSON";
@@ -110,11 +110,11 @@ enum VendorMatch {
 
 /// A vendor that bills per run, as returned by the vendor lookups.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct VendorRate<'table> {
-    /// Configured vendor name.
-    pub name: &'table str,
+pub(crate) struct VendorRate<'table> {
+    /// Configured vendor name, already a valid display name.
+    pub(crate) name: &'table DisplayName,
     /// USD charged for one run.
-    pub usd_per_run: UsdRate,
+    pub(crate) usd_per_run: UsdRate,
 }
 
 /// The rate chosen for one workflow job.
@@ -134,8 +134,8 @@ pub struct RunnerRate<'table> {
 pub struct CostsConfig {
     table: PriceTable,
     version: String,
-    vendors_by_check_suite_app: HashMap<String, String>,
-    vendors_by_review_login: HashMap<String, String>,
+    vendors_by_check_suite_app: HashMap<String, DisplayName>,
+    vendors_by_review_login: HashMap<String, DisplayName>,
 }
 
 impl CostsConfig {
@@ -149,8 +149,9 @@ impl CostsConfig {
     ///
     /// Returns [`ConfigError::Invalid`] naming [`COSTS_VARIABLE`] when the JSON is malformed,
     /// has an unknown field, holds a negative or non-numeric rate, gives a vendor zero or two
-    /// match rules or an empty one, or lets two vendors claim the same app slug or login. Parser
-    /// messages are discarded because they can quote configured values.
+    /// match rules or an empty one, names a vendor with anything but 1 to 128 characters free of
+    /// control characters, or lets two vendors claim the same app slug or login. Parser messages
+    /// are discarded because they can quote configured values.
     pub fn from_json(json: &str) -> Result<Self, ConfigError> {
         let invalid = || ConfigError::Invalid {
             variable: COSTS_VARIABLE,
@@ -176,10 +177,10 @@ impl CostsConfig {
                 VendorMatch::ReviewLogin(login) => (&mut vendors_by_review_login, login),
             };
             key.make_ascii_lowercase();
-            if name.is_empty()
-                || key.is_empty()
-                || index.insert(key.clone(), name.clone()).is_some()
-            {
+            let display_name = DisplayName::sanitize(name)
+                .filter(|display_name| display_name.as_str() == name)
+                .ok_or_else(invalid)?;
+            if key.is_empty() || index.insert(key.clone(), display_name).is_some() {
                 return Err(invalid());
             }
         }
@@ -260,7 +261,7 @@ impl CostsConfig {
     }
 
     /// Returns the vendor matched by a check-suite GitHub App slug.
-    pub fn vendor_for_check_suite_app(&self, slug: &str) -> Option<VendorRate<'_>> {
+    pub(crate) fn vendor_for_check_suite_app(&self, slug: &str) -> Option<VendorRate<'_>> {
         self.vendor_rate(
             self.vendors_by_check_suite_app
                 .get(ascii_lowercase(slug).as_ref())?,
@@ -268,18 +269,18 @@ impl CostsConfig {
     }
 
     /// Returns the vendor matched by a pull-request reviewer login.
-    pub fn vendor_for_review_login(&self, login: &str) -> Option<VendorRate<'_>> {
+    pub(crate) fn vendor_for_review_login(&self, login: &str) -> Option<VendorRate<'_>> {
         self.vendor_rate(
             self.vendors_by_review_login
                 .get(ascii_lowercase(login).as_ref())?,
         )
     }
 
-    fn vendor_rate(&self, name: &str) -> Option<VendorRate<'_>> {
+    fn vendor_rate<'table>(&'table self, name: &'table DisplayName) -> Option<VendorRate<'table>> {
         self.table
             .vendors
-            .get_key_value(name)
-            .map(|(name, vendor)| VendorRate {
+            .get(name.as_str())
+            .map(|vendor| VendorRate {
                 name,
                 usd_per_run: vendor.usd_per_run,
             })
@@ -467,20 +468,16 @@ mod tests {
                 usd_per_ram_gb_second: UsdRate(0.0000045),
             })
         );
-        assert_eq!(
-            costs.vendor_for_check_suite_app("visual-tests"),
-            Some(VendorRate {
-                name: "example-visual-tests",
-                usd_per_run: UsdRate(0.25)
-            })
-        );
-        assert_eq!(
-            costs.vendor_for_review_login("review-bot[bot]"),
-            Some(VendorRate {
-                name: "example-review-bot",
-                usd_per_run: UsdRate(0.5)
-            })
-        );
+        let visual_tests = costs
+            .vendor_for_check_suite_app("visual-tests")
+            .expect("the app slug matches");
+        assert_eq!(visual_tests.name.as_str(), "example-visual-tests");
+        assert_eq!(visual_tests.usd_per_run, UsdRate(0.25));
+        let review_bot = costs
+            .vendor_for_review_login("review-bot[bot]")
+            .expect("the login matches");
+        assert_eq!(review_bot.name.as_str(), "example-review-bot");
+        assert_eq!(review_bot.usd_per_run, UsdRate(0.5));
         assert_eq!(costs.vendor_for_check_suite_app("review-bot[bot]"), None);
         assert_eq!(costs.vendor_for_review_login("visual-tests"), None);
     }
@@ -523,13 +520,13 @@ mod tests {
         assert_eq!(
             costs
                 .vendor_for_review_login("review-bot[BOT]")
-                .map(|vendor| vendor.name),
+                .map(|vendor| vendor.name.as_str()),
             Some("v")
         );
         assert_eq!(
             example()
                 .vendor_for_check_suite_app("Visual-Tests")
-                .map(|vendor| vendor.name),
+                .map(|vendor| vendor.name.as_str()),
             Some("example-visual-tests")
         );
     }
@@ -582,6 +579,30 @@ mod tests {
             .expect_err("string rate is invalid");
         assert!(!error.to_string().contains("s3cr3t"));
         assert!(error.to_string().contains(COSTS_VARIABLE));
+    }
+
+    fn vendor_named(name: &str) -> String {
+        serde_json::json!({
+            "runners": {"default_usd_per_minute": 1},
+            "vendors": {name: {"match": {"review_login": "bot"}, "usd_per_run": 1}}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_vendor_name_longer_than_128_characters_is_rejected() {
+        let longest = "\u{e9}".repeat(128);
+        CostsConfig::from_json(&vendor_named(&longest)).expect("128 characters are allowed");
+
+        assert_invalid(&vendor_named(&"v".repeat(129)));
+        assert_invalid(&vendor_named(&"\u{e9}".repeat(129)));
+    }
+
+    #[test]
+    fn a_vendor_name_with_control_characters_is_rejected() {
+        assert_invalid(&vendor_named("\u{7}\t"));
+        assert_invalid(&vendor_named("review\nbot"));
+        assert_invalid(&vendor_named("review-bot\u{85}"));
     }
 
     #[test]

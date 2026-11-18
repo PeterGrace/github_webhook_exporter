@@ -23,6 +23,7 @@ matter directly when running the container or binary yourself.
 | `GHE_MERGE_QUEUE_RETENTION_DAYS` | `90` | Completed merge-queue attempt retention; positive integer. |
 | `GHE_DELIVERY_PRUNE_INTERVAL_SECONDS` | `3600` | Retention sweep interval; positive integer. |
 | `GHE_REQUIRED_CHECK_TTL_SECONDS` | `300` | How long a cached branch-protection answer stays confident; integer in `1..=86400`. |
+| `GHE_RUN_GRACE_SECONDS` | `300` | How long after `workflow_run.completed` a run's cost is totalled, so late job deliveries and usage posts still count; integer in `1..=3600`. Used only when `GHE_COSTS_JSON` or `GHE_INGEST_OIDC_JSON` is set. See [Run cost totals](traces.md#run-cost-totals). |
 | `GHE_OTEL_QUEUE_CAPACITY` | `2048` | Bounded export queue capacity, per enabled signal. |
 | `GHE_OTEL_BATCH_SIZE` | `512` | Export batch size; cannot exceed queue capacity. |
 | `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` | `5` | Telemetry flush deadline. |

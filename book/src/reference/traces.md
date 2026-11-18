@@ -27,6 +27,10 @@ Each scheduled delivery/merge-queue pruning pass emits an independent `retention
 `delivery.prune` and `merge_queue.prune` as children — independent even when the retention task
 starts from a context carrying another span.
 
+Each background run-cost finalization emits an independent `run_cost.finalize` root whose
+`sqlite.query` children sum the run and write its total. The poll that looks for due runs records
+no span, so an idle finalizer exports nothing.
+
 `http.route` carries the Axum route template (for example `/api/v1/repositories/{id}`); unmatched
 requests use the fixed value `unmatched`. Raw paths, query strings, and URLs are never trace
 attributes. HTTP methods, response classes, repository operations, webhook event/action values,
@@ -193,8 +197,10 @@ When a [`costs`](costs.md) table is configured, the root also carries the job's 
 A job that billed 0 minutes is priced at 0 without a rate lookup, so it never logs
 `ci price missing`. Step spans carry none of these attributes.
 
-Each priced job also writes one parentless `ci cost recorded` info log, whether or not trace
-export is enabled. It carries `ci.source`, `ci.cost_usd`, `ci.billable_minutes`,
+Each priced job also writes one `ci cost recorded` info log, whether or not trace export is
+enabled. The log carries the run's [pipeline trace ID](#pipeline-run-summary-traces) and no span ID, so it
+appears in that run's trace at the top level, next to the pipeline root rather than under it. It
+carries `ci.source`, `ci.cost_usd`, `ci.billable_minutes`,
 `ci.price_table.version`, `ci.price.fell_back`, `ci.price.usd_per_minute`, `ci.price.label`,
 `ci.job` (the sanitized job name), `cicd.runner.labels` (comma-joined), `cicd.runner.name`, `github.workflow`, `github.workflow_file`,
 `github.workflow.event`, `github.pull_request.number` (the job's first PR or the run's attributed
@@ -205,8 +211,11 @@ unknown. Without a `costs` table the log is never written.
 
 ### In-job usage spans
 
-Each entry accepted by `POST /ci-cost/usage` exports one independent root span named `ci.usage`,
-with `sentry.op=ci.usage` and an instant timestamp at receipt. It carries:
+Each entry accepted by `POST /ci-cost/usage` exports one span named `ci.usage`, with
+`sentry.op=ci.usage` and an instant timestamp at receipt. It is exported into the run's
+[pipeline trace](#pipeline-run-summary-traces), derived from the token's repository, `run_id` and
+`run_attempt`, as a root with no parent span: it appears at the top level of that trace, next
+to the pipeline root. It carries:
 
 - the claim attributes `cicd.pipeline.name`, `cicd.pipeline.run.id`,
   `cicd.pipeline.run.url.full`, `vcs.repository.url.full`, `vcs.repository.name`,
@@ -224,13 +233,153 @@ with `sentry.op=ci.usage` and an instant timestamp at receipt. It carries:
 - `ci.input_tokens` and `ci.output_tokens` for inference entries, or `ci.cpu_seconds` and
   `ci.ram_gb_seconds` for Daytona entries.
 
-Each entry also writes one parentless `ci cost recorded` info log, whether or not trace export is
-enabled, with the same cost, label and measure fields plus `ci.job_workflow_file`,
+Each entry also writes one `ci cost recorded` info log, whether or not trace export is enabled.
+It carries the same pipeline trace ID and no span ID, along with the same cost, label and measure fields plus `ci.job_workflow_file`,
 `github.workflow`, `github.workflow_file`, `github.workflow.event`, `github.pull_request.number`,
 `github.repository`, `cicd.pipeline.run.id`, and `github.workflow.run.attempt`.
 
 Accepted entries are stored per repository, run and attempt for run totals, and pruned on the
 processed-delivery retention cutoff.
+
+### Vendor run spans
+
+When a [`costs`](costs.md) table lists `vendors`, each newly claimed delivery that matches one
+exports one span named `ci.vendor.run`, with `sentry.op=ci.vendor.run` and an instant timestamp at
+receipt. Two deliveries can match:
+
+| Delivery | Matched by | `ci.vendor.trigger` |
+| --- | --- | --- |
+| `check_suite` with action `completed` | `check_suite.app.slug` against `match.check_suite_app` | `check_suite` |
+| `pull_request_review` with action `submitted` | `review.user.login` against `match.review_login` | `pull_request_review` |
+
+Other actions, unmatched slugs and logins, and deployments without a `costs` table export nothing.
+A redelivered delivery UUID is stopped by the durable delivery claim, so each run counts once.
+
+Vendor runs have no workflow run, so the span is a parentless root in its own trace. It carries:
+
+- `ci.source=vendor`, `ci.vendor` (the configured vendor name), `ci.vendor.trigger`,
+  `ci.cost_usd` (the vendor's `usd_per_run`) and `ci.price_table.version`;
+- `github.repository.name`, `vcs.repository.url.full`, `vcs.repository.name`, and
+  `vcs.ref.head.revision` (`check_suite.head_sha` or `pull_request.head.sha`, when valid);
+- `github.pull_request.number` and the groupable `ci.pull_request.number`, when the run is
+  attributed to exactly one pull request. A review names its pull request. A check suite is
+  attributed only when `check_suite.pull_requests` names exactly one distinct pull request; a
+  suite on a fork names none, and a suite on a shared head can name several, so both export the
+  span without either attribute.
+
+Each matched run also writes one `ci cost recorded` info log, whether or not trace export is
+enabled. It has no trace context, and carries `ci.source`, `ci.vendor`, `ci.vendor.trigger`,
+`ci.cost_usd`, `ci.price_table.version`, `github.pull_request.number` (when attributed),
+`github.repository` and `vcs.ref.head.revision` (when valid).
+
+Runs attributed to a pull request are stored per repository and pull request, and pruned on the
+processed-delivery retention cutoff. An unattributed run is exported and logged but not stored.
+A storage failure keeps the authenticated `204 No Content` response, increments
+`github_webhook_processing_failures_total{stage="vendor_run"}`, and writes one
+`vendor-run persistence failed` error log carrying only `stage`, `result` and
+`error_correlation_id`.
+
+### Run cost totals
+
+When a `costs` table or `ingest.oidc` is configured, each `workflow_run` delivery whose action is
+`completed` schedules its run attempt to be totalled after `GHE_RUN_GRACE_SECONDS` (default
+`300`). The delivery returns `204 No Content` at once. The schedule is stored in SQLite, so an
+attempt whose grace period spans a restart is totalled by the next process, and a redelivered
+`completed` for the same attempt, with the same or a different delivery ID, schedules nothing
+more. Each attempt of a re-run is totalled on its own, and cancelled runs are totalled too.
+
+The total is the sum of the attempt's stored job costs and usage entries. Job costs are stored
+whether or not trace export is enabled. Once totalled, the attempt exports one span named
+`ci.run.cost`, with `sentry.op=ci.run.cost`, `sentry.description` `<workflow> cost` and an
+instant timestamp. Like `ci.usage` spans it is a root in the run's
+[pipeline trace](#pipeline-run-summary-traces). It carries:
+
+- `cicd.pipeline.name`, `cicd.pipeline.run.id`, `cicd.pipeline.run.url.full`,
+  `vcs.repository.url.full`, `vcs.repository.name`, `vcs.ref.head.revision` (when valid),
+  `github.repository.name`, `github.workflow.run.attempt`, `github.workflow.event`,
+  `github.workflow` and `github.workflow_file`;
+- `cicd.pipeline.result`, the run's conclusion as a semantic-convention result such as `success`,
+  `failure` or `cancellation`;
+- `github.pull_request.number` and the groupable `ci.pull_request.number`, when a pull request was
+  resolved, and `github.pr_resolution`, the rule that resolved it (below);
+- `ci.cost.total_usd`, the run total, and one `ci.cost.<source>_usd` per source: `github_actions`
+  for runner minutes and each usage `source`, with `-` written as `_`;
+- one `ci.minutes.<label>` per price-table label the jobs were billed under, normalized to
+  lowercase letters, digits and `_` and cut to 32 characters, with `default` for jobs billed at
+  the default rate, `unpriced` for jobs no price table priced (for example when only
+  `ingest.oidc` is configured), and `unlabelled` for priced jobs stored before the exporter
+  recorded runner labels;
+- `ci.usage.entries`, the number of usage entries counted;
+- `ci.price_table.version`, when every priced record of the attempt used the same table.
+
+At most 16 `ci.cost.<source>_usd` and 16 `ci.minutes.<label>` keys are exported per run; past that
+the smallest are summed into `ci.cost.other_usd` or `ci.minutes.other`, so the key set stays
+bounded and the breakdown still adds up to the total.
+
+The pull request is resolved from webhook state only, never from the GitHub API. The first rule
+that matches wins:
+
+| `github.pr_resolution` | Rule |
+| --- | --- |
+| `pull_requests` | The run's `pull_requests` name exactly one pull request. |
+| `merge_queue_branch` | A `merge_group` run's branch is `gh-readonly-queue/<base>/pr-<N>-<sha>`. |
+| `run_name` | A comment-, review- or `workflow_run`-triggered run's name contains `PR #<N>`. A `push` run's name, such as a squash-merge title, is never read. |
+| `commit_map` | The run's head commit was the head of a pull request when it was opened, synchronized or reopened, or its merge commit when it was closed, as seen on `pull_request` deliveries. |
+| `none` | Nothing matched. |
+
+The same attempt also writes one `ci run cost finalized` info log, whether or not trace export is
+enabled, with the span's trace ID and no span ID. It carries `ci.cost.total_usd`,
+`ci.usage.entries`, `ci.price_table.version`, `cicd.pipeline.result`, `github.workflow`,
+`github.workflow_file`, `github.workflow.event`, `github.pull_request.number`,
+`github.pr_resolution`, `github.repository`, `vcs.ref.head.revision`, `cicd.pipeline.run.id` and
+`github.workflow.run.attempt`. Log fields are fixed names, so the per-source and per-label
+breakdowns are written as `key=value` lists in `ci.cost.by_source` (for example
+`anthropic=0.25,github_actions=0.012`) and `ci.minutes.by_label` (for example `default=2`).
+
+A run with no resolved pull request still exports its total and also logs a `ci run unattributed`
+warning with `ci.cost.total_usd`, `github.workflow`, `github.workflow.event`, `github.repository`,
+`cicd.pipeline.run.id` and `github.workflow.run.attempt`. A run that resolves one stores its total
+against that pull request. An attempt is stored under at most one pull request: if it is totalled
+again, for example after retention removed its schedule and `completed` was redelivered, its new
+total replaces any stored one. Its job links and usage entries share the same retention cutoff
+and may already be gone, so such a re-total can be lower than the one it replaces.
+
+An attempt's job and usage sums are read in the same transaction that marks it final, after taking
+SQLite's write lock. Each job link or usage write checks whether its attempt is final inside its
+own transaction, also under the write lock, so a priced record is either counted in the total or
+warned about as late. A priced job delivery or usage post that arrives after its attempt was
+totalled still writes its own `ci cost recorded` log but is left out of the total, and logs a
+`ci cost after finalize` warning in the run's trace, with `ci.source`, `ci.cost_usd`,
+`github.repository`, `cicd.pipeline.run.id` and `github.workflow.run.attempt`. A job that GitHub
+delivers again under a new delivery ID after it was counted rewrites its row and is warned about
+as well.
+
+Some records are left out of a total without that warning:
+
+- records for an attempt that is never totalled, because its `completed` delivery never arrived,
+  its pending row was abandoned, or retention removed its schedule;
+- a late job with no price, which adds no cost but whose minutes are missing from
+  `ci.minutes.<label>`.
+
+Deliveries GitHub never sent are not recovered.
+
+A storage failure while scheduling or totalling never changes a response. Scheduling and
+commit-map failures log `ci run cost enrichment failed` errors, and totalling failures log
+`ci run cost finalization failed` warnings, each with only an `outcome` and an opaque
+`error_correlation_id`. A failed total (`finalize_failed`) stays pending and is retried after a
+delay that starts at 30 seconds and doubles with each failure up to one hour; an attempt that
+never succeeds is removed by retention. A pending row whose stored values no longer parse is set
+aside for good (`unreadable_abandoned`) and never totalled; if setting it aside fails
+(`abandon_failed`), the rest of the poll goes on and a later poll tries again.
+
+Jobs rejected by `GHE_WORKFLOW_JOB_MAX_STEPS` emit no job trace, but their billing is still
+stored, so they count toward the total and still log `ci cost recorded`. Their log carries no
+`github.workflow_file` or `github.workflow.event`, since the rejected path does not read the
+run's stored context.
+
+Schedules, totals, the commit map and per-pull-request totals are pruned on the
+processed-delivery retention cutoff. A pull request's stored totals therefore cover only the runs
+finalized within that window.
 
 ### Branch-protection required checks
 
@@ -273,12 +422,14 @@ or metrics.
 Commands, output, logs, actors, payload-provided URLs, request bodies, arbitrary payload fragments,
 secrets, signatures, authorization/other headers, unsupported actions, and raw unknown conclusions
 never enter workflow telemetry, in traces, logs, or metrics. Workflow identifiers and names stay
-out of logs with two exceptions. One is a parentless structured warning on a newly claimed
+out of logs with five exceptions. One is a parentless structured warning on a newly claimed
 `too_many_steps` rejection, which may contain only `repository_name`, `delivery_id`,
 `workflow_run_id`, `workflow_run_attempt`, `workflow_job_id`, `step_count`, and `step_limit`. The
-other is the `ci cost recorded` log described above, written for priced jobs when a `costs`
-table is configured and for accepted usage entries, and carrying only the listed fields, so cost
-can be charted from the logs dataset. The `ci usage post rejected` warning carries only its
+second is the `ci cost recorded` log described above, written for priced jobs when a `costs`
+table is configured, for accepted usage entries and for matched vendor runs, and carrying only the
+listed fields, so cost can be charted from the logs dataset. The other three are the `ci run cost
+finalized` log and the `ci run unattributed` and `ci cost after finalize` warnings, each carrying
+only the fields listed under [Run cost totals](#run-cost-totals). The `ci usage post rejected` warning carries only its
 `reason` and, after token verification, `github.repository`; the `ci usage post failed` error
 carries only `outcome`, `error_id` and `github.repository`. Operators can query
 `GET /repos/{owner}/{repo}/actions/jobs/{job_id}` with the canonical repository name and
@@ -348,6 +499,12 @@ identifiers; traces exported before it keep their random ones and cannot be join
 theoretical case where the truncated digest is all zeroes, which is not a valid trace ID, the root
 falls back to a randomly generated identifier and simply loses in-job association for that one run.
 
+The exporter itself joins this trace from the records it emits before the run completes: every
+`ci cost recorded` log and every `ci.usage` span carries the run's derived trace ID, with no
+parent span, because the root's span ID is random. Until `workflow_run.completed` arrives, the
+run's trace holds only those records; the pipeline root and its task spans join them when it
+does. When the digest is all zeroes, they fall back to no trace context, as the root does.
+
 Only the pipeline root is derived. Job traces keep independent random identifiers, and the
 `github.actions.pipeline.task` child span IDs are random too, so an in-job emitter can attach to
 the run's trace but not to its own job's summary span — that would need the numeric GitHub job ID,
@@ -404,12 +561,15 @@ and every child carry `github.workflow_file` when known. Each child additionally
 
 **Persistence.** Linking requires the job trace identities to outlive the delivery that produced
 them, so each emitted job trace durably records its trace ID, span ID, sanitized job name, bounded
-conclusion, selected interval, billable minutes, and, when priced, its USD cost and price-table
-version, keyed by repository, run ID, run attempt, and job ID. The cost columns are what a later
-run total sums. Nothing else is retained: no payload data, logs, commands, output, secrets, actors, or raw URLs. These
-records use the processed-delivery retention cutoff and are pruned in the same scheduled pass as
-workflow-run context. Identities are recorded only when remote telemetry is enabled, since a
-disabled emitter exports no job trace to link to.
+conclusion, selected interval, billable minutes, and, when priced, its USD cost, price-table
+version and normalized price-table label, keyed by repository, run ID, run attempt, and job ID.
+The cost columns are what a later [run total](#run-cost-totals) sums. Nothing else is retained: no
+payload data, logs, commands, output, secrets, actors, or raw URLs. These records use the
+processed-delivery retention cutoff and are pruned in the same scheduled pass as workflow-run
+context. A row is written when remote telemetry is enabled, and also when a `costs` table or
+`ingest.oidc` is configured; a job with no exported trace, including one rejected by
+`GHE_WORKFLOW_JOB_MAX_STEPS`, is stored with null trace and span IDs and is never linked into a
+pipeline trace.
 
 **Omissions and limits.** A run attempt with no recorded job traces emits no pipeline trace at
 all — this covers runs whose jobs were all rejected by `GHE_WORKFLOW_JOB_MAX_STEPS`, and runs
@@ -431,4 +591,6 @@ failure along this path — link persistence, lookup, or export — degrades to
 `github_webhook_processing_failures_total{stage="workflow_link"}` plus one redacted correlated
 error log, and leaves the authenticated `204 No Content` response, readiness, and merge-queue
 state untouched. That stage is distinct from the generic `database` stage so operators can alert
-on link health without reading logs.
+on link health without reading logs. The same stage also counts a failed write of a billing-only
+job row, written when trace export is off or a job exceeds `GHE_WORKFLOW_JOB_MAX_STEPS`, since run
+cost totals read those rows.

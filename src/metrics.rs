@@ -280,6 +280,8 @@ pub enum FailureStage {
     QueueState,
     /// Durable workflow-job trace link persistence or lookup failure.
     WorkflowLink,
+    /// Durable vendor-run persistence failure.
+    VendorRun,
 }
 
 /// A bounded merge-group webhook action.
@@ -603,6 +605,7 @@ impl FailureStage {
             Self::Database => "database",
             Self::QueueState => "queue_state",
             Self::WorkflowLink => "workflow_link",
+            Self::VendorRun => "vendor_run",
         }
     }
 }
@@ -800,6 +803,7 @@ impl Metrics {
             FailureStage::Database,
             FailureStage::QueueState,
             FailureStage::WorkflowLink,
+            FailureStage::VendorRun,
         ] {
             let _ = processing_failures.get_or_create(&FailureLabels {
                 repository: RepositoryLabel::Unknown,

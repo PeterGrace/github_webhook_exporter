@@ -16,7 +16,7 @@ use tracing::Instrument;
 
 use crate::{
     api,
-    config::{GitHubAppConfig, DEFAULT_REQUIRED_CHECK_TTL_SECONDS},
+    config::{GitHubAppConfig, DEFAULT_REQUIRED_CHECK_TTL_SECONDS, DEFAULT_RUN_GRACE_SECONDS},
     costs::CostsConfig,
     github::{
         GitHubAppClient, GitHubClientError, RequiredCheckRefreshHandle, RequiredCheckRefresher,
@@ -24,13 +24,14 @@ use crate::{
     health, lifecycle,
     metrics::{self, Metrics},
     retention::{run_retention, RetentionConfig},
+    run_costs::RunCostFinalizer,
     security::{
         oidc::{GitHubJwksClient, JwksFetchError, JwksSource, OidcVerifier},
         AdminAuthenticator, CanonicalRepositoryName, IngestOidcConfig,
     },
     storage::{
-        CiUsageStore, DeliveryStore, MergeQueueStore, RepositoryStore, RequiredCheckStore,
-        WorkflowJobLinkStore, WorkflowRunStore,
+        CiUsageStore, DeliveryStore, MergeQueueStore, PullRequestCommitStore, RepositoryStore,
+        RequiredCheckStore, RunCostStore, VendorRunStore, WorkflowJobLinkStore, WorkflowRunStore,
     },
     telemetry::{
         trace::{self, Operation},
@@ -73,7 +74,11 @@ pub struct AppState {
     workflow_job_max_steps: usize,
     costs: Option<Arc<CostsConfig>>,
     ci_usage_store: CiUsageStore,
+    vendor_run_store: VendorRunStore,
     oidc_verifier: Option<Arc<OidcVerifier>>,
+    run_cost_store: RunCostStore,
+    pull_request_commit_store: PullRequestCommitStore,
+    run_grace_period: Duration,
 }
 
 /// The JWKS client for `ingest.oidc` could not be built.
@@ -95,6 +100,9 @@ impl AppState {
         let workflow_run_store = WorkflowRunStore::new(database_pool.clone());
         let workflow_job_link_store = WorkflowJobLinkStore::new(database_pool.clone());
         let ci_usage_store = CiUsageStore::new(database_pool.clone());
+        let run_cost_store = RunCostStore::new(database_pool.clone());
+        let pull_request_commit_store = PullRequestCommitStore::new(database_pool.clone());
+        let vendor_run_store = VendorRunStore::new(database_pool.clone());
         let required_check_store = RequiredCheckStore::new(
             database_pool.clone(),
             Duration::from_secs(DEFAULT_REQUIRED_CHECK_TTL_SECONDS),
@@ -115,8 +123,22 @@ impl AppState {
             workflow_job_max_steps,
             costs: None,
             ci_usage_store,
+            vendor_run_store,
             oidc_verifier: None,
+            run_cost_store,
+            pull_request_commit_store,
+            run_grace_period: Duration::from_secs(DEFAULT_RUN_GRACE_SECONDS),
         }
+    }
+
+    /// Returns application state that totals each completed run after `grace_period`.
+    ///
+    /// # Parameters
+    ///
+    /// * `grace_period` - How long late job and usage records may still join a run's total.
+    pub fn with_run_grace_period(mut self, grace_period: Duration) -> Self {
+        self.run_grace_period = grace_period;
+        self
     }
 
     /// Returns application state that serves `POST /ci-cost/usage` for `ingest_oidc`.
@@ -286,6 +308,31 @@ impl AppState {
         &self.ci_usage_store
     }
 
+    /// Returns durable run-cost finalization persistence.
+    pub(crate) fn run_cost_store(&self) -> &RunCostStore {
+        &self.run_cost_store
+    }
+
+    /// Returns the durable commit-to-pull-request map.
+    pub(crate) fn pull_request_commit_store(&self) -> &PullRequestCommitStore {
+        &self.pull_request_commit_store
+    }
+
+    /// Returns how long a completed run waits before its cost is totalled.
+    pub(crate) fn run_grace_period(&self) -> Duration {
+        self.run_grace_period
+    }
+
+    /// Returns whether any cost input is configured, so completed runs are totalled.
+    pub(crate) fn run_costs_enabled(&self) -> bool {
+        self.costs.is_some() || self.oidc_verifier.is_some()
+    }
+
+    /// Returns durable priced vendor-run persistence.
+    pub(crate) fn vendor_run_store(&self) -> &VendorRunStore {
+        &self.vendor_run_store
+    }
+
     /// Returns the OIDC verifier, when `ingest.oidc` is configured.
     pub(crate) fn oidc_verifier(&self) -> Option<&OidcVerifier> {
         self.oidc_verifier.as_deref()
@@ -395,6 +442,9 @@ where
 {
     let delivery_store = state.delivery_store.clone();
     let merge_queue_store = state.merge_queue_store.clone();
+    let run_cost_finalizer = state
+        .run_costs_enabled()
+        .then(|| RunCostFinalizer::new(&state.database_pool, state.workflow_trace_emitter.clone()));
     let BackgroundServices {
         retention,
         required_check_refresher,
@@ -410,8 +460,13 @@ where
                     refresher.run(cancellation.clone()).await;
                 }
             };
-            // Both background workloads observe the same cancellation channel, so joining them
-            // keeps a single background task handle while letting either stop independently.
+            let finalize = async {
+                if let Some(finalizer) = run_cost_finalizer {
+                    finalizer.run(cancellation.clone()).await;
+                }
+            };
+            // Every background workload observes the same cancellation channel, so joining them
+            // keeps a single background task handle while letting each stop independently.
             tokio::join!(
                 run_retention(
                     delivery_store,
@@ -420,6 +475,7 @@ where
                     cancellation.clone(),
                 ),
                 refresh,
+                finalize,
             );
         },
     )

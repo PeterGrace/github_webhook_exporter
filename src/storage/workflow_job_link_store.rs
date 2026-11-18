@@ -4,7 +4,7 @@ use std::{
 };
 
 use opentelemetry::trace::{SpanId, TraceId};
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{FromRow, SqliteConnection, SqlitePool};
 use thiserror::Error;
 use time::{format_description::FormatItem, macros::format_description, OffsetDateTime, UtcOffset};
 
@@ -12,6 +12,10 @@ use crate::{
     domain::repository::RepositoryId,
     telemetry::{
         pipeline::{PipelineJobSummary, WorkflowJobTraceIdentity},
+        run_cost::{
+            breakdown_key, DEFAULT_RUNNER_LABEL_KEY, UNLABELLED_RUNNER_LABEL_KEY,
+            UNPRICED_RUNNER_LABEL_KEY,
+        },
         trace::{self, DatabaseOperation},
         workflow::{
             DisplayName, HistoricalTiming, TimingSource, WorkflowConclusion, WorkflowJobId,
@@ -20,17 +24,19 @@ use crate::{
     },
 };
 
-use super::sqlite_is_busy_or_locked;
+use super::{run_cost_store::attempt_is_final, sqlite_is_busy_or_locked};
 
 const WORKFLOW_JOB_LINK_PRUNE_BATCH_SIZE: i64 = 1_000;
 const WORKFLOW_JOB_LINK_TIMESTAMP_FORMAT: &[FormatItem<'static>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
 
-/// Durable identities of emitted workflow-job traces, used to link pipeline-run summaries.
+/// Durable identities and billing of completed workflow jobs, used to link pipeline-run
+/// summaries and to total run costs.
 ///
-/// Only what a pipeline-run summary span needs is retained: the exported trace and span
-/// identifiers, the sanitized job name, the bounded conclusion, and the historical interval that
-/// the job trace itself used.
+/// Only what a pipeline-run summary span and a run total need is retained: the exported trace and
+/// span identifiers when a job trace was exported, the sanitized job name, the bounded conclusion,
+/// the historical interval that the job trace itself used, and the job's minutes, price and
+/// normalized price-table label.
 #[derive(Clone)]
 pub(crate) struct WorkflowJobLinkStore {
     pool: SqlitePool,
@@ -42,13 +48,20 @@ impl WorkflowJobLinkStore {
         Self { pool }
     }
 
-    /// Inserts or replaces the exported identity of one emitted workflow-job trace.
+    /// Inserts or replaces one completed job's link and billing.
     ///
     /// # Parameters
     ///
     /// * `repository_id` - The authenticated repository row identifier.
-    /// * `job` - The bounded job trace that was just emitted.
-    /// * `identity` - The exported identity of that job trace's root span.
+    /// * `job` - The bounded completed job.
+    /// * `identity` - The exported identity of the job trace's root span, or `None` when no job
+    ///   trace was exported; such a row counts toward run totals but never links a pipeline span.
+    ///
+    /// # Returns
+    ///
+    /// Whether the run attempt was already final when the write committed. The check runs in the
+    /// write's own transaction, under SQLite's write lock, so `true` means the record is not in
+    /// the attempt's total and `false` means it will be.
     ///
     /// # Errors
     ///
@@ -59,8 +72,8 @@ impl WorkflowJobLinkStore {
         &self,
         repository_id: RepositoryId,
         job: &WorkflowJobTrace,
-        identity: WorkflowJobTraceIdentity,
-    ) -> Result<(), WorkflowJobLinkStoreError> {
+        identity: Option<WorkflowJobTraceIdentity>,
+    ) -> Result<bool, WorkflowJobLinkStoreError> {
         trace::instrument_database_operation(
             DatabaseOperation::WorkflowJobLinkRecord,
             self.record_inner(repository_id, job, identity),
@@ -72,9 +85,9 @@ impl WorkflowJobLinkStore {
         &self,
         repository_id: RepositoryId,
         job: &WorkflowJobTrace,
-        identity: WorkflowJobTraceIdentity,
-    ) -> Result<(), WorkflowJobLinkStoreError> {
-        if !identity.is_valid() {
+        identity: Option<WorkflowJobTraceIdentity>,
+    ) -> Result<bool, WorkflowJobLinkStoreError> {
+        if identity.is_some_and(|identity| !identity.is_valid()) {
             return Err(WorkflowJobLinkStoreError::Internal);
         }
         let started_at_nanos = system_time_to_nanos(job.timing().start())
@@ -83,13 +96,24 @@ impl WorkflowJobLinkStore {
             system_time_to_nanos(job.timing().end()).ok_or(WorkflowJobLinkStoreError::Internal)?;
         let billing = job.billing();
         let cost = billing.and_then(|billing| billing.cost.as_ref());
+        let runner_label = cost.map(|cost| {
+            cost.price_label
+                .as_deref()
+                .and_then(breakdown_key)
+                .unwrap_or_else(|| DEFAULT_RUNNER_LABEL_KEY.to_owned())
+        });
 
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_sqlx_error)?;
         sqlx::query(
             "INSERT INTO workflow_job_links \
              (repository_id, workflow_run_id, workflow_run_attempt, workflow_job_id, job_name, \
               conclusion, trace_id, span_id, started_at_nanos, completed_at_nanos, timing_source, \
-              billable_minutes, cost_usd, price_table_version, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+              billable_minutes, cost_usd, price_table_version, runner_label, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
              ON CONFLICT(repository_id, workflow_run_id, workflow_run_attempt, workflow_job_id) \
              DO UPDATE SET job_name = excluded.job_name, conclusion = excluded.conclusion, \
@@ -99,7 +123,7 @@ impl WorkflowJobLinkStore {
              timing_source = excluded.timing_source, \
              billable_minutes = excluded.billable_minutes, cost_usd = excluded.cost_usd, \
              price_table_version = excluded.price_table_version, \
-             updated_at = excluded.updated_at",
+             runner_label = excluded.runner_label, updated_at = excluded.updated_at",
         )
         .bind(repository_id.get())
         .bind(job.run_id().get())
@@ -107,18 +131,28 @@ impl WorkflowJobLinkStore {
         .bind(job.job_id().get())
         .bind(job.job_name().map(DisplayName::as_str))
         .bind(job.conclusion().as_str())
-        .bind(format!("{:032x}", identity.trace_id()))
-        .bind(format!("{:016x}", identity.span_id()))
+        .bind(identity.map(|identity| format!("{:032x}", identity.trace_id())))
+        .bind(identity.map(|identity| format!("{:016x}", identity.span_id())))
         .bind(started_at_nanos)
         .bind(completed_at_nanos)
         .bind(job.timing().source().as_str())
         .bind(billing.map(|billing| billing.billable_minutes))
         .bind(cost.map(|cost| cost.cost_usd))
         .bind(cost.map(|cost| cost.price_table_version.as_str()))
-        .execute(&self.pool)
+        .bind(runner_label)
+        .execute(&mut *transaction)
         .await
         .map_err(map_sqlx_error)?;
-        Ok(())
+        let attempt_final = attempt_is_final(
+            &mut transaction,
+            repository_id,
+            job.run_id(),
+            job.run_attempt(),
+        )
+        .await
+        .map_err(map_sqlx_error)?;
+        transaction.commit().await.map_err(map_sqlx_error)?;
+        Ok(attempt_final)
     }
 
     /// Lists the emitted job traces of one run attempt, oldest job start first.
@@ -165,6 +199,7 @@ impl WorkflowJobLinkStore {
             "SELECT workflow_job_id, job_name, conclusion, trace_id, span_id, started_at_nanos, \
              completed_at_nanos, timing_source FROM workflow_job_links \
              WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ? \
+             AND trace_id IS NOT NULL \
              ORDER BY started_at_nanos, workflow_job_id LIMIT ?",
         )
         .bind(repository_id.get())
@@ -179,6 +214,73 @@ impl WorkflowJobLinkStore {
             .into_iter()
             .filter_map(StoredWorkflowJobLink::into_summary)
             .collect())
+    }
+
+    /// Sums the job costs and billable minutes of one run attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkflowJobLinkStoreError::Unavailable`] when SQLite is busy or locked, and
+    /// [`WorkflowJobLinkStoreError::Internal`] for any other persistence failure.
+    #[cfg(test)]
+    pub(crate) async fn run_totals(
+        &self,
+        repository_id: RepositoryId,
+        run_id: WorkflowRunId,
+        run_attempt: WorkflowRunAttempt,
+    ) -> Result<JobCostTotals, WorkflowJobLinkStoreError> {
+        let mut connection = self.pool.acquire().await.map_err(map_sqlx_error)?;
+        Self::run_totals_in(&mut connection, repository_id, run_id, run_attempt)
+            .await
+            .map_err(map_sqlx_error)
+    }
+
+    /// Runs the sums of [`Self::run_totals`] on `connection`, so a caller can read them inside its
+    /// own transaction.
+    pub(crate) async fn run_totals_in(
+        connection: &mut SqliteConnection,
+        repository_id: RepositoryId,
+        run_id: WorkflowRunId,
+        run_attempt: WorkflowRunAttempt,
+    ) -> Result<JobCostTotals, sqlx::Error> {
+        let (cost_usd, priced_jobs): (f64, i64) = sqlx::query_as(
+            "SELECT TOTAL(cost_usd), COUNT(cost_usd) FROM workflow_job_links \
+             WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ?",
+        )
+        .bind(repository_id.get())
+        .bind(run_id.get())
+        .bind(run_attempt.get())
+        .fetch_one(&mut *connection)
+        .await?;
+        let minutes_by_label: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT CASE WHEN cost_usd IS NULL THEN ? ELSE coalesce(runner_label, ?) END \
+             AS label, SUM(billable_minutes) FROM workflow_job_links \
+             WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ? \
+             AND billable_minutes IS NOT NULL GROUP BY label",
+        )
+        .bind(UNPRICED_RUNNER_LABEL_KEY)
+        .bind(UNLABELLED_RUNNER_LABEL_KEY)
+        .bind(repository_id.get())
+        .bind(run_id.get())
+        .bind(run_attempt.get())
+        .fetch_all(&mut *connection)
+        .await?;
+        // Two versions are enough to tell that the attempt was priced by more than one table.
+        let price_table_versions: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT price_table_version FROM workflow_job_links \
+             WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ? \
+             AND price_table_version IS NOT NULL LIMIT 2",
+        )
+        .bind(repository_id.get())
+        .bind(run_id.get())
+        .bind(run_attempt.get())
+        .fetch_all(&mut *connection)
+        .await?;
+        Ok(JobCostTotals {
+            cost_usd: (priced_jobs > 0).then_some(cost_usd),
+            minutes_by_label,
+            price_table_versions,
+        })
     }
 
     /// Deletes at most 1,000 workflow-job links last updated before `cutoff`.
@@ -219,6 +321,17 @@ impl WorkflowJobLinkStore {
         .map_err(map_sqlx_error)?;
         Ok(result.rows_affected())
     }
+}
+
+/// The summed job billing of one run attempt.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct JobCostTotals {
+    /// The summed job cost, or `None` when no job of the attempt was priced.
+    pub(crate) cost_usd: Option<f64>,
+    /// Billable minutes per normalized price-table label; `None` is the default rate.
+    pub(crate) minutes_by_label: Vec<(String, i64)>,
+    /// At most two distinct price-table versions of the attempt's priced jobs.
+    pub(crate) price_table_versions: Vec<String>,
 }
 
 #[derive(FromRow)]
@@ -415,6 +528,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn priced_links_survive_the_nullable_trace_rebuild() {
+        const REBUILD_VERSION: i64 = 202_611_180_002;
+        let directory = tempfile::tempdir().expect("temporary directory exists");
+        let path = directory.path().join("exporter.sqlite3");
+        let pool = SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .expect("database opens");
+        let mut earlier = sqlx::migrate!();
+        earlier.migrations = earlier
+            .migrations
+            .iter()
+            .filter(|migration| migration.version < REBUILD_VERSION)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        earlier.run(&pool).await.expect("earlier migrations apply");
+        let repository_id = insert_repository(&pool).await;
+        sqlx::query(
+            "INSERT INTO workflow_job_links (repository_id, workflow_run_id, \
+             workflow_run_attempt, workflow_job_id, job_name, conclusion, trace_id, span_id, \
+             started_at_nanos, completed_at_nanos, timing_source, updated_at, billable_minutes, \
+             cost_usd, price_table_version) \
+             VALUES (?, 31, 2, 7, 'build', 'success', ?, ?, 100, 220, 'reported', \
+             '2026-11-13T10:00:00.000Z', 2, 0.012, '0123456789ab')",
+        )
+        .bind(repository_id.get())
+        .bind(format!("{:032x}", 1_u128))
+        .bind(format!("{:016x}", 1_u64))
+        .execute(&pool)
+        .await
+        .expect("pre-rebuild link inserts");
+        pool.close().await;
+
+        let migrated = open_database(&path)
+            .await
+            .expect("remaining migrations apply");
+        let store = WorkflowJobLinkStore::new(migrated.clone());
+
+        let totals = store
+            .run_totals(repository_id, run_id(), run_attempt())
+            .await
+            .expect("totals succeed");
+        assert_eq!(totals.cost_usd, Some(0.012));
+        assert_eq!(totals.minutes_by_label, [("unlabelled".to_owned(), 2)]);
+        assert_eq!(totals.price_table_versions, ["0123456789ab"]);
+        let summaries = store
+            .list(repository_id, run_id(), run_attempt(), 10)
+            .await
+            .expect("lookup succeeds");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].conclusion(), WorkflowConclusion::Success);
+        let runner_label: Option<String> =
+            sqlx::query_scalar("SELECT runner_label FROM workflow_job_links")
+                .fetch_one(&migrated)
+                .await
+                .expect("link row loads");
+        assert_eq!(runner_label, None);
+    }
+
+    #[tokio::test]
     async fn migration_contains_only_bounded_link_fields() {
         let directory = tempfile::tempdir().expect("temporary directory exists");
         let pool = open_database(&directory.path().join("exporter.sqlite3"))
@@ -446,6 +624,7 @@ mod tests {
                 "billable_minutes",
                 "cost_usd",
                 "price_table_version",
+                "runner_label",
             ]
         );
         for forbidden in [
@@ -480,7 +659,7 @@ mod tests {
                     HistoricalTiming::reported(instant(300), instant(400))
                         .expect("timing is ordered"),
                 ),
-                identity(41),
+                Some(identity(41)),
             )
             .await
             .expect("first link persists");
@@ -493,7 +672,7 @@ mod tests {
                     WorkflowConclusion::Failure,
                     HistoricalTiming::fallback(instant(100)),
                 ),
-                identity(42),
+                Some(identity(42)),
             )
             .await
             .expect("second link persists");
@@ -524,7 +703,7 @@ mod tests {
             .record(
                 repository_id,
                 &job(41, None, WorkflowConclusion::Success, timing.clone()),
-                identity(41),
+                Some(identity(41)),
             )
             .await
             .expect("first link persists");
@@ -532,7 +711,7 @@ mod tests {
             .record(
                 repository_id,
                 &job(41, None, WorkflowConclusion::Failure, timing),
-                identity(99),
+                Some(identity(99)),
             )
             .await
             .expect("replacement link persists");
@@ -562,7 +741,9 @@ mod tests {
                         )
                         .expect("timing is ordered"),
                     ),
-                    identity(u128::try_from(job_id).expect("job id is positive")),
+                    Some(identity(
+                        u128::try_from(job_id).expect("job id is positive"),
+                    )),
                 )
                 .await
                 .expect("link persists");
@@ -609,7 +790,9 @@ mod tests {
                         )
                         .expect("timing is ordered"),
                     ),
-                    identity(u128::try_from(job_id).expect("job id is positive")),
+                    Some(identity(
+                        u128::try_from(job_id).expect("job id is positive"),
+                    )),
                 )
                 .await
                 .expect("link persists");
@@ -687,7 +870,7 @@ mod tests {
 
         for (job, seed) in [(&priced, 41), (&unpriced, 42)] {
             store
-                .record(repository_id, job, identity(seed))
+                .record(repository_id, job, Some(identity(seed)))
                 .await
                 .expect("link persists");
         }
@@ -719,7 +902,7 @@ mod tests {
             .record(
                 RepositoryId::new(999).expect("repository id is positive"),
                 &job(41, None, WorkflowConclusion::Success, timing.clone()),
-                identity(41),
+                Some(identity(41)),
             )
             .await
             .expect_err("unknown repository fails");
@@ -733,7 +916,10 @@ mod tests {
             .record(
                 repository_id,
                 &job(41, None, WorkflowConclusion::Success, timing),
-                WorkflowJobTraceIdentity::new(TraceId::INVALID, SpanId::INVALID),
+                Some(WorkflowJobTraceIdentity::new(
+                    TraceId::INVALID,
+                    SpanId::INVALID,
+                )),
             )
             .await
             .expect_err("an unexported identity is never persisted");
@@ -741,5 +927,101 @@ mod tests {
             format!("{identity_error:?}"),
             "WorkflowJobLinkStoreError::Internal"
         );
+    }
+
+    #[tokio::test]
+    async fn untraced_jobs_count_toward_run_totals_but_never_link_a_pipeline_span() {
+        let (_directory, pool, store, repository_id) = store_with_repository().await;
+        let timing =
+            HistoricalTiming::reported(instant(0), instant(300)).expect("timing is ordered");
+        let priced = |job_id, minutes, cost_usd, label: Option<&str>| {
+            job(job_id, None, WorkflowConclusion::Success, timing.clone()).with_billing(
+                WorkflowJobBilling {
+                    runner_labels: Vec::new(),
+                    runner_group: None,
+                    runner_name: None,
+                    billable_minutes: minutes,
+                    cost: Some(WorkflowJobCost {
+                        cost_usd,
+                        price_table_version: "0123456789ab".to_owned(),
+                        fell_back: label.is_none(),
+                        usd_per_minute: Some(0.01),
+                        price_label: label.map(str::to_owned),
+                    }),
+                },
+            )
+        };
+        store
+            .record(
+                repository_id,
+                &priced(41, 5, 0.4, Some("Ubuntu-24.04-XL")),
+                Some(identity(41)),
+            )
+            .await
+            .expect("traced job persists");
+        store
+            .record(repository_id, &priced(42, 3, 0.03, None), None)
+            .await
+            .expect("untraced job persists");
+        store
+            .record(
+                repository_id,
+                &job(44, None, WorkflowConclusion::Success, timing.clone()).with_billing(
+                    WorkflowJobBilling {
+                        runner_labels: Vec::new(),
+                        runner_group: None,
+                        runner_name: None,
+                        billable_minutes: 4,
+                        cost: None,
+                    },
+                ),
+                None,
+            )
+            .await
+            .expect("unpriced job persists");
+        store
+            .record(repository_id, &priced(43, 7, 0.07, None), None)
+            .await
+            .expect("other attempt persists");
+        sqlx::query(
+            "UPDATE workflow_job_links SET workflow_run_attempt = 1 WHERE workflow_job_id = 43",
+        )
+        .execute(&pool)
+        .await
+        .expect("other attempt fixture updates");
+
+        let links = store
+            .list(repository_id, run_id(), run_attempt(), 10)
+            .await
+            .expect("lookup succeeds");
+        assert_eq!(links.len(), 1, "only the traced job links a pipeline span");
+        let totals = store
+            .run_totals(repository_id, run_id(), run_attempt())
+            .await
+            .expect("totals load");
+        let mut minutes = totals.minutes_by_label.clone();
+        minutes.sort();
+        assert_eq!(
+            minutes,
+            [
+                ("default".to_owned(), 3),
+                ("ubuntu_24_04_xl".to_owned(), 5),
+                ("unpriced".to_owned(), 4),
+            ]
+        );
+        assert!((totals.cost_usd.expect("jobs are priced") - 0.43).abs() < 1e-9);
+        assert_eq!(totals.price_table_versions, ["0123456789ab"]);
+
+        let empty = store
+            .run_totals(
+                repository_id,
+                WorkflowRunId::new(99).expect("run id is positive"),
+                run_attempt(),
+            )
+            .await
+            .expect("totals load");
+        assert_eq!(empty.cost_usd, None);
+        assert!(empty.minutes_by_label.is_empty());
+        assert!(empty.price_table_versions.is_empty());
     }
 }

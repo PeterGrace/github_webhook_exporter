@@ -12,6 +12,7 @@ use crate::{
     domain::merge_queue::PullRequestNumber,
     security::oidc::GitHubActionsClaims,
     telemetry::{
+        pipeline::run_trace_context,
         trace::{
             attributed_pull_request_attribute, github_workflow_attribute,
             job_workflow_file_attribute, price_table_version_attribute,
@@ -110,11 +111,13 @@ impl UsageReport {
 }
 
 impl WorkflowTraceEmitter {
-    /// Emits one independent, instantaneous `ci.usage` span per entry of `report`.
+    /// Emits one instantaneous `ci.usage` span per entry of `report`, each a root within the run's
+    /// pipeline trace.
     pub(crate) fn emit_usage(&self, report: &UsageReport) {
         let Some(tracer) = self.tracer() else {
             return;
         };
+        let run_trace = report_run_trace_context(report);
         for entry in &report.entries {
             let mut span = tracer.build_with_context(
                 tracer
@@ -122,7 +125,7 @@ impl WorkflowTraceEmitter {
                     .with_kind(SpanKind::Internal)
                     .with_start_time(report.received_at)
                     .with_attributes(usage_attributes(report, entry)),
-                &Context::new(),
+                &run_trace,
             );
             span.end_with_timestamp(report.received_at);
         }
@@ -194,13 +197,22 @@ fn usage_attributes(report: &UsageReport, entry: &UsageEntry) -> Vec<KeyValue> {
     attributes
 }
 
+fn report_run_trace_context(report: &UsageReport) -> Context {
+    run_trace_context(
+        &report.claims.repository,
+        report.claims.run_id,
+        report.claims.run_attempt,
+    )
+}
+
 /// Logs one `ci cost recorded` line per entry of `report`, with the attributes of its span.
 ///
-/// The log is independent of span export, so usage cost reaches the logs dataset even when the
-/// trace emitter is off.
+/// The log carries the run's pipeline trace identifier, so it appears in that run's trace. It is
+/// independent of span export, so usage cost reaches the logs dataset even when the trace emitter
+/// is off.
 pub(crate) fn log_usage_costs(report: &UsageReport) {
     let claims = &report.claims;
-    let _parentless_context = Context::new().attach();
+    let _run_trace_context = report_run_trace_context(report).attach();
     for entry in &report.entries {
         let (input_tokens, output_tokens, cpu_seconds, ram_gb_seconds) = match entry.measure {
             UsageMeasure::Inference {

@@ -27,6 +27,7 @@ use crate::{
     },
     storage::{CiUsageStoreError, RepositoryStoreError},
     telemetry::{
+        run_cost::warn_cost_after_finalize,
         usage::{log_usage_costs, UsageEntry, UsageMeasure, UsageReport, UsageSource},
         workflow::{DisplayName, WorkflowRunContext},
     },
@@ -401,15 +402,29 @@ async fn usage_handler(State(state): State<AppState>, request: Request) -> Respo
         received_at,
         entries: post.entries,
     };
-    if let Err(failure) = state.ci_usage_store().record(repository_id, &report).await {
-        let failure = match failure {
-            CiUsageStoreError::Unavailable => StorageFailure::Unavailable,
-            CiUsageStoreError::Internal => StorageFailure::Internal,
-        };
-        return storage_failure(failure, &report.claims.repository);
-    }
+    let attempt_final = match state.ci_usage_store().record(repository_id, &report).await {
+        Ok(attempt_final) => attempt_final,
+        Err(failure) => {
+            let failure = match failure {
+                CiUsageStoreError::Unavailable => StorageFailure::Unavailable,
+                CiUsageStoreError::Internal => StorageFailure::Internal,
+            };
+            return storage_failure(failure, &report.claims.repository);
+        }
+    };
     log_usage_costs(&report);
     state.workflow_trace_emitter().emit_usage(&report);
+    if attempt_final {
+        for entry in &report.entries {
+            warn_cost_after_finalize(
+                &report.claims.repository,
+                report.claims.run_id,
+                report.claims.run_attempt,
+                entry.source.as_str(),
+                entry.cost_usd,
+            );
+        }
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 

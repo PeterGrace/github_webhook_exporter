@@ -74,6 +74,17 @@ The chart's optional PDB sets `minAvailable: 0` deliberately — it permits volu
 rather than blocking it, because a singleton has no other replica to preserve availability with.
 It won't get in the way of either procedure above.
 
+## Rolling back
+
+Migrations only run forward. Each release applies its new migrations on startup, and an older
+release refuses to start against a database that has a migration it doesn't know. To go back,
+restore the backup taken before the upgrade (see [Back up and restore](back-up-and-restore.md))
+rather than redeploying the older image on the migrated volume.
+
+Migration `202611180002` (run cost totals) is a case where this matters: it makes
+`workflow_job_links.trace_id` and `span_id` nullable and writes rows without them, which earlier
+releases can't read.
+
 ## Verify
 
 ```bash
