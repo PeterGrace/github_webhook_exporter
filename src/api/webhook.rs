@@ -16,8 +16,9 @@ use tracing::{debug, error, info, warn, Instrument};
 
 use crate::{
     api::{
-        merge_group::EventProjection, pull_request::QueueProcessor, vendor_run, workflow_job,
-        workflow_run,
+        merge_group::EventProjection,
+        pull_request::{PullRequestProjection, QueueProcessor},
+        vendor_run, workflow_job, workflow_run,
     },
     app::{AppState, RequestRepositoryContext},
     domain::{delivery::DeliveryId, repository::RepositoryId},
@@ -30,11 +31,13 @@ use crate::{
     security::{
         CanonicalRepositoryName, WebhookAuthenticationError, WebhookAuthenticator, WebhookSignature,
     },
-    storage::DeliveryClaim,
+    storage::{DeliveryClaim, PendingRunCost},
     telemetry::{
         pipeline::{
-            run_trace_context, PipelineRunTrace, PipelineRunTraceParts, MAX_PIPELINE_JOB_SPANS,
+            run_trace_context, PipelineRunTrace, PipelineRunTraceParts, WorkflowJobTraceIdentity,
+            MAX_PIPELINE_JOB_SPANS,
         },
+        run_cost::warn_cost_after_finalize,
         trace::{
             self, CommitSha, Operation, OperationOutcome, QueueEntity, CI_SOURCE_GITHUB_ACTIONS,
         },
@@ -194,6 +197,7 @@ async fn webhook_handler(
                             })?;
                         if action == Action::Completed {
                             emit_pipeline_trace(&state, repository_id, &request, &context).await;
+                            schedule_run_cost(&state, repository_id, &request, &context).await;
                         }
                     }
                 }
@@ -214,6 +218,21 @@ async fn webhook_handler(
                                 &admission,
                                 step_limit,
                             );
+                            if state.run_costs_enabled() {
+                                if let Some(workflow_job) =
+                                    workflow_job::project_completed_job_billing(
+                                        request.body.as_ref(),
+                                        &request.repository_name,
+                                        &request.delivery_id,
+                                        received_at,
+                                        None,
+                                        state.costs(),
+                                    )
+                                {
+                                    record_job_billing(&state, repository_id, &workflow_job, None)
+                                        .await;
+                                }
+                            }
                         } else {
                             let workflow_run_context = state
                                 .workflow_run_store()
@@ -242,22 +261,14 @@ async fn webhook_handler(
                                 required_checks.as_ref(),
                                 state.costs(),
                             ) {
-                                log_job_cost(&workflow_trace);
-                                if let Some(identity) =
-                                    state.workflow_trace_emitter().emit(&workflow_trace)
-                                {
-                                    if state
-                                        .workflow_job_link_store()
-                                        .record(repository_id, &workflow_trace, identity)
-                                        .await
-                                        .is_err()
-                                    {
-                                        record_workflow_link_failure(
-                                            &state,
-                                            &request.repository_name,
-                                        );
-                                    }
-                                }
+                                let identity = state.workflow_trace_emitter().emit(&workflow_trace);
+                                record_job_billing(
+                                    &state,
+                                    repository_id,
+                                    &workflow_trace,
+                                    identity,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -301,6 +312,10 @@ async fn webhook_handler(
                     trace::set_status(&update_span, OperationOutcome::Success);
                 }
                 if let Some(pull_request) = event_projection.pull_request() {
+                    if event_type == EventType::PullRequest && state.run_costs_enabled() {
+                        record_pull_request_commit(&state, repository_id, pull_request, action)
+                            .await;
+                    }
                     let processor = QueueProcessor {
                         repository_id,
                         repository_name: &request.repository_name,
@@ -339,18 +354,52 @@ async fn webhook_handler(
     }
 }
 
+/// Logs a completed job's cost and keeps its billing link row, then warns when the job's run
+/// attempt was already totalled.
+///
+/// Run totals read job billing from the link row, so it is kept even when no job trace was
+/// exported.
+async fn record_job_billing(
+    state: &AppState,
+    repository_id: RepositoryId,
+    job: &WorkflowJobTrace,
+    identity: Option<WorkflowJobTraceIdentity>,
+) {
+    let job_cost = log_job_cost(job);
+    if identity.is_none() && !state.run_costs_enabled() {
+        return;
+    }
+    let Ok(attempt_final) = state
+        .workflow_job_link_store()
+        .record(repository_id, job, identity)
+        .await
+    else {
+        record_workflow_link_failure(state, job.repository_name());
+        return;
+    };
+    if let Some(cost_usd) = job_cost.filter(|_| attempt_final) {
+        warn_cost_after_finalize(
+            job.repository_name(),
+            job.run_id(),
+            job.run_attempt(),
+            CI_SOURCE_GITHUB_ACTIONS,
+            cost_usd,
+        );
+    }
+}
+
 /// Logs `ci cost recorded` for one priced job, with the attributes of its job span.
 ///
 /// The log carries the run's pipeline trace identifier, so it appears in that run's trace. It is
 /// independent of span export, so cost data reaches the logs dataset even when the trace emitter
 /// is off.
-fn log_job_cost(job: &WorkflowJobTrace) {
-    let Some(billing) = job.billing() else {
-        return;
-    };
-    let Some(cost) = billing.cost.as_ref() else {
-        return;
-    };
+///
+/// # Returns
+///
+/// The logged job cost, or `None` when the job was not priced and nothing was logged.
+fn log_job_cost(job: &WorkflowJobTrace) -> Option<f64> {
+    let billing = job.billing()?;
+    let cost = billing.cost.as_ref()?;
     let context = job.workflow_run_context();
     let runner_labels = billing
         .runner_labels
@@ -387,6 +436,75 @@ fn log_job_cost(job: &WorkflowJobTrace) {
         github.workflow.run.attempt = job.run_attempt().get(),
         cicd.pipeline.task.run.id = job.job_id().get(),
         "ci cost recorded"
+    );
+    Some(cost.cost_usd)
+}
+
+/// Schedules the run attempt's cost total for after the grace period, without waiting for it.
+///
+/// A redelivered `completed` for the same attempt is a no-op. Like pipeline traces this is
+/// enrichment, so a storage failure is logged and never changes the response.
+async fn schedule_run_cost(
+    state: &AppState,
+    repository_id: RepositoryId,
+    request: &WebhookRequest,
+    context: &WorkflowRunContext,
+) {
+    if !state.run_costs_enabled() {
+        return;
+    }
+    let Some(summary) = workflow_run::project_run_summary(request.body.as_ref()) else {
+        return;
+    };
+    let pending = PendingRunCost {
+        run_id: context.run_id(),
+        run_attempt: context.run_attempt(),
+        event: context.event(),
+        workflow_name: summary.workflow_name,
+        workflow_file: context.workflow_file().cloned(),
+        conclusion: summary.conclusion,
+        head_sha: summary.head_sha,
+        pull_request: summary.pull_request,
+    };
+    let due_at = OffsetDateTime::now_utc() + state.run_grace_period();
+    if state
+        .run_cost_store()
+        .schedule(repository_id, &pending, due_at)
+        .await
+        .is_err()
+    {
+        log_run_cost_enrichment_failure("run_cost_schedule_failed");
+    }
+}
+
+/// Maps the commit a `pull_request` delivery names to its pull request, for runs whose payload
+/// names none.
+async fn record_pull_request_commit(
+    state: &AppState,
+    repository_id: RepositoryId,
+    pull_request: &PullRequestProjection,
+    action: Action,
+) {
+    let Some((number, commit_sha)) = pull_request.attributable_commit(action) else {
+        return;
+    };
+    if state
+        .pull_request_commit_store()
+        .record(repository_id, &commit_sha, number)
+        .await
+        .is_err()
+    {
+        log_run_cost_enrichment_failure("pull_request_commit_record_failed");
+    }
+}
+
+fn log_run_cost_enrichment_failure(outcome: &'static str) {
+    let error_correlation_id = crate::error::ErrorCorrelationId::new();
+    error!(
+        parent: None,
+        outcome,
+        %error_correlation_id,
+        "ci run cost enrichment failed"
     );
 }
 

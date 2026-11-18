@@ -12,6 +12,7 @@ use axum::{
 use github_webhook_exporter::{
     app::{build_router, AppState},
     config::DEFAULT_WORKFLOW_JOB_MAX_STEPS,
+    costs::CostsConfig,
     security::{
         AdminAuthenticator, AdminToken, CanonicalRepositoryName, MasterKey, RepositorySecret,
         RepositorySecretCipher,
@@ -252,6 +253,180 @@ async fn workflow_run_context_is_persisted_once_per_new_delivery() {
     assert_eq!(
         row.get::<Option<String>, _>("target_branch").as_deref(),
         Some("main")
+    );
+}
+
+/// Rebuilds `app`'s router over the same database with a price table, so run costs are on.
+fn with_costs(app: &TestApp) -> Router {
+    with_costs_and_step_limit(app, DEFAULT_WORKFLOW_JOB_MAX_STEPS)
+}
+
+fn with_costs_and_step_limit(app: &TestApp, workflow_job_max_steps: usize) -> Router {
+    let cipher = RepositorySecretCipher::new(
+        &MasterKey::from_slice(&[7_u8; 32]).expect("test master key is valid"),
+    )
+    .expect("repository cipher initializes");
+    let admin_token = AdminToken::new("admin-token-for-application-tests".to_owned())
+        .expect("admin token is valid");
+    let costs = CostsConfig::from_json(r#"{"runners": {"default_usd_per_minute": 0.006}}"#)
+        .expect("costs are valid");
+    build_router(
+        AppState::new(
+            RepositoryStore::new(app.pool.clone(), cipher),
+            AdminAuthenticator::new(&admin_token),
+            2_097_152,
+            workflow_job_max_steps,
+        )
+        .with_costs(Some(costs)),
+    )
+}
+
+async fn send(router: &Router, body: &[u8], delivery_id: &str, event_type: &str) {
+    let response = router
+        .clone()
+        .oneshot(webhook_request_for_event(
+            body,
+            SECRET,
+            delivery_id,
+            event_type,
+        ))
+        .await
+        .expect("webhook request succeeds");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn pull_request_deliveries_map_head_and_merge_commits_only_when_costs_are_on() {
+    const HEAD_SHA: &str = "1111111111111111111111111111111111111111";
+    const SYNCHRONIZED_SHA: &str = "2222222222222222222222222222222222222222";
+    const MERGE_SHA: &str = "3333333333333333333333333333333333333333";
+    let app = test_app(2_097_152, Some(true)).await;
+    let pull_request = |action: &str, head: &str| {
+        format!(
+            r#"{{"action":"{action}","pull_request":{{"number":42,"head":{{"sha":"{head}"}},"merge_commit_sha":"{MERGE_SHA}"}},"repository":{{"full_name":"owner/repository"}}}}"#
+        )
+    };
+
+    send(
+        &app.router,
+        pull_request("opened", HEAD_SHA).as_bytes(),
+        "550e8400-e29b-41d4-a716-446655440090",
+        "pull_request",
+    )
+    .await;
+    let unmapped: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pull_request_commits")
+        .fetch_one(&app.pool)
+        .await
+        .expect("commit map is countable");
+    assert_eq!(
+        unmapped, 0,
+        "nothing is mapped while cost attribution is off"
+    );
+
+    let router = with_costs(&app);
+    for (action, head, delivery_id) in [
+        ("opened", HEAD_SHA, "550e8400-e29b-41d4-a716-446655440091"),
+        (
+            "synchronize",
+            SYNCHRONIZED_SHA,
+            "550e8400-e29b-41d4-a716-446655440092",
+        ),
+        (
+            "closed",
+            SYNCHRONIZED_SHA,
+            "550e8400-e29b-41d4-a716-446655440093",
+        ),
+    ] {
+        send(
+            &router,
+            pull_request(action, head).as_bytes(),
+            delivery_id,
+            "pull_request",
+        )
+        .await;
+    }
+
+    let mapped: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT commit_sha, pull_request_number FROM pull_request_commits ORDER BY commit_sha",
+    )
+    .fetch_all(&app.pool)
+    .await
+    .expect("commit map loads");
+    assert_eq!(
+        mapped,
+        [
+            (HEAD_SHA.to_owned(), 42),
+            (SYNCHRONIZED_SHA.to_owned(), 42),
+            (MERGE_SHA.to_owned(), 42),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_job_over_the_step_limit_still_records_its_billing_without_a_trace() {
+    let app = test_app(2_097_152, Some(true)).await;
+    let router = with_costs_and_step_limit(&app, 1);
+    let body = br#"{"action":"completed","workflow_job":{"id":61,"run_id":51,"run_attempt":1,"name":"build","conclusion":"success","started_at":"2026-08-06T10:00:00Z","completed_at":"2026-08-06T10:02:00Z","labels":["ubuntu-latest"],"runner_id":7,"steps":[{"number":1},{"number":2}]},"repository":{"full_name":"owner/repository"}}"#;
+
+    send(
+        &router,
+        body,
+        "550e8400-e29b-41d4-a716-446655440097",
+        "workflow_job",
+    )
+    .await;
+
+    type LinkRow = (Option<String>, Option<String>, Option<i64>, Option<f64>);
+    let links: Vec<LinkRow> = sqlx::query_as(
+        "SELECT trace_id, span_id, billable_minutes, cost_usd FROM workflow_job_links \
+         WHERE workflow_run_id = 51 AND workflow_job_id = 61",
+    )
+    .fetch_all(&app.pool)
+    .await
+    .expect("job links load");
+    assert_eq!(links, [(None, None, Some(2), Some(2.0 * 0.006))]);
+}
+
+#[tokio::test]
+async fn a_completed_run_is_scheduled_once_per_attempt_without_waiting() {
+    let app = test_app(2_097_152, Some(true)).await;
+    let router = with_costs(&app);
+    let completed = |attempt: i64| {
+        format!(
+            r#"{{"action":"completed","workflow_run":{{"id":31,"run_attempt":{attempt},"name":"CI","event":"push","conclusion":"cancelled","head_sha":"{PULL_REQUEST_SHA}","display_title":"fix: PR #9 (#9)"}},"repository":{{"full_name":"owner/repository"}}}}"#
+        )
+    };
+
+    for (attempt, delivery_id) in [
+        (1, "550e8400-e29b-41d4-a716-446655440094"),
+        (1, "550e8400-e29b-41d4-a716-446655440095"),
+        (2, "550e8400-e29b-41d4-a716-446655440096"),
+    ] {
+        send(
+            &router,
+            completed(attempt).as_bytes(),
+            delivery_id,
+            "workflow_run",
+        )
+        .await;
+    }
+
+    type PendingRow = (i64, String, Option<i64>, String, Option<String>);
+    let pending: Vec<PendingRow> = sqlx::query_as(
+        "SELECT workflow_run_attempt, conclusion, pull_request_number, \
+         pull_request_resolution, finalized_at FROM run_cost_finalizations \
+         ORDER BY workflow_run_attempt",
+    )
+    .fetch_all(&app.pool)
+    .await
+    .expect("finalizations load");
+    assert_eq!(
+        pending,
+        [
+            (1, "cancelled".to_owned(), None, "none".to_owned(), None),
+            (2, "cancelled".to_owned(), None, "none".to_owned(), None),
+        ],
+        "one pending row per attempt, and a push run's squash-merge title attributes nothing"
     );
 }
 

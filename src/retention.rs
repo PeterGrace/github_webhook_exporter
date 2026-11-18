@@ -12,9 +12,10 @@ use crate::{
     lifecycle,
     storage::{
         CiUsageStore, CiUsageStoreError, DeliveryStore, DeliveryStoreError, MergeQueueStore,
-        MergeQueueStoreError, RequiredCheckStore, RequiredCheckStoreError, VendorRunStore,
-        VendorRunStoreError, WorkflowJobLinkStore, WorkflowJobLinkStoreError, WorkflowRunStore,
-        WorkflowRunStoreError,
+        MergeQueueStoreError, PullRequestCommitStore, PullRequestCommitStoreError,
+        RequiredCheckStore, RequiredCheckStoreError, RunCostStore, RunCostStoreError,
+        VendorRunStore, VendorRunStoreError, WorkflowJobLinkStore, WorkflowJobLinkStoreError,
+        WorkflowRunStore, WorkflowRunStoreError,
     },
     telemetry::trace::{self, Operation, OperationOutcome},
 };
@@ -131,6 +132,9 @@ struct DerivedRetentionStores {
     workflow_job_link: WorkflowJobLinkStore,
     required_check: RequiredCheckStore,
     ci_usage: CiUsageStore,
+    run_cost: RunCostStore,
+    pull_request_run_cost: PullRequestRunCosts,
+    pull_request_commit: PullRequestCommitStore,
     vendor_run: VendorRunStore,
 }
 
@@ -146,10 +150,16 @@ impl DerivedRetentionStores {
                 Duration::from_secs(DEFAULT_REQUIRED_CHECK_TTL_SECONDS),
             ),
             ci_usage: CiUsageStore::new(pool.clone()),
+            run_cost: RunCostStore::new(pool.clone()),
+            pull_request_run_cost: PullRequestRunCosts(RunCostStore::new(pool.clone())),
+            pull_request_commit: PullRequestCommitStore::new(pool.clone()),
             vendor_run: VendorRunStore::new(pool.clone()),
         }
     }
 }
+
+/// The pull-request run totals kept by [`RunCostStore`], pruned as their own workload.
+struct PullRequestRunCosts(RunCostStore);
 
 /// Runs exactly one traced retention pass for deterministic test coverage.
 #[cfg(test)]
@@ -180,9 +190,9 @@ async fn prune_retention_pass(
     let pass_started_at = OffsetDateTime::now_utc();
     let delivery_cutoff = pass_started_at.checked_sub(config.delivery_retention);
     let merge_queue_cutoff = pass_started_at.checked_sub(config.merge_queue_retention);
-    // Workflow correlation, required-check, usage and vendor-run rows are keyed to deliveries,
-    // runs and pull requests, so they share the delivery cutoff rather than carrying retention
-    // settings of their own.
+    // Workflow correlation, required-check, usage, vendor-run and run-cost rows are keyed to
+    // deliveries, runs and pull requests, so they share the delivery cutoff rather than carrying
+    // retention settings of their own.
     prune_retention_workloads(
         &[
             (delivery_store, delivery_cutoff),
@@ -192,6 +202,9 @@ async fn prune_retention_pass(
             (&derived_stores.required_check, delivery_cutoff),
             (&derived_stores.ci_usage, delivery_cutoff),
             (&derived_stores.vendor_run, delivery_cutoff),
+            (&derived_stores.run_cost, delivery_cutoff),
+            (&derived_stores.pull_request_run_cost, delivery_cutoff),
+            (&derived_stores.pull_request_commit, delivery_cutoff),
         ],
         shutdown,
     )
@@ -358,6 +371,46 @@ impl PrunableStore for CiUsageStore {
         CiUsageStore::prune_batch(self, cutoff)
             .await
             .map_err(|_: CiUsageStoreError| StorePruneFailure)
+    }
+}
+
+#[async_trait]
+impl PrunableStore for RunCostStore {
+    fn workload(&self) -> &'static str {
+        "run_cost"
+    }
+
+    async fn prune_batch_erased(&self, cutoff: OffsetDateTime) -> Result<u64, StorePruneFailure> {
+        RunCostStore::prune_batch(self, cutoff)
+            .await
+            .map_err(|_: RunCostStoreError| StorePruneFailure)
+    }
+}
+
+#[async_trait]
+impl PrunableStore for PullRequestRunCosts {
+    fn workload(&self) -> &'static str {
+        "pull_request_run_cost"
+    }
+
+    async fn prune_batch_erased(&self, cutoff: OffsetDateTime) -> Result<u64, StorePruneFailure> {
+        self.0
+            .prune_pull_request_batch(cutoff)
+            .await
+            .map_err(|_: RunCostStoreError| StorePruneFailure)
+    }
+}
+
+#[async_trait]
+impl PrunableStore for PullRequestCommitStore {
+    fn workload(&self) -> &'static str {
+        "pull_request_commit"
+    }
+
+    async fn prune_batch_erased(&self, cutoff: OffsetDateTime) -> Result<u64, StorePruneFailure> {
+        PullRequestCommitStore::prune_batch(self, cutoff)
+            .await
+            .map_err(|_: PullRequestCommitStoreError| StorePruneFailure)
     }
 }
 

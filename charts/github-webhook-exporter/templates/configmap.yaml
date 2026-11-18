@@ -10,6 +10,7 @@ data:
   GHE_WEBHOOK_BODY_LIMIT_BYTES: {{ .Values.application.webhookBodyLimitBytes | int | quote }}
   GHE_WORKFLOW_JOB_MAX_STEPS: {{ .Values.application.workflowJobMaxSteps | int | quote }}
   GHE_REQUIRED_CHECK_TTL_SECONDS: {{ .Values.application.requiredCheckTtlSeconds | int | quote }}
+  GHE_RUN_GRACE_SECONDS: {{ .Values.application.runGraceSeconds | int | quote }}
   {{- with .Values.costs }}
   GHE_COSTS_JSON: {{ toJson . | quote }}
   {{- end }}

@@ -10,7 +10,7 @@ This table is only a map of the value groups, so you know where to look.
 | `image.*` | Repository, tag, pull policy. An empty tag selects the chart `appVersion`. |
 | `existingSecret.*` | Name of your Secret and the key names projected as `GHE_MASTER_KEY`, `GHE_ADMIN_TOKEN`, optional OTLP header keys, and the optional GitHub App private key. |
 | `service.*` | Fixed `ClusterIP`; `service.port` drives the Service, container port, probes, and the application listener together. |
-| `application.*` | Shutdown deadline, webhook body limit, workflow-job step cap, required-check cache lifetime, `RUST_LOG`. |
+| `application.*` | Shutdown deadline, webhook body limit, workflow-job step cap, required-check cache lifetime, run-cost grace period, `RUST_LOG`. |
 | `githubApp.*` | Optional GitHub App identifiers and API base URL enabling branch-protection required-check lookups. |
 | `costs.*` | Optional CI cost unit-price table, rendered as `GHE_COSTS_JSON`; empty disables cost features. See [CI cost price table](costs.md). |
 | `ingest.oidc.*` | Optional `audience` and `allowed_repositories` for in-job usage reports, rendered as `GHE_INGEST_OIDC_JSON`; also routes `/ci-cost/usage` through `webhookIngress`. Empty leaves the endpoint off. See [HTTP API](http-api.md#post-ci-costusage). |

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 use thiserror::Error;
 use time::{format_description::FormatItem, macros::format_description, OffsetDateTime, UtcOffset};
 
@@ -9,11 +9,11 @@ use crate::{
     telemetry::{
         trace::{self, DatabaseOperation},
         usage::{UsageMeasure, UsageReport},
-        workflow::DisplayName,
+        workflow::{DisplayName, WorkflowRunAttempt, WorkflowRunId},
     },
 };
 
-use super::sqlite_is_busy_or_locked;
+use super::{run_cost_store::attempt_is_final, sqlite_is_busy_or_locked};
 
 const CI_USAGE_PRUNE_BATCH_SIZE: i64 = 1_000;
 const CI_USAGE_TIMESTAMP_FORMAT: &[FormatItem<'static>] =
@@ -77,6 +77,12 @@ impl CiUsageStore {
 
     /// Inserts every entry of one accepted post in a single transaction.
     ///
+    /// # Returns
+    ///
+    /// Whether the run attempt was already final when the write committed. The check runs in the
+    /// write's own transaction, under SQLite's write lock, so `true` means the record is not in
+    /// the attempt's total and `false` means it will be.
+    ///
     /// # Errors
     ///
     /// Returns [`CiUsageStoreError::Unavailable`] when SQLite is busy or locked, and
@@ -86,7 +92,7 @@ impl CiUsageStore {
         &self,
         repository_id: RepositoryId,
         report: &UsageReport,
-    ) -> Result<(), CiUsageStoreError> {
+    ) -> Result<bool, CiUsageStoreError> {
         trace::instrument_database_operation(
             DatabaseOperation::CiUsageRecord,
             self.record_inner(repository_id, report),
@@ -98,8 +104,12 @@ impl CiUsageStore {
         &self,
         repository_id: RepositoryId,
         report: &UsageReport,
-    ) -> Result<(), CiUsageStoreError> {
-        let mut transaction = self.pool.begin().await.map_err(map_sqlx_error)?;
+    ) -> Result<bool, CiUsageStoreError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_sqlx_error)?;
         for entry in &report.entries {
             let (input_tokens, output_tokens, cpu_seconds, ram_gb_seconds) = match entry.measure {
                 UsageMeasure::Inference {
@@ -138,7 +148,74 @@ impl CiUsageStore {
             .await
             .map_err(map_sqlx_error)?;
         }
-        transaction.commit().await.map_err(map_sqlx_error)
+        let attempt_final = attempt_is_final(
+            &mut transaction,
+            repository_id,
+            report.claims.run_id,
+            report.claims.run_attempt,
+        )
+        .await
+        .map_err(map_sqlx_error)?;
+        transaction.commit().await.map_err(map_sqlx_error)?;
+        Ok(attempt_final)
+    }
+
+    /// Sums the usage entries of one run attempt per source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CiUsageStoreError::Unavailable`] when SQLite is busy or locked, and
+    /// [`CiUsageStoreError::Internal`] for any other persistence failure.
+    #[cfg(test)]
+    pub(crate) async fn run_totals(
+        &self,
+        repository_id: RepositoryId,
+        run_id: WorkflowRunId,
+        run_attempt: WorkflowRunAttempt,
+    ) -> Result<UsageTotals, CiUsageStoreError> {
+        let mut connection = self.pool.acquire().await.map_err(map_sqlx_error)?;
+        Self::run_totals_in(&mut connection, repository_id, run_id, run_attempt)
+            .await
+            .map_err(map_sqlx_error)
+    }
+
+    /// Runs the sums of [`Self::run_totals`] on `connection`, so a caller can read them inside its
+    /// own transaction.
+    pub(crate) async fn run_totals_in(
+        connection: &mut SqliteConnection,
+        repository_id: RepositoryId,
+        run_id: WorkflowRunId,
+        run_attempt: WorkflowRunAttempt,
+    ) -> Result<UsageTotals, sqlx::Error> {
+        let by_source: Vec<(String, f64, i64)> = sqlx::query_as(
+            "SELECT source, TOTAL(cost_usd), COUNT(*) FROM ci_usage_entries \
+             WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ? \
+             GROUP BY source",
+        )
+        .bind(repository_id.get())
+        .bind(run_id.get())
+        .bind(run_attempt.get())
+        .fetch_all(&mut *connection)
+        .await?;
+        // Two versions are enough to tell that the attempt was priced by more than one table.
+        let price_table_versions: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT price_table_version FROM ci_usage_entries \
+             WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ? \
+             AND price_table_version IS NOT NULL LIMIT 2",
+        )
+        .bind(repository_id.get())
+        .bind(run_id.get())
+        .bind(run_attempt.get())
+        .fetch_all(&mut *connection)
+        .await?;
+        Ok(UsageTotals {
+            entries: by_source.iter().map(|(_, _, entries)| entries).sum(),
+            cost_by_source: by_source
+                .into_iter()
+                .map(|(source, cost_usd, _)| (source, cost_usd))
+                .collect(),
+            price_table_versions,
+        })
     }
 
     /// Deletes at most one bounded batch of entries last updated before `cutoff`.
@@ -176,6 +253,17 @@ impl CiUsageStore {
         .map_err(map_sqlx_error)?;
         Ok(result.rows_affected())
     }
+}
+
+/// The summed usage entries of one run attempt.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct UsageTotals {
+    /// Summed USD per stored source.
+    pub(crate) cost_by_source: Vec<(String, f64)>,
+    /// The number of entries summed.
+    pub(crate) entries: i64,
+    /// At most two distinct price-table versions of the attempt's entries.
+    pub(crate) price_table_versions: Vec<String>,
 }
 
 /// A stable, redacted usage persistence failure.
@@ -344,6 +432,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_post_reports_whether_its_attempt_was_already_final() {
+        let (_directory, pool, store, repository_id) = store_with_repository().await;
+        assert!(!store
+            .record(repository_id, &report(vec![inference(0.1)]))
+            .await
+            .expect("entries persist"));
+
+        sqlx::query(
+            "INSERT INTO run_cost_finalizations (repository_id, workflow_run_id, \
+             workflow_run_attempt, event, conclusion, pull_request_resolution, due_at, \
+             finalized_at, total_usd, updated_at) \
+             VALUES (?, 31, 2, 'pull_request', 'success', 'none', '2026-11-18T10:05:00.000Z', \
+             '2026-11-18T10:05:01.000Z', 0.1, '2026-11-18T10:05:01.000Z')",
+        )
+        .bind(repository_id.get())
+        .execute(&pool)
+        .await
+        .expect("finalized attempt inserts");
+        assert!(store
+            .record(repository_id, &report(vec![inference(0.2)]))
+            .await
+            .expect("entries persist"));
+    }
+
+    #[tokio::test]
     async fn a_rejected_entry_stores_nothing_from_its_post() {
         let (_directory, pool, store, repository_id) = store_with_repository().await;
 
@@ -425,5 +538,56 @@ mod tests {
             .await
             .expect("count loads");
         assert_eq!(remaining, 1);
+    }
+
+    #[tokio::test]
+    async fn run_totals_sum_one_attempt_per_source() {
+        let (_directory, pool, store, repository_id) = store_with_repository().await;
+        store
+            .record(
+                repository_id,
+                &report(vec![inference(0.25), inference(0.5), sandbox()]),
+            )
+            .await
+            .expect("entries persist");
+        let mut other_attempt = report(vec![inference(9.0)]);
+        other_attempt.claims.run_attempt = WorkflowRunAttempt::new(1).expect("attempt is positive");
+        store
+            .record(repository_id, &other_attempt)
+            .await
+            .expect("other attempt persists");
+        sqlx::query(
+            "INSERT INTO repositories (full_name, webhook_secret_ciphertext, \
+             webhook_secret_nonce, encryption_version, enabled, created_at, updated_at) \
+             VALUES ('owner/other', X'01', X'02', 1, 1, \
+             '2026-11-13T10:00:00.000Z', '2026-11-13T10:00:00.000Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("other repository inserts");
+        let other_repository = RepositoryId::new(repository_id.get() + 1).expect("id is positive");
+        store
+            .record(other_repository, &report(vec![inference(7.0)]))
+            .await
+            .expect("other repository persists");
+
+        let mut totals = store
+            .run_totals(
+                repository_id,
+                WorkflowRunId::new(31).expect("run id is positive"),
+                WorkflowRunAttempt::new(2).expect("attempt is positive"),
+            )
+            .await
+            .expect("totals load");
+        totals
+            .cost_by_source
+            .sort_by(|left, right| left.0.cmp(&right.0));
+
+        assert_eq!(totals.entries, 3);
+        assert_eq!(
+            totals.cost_by_source,
+            [("anthropic".to_owned(), 0.75), ("daytona".to_owned(), 0.0)]
+        );
+        assert_eq!(totals.price_table_versions, ["0123456789ab"]);
     }
 }

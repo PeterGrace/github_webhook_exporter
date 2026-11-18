@@ -76,7 +76,9 @@ failure.
 `delivery_claim`, `metrics`, `database`, `queue_state`, `workflow_link`, and `vendor_run`. The
 last three mark enrichment-only paths that keep the authenticated `204 No Content` response:
 `queue_state` for merge-queue persistence, `workflow_link` for pipeline-run link persistence,
-lookup, and export, and `vendor_run` for vendor-run persistence.
+lookup, and export, and `vendor_run` for vendor-run persistence. `workflow_link` also counts
+failed writes of billing-only job rows (trace export off, or a job rejected by
+`GHE_WORKFLOW_JOB_MAX_STEPS`), which run cost totals read.
 Every stage is published zero-valued at startup.
 
 `github_workflow_job_trace_rejections_total` uses the closed `reason` vocabulary `too_many_steps`
