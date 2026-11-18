@@ -73,9 +73,10 @@ over-365-day durations are omitted and increment only the bounded `invalid_durat
 failure.
 
 `github_webhook_processing_failures_total` uses the closed `stage` vocabulary `authentication`,
-`delivery_claim`, `metrics`, `database`, `queue_state`, and `workflow_link`. The last two mark
-enrichment-only paths that keep the authenticated `204 No Content` response: `queue_state` for
-merge-queue persistence and `workflow_link` for pipeline-run link persistence, lookup, and export.
+`delivery_claim`, `metrics`, `database`, `queue_state`, `workflow_link`, and `vendor_run`. The
+last three mark enrichment-only paths that keep the authenticated `204 No Content` response:
+`queue_state` for merge-queue persistence, `workflow_link` for pipeline-run link persistence,
+lookup, and export, and `vendor_run` for vendor-run persistence.
 Every stage is published zero-valued at startup.
 
 `github_workflow_job_trace_rejections_total` uses the closed `reason` vocabulary `too_many_steps`

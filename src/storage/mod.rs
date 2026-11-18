@@ -3,6 +3,7 @@ mod delivery_store;
 mod merge_queue_store;
 mod repository_store;
 mod required_check_store;
+mod vendor_run_store;
 mod workflow_job_link_store;
 mod workflow_run_store;
 
@@ -24,6 +25,7 @@ use sqlx::{
     SqlitePool,
 };
 use thiserror::Error;
+pub(crate) use vendor_run_store::{VendorRunStore, VendorRunStoreError};
 pub(crate) use workflow_job_link_store::{WorkflowJobLinkStore, WorkflowJobLinkStoreError};
 pub(crate) use workflow_run_store::{WorkflowRunStore, WorkflowRunStoreError};
 

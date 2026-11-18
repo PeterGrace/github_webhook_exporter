@@ -1,7 +1,7 @@
 # CI cost price table
 
-The optional `costs` table holds the unit prices that later cost-attribution work uses to price CI
-jobs, Daytona sandbox time, and per-run vendor charges. Workflows never send rates, so every price
+The optional `costs` table holds the unit prices used to price CI jobs, Daytona sandbox time,
+and per-run vendor charges. Workflows never send rates, so every price
 comes from deployment config. When the table is absent, every cost feature is off.
 
 ## Supplying the table
@@ -39,6 +39,7 @@ as `0.01` as strings, and the schema rejects them.
 | `runners.default_usd_per_minute` | yes | USD per billable minute for a job whose labels match no entry in `runners.labels`. |
 | `runners.labels` | no | Map of runner label to USD per billable minute. |
 | `daytona.usd_per_cpu_second`, `daytona.usd_per_ram_gb_second` | no; both or neither | Daytona sandbox rates. |
+| `vendors.<name>` | no | Vendor name, exported as `ci.vendor`: 1 to 128 characters with no control characters. |
 | `vendors.<name>.match` | yes, per vendor | Exactly one of `check_suite_app` (a GitHub App slug) or `review_login` (a reviewer login), non-empty. |
 | `vendors.<name>.usd_per_run` | yes, per vendor | USD charged for one run. |
 
@@ -51,7 +52,9 @@ invalid when:
 
 - the JSON is malformed or has an unknown field;
 - a rate is negative or not a number;
-- a runner label or vendor name is empty;
+- a runner label is empty;
+- a vendor name is empty, longer than 128 characters, or contains a control character, since it is
+  exported and stored unchanged;
 - a vendor has no match rule, two match rules, or an empty one;
 - two runner labels, two app slugs, or two reviewer logins differ only in case, or two vendors
   claim the same app slug or the same reviewer login.
@@ -88,6 +91,24 @@ Daytona usage that a job reports to `POST /ci-cost/usage` is priced at `cpu_seco
 daytona.usd_per_cpu_second + ram_gb_seconds × daytona.usd_per_ram_gb_second`. Without a
 `daytona` block it is recorded at 0 USD with `ci.price.fell_back=true`. Inference entries carry
 their own USD amount and never use the table; see [HTTP API](http-api.md#post-ci-costusage).
+
+Each matched vendor run is priced at its vendor's `usd_per_run`: one run per `check_suite`
+delivery with action `completed` whose app slug matches `match.check_suite_app`, and one per
+`pull_request_review` delivery with action `submitted` whose reviewer login matches
+`match.review_login`. Each matching delivery is charged once: a bot that submits several reviews
+on one pull request, or a check suite that is re-requested and completes again, is charged for
+each delivery. The run exports a `ci.vendor.run` span, writes a `ci cost recorded` log, and,
+when it is attributed to one pull request, is stored for per-PR totals; see
+[Vendor run spans](traces.md#vendor-run-spans). Vendors that bill per minute or per seat are not
+priced.
+
+GitHub sends these events only when the repository webhook subscribes to them. In the webhook's
+settings, choose **Let me select individual events** and enable **Check suites** for
+`check_suite_app` vendors and **Pull request reviews** for `review_login` vendors, alongside the
+events the exporter already uses. Repository and organization webhooks receive only the
+`completed` check-suite action, which is the one priced. Find a vendor's app slug in its GitHub
+App URL, `https://github.com/apps/<slug>`, and its reviewer login on any review it has posted,
+such as `review-bot[bot]`.
 
 A job whose labels have no price is charged at `runners.default_usd_per_minute`. Self-hosted
 runners are included: price their label, for example `self-hosted: 0`, if their minutes should

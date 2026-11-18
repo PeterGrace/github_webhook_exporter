@@ -12,8 +12,9 @@ use crate::{
     lifecycle,
     storage::{
         CiUsageStore, CiUsageStoreError, DeliveryStore, DeliveryStoreError, MergeQueueStore,
-        MergeQueueStoreError, RequiredCheckStore, RequiredCheckStoreError, WorkflowJobLinkStore,
-        WorkflowJobLinkStoreError, WorkflowRunStore, WorkflowRunStoreError,
+        MergeQueueStoreError, RequiredCheckStore, RequiredCheckStoreError, VendorRunStore,
+        VendorRunStoreError, WorkflowJobLinkStore, WorkflowJobLinkStoreError, WorkflowRunStore,
+        WorkflowRunStoreError,
     },
     telemetry::trace::{self, Operation, OperationOutcome},
 };
@@ -130,6 +131,7 @@ struct DerivedRetentionStores {
     workflow_job_link: WorkflowJobLinkStore,
     required_check: RequiredCheckStore,
     ci_usage: CiUsageStore,
+    vendor_run: VendorRunStore,
 }
 
 impl DerivedRetentionStores {
@@ -144,6 +146,7 @@ impl DerivedRetentionStores {
                 Duration::from_secs(DEFAULT_REQUIRED_CHECK_TTL_SECONDS),
             ),
             ci_usage: CiUsageStore::new(pool.clone()),
+            vendor_run: VendorRunStore::new(pool.clone()),
         }
     }
 }
@@ -177,8 +180,9 @@ async fn prune_retention_pass(
     let pass_started_at = OffsetDateTime::now_utc();
     let delivery_cutoff = pass_started_at.checked_sub(config.delivery_retention);
     let merge_queue_cutoff = pass_started_at.checked_sub(config.merge_queue_retention);
-    // Workflow correlation, required-check and usage rows are keyed to deliveries and runs, so
-    // they share the delivery cutoff rather than carrying retention settings of their own.
+    // Workflow correlation, required-check, usage and vendor-run rows are keyed to deliveries,
+    // runs and pull requests, so they share the delivery cutoff rather than carrying retention
+    // settings of their own.
     prune_retention_workloads(
         &[
             (delivery_store, delivery_cutoff),
@@ -187,6 +191,7 @@ async fn prune_retention_pass(
             (&derived_stores.workflow_job_link, delivery_cutoff),
             (&derived_stores.required_check, delivery_cutoff),
             (&derived_stores.ci_usage, delivery_cutoff),
+            (&derived_stores.vendor_run, delivery_cutoff),
         ],
         shutdown,
     )
@@ -353,6 +358,19 @@ impl PrunableStore for CiUsageStore {
         CiUsageStore::prune_batch(self, cutoff)
             .await
             .map_err(|_: CiUsageStoreError| StorePruneFailure)
+    }
+}
+
+#[async_trait]
+impl PrunableStore for VendorRunStore {
+    fn workload(&self) -> &'static str {
+        "vendor_run"
+    }
+
+    async fn prune_batch_erased(&self, cutoff: OffsetDateTime) -> Result<u64, StorePruneFailure> {
+        VendorRunStore::prune_batch(self, cutoff)
+            .await
+            .map_err(|_: VendorRunStoreError| StorePruneFailure)
     }
 }
 
@@ -867,6 +885,36 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("usage entries are countable");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn retention_prunes_vendor_runs_with_the_delivery_cutoff() {
+        let (_directory, pool, delivery_store, queue_store) = retention_stores().await;
+        sqlx::query(
+            "INSERT INTO ci_vendor_runs \
+             (repository_id, pull_request_number, vendor, trigger, cost_usd, \
+              price_table_version, updated_at) \
+             VALUES (1, 42, 'example-review-bot', 'pull_request_review', 0.5, \
+                     '0123456789ab', '2020-01-01T00:00:00.000Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("expired vendor run inserts");
+        let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let config = RetentionConfig::new(
+            Duration::from_millis(10),
+            Duration::from_secs(86_400),
+            Duration::from_secs(90 * 86_400),
+        )
+        .expect("retention configuration is valid");
+
+        run_retention_once(&delivery_store, &queue_store, config, &shutdown_receiver).await;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ci_vendor_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("vendor runs are countable");
         assert_eq!(count, 0);
     }
 

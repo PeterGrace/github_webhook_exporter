@@ -209,6 +209,8 @@ const SPAN_ATTRIBUTE_ALLOWLIST: &[&str] = &[
     "ci.output_tokens",
     "ci.cpu_seconds",
     "ci.ram_gb_seconds",
+    "ci.vendor",
+    "ci.vendor.trigger",
     "timing_source",
     "db.system.name",
     "db.operation.name",
@@ -6246,6 +6248,7 @@ async fn integrated_core_trace_privacy() {
                 Some("required_check.prune"),
                 Some("success")
             ),
+            ("sqlite.query", Some("vendor_run.prune"), Some("success")),
             (
                 "sqlite.query",
                 Some("workflow_job_link.prune"),
@@ -8222,4 +8225,298 @@ async fn cost_logs_carry_the_run_trace_when_trace_export_is_off() {
         assert_eq!(log.trace_id, expected);
         assert_no_span_id(&log.span_id, "a cost log");
     }
+}
+
+const VENDOR_HEAD_SHA: &str = "89abcdef0123456789abcdef0123456789abcdef";
+const VENDOR_COSTS: &str = r#"{"runners": {"default_usd_per_minute": 0.01},
+    "vendors": {
+        "example-review-bot": {"match": {"review_login": "review-bot[bot]"}, "usd_per_run": 0.5},
+        "example-visual-tests": {"match": {"check_suite_app": "visual-tests"}, "usd_per_run": 0.25}
+    }}"#;
+
+fn check_suite_body(action: &str, slug: &str, pull_requests: &[i64]) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "action": action,
+        "check_suite": {
+            "head_sha": VENDOR_HEAD_SHA,
+            "app": {"slug": slug},
+            "pull_requests": pull_requests
+                .iter()
+                .map(|number| serde_json::json!({"number": number}))
+                .collect::<Vec<_>>()
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("check-suite payload serializes")
+}
+
+fn review_body(action: &str, login: &str, pull_request: i64) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "action": action,
+        "review": {"user": {"login": login}},
+        "pull_request": {
+            "number": pull_request,
+            "updated_at": "2026-11-18T10:00:00Z",
+            "head": {"sha": VENDOR_HEAD_SHA}
+        },
+        "repository": {"full_name": WEBHOOK_REPOSITORY}
+    }))
+    .expect("review payload serializes")
+}
+
+async fn deliver(fixture: &WebhookTraceFixture, body: &[u8], event_type: &str, delivery_id: &str) {
+    let response = fixture
+        .webhook(body, event_type, delivery_id, WEBHOOK_SECRET)
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT, "{delivery_id}");
+}
+
+fn vendor_spans(captured: &CapturedSpans) -> Vec<&Span> {
+    captured
+        .spans
+        .iter()
+        .filter(|span| span.name == "ci.vendor.run")
+        .collect()
+}
+
+fn log_string<'record>(log: &'record LogRecord, key: &str) -> Option<&'record str> {
+    match log_attribute(log, key) {
+        Some(AttributeValue::StringValue(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+async fn vendor_run_rows(pool: &SqlitePool) -> Vec<(i64, String, String, f64)> {
+    sqlx::query_as(
+        "SELECT pull_request_number, vendor, trigger, cost_usd FROM ci_vendor_runs ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("vendor runs load")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matched_vendor_runs_export_one_span_and_one_cost_log_each() {
+    let costs = CostsConfig::from_json(VENDOR_COSTS).expect("costs are valid");
+    let version = costs.version().to_owned();
+    let fixture = WebhookTraceFixture::new_with_costs(costs).await;
+    let review = review_body("submitted", "Review-Bot[bot]", 42);
+    let deliveries = [
+        (
+            check_suite_body("completed", "Visual-Tests", &[7]),
+            "check_suite",
+            "550e8400-e29b-41d4-a716-446655440501",
+        ),
+        (
+            review.clone(),
+            "pull_request_review",
+            "550e8400-e29b-41d4-a716-446655440502",
+        ),
+        (
+            review,
+            "pull_request_review",
+            "550e8400-e29b-41d4-a716-446655440502",
+        ),
+        (
+            check_suite_body("completed", "visual-tests", &[7, 8]),
+            "check_suite",
+            "550e8400-e29b-41d4-a716-446655440503",
+        ),
+        (
+            check_suite_body("requested", "visual-tests", &[7]),
+            "check_suite",
+            "550e8400-e29b-41d4-a716-446655440504",
+        ),
+        (
+            check_suite_body("completed", "github-actions", &[7]),
+            "check_suite",
+            "550e8400-e29b-41d4-a716-446655440505",
+        ),
+        (
+            review_body("edited", "review-bot[bot]", 42),
+            "pull_request_review",
+            "550e8400-e29b-41d4-a716-446655440506",
+        ),
+        (
+            review_body("dismissed", "review-bot[bot]", 42),
+            "pull_request_review",
+            "550e8400-e29b-41d4-a716-446655440507",
+        ),
+        (
+            review_body("submitted", "octocat", 42),
+            "pull_request_review",
+            "550e8400-e29b-41d4-a716-446655440508",
+        ),
+    ];
+
+    for (body, event_type, delivery_id) in &deliveries {
+        deliver(&fixture, body, event_type, delivery_id).await;
+    }
+
+    let captured = fixture.force_flush();
+    captured.assert_approved_attribute_keys();
+    let spans = vendor_spans(&captured);
+    assert_eq!(
+        spans.len(),
+        3,
+        "one span per matched delivery, none for the redelivery or unmatched deliveries"
+    );
+    for span in &spans {
+        assert!(span.parent_span_id.is_empty(), "vendor spans are roots");
+        assert_attribute(span, "ci.source", "vendor");
+        assert_attribute(span, "ci.price_table.version", &version);
+        assert_attribute(span, "github.repository.name", WEBHOOK_REPOSITORY);
+        assert_attribute(span, "vcs.ref.head.revision", VENDOR_HEAD_SHA);
+        assert_attribute(span, "sentry.op", "ci.vendor.run");
+    }
+    let check_suites = spans
+        .iter()
+        .filter(|span| string_attribute(span, "ci.vendor.trigger") == Some("check_suite"))
+        .collect::<Vec<_>>();
+    assert_eq!(check_suites.len(), 2);
+    let attributed_suite = check_suites
+        .iter()
+        .find(|span| has_attribute(span, "ci.pull_request.number"))
+        .expect("the single-PR suite is attributed");
+    assert_attribute(attributed_suite, "ci.vendor", "example-visual-tests");
+    assert_i64_array_attribute(attributed_suite, "github.pull_request.number", &[7]);
+    assert_i64_attribute(attributed_suite, "ci.pull_request.number", 7);
+    assert!(attributed_suite.attributes.iter().any(|attribute| {
+        attribute.key == "ci.cost_usd"
+            && attribute
+                .value
+                .as_ref()
+                .and_then(|value| value.value.as_ref())
+                == Some(&AttributeValue::DoubleValue(0.25))
+    }));
+    let ambiguous_suite = check_suites
+        .iter()
+        .find(|span| !has_attribute(span, "ci.pull_request.number"))
+        .expect("the two-PR suite is exported");
+    assert!(!has_attribute(
+        ambiguous_suite,
+        "github.pull_request.number"
+    ));
+    let review_span = spans
+        .iter()
+        .find(|span| string_attribute(span, "ci.vendor.trigger") == Some("pull_request_review"))
+        .expect("the review span is exported");
+    assert_attribute(review_span, "ci.vendor", "example-review-bot");
+    assert_i64_attribute(review_span, "ci.pull_request.number", 42);
+
+    let logs = cost_logs(&captured);
+    assert_eq!(logs.len(), 3, "one cost log per matched delivery");
+    for log in &logs {
+        assert_eq!(log_string(log, "ci.source"), Some("vendor"));
+        assert_eq!(
+            log_string(log, "ci.price_table.version"),
+            Some(version.as_str())
+        );
+        assert_eq!(
+            log_string(log, "github.repository"),
+            Some(WEBHOOK_REPOSITORY)
+        );
+        assert_eq!(
+            log_string(log, "vcs.ref.head.revision"),
+            Some(VENDOR_HEAD_SHA)
+        );
+        assert!(
+            log.trace_id.iter().all(|byte| *byte == 0),
+            "vendor cost logs are parentless"
+        );
+    }
+    let review_log = logs
+        .iter()
+        .find(|log| log_string(log, "ci.vendor.trigger") == Some("pull_request_review"))
+        .expect("the review is logged");
+    assert_eq!(
+        log_string(review_log, "ci.vendor"),
+        Some("example-review-bot")
+    );
+    assert_eq!(
+        log_attribute(review_log, "ci.cost_usd"),
+        Some(&AttributeValue::DoubleValue(0.5))
+    );
+    assert_eq!(
+        log_attribute(review_log, "github.pull_request.number"),
+        Some(&AttributeValue::IntValue(42))
+    );
+    let unattributed_logs = logs
+        .iter()
+        .filter(|log| log_attribute(log, "github.pull_request.number").is_none())
+        .count();
+    assert_eq!(unattributed_logs, 1, "only the two-PR suite has no PR");
+
+    assert_eq!(
+        vendor_run_rows(&fixture.pool).await,
+        [
+            (
+                7,
+                "example-visual-tests".to_owned(),
+                "check_suite".to_owned(),
+                0.25
+            ),
+            (
+                42,
+                "example-review-bot".to_owned(),
+                "pull_request_review".to_owned(),
+                0.5
+            ),
+        ],
+        "attributed runs are stored once; the two-PR suite is not"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vendor_deliveries_without_a_costs_table_record_nothing() {
+    let fixture = WebhookTraceFixture::new().await;
+
+    deliver(
+        &fixture,
+        &check_suite_body("completed", "visual-tests", &[7]),
+        "check_suite",
+        "550e8400-e29b-41d4-a716-446655440511",
+    )
+    .await;
+    deliver(
+        &fixture,
+        &review_body("submitted", "review-bot[bot]", 42),
+        "pull_request_review",
+        "550e8400-e29b-41d4-a716-446655440512",
+    )
+    .await;
+
+    let captured = fixture.force_flush();
+    assert!(vendor_spans(&captured).is_empty());
+    assert!(!captured.has_log_body("ci cost recorded"));
+    assert!(!captured.has_trace_attribute_key("ci.vendor"));
+    assert!(vendor_run_rows(&fixture.pool).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vendor_run_storage_failure_keeps_the_response_and_the_cost_log() {
+    let costs = CostsConfig::from_json(VENDOR_COSTS).expect("costs are valid");
+    let fixture = WebhookTraceFixture::new_with_costs(costs).await;
+    sqlx::query("DROP TABLE ci_vendor_runs")
+        .execute(&fixture.pool)
+        .await
+        .expect("vendor-run table drops");
+
+    deliver(
+        &fixture,
+        &review_body("submitted", "review-bot[bot]", 42),
+        "pull_request_review",
+        "550e8400-e29b-41d4-a716-446655440521",
+    )
+    .await;
+
+    let captured = fixture.force_flush();
+    assert_eq!(vendor_spans(&captured).len(), 1);
+    assert_eq!(cost_logs(&captured).len(), 1);
+    assert!(captured.has_log_body("vendor-run persistence failed"));
+    let exposition = fixture.metrics_text().await;
+    assert_metric_line(
+        &exposition,
+        "github_webhook_processing_failures_total{repository=\"owner/webhook-private-repository\",stage=\"vendor_run\"} 1",
+    );
 }

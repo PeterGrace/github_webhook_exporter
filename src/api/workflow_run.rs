@@ -115,9 +115,19 @@ pub(super) fn project_context(body: &[u8]) -> Option<WorkflowRunContext> {
 
 /// Returns the run's pull request when its `pull_requests` name exactly one distinct number.
 fn unique_pull_request(pull_requests: &[PullRequestProjection]) -> Option<PullRequestNumber> {
-    let mut numbers = pull_requests
-        .iter()
-        .filter_map(|pull_request| pull_request.number)
+    unique_pull_request_number(
+        pull_requests
+            .iter()
+            .filter_map(|pull_request| pull_request.number),
+    )
+}
+
+/// Returns the pull request when `numbers` name exactly one distinct positive number.
+pub(super) fn unique_pull_request_number(
+    numbers: impl IntoIterator<Item = i64>,
+) -> Option<PullRequestNumber> {
+    let mut numbers = numbers
+        .into_iter()
         .filter_map(|number| PullRequestNumber::new(number).ok());
     let first = numbers.next()?;
     numbers.all(|number| number == first).then_some(first)

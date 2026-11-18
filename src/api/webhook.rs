@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use axum::{
     body::Bytes,
@@ -15,7 +15,10 @@ use time::OffsetDateTime;
 use tracing::{debug, error, info, warn, Instrument};
 
 use crate::{
-    api::{merge_group::EventProjection, pull_request::QueueProcessor, workflow_job, workflow_run},
+    api::{
+        merge_group::EventProjection, pull_request::QueueProcessor, vendor_run, workflow_job,
+        workflow_run,
+    },
     app::{AppState, RequestRepositoryContext},
     domain::{delivery::DeliveryId, repository::RepositoryId},
     error::AppError,
@@ -35,6 +38,7 @@ use crate::{
         trace::{
             self, CommitSha, Operation, OperationOutcome, QueueEntity, CI_SOURCE_GITHUB_ACTIONS,
         },
+        vendor::{log_vendor_run_cost, VendorRun},
         workflow::{
             DisplayName, RequiredChecks, WorkflowFile, WorkflowJobTrace, WorkflowRunContext,
         },
@@ -258,6 +262,20 @@ async fn webhook_handler(
                         }
                     }
                 }
+                if let (Some(trigger), Some(costs)) = (
+                    vendor_run::vendor_trigger(event_type, action),
+                    state.costs(),
+                ) {
+                    if let Some(run) = vendor_run::project_vendor_run(
+                        request.body.as_ref(),
+                        trigger,
+                        costs,
+                        &request.repository_name,
+                        SystemTime::from(received_at),
+                    ) {
+                        record_vendor_run(&state, repository_id, &run).await;
+                    }
+                }
                 if let Some(transition) =
                     event_projection.merge_group_transition(event_type, action)
                 {
@@ -370,6 +388,37 @@ fn log_job_cost(job: &WorkflowJobTrace) {
         cicd.pipeline.task.run.id = job.job_id().get(),
         "ci cost recorded"
     );
+}
+
+/// Logs, exports and stores one priced vendor run.
+///
+/// Vendor cost is enrichment, so a storage failure degrades to a bounded failure metric and
+/// leaves the authenticated `204 No Content` response untouched. The log and span are written
+/// first, so the cost still reaches telemetry when storage fails.
+async fn record_vendor_run(state: &AppState, repository_id: RepositoryId, run: &VendorRun) {
+    log_vendor_run_cost(run);
+    state.workflow_trace_emitter().emit_vendor_run(run);
+    if state
+        .vendor_run_store()
+        .record(repository_id, run)
+        .await
+        .is_err()
+    {
+        state
+            .metrics()
+            .record_failure(Some(&run.repository_name), FailureStage::VendorRun);
+        let error = AppError::webhook_unavailable();
+        let error_correlation_id = error
+            .correlation_id()
+            .expect("webhook dependency failures carry a correlation ID");
+        error!(
+            parent: None,
+            stage = FailureStage::VendorRun.as_str(),
+            result = WebhookResult::Unavailable.as_str(),
+            %error_correlation_id,
+            "vendor-run persistence failed"
+        );
+    }
 }
 
 /// Emits the pipeline-run summary trace for one terminal `workflow_run` delivery.
