@@ -5,6 +5,7 @@ mod pull_request_commit_store;
 mod repository_store;
 mod required_check_store;
 mod run_cost_store;
+mod vendor_run_store;
 mod workflow_job_link_store;
 mod workflow_run_store;
 
@@ -30,6 +31,7 @@ use sqlx::{
     SqlitePool,
 };
 use thiserror::Error;
+pub(crate) use vendor_run_store::{VendorRunStore, VendorRunStoreError};
 pub(crate) use workflow_job_link_store::{
     JobCostTotals, WorkflowJobLinkStore, WorkflowJobLinkStoreError,
 };

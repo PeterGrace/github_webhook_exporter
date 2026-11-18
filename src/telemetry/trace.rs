@@ -94,11 +94,15 @@ const CI_COST_TOTAL_USD_KEY: &str = "ci.cost.total_usd";
 const CI_USAGE_ENTRIES_KEY: &str = "ci.usage.entries";
 const CICD_PIPELINE_RESULT_KEY: &str = "cicd.pipeline.result";
 const GITHUB_PR_RESOLUTION_KEY: &str = "github.pr_resolution";
+const CI_VENDOR_KEY: &str = "ci.vendor";
+const CI_VENDOR_TRIGGER_KEY: &str = "ci.vendor.trigger";
 
 /// The `ci.source` of GitHub Actions runner minutes.
 pub(crate) const CI_SOURCE_GITHUB_ACTIONS: &str = "github_actions";
 /// The `ci.source` of Daytona sandbox usage reported from inside a job.
 pub(crate) const CI_SOURCE_DAYTONA: &str = "daytona";
+/// The `ci.source` of a third-party vendor that bills per run.
+pub(crate) const CI_SOURCE_VENDOR: &str = "vendor";
 
 pub(super) const GITHUB_ACTIONS_PIPELINE_OPERATION: &str = "github.actions.pipeline";
 pub(super) const GITHUB_ACTIONS_PIPELINE_TASK_OPERATION: &str = "github.actions.pipeline.task";
@@ -106,6 +110,7 @@ pub(super) const GITHUB_ACTIONS_JOB_OPERATION: &str = "github.actions.job";
 pub(super) const GITHUB_ACTIONS_STEP_OPERATION: &str = "github.actions.step";
 pub(super) const CI_USAGE_OPERATION: &str = "ci.usage";
 pub(super) const CI_RUN_COST_OPERATION: &str = "ci.run.cost";
+pub(super) const CI_VENDOR_RUN_OPERATION: &str = "ci.vendor.run";
 
 fn string_key_value(key: &'static str, value: impl Into<String>) -> KeyValue {
     KeyValue::new(key, value.into())
@@ -300,6 +305,17 @@ pub(crate) fn pipeline_result_attribute(conclusion: WorkflowConclusion) -> KeyVa
 /// Returns the attribute naming which rule attributed a run to its pull request.
 pub(crate) fn pull_request_resolution_attribute(resolution: &'static str) -> KeyValue {
     string_key_value(GITHUB_PR_RESOLUTION_KEY, resolution)
+}
+
+/// Returns the `ci.source`, `ci.cost_usd`, `ci.vendor` and `ci.vendor.trigger` attributes of one
+/// vendor run.
+pub(crate) fn vendor_run_attributes(vendor: &str, trigger: &str, cost_usd: f64) -> [KeyValue; 4] {
+    [
+        string_key_value(CI_SOURCE_KEY, CI_SOURCE_VENDOR),
+        KeyValue::new(CI_COST_USD_KEY, cost_usd),
+        string_key_value(CI_VENDOR_KEY, vendor),
+        string_key_value(CI_VENDOR_TRIGGER_KEY, trigger),
+    ]
 }
 
 /// Returns the price-table version attribute.
@@ -715,6 +731,10 @@ pub(crate) enum DatabaseOperation {
     PullRequestCommitGet,
     /// Pruning pull-request commits.
     PullRequestCommitPrune,
+    /// Recording one priced vendor run.
+    VendorRunRecord,
+    /// Pruning stored vendor runs.
+    VendorRunPrune,
 }
 
 /// Creates a bounded tracing span for a high-level operation.
@@ -1142,6 +1162,8 @@ impl DatabaseOperation {
             Self::PullRequestCommitRecord => "pull_request_commit.record",
             Self::PullRequestCommitGet => "pull_request_commit.get",
             Self::PullRequestCommitPrune => "pull_request_commit.prune",
+            Self::VendorRunRecord => "vendor_run.record",
+            Self::VendorRunPrune => "vendor_run.prune",
         }
     }
 }
@@ -1410,6 +1432,8 @@ mod tests {
                 DatabaseOperation::PullRequestCommitPrune,
                 "pull_request_commit.prune",
             ),
+            (DatabaseOperation::VendorRunRecord, "vendor_run.record"),
+            (DatabaseOperation::VendorRunPrune, "vendor_run.prune"),
         ];
         for (operation, expected) in database_operations {
             assert_eq!(operation.as_str(), expected);

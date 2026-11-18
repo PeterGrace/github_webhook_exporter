@@ -15,6 +15,7 @@ mod queue;
 pub(crate) mod run_cost;
 pub(crate) mod trace;
 pub(crate) mod usage;
+pub(crate) mod vendor;
 pub(crate) mod workflow;
 mod workflow_error;
 

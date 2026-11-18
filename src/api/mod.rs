@@ -7,6 +7,7 @@ pub(crate) use ci_usage::MAX_USAGE_BODY_BYTES;
 mod merge_group;
 mod pull_request;
 mod repositories;
+mod vendor_run;
 mod webhook;
 mod workflow_job;
 mod workflow_run;

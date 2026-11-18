@@ -241,6 +241,44 @@ It carries the same pipeline trace ID and no span ID, along with the same cost, 
 Accepted entries are stored per repository, run and attempt for run totals, and pruned on the
 processed-delivery retention cutoff.
 
+### Vendor run spans
+
+When a [`costs`](costs.md) table lists `vendors`, each newly claimed delivery that matches one
+exports one span named `ci.vendor.run`, with `sentry.op=ci.vendor.run` and an instant timestamp at
+receipt. Two deliveries can match:
+
+| Delivery | Matched by | `ci.vendor.trigger` |
+| --- | --- | --- |
+| `check_suite` with action `completed` | `check_suite.app.slug` against `match.check_suite_app` | `check_suite` |
+| `pull_request_review` with action `submitted` | `review.user.login` against `match.review_login` | `pull_request_review` |
+
+Other actions, unmatched slugs and logins, and deployments without a `costs` table export nothing.
+A redelivered delivery UUID is stopped by the durable delivery claim, so each run counts once.
+
+Vendor runs have no workflow run, so the span is a parentless root in its own trace. It carries:
+
+- `ci.source=vendor`, `ci.vendor` (the configured vendor name), `ci.vendor.trigger`,
+  `ci.cost_usd` (the vendor's `usd_per_run`) and `ci.price_table.version`;
+- `github.repository.name`, `vcs.repository.url.full`, `vcs.repository.name`, and
+  `vcs.ref.head.revision` (`check_suite.head_sha` or `pull_request.head.sha`, when valid);
+- `github.pull_request.number` and the groupable `ci.pull_request.number`, when the run is
+  attributed to exactly one pull request. A review names its pull request. A check suite is
+  attributed only when `check_suite.pull_requests` names exactly one distinct pull request; a
+  suite on a fork names none, and a suite on a shared head can name several, so both export the
+  span without either attribute.
+
+Each matched run also writes one `ci cost recorded` info log, whether or not trace export is
+enabled. It has no trace context, and carries `ci.source`, `ci.vendor`, `ci.vendor.trigger`,
+`ci.cost_usd`, `ci.price_table.version`, `github.pull_request.number` (when attributed),
+`github.repository` and `vcs.ref.head.revision` (when valid).
+
+Runs attributed to a pull request are stored per repository and pull request, and pruned on the
+processed-delivery retention cutoff. An unattributed run is exported and logged but not stored.
+A storage failure keeps the authenticated `204 No Content` response, increments
+`github_webhook_processing_failures_total{stage="vendor_run"}`, and writes one
+`vendor-run persistence failed` error log carrying only `stage`, `result` and
+`error_correlation_id`.
+
 ### Run cost totals
 
 When a `costs` table or `ingest.oidc` is configured, each `workflow_run` delivery whose action is
@@ -388,10 +426,10 @@ out of logs with five exceptions. One is a parentless structured warning on a ne
 `too_many_steps` rejection, which may contain only `repository_name`, `delivery_id`,
 `workflow_run_id`, `workflow_run_attempt`, `workflow_job_id`, `step_count`, and `step_limit`. The
 second is the `ci cost recorded` log described above, written for priced jobs when a `costs`
-table is configured and for accepted usage entries, and carrying only the listed fields, so cost
-can be charted from the logs dataset. The other three are the `ci run cost finalized` log and the
-`ci run unattributed` and `ci cost after finalize` warnings, each carrying only the fields listed
-under [Run cost totals](#run-cost-totals). The `ci usage post rejected` warning carries only its
+table is configured, for accepted usage entries and for matched vendor runs, and carrying only the
+listed fields, so cost can be charted from the logs dataset. The other three are the `ci run cost
+finalized` log and the `ci run unattributed` and `ci cost after finalize` warnings, each carrying
+only the fields listed under [Run cost totals](#run-cost-totals). The `ci usage post rejected` warning carries only its
 `reason` and, after token verification, `github.repository`; the `ci usage post failed` error
 carries only `outcome`, `error_id` and `github.repository`. Operators can query
 `GET /repos/{owner}/{repo}/actions/jobs/{job_id}` with the canonical repository name and

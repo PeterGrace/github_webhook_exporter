@@ -31,7 +31,7 @@ use crate::{
     },
     storage::{
         CiUsageStore, DeliveryStore, MergeQueueStore, PullRequestCommitStore, RepositoryStore,
-        RequiredCheckStore, RunCostStore, WorkflowJobLinkStore, WorkflowRunStore,
+        RequiredCheckStore, RunCostStore, VendorRunStore, WorkflowJobLinkStore, WorkflowRunStore,
     },
     telemetry::{
         trace::{self, Operation},
@@ -74,6 +74,7 @@ pub struct AppState {
     workflow_job_max_steps: usize,
     costs: Option<Arc<CostsConfig>>,
     ci_usage_store: CiUsageStore,
+    vendor_run_store: VendorRunStore,
     oidc_verifier: Option<Arc<OidcVerifier>>,
     run_cost_store: RunCostStore,
     pull_request_commit_store: PullRequestCommitStore,
@@ -101,6 +102,7 @@ impl AppState {
         let ci_usage_store = CiUsageStore::new(database_pool.clone());
         let run_cost_store = RunCostStore::new(database_pool.clone());
         let pull_request_commit_store = PullRequestCommitStore::new(database_pool.clone());
+        let vendor_run_store = VendorRunStore::new(database_pool.clone());
         let required_check_store = RequiredCheckStore::new(
             database_pool.clone(),
             Duration::from_secs(DEFAULT_REQUIRED_CHECK_TTL_SECONDS),
@@ -121,6 +123,7 @@ impl AppState {
             workflow_job_max_steps,
             costs: None,
             ci_usage_store,
+            vendor_run_store,
             oidc_verifier: None,
             run_cost_store,
             pull_request_commit_store,
@@ -323,6 +326,11 @@ impl AppState {
     /// Returns whether any cost input is configured, so completed runs are totalled.
     pub(crate) fn run_costs_enabled(&self) -> bool {
         self.costs.is_some() || self.oidc_verifier.is_some()
+    }
+
+    /// Returns durable priced vendor-run persistence.
+    pub(crate) fn vendor_run_store(&self) -> &VendorRunStore {
+        &self.vendor_run_store
     }
 
     /// Returns the OIDC verifier, when `ingest.oidc` is configured.
