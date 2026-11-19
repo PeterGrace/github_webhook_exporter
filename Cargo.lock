@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "github_webhook_exporter"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "aes",
  "aes-gcm",
