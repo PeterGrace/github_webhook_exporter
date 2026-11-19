@@ -854,6 +854,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_rule_against_every_outcome_and_the_first_applying_rule_wins() {
+        use PullRequestFinalizedBy::{ClosedGrace, MaxAge, PostMergeRun, Timeout};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Outcome {
+            Open,
+            MergedWithoutPostMergeRun,
+            MergedWithPostMergeRun,
+            Closed,
+        }
+        // expected rule per elapsed cutoff, in [post_merge_run, timeout, closed_grace, max_age]
+        // order, then with every cutoff elapsed at once
+        let grid = [
+            (Outcome::Open, [None, None, None, Some(MaxAge)], MaxAge),
+            (
+                Outcome::MergedWithoutPostMergeRun,
+                [None, Some(Timeout), None, Some(MaxAge)],
+                Timeout,
+            ),
+            (
+                Outcome::MergedWithPostMergeRun,
+                [Some(PostMergeRun), None, None, Some(MaxAge)],
+                PostMergeRun,
+            ),
+            (
+                Outcome::Closed,
+                [None, None, Some(ClosedGrace), Some(MaxAge)],
+                ClosedGrace,
+            ),
+        ];
+
+        for (outcome, by_rule, all_elapsed) in grid {
+            let fixture = fixture().await;
+            let created_at = datetime!(2030-01-01 00:00 UTC);
+            match outcome {
+                Outcome::Open => {
+                    fixture
+                        .record(created_at, PullRequestCostTransition::None)
+                        .await;
+                }
+                Outcome::MergedWithoutPostMergeRun => {
+                    fixture.record(created_at, closed(true)).await
+                }
+                Outcome::MergedWithPostMergeRun => {
+                    fixture.record(created_at, closed(true)).await;
+                    fixture
+                        .finalize_run(
+                            &pending(2, 1, WorkflowEvent::Push, MERGE_SHA),
+                            &[("github_actions", 0.5)],
+                        )
+                        .await;
+                }
+                Outcome::Closed => fixture.record(created_at, closed(false)).await,
+            }
+
+            for (rule, expected) in [PostMergeRun, Timeout, ClosedGrace, MaxAge]
+                .into_iter()
+                .zip(by_rule)
+            {
+                assert_eq!(
+                    fixture.due_rules(elapsed(rule)).await,
+                    expected.into_iter().collect::<Vec<_>>(),
+                    "{outcome:?} with only {rule:?} elapsed"
+                );
+            }
+            let later = OffsetDateTime::now_utc() + Duration::hours(1);
+            let everything = PullRequestCostCutoffs {
+                settled_before: later,
+                merged_before: later,
+                closed_before: later,
+                inactive_before: later,
+            };
+            assert_eq!(
+                fixture.due_rules(everything).await,
+                [all_elapsed],
+                "{outcome:?} with every cutoff elapsed"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_pending_run_holds_a_closed_pull_request_but_not_one_at_max_age() {
         let fixture = fixture().await;
         fixture

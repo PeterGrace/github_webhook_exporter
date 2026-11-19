@@ -356,7 +356,7 @@ impl RunCostStore {
     ) -> Result<u64, RunCostStoreError> {
         trace::instrument_database_operation(
             DatabaseOperation::RunCostPrune,
-            self.prune_table_batch("run_cost_finalizations", "", cutoff),
+            self.prune_table_batch("run_cost_finalizations", cutoff),
         )
         .await
     }
@@ -372,31 +372,56 @@ impl RunCostStore {
         &self,
         cutoff: OffsetDateTime,
     ) -> Result<u64, RunCostStoreError> {
-        trace::instrument_database_operation(
-            DatabaseOperation::PullRequestRunCostPrune,
-            self.prune_table_batch(
-                "pull_request_run_costs",
-                "AND NOT EXISTS (\
-                     SELECT 1 FROM pull_request_costs AS state \
-                     WHERE state.repository_id = pull_request_run_costs.repository_id \
-                     AND state.pull_request_number = pull_request_run_costs.pull_request_number \
-                     AND state.finalized_at IS NULL)",
-                cutoff,
-            ),
-        )
+        // the batch query is deterministic, so inside one write transaction both deletes select
+        // the same totals
+        const BATCH: &str = "SELECT repository_id, pull_request_number, workflow_run_id, \
+             workflow_run_attempt FROM pull_request_run_costs AS run \
+             WHERE run.updated_at < ?1 AND NOT EXISTS (\
+                 SELECT 1 FROM pull_request_costs AS state \
+                 WHERE state.repository_id = run.repository_id \
+                 AND state.pull_request_number = run.pull_request_number \
+                 AND state.finalized_at IS NULL) \
+             ORDER BY run.updated_at, run.rowid LIMIT ?2";
+        trace::instrument_database_operation(DatabaseOperation::PullRequestRunCostPrune, async {
+            let cutoff = format_timestamp(cutoff)?;
+            let mut transaction = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(map_sqlx_error)?;
+            sqlx::query(&format!(
+                "DELETE FROM pull_request_run_cost_sources WHERE (repository_id, \
+                 pull_request_number, workflow_run_id, workflow_run_attempt) IN ({BATCH})"
+            ))
+            .bind(&cutoff)
+            .bind(RUN_COST_PRUNE_BATCH_SIZE)
+            .execute(&mut *transaction)
+            .await
+            .map_err(map_sqlx_error)?;
+            let result = sqlx::query(&format!(
+                "DELETE FROM pull_request_run_costs WHERE (repository_id, pull_request_number, \
+                 workflow_run_id, workflow_run_attempt) IN ({BATCH})"
+            ))
+            .bind(&cutoff)
+            .bind(RUN_COST_PRUNE_BATCH_SIZE)
+            .execute(&mut *transaction)
+            .await
+            .map_err(map_sqlx_error)?;
+            transaction.commit().await.map_err(map_sqlx_error)?;
+            Ok(result.rows_affected())
+        })
         .await
     }
 
     async fn prune_table_batch(
         &self,
         table: &'static str,
-        keep: &'static str,
         cutoff: OffsetDateTime,
     ) -> Result<u64, RunCostStoreError> {
-        // `table` and `keep` are literals above, never caller input.
+        // `table` is a literal above, never caller input.
         let result = sqlx::query(&format!(
             "DELETE FROM {table} WHERE rowid IN (\
-                 SELECT rowid FROM {table} WHERE updated_at < ? {keep} \
+                 SELECT rowid FROM {table} WHERE updated_at < ? \
                  ORDER BY updated_at, rowid LIMIT ?\
              )"
         ))
@@ -480,6 +505,17 @@ async fn finalize_in(
     .bind(finalized.pull_request.map(PullRequestNumber::get))
     .execute(&mut *connection)
     .await?;
+    // the split has no foreign key to its total, so it is cleared for every pull request here and
+    // rewritten below for the one this attempt is now stored under
+    sqlx::query(
+        "DELETE FROM pull_request_run_cost_sources \
+             WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ?",
+    )
+    .bind(repository_id.get())
+    .bind(run_id.get())
+    .bind(run_attempt.get())
+    .execute(&mut *connection)
+    .await?;
     let Some(pull_request) = finalized.pull_request else {
         return Ok(Some(false));
     };
@@ -501,17 +537,6 @@ async fn finalize_in(
     .bind(finalized.total_usd)
     .bind(finalized.price_table_version.as_deref())
     .bind(finalized.head_sha.as_ref().map(CommitSha::as_str))
-    .execute(&mut *connection)
-    .await?;
-    sqlx::query(
-        "DELETE FROM pull_request_run_cost_sources \
-             WHERE repository_id = ? AND pull_request_number = ? AND workflow_run_id = ? \
-             AND workflow_run_attempt = ?",
-    )
-    .bind(repository_id.get())
-    .bind(pull_request.get())
-    .bind(run_id.get())
-    .bind(run_attempt.get())
     .execute(&mut *connection)
     .await?;
     for (source, cost_usd) in &finalized.cost_by_source {
@@ -1097,6 +1122,83 @@ mod tests {
             .expect("sources count");
         assert_eq!(sources, 0, "the per-source split goes with its total");
         assert_eq!(store.prune_batch(cutoff).await.expect("prune succeeds"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_run_reports_whether_its_pull_request_was_already_final() {
+        let (_directory, pool, store, repository_id) = store_with_repository().await;
+        let first = pending(1);
+        let second = pending(2);
+        for pending in [&first, &second] {
+            store
+                .schedule(repository_id, pending, datetime!(2026-11-18 10:05:00 UTC))
+                .await
+                .expect("schedule succeeds");
+        }
+        let finalize = |pending: PendingRunCost| {
+            let store = store.clone();
+            async move {
+                store
+                    .finalize(
+                        repository_id,
+                        pending.run_id,
+                        pending.run_attempt,
+                        |_, _| (finalized(&pending, 0.5), ()),
+                    )
+                    .await
+                    .expect("finalize succeeds")
+                    .expect("the attempt was pending")
+                    .pull_request_was_final
+            }
+        };
+
+        assert!(!finalize(first).await);
+        sqlx::query(
+            "UPDATE pull_request_costs SET finalized_at = '2026-11-18T11:00:00.000Z', \
+             finalized_by = 'closed_grace', partial = 0, total_usd = 0.5",
+        )
+        .execute(&pool)
+        .await
+        .expect("pull request finalizes");
+        assert!(finalize(second).await);
+    }
+
+    #[tokio::test]
+    async fn reattributing_an_attempt_moves_its_source_split() {
+        let (_directory, pool, store, repository_id) = store_with_repository().await;
+        let pending = pending(1);
+        store
+            .schedule(repository_id, &pending, datetime!(2026-11-18 10:05:00 UTC))
+            .await
+            .expect("schedule succeeds");
+        store
+            .finalize_pending(repository_id, &pending, finalized(&pending, 0.5))
+            .await
+            .expect("finalize succeeds");
+        sqlx::query("UPDATE run_cost_finalizations SET finalized_at = NULL, total_usd = NULL")
+            .execute(&pool)
+            .await
+            .expect("attempt becomes pending again");
+        let mut moved = finalized(&pending, 0.5);
+        moved.pull_request = Some(PullRequestNumber::new(43).expect("PR is positive"));
+
+        store
+            .finalize_pending(repository_id, &pending, moved)
+            .await
+            .expect("finalize succeeds");
+
+        let owners: Vec<i64> = sqlx::query_scalar(
+            "SELECT pull_request_number FROM pull_request_run_cost_sources \
+             UNION ALL SELECT pull_request_number FROM pull_request_run_costs",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("rows load");
+        assert_eq!(
+            owners,
+            [43, 43],
+            "the old pull request keeps neither total nor split"
+        );
     }
 
     #[tokio::test]

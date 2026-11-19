@@ -90,13 +90,14 @@ bounded task identity attached to an enabled application-generated Sentry workfl
 Canonical repository names additionally appear on repository-scoped Prometheus series. None of
 these identifiers appears in local or OTLP application logs, except the bounded
 workflow-rejection warning, the `ci cost recorded` log, the `ci run cost finalized` and
-`ci pr cost finalized` logs, the `ci run unattributed` and `ci cost after finalize` warnings, and
-the `ci usage post rejected`
+`ci pr cost finalized` logs, the `ci run unattributed`, `ci cost after finalize` and
+`ci pr cost after finalize` warnings, and the `ci usage post rejected`
 warning and `ci usage post failed` error, all documented in
 [Traces](traces.md#completed-workflow-traces). `ci cost recorded` logs for jobs and usage
 entries, and the `ci run cost finalized`, `ci run unattributed` and `ci cost after finalize` logs,
 carry their workflow run's derived pipeline trace ID, so they appear in that run's trace.
 Vendor-run cost logs have no workflow run and carry no trace context; see
-[Vendor run spans](traces.md#vendor-run-spans). Neither do `ci pr cost finalized` logs or
-`ci cost after finalize` warnings about a pull request's record; see
+[Vendor run spans](traces.md#vendor-run-spans). Neither do `ci pr cost finalized` logs, or
+`ci pr cost after finalize` warnings about a vendor run; the same warning about a late run total
+carries that run's pipeline trace ID. See
 [Pull request cost records](traces.md#pull-request-cost-records).

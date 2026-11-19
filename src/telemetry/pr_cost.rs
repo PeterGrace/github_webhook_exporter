@@ -13,6 +13,7 @@ use crate::{
     domain::merge_queue::PullRequestNumber,
     security::CanonicalRepositoryName,
     telemetry::{
+        pipeline::run_trace_context,
         trace::{
             attributed_pull_request_attribute, pull_request_cost_attributes,
             pull_request_number_attribute, repository_name_attribute, run_cost_source_attribute,
@@ -219,12 +220,25 @@ pub(crate) fn log_pull_request_cost_finalized(total: &PullRequestCostTotal) {
 }
 
 /// Warns that a cost reached a pull request whose record was already final.
+///
+/// A late run total is logged in its run's derived pipeline trace, like the run's other cost logs;
+/// a vendor run has no workflow run, so its warning is parentless. The message differs from the
+/// run-level `ci cost after finalize`, which means late to a run's total rather than to a pull
+/// request's record.
 pub(crate) fn warn_pull_request_cost_after_finalize(
     repository_name: &CanonicalRepositoryName,
     pull_request: PullRequestNumber,
     late: LatePullRequestCost<'_>,
 ) {
-    let _parentless_context = Context::new().attach();
+    let _trace_context = match late {
+        LatePullRequestCost::Run {
+            run_id,
+            run_attempt,
+            ..
+        } => run_trace_context(repository_name, run_id, run_attempt),
+        LatePullRequestCost::Vendor { .. } => Context::new(),
+    }
+    .attach();
     let (cost_usd, run_id, run_attempt, vendor) = match late {
         LatePullRequestCost::Run {
             run_id,
@@ -241,7 +255,7 @@ pub(crate) fn warn_pull_request_cost_after_finalize(
         github.repository = repository_name.as_str(),
         cicd.pipeline.run.id = run_id,
         github.workflow.run.attempt = run_attempt,
-        "ci cost after finalize"
+        "ci pr cost after finalize"
     );
 }
 

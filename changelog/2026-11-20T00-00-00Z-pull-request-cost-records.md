@@ -30,7 +30,8 @@ Date: 2026-11-20T00:00:00Z
   request's record can split its cost by source after the run's job links and usage entries are
   pruned.
 - A run total or vendor run that arrives after its pull request's record is final is stored but
-  not counted, and logs a `ci cost after finalize` warning naming the pull request.
+  not counted, and logs a `ci pr cost after finalize` warning naming the pull request, in the
+  run's pipeline trace for a late run total.
 - `ci.pr.partial` is `true` for a pull request created before run totals began, or whose creation
   time is unknown. When run totals began is written once.
 - Vendor runs and per-pull-request run totals now use the `GHE_PR_COST_RETENTION_DAYS` cutoff

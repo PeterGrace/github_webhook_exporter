@@ -11,23 +11,21 @@ UPDATE pull_request_run_costs SET head_sha = (
 );
 
 -- Each finalized run total split by cost source, so a pull request's record can carry one
--- `ci.cost.<source>_usd` per source after the run's job links and usage entries are pruned.
+-- `ci.cost.<source>_usd` per source after the run's job links and usage entries are pruned. Like
+-- every child table it references only `repositories(id)`, so rebuilding
+-- `pull_request_run_costs` can never cascade here; the store deletes a split with its total.
 CREATE TABLE pull_request_run_cost_sources (
-    repository_id INTEGER NOT NULL,
-    pull_request_number INTEGER NOT NULL,
-    workflow_run_id INTEGER NOT NULL,
-    workflow_run_attempt INTEGER NOT NULL,
+    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    pull_request_number INTEGER NOT NULL CHECK (pull_request_number > 0),
+    workflow_run_id INTEGER NOT NULL CHECK (workflow_run_id > 0),
+    workflow_run_attempt INTEGER NOT NULL CHECK (workflow_run_attempt > 0),
     source TEXT NOT NULL CHECK (
         length(source) BETWEEN 1 AND 32 AND source NOT GLOB '*[^a-z0-9_-]*'
     ),
     cost_usd REAL NOT NULL CHECK (cost_usd >= 0),
     PRIMARY KEY (
         repository_id, pull_request_number, workflow_run_id, workflow_run_attempt, source
-    ),
-    FOREIGN KEY (repository_id, pull_request_number, workflow_run_id, workflow_run_attempt)
-        REFERENCES pull_request_run_costs (
-            repository_id, pull_request_number, workflow_run_id, workflow_run_attempt
-        ) ON DELETE CASCADE
+    )
 );
 
 -- Run totals finalized before this migration are split from the job links and usage entries that
