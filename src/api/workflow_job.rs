@@ -322,6 +322,13 @@ where
     let job_id = WorkflowJobId::new(id).ok()?;
     let workflow_run_context = workflow_run_context
         .filter(|context| context.run_id() == run_id && context.run_attempt() == run_attempt);
+    // `workflow_job.workflow_name` is the run's `run-name` when the workflow sets one, so the
+    // definition's name stored from the run's own delivery wins
+    let workflow_name = workflow_run_context
+        .as_ref()
+        .and_then(WorkflowRunContext::workflow_name)
+        .cloned()
+        .or_else(|| sanitize_display_name(workflow_name.as_ref()));
     let timing = select_job_timing(
         parse_timestamp(started_at.as_ref()),
         parse_timestamp(completed_at.as_ref()),
@@ -371,7 +378,7 @@ where
         WorkflowJobTrace::new(WorkflowJobTraceParts {
             repository_name: repository_name.clone(),
             delivery_id: *delivery_id,
-            workflow_name: sanitize_display_name(workflow_name.as_ref()),
+            workflow_name,
             run_id,
             run_attempt,
             job_id,
@@ -874,6 +881,57 @@ mod tests {
     }
 
     #[test]
+    fn the_stored_workflow_name_wins_over_a_run_name_on_the_job() {
+        let body = serde_json::to_vec(&json!({
+            "workflow_job": {
+                "id": 41,
+                "run_id": 31,
+                "run_attempt": 2,
+                "workflow_name": "PR #7 · fix the thing",
+                "completed_at": "2026-08-06T10:05:00Z",
+                "steps": []
+            }
+        }))
+        .expect("fixture serializes");
+        let context = |run_attempt| {
+            WorkflowRunContext::new(
+                WorkflowRunId::new(31).expect("run id is positive"),
+                WorkflowRunAttempt::new(run_attempt).expect("attempt is positive"),
+                WorkflowEvent::IssueComment,
+                None,
+                None,
+            )
+            .with_workflow_name(DisplayName::sanitize("Code Review"))
+        };
+        let project = |context| {
+            project_completed_job(
+                &body,
+                &repository_name(),
+                &delivery_id(),
+                datetime!(2026-08-06 10:06:00 UTC),
+                context,
+                None,
+                None,
+            )
+            .expect("valid completed job projects")
+        };
+
+        assert_eq!(
+            project(Some(context(2)))
+                .workflow_name()
+                .map(DisplayName::as_str),
+            Some("Code Review")
+        );
+        for unmatched in [None, Some(context(1))] {
+            assert_eq!(
+                project(unmatched).workflow_name().map(DisplayName::as_str),
+                Some("PR #7 · fix the thing"),
+                "without a matching context the payload name is the fallback"
+            );
+        }
+    }
+
+    #[test]
     fn completed_projection_retains_matching_workflow_run_context() {
         let body = serde_json::to_vec(&json!({
             "workflow_job": {
@@ -906,6 +964,10 @@ mod tests {
 
         let retained = trace.workflow_run_context().expect("context is retained");
         assert_eq!(retained.event(), WorkflowEvent::MergeGroup);
+        assert!(
+            trace.workflow_name().is_none(),
+            "neither the context nor the payload names the workflow"
+        );
         assert_eq!(
             retained.source_branch().map(|branch| branch.as_str()),
             Some("gh-readonly-queue/main/pr-7")

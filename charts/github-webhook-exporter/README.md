@@ -115,6 +115,9 @@ The chart never reads or copies Secret data into its ConfigMap.
 | `application.workflowJobMaxSteps` | `256` | Maximum admitted steps in a completed workflow job. |
 | `application.requiredCheckTtlSeconds` | `300` | Branch-protection cache lifetime; range `1..=86400` seconds. |
 | `application.runGraceSeconds` | `300` | Wait after `workflow_run.completed` before a run's cost is totalled, so late job and usage records still count; range `1..=3600` seconds. Used only when `costs` or `ingest.oidc` is set. |
+| `application.prCostSettleSeconds` | `1800` | Quiet period after a merged pull request's latest post-merge run before its cost record is finalized. Used only when `costs` or `ingest.oidc` is set. |
+| `application.prCostPostMergeTimeoutSeconds` | `21600` | How long a merged pull request waits for its first post-merge run before its cost record is finalized with `timeout`. |
+| `application.prCostClosedGraceSeconds` | `3600` | How long a pull request closed without merging waits before its cost record is finalized. |
 | `application.rustLog` | `info` | Rust logging filter. |
 | `githubApp.appId` | `null` | GitHub App identifier; null disables required-check lookups. |
 | `githubApp.installationId` | `null` | GitHub App installation identifier; null disables required-check lookups. |
@@ -123,6 +126,7 @@ The chart never reads or copies Secret data into its ConfigMap.
 | `ingest.oidc` | `{}` | Optional `audience` and `allowed_repositories` (1 to 256 `owner/repo` names) for GitHub Actions OIDC-authenticated usage reports, rendered as `GHE_INGEST_OIDC_JSON`. When set, `webhookIngress` also routes `/ci-cost/usage`, and the pod must reach `token.actions.githubusercontent.com` over HTTPS to fetch signing keys. Empty leaves the endpoint unregistered. |
 | `retention.deliveryDays` | `7` | Authenticated delivery-claim retention in days. |
 | `retention.mergeQueueDays` | `90` | Completed merge-queue-attempt retention in days. |
+| `retention.pullRequestCostDays` | `90` | Days without activity before a pull request's cost record is finalized with `max_age`; its cost state, run totals and vendor runs are pruned on the same clock. |
 | `retention.pruneIntervalSeconds` | `3600` | Shared retention pruning interval in seconds. |
 | `telemetry.endpoint` | `""` | Generic OTLP/HTTP endpoint; empty disables the generic endpoint. |
 | `telemetry.tracesEndpoint` | `""` | Trace-specific OTLP/HTTP endpoint; empty omits the override. |

@@ -6,6 +6,7 @@ use github_webhook_exporter::{
     config::RuntimeConfig,
     lifecycle,
     metrics::Metrics,
+    pr_costs::PullRequestCostPolicy,
     retention::RetentionConfig,
     security::{AdminAuthenticator, RepositorySecretCipher},
     storage::{self, RepositoryStore},
@@ -69,6 +70,15 @@ async fn run_service(
     .with_workflow_trace_emitter(workflow_trace_emitter)
     .with_required_check_ttl(config.required_check_ttl())
     .with_run_grace_period(config.run_grace())
+    .with_pull_request_cost_policy(
+        PullRequestCostPolicy::new(
+            config.pr_cost_settle(),
+            config.pr_cost_post_merge_timeout(),
+            config.pr_cost_closed_grace(),
+            config.pr_cost_retention(),
+        )
+        .context("failed to initialize pull-request cost finalization")?,
+    )
     .with_costs(config.costs().cloned())
     .with_ingest_oidc(config.ingest_oidc().cloned())
     .context("failed to initialize OIDC usage ingestion")?;
@@ -108,6 +118,7 @@ async fn run_service(
         config.delivery_prune_interval(),
         config.delivery_retention(),
         config.merge_queue_retention(),
+        config.pr_cost_retention(),
     )
     .context("failed to initialize retention")?;
     let listener = TcpListener::bind(configured_bind_address)

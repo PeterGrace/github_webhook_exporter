@@ -13,9 +13,10 @@ use crate::{
     storage::{
         CiUsageStore, CiUsageStoreError, DeliveryStore, DeliveryStoreError, MergeQueueStore,
         MergeQueueStoreError, PullRequestCommitStore, PullRequestCommitStoreError,
-        RequiredCheckStore, RequiredCheckStoreError, RunCostStore, RunCostStoreError,
-        VendorRunStore, VendorRunStoreError, WorkflowJobLinkStore, WorkflowJobLinkStoreError,
-        WorkflowRunStore, WorkflowRunStoreError,
+        PullRequestCostStore, PullRequestCostStoreError, RequiredCheckStore,
+        RequiredCheckStoreError, RunCostStore, RunCostStoreError, VendorRunStore,
+        VendorRunStoreError, WorkflowJobLinkStore, WorkflowJobLinkStoreError, WorkflowRunStore,
+        WorkflowRunStoreError,
     },
     telemetry::trace::{self, Operation, OperationOutcome},
 };
@@ -28,30 +29,36 @@ pub struct RetentionConfig {
     interval: Duration,
     delivery_retention: time::Duration,
     merge_queue_retention: time::Duration,
+    pull_request_cost_retention: time::Duration,
 }
 
 impl RetentionConfig {
     /// Validates a positive prune interval and retention durations representable by `time`.
     ///
+    /// # Parameters
+    ///
+    /// * `pull_request_cost_retention` - How long a pull request's cost state, run totals and
+    ///   vendor runs are kept after its last activity.
+    ///
     /// # Errors
     ///
     /// Returns [`RetentionError::InvalidInterval`] for a zero interval and
-    /// [`RetentionError::InvalidRetention`] when either retention duration is zero or cannot be
+    /// [`RetentionError::InvalidRetention`] when any retention duration is zero or cannot be
     /// represented safely for cutoff calculation.
     pub fn new(
         interval: Duration,
         delivery_retention: Duration,
         merge_queue_retention: Duration,
+        pull_request_cost_retention: Duration,
     ) -> Result<Self, RetentionError> {
         if interval.is_zero() {
             return Err(RetentionError::InvalidInterval);
         }
-        let delivery_retention = validate_retention(delivery_retention)?;
-        let merge_queue_retention = validate_retention(merge_queue_retention)?;
         Ok(Self {
             interval,
-            delivery_retention,
-            merge_queue_retention,
+            delivery_retention: validate_retention(delivery_retention)?,
+            merge_queue_retention: validate_retention(merge_queue_retention)?,
+            pull_request_cost_retention: validate_retention(pull_request_cost_retention)?,
         })
     }
 }
@@ -135,6 +142,7 @@ struct DerivedRetentionStores {
     run_cost: RunCostStore,
     pull_request_run_cost: PullRequestRunCosts,
     pull_request_commit: PullRequestCommitStore,
+    pull_request_cost: PullRequestCostStore,
     vendor_run: VendorRunStore,
 }
 
@@ -153,6 +161,7 @@ impl DerivedRetentionStores {
             run_cost: RunCostStore::new(pool.clone()),
             pull_request_run_cost: PullRequestRunCosts(RunCostStore::new(pool.clone())),
             pull_request_commit: PullRequestCommitStore::new(pool.clone()),
+            pull_request_cost: PullRequestCostStore::new(pool.clone()),
             vendor_run: VendorRunStore::new(pool.clone()),
         }
     }
@@ -190,9 +199,11 @@ async fn prune_retention_pass(
     let pass_started_at = OffsetDateTime::now_utc();
     let delivery_cutoff = pass_started_at.checked_sub(config.delivery_retention);
     let merge_queue_cutoff = pass_started_at.checked_sub(config.merge_queue_retention);
-    // Workflow correlation, required-check, usage, vendor-run and run-cost rows are keyed to
-    // deliveries, runs and pull requests, so they share the delivery cutoff rather than carrying
-    // retention settings of their own.
+    let pull_request_cost_cutoff = pass_started_at.checked_sub(config.pull_request_cost_retention);
+    // Workflow correlation, required-check, usage and run-cost rows are keyed to deliveries and
+    // runs, so they share the delivery cutoff. Pull-request cost state, and the run totals and
+    // vendor runs it is built from, can outlive a run by weeks, so they share the pull-request
+    // cost cutoff instead; rows of a still pending pull request are kept regardless.
     prune_retention_workloads(
         &[
             (delivery_store, delivery_cutoff),
@@ -201,9 +212,13 @@ async fn prune_retention_pass(
             (&derived_stores.workflow_job_link, delivery_cutoff),
             (&derived_stores.required_check, delivery_cutoff),
             (&derived_stores.ci_usage, delivery_cutoff),
-            (&derived_stores.vendor_run, delivery_cutoff),
+            (&derived_stores.vendor_run, pull_request_cost_cutoff),
             (&derived_stores.run_cost, delivery_cutoff),
-            (&derived_stores.pull_request_run_cost, delivery_cutoff),
+            (
+                &derived_stores.pull_request_run_cost,
+                pull_request_cost_cutoff,
+            ),
+            (&derived_stores.pull_request_cost, pull_request_cost_cutoff),
             (&derived_stores.pull_request_commit, delivery_cutoff),
         ],
         shutdown,
@@ -398,6 +413,19 @@ impl PrunableStore for PullRequestRunCosts {
             .prune_pull_request_batch(cutoff)
             .await
             .map_err(|_: RunCostStoreError| StorePruneFailure)
+    }
+}
+
+#[async_trait]
+impl PrunableStore for PullRequestCostStore {
+    fn workload(&self) -> &'static str {
+        "pull_request_cost"
+    }
+
+    async fn prune_batch_erased(&self, cutoff: OffsetDateTime) -> Result<u64, StorePruneFailure> {
+        PullRequestCostStore::prune_batch(self, cutoff)
+            .await
+            .map_err(|_: PullRequestCostStoreError| StorePruneFailure)
     }
 }
 
@@ -701,20 +729,25 @@ mod tests {
                 Duration::ZERO,
                 Duration::from_secs(1),
                 Duration::from_secs(1),
+                Duration::from_secs(1),
             ),
             Err(RetentionError::InvalidInterval)
         );
-        for (delivery_retention, merge_queue_retention) in [
-            (Duration::ZERO, Duration::from_secs(1)),
-            (Duration::MAX, Duration::from_secs(1)),
-            (Duration::from_secs(1), Duration::ZERO),
-            (Duration::from_secs(1), Duration::MAX),
+        let valid = Duration::from_secs(1);
+        for (delivery_retention, merge_queue_retention, pull_request_cost_retention) in [
+            (Duration::ZERO, valid, valid),
+            (Duration::MAX, valid, valid),
+            (valid, Duration::ZERO, valid),
+            (valid, Duration::MAX, valid),
+            (valid, valid, Duration::ZERO),
+            (valid, valid, Duration::MAX),
         ] {
             assert_eq!(
                 RetentionConfig::new(
-                    Duration::from_secs(1),
+                    valid,
                     delivery_retention,
                     merge_queue_retention,
+                    pull_request_cost_retention,
                 ),
                 Err(RetentionError::InvalidRetention)
             );
@@ -784,6 +817,7 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_secs(86_400),
             Duration::from_secs(90 * 86_400),
+            Duration::from_secs(90 * 86_400),
         )
         .expect("retention configuration is valid");
         let runner = tokio::spawn(run_retention(store, queue_store, config, shutdown_receiver));
@@ -824,6 +858,7 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_secs(86_400),
             Duration::from_secs(90 * 86_400),
+            Duration::from_secs(90 * 86_400),
         )
         .expect("retention configuration is valid");
         let runner = tokio::spawn(run_retention(store, queue_store, config, shutdown_receiver));
@@ -849,6 +884,7 @@ mod tests {
         let config = RetentionConfig::new(
             Duration::from_secs(60),
             Duration::from_secs(86_400),
+            Duration::from_secs(90 * 86_400),
             Duration::from_secs(90 * 86_400),
         )
         .expect("retention configuration is valid");
@@ -900,6 +936,7 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_secs(86_400),
             Duration::from_secs(90 * 86_400),
+            Duration::from_secs(90 * 86_400),
         )
         .expect("retention configuration is valid");
 
@@ -928,6 +965,7 @@ mod tests {
         let config = RetentionConfig::new(
             Duration::from_millis(10),
             Duration::from_secs(86_400),
+            Duration::from_secs(90 * 86_400),
             Duration::from_secs(90 * 86_400),
         )
         .expect("retention configuration is valid");
@@ -959,6 +997,7 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_secs(86_400),
             Duration::from_secs(90 * 86_400),
+            Duration::from_secs(90 * 86_400),
         )
         .expect("retention configuration is valid");
 
@@ -983,6 +1022,7 @@ mod tests {
         let config = RetentionConfig::new(
             Duration::from_millis(10),
             Duration::from_secs(86_400),
+            Duration::from_secs(90 * 86_400),
             Duration::from_secs(90 * 86_400),
         )
         .expect("retention configuration is valid");
@@ -1013,6 +1053,7 @@ mod tests {
         let config = RetentionConfig::new(
             Duration::from_millis(10),
             Duration::from_secs(86_400),
+            Duration::from_secs(90 * 86_400),
             Duration::from_secs(90 * 86_400),
         )
         .expect("retention configuration is valid");

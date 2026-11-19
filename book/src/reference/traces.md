@@ -172,6 +172,12 @@ it is omitted when there is no PR or more than one.
 The job root also carries `github.workflow`, the workflow name. It repeats `cicd.pipeline.name` so
 job spans and in-job usage spans group spend by the same key.
 
+The workflow name is the workflow definition's own `name`, taken from the top-level `workflow`
+of the run's `workflow_run` deliveries and stored with the run context. A workflow that sets
+`run-name` reports that run name in `workflow_run.name` and `workflow_job.workflow_name`, so those
+are used only as a fallback: for a job whose run context was not stored, or a run delivery with
+no usable `workflow.name`. Pipeline roots and `ci.run.cost` spans use the same name.
+
 ### Runner and cost attributes
 
 Every job root carries the runner and the minutes GitHub bills for the job:
@@ -272,8 +278,10 @@ enabled. It has no trace context, and carries `ci.source`, `ci.vendor`, `ci.vend
 `ci.cost_usd`, `ci.price_table.version`, `github.pull_request.number` (when attributed),
 `github.repository` and `vcs.ref.head.revision` (when valid).
 
-Runs attributed to a pull request are stored per repository and pull request, and pruned on the
-processed-delivery retention cutoff. An unattributed run is exported and logged but not stored.
+Runs attributed to a pull request are stored per repository and pull request, and count toward
+its [cost record](#pull-request-cost-records). They are pruned on the `GHE_PR_COST_RETENTION_DAYS`
+cutoff, and never while that record is still pending. An unattributed run is exported and logged
+but not stored.
 A storage failure keeps the authenticated `204 No Content` response, increments
 `github_webhook_processing_failures_total{stage="vendor_run"}`, and writes one
 `vendor-run persistence failed` error log carrying only `stage`, `result` and
@@ -377,9 +385,79 @@ stored, so they count toward the total and still log `ci cost recorded`. Their l
 `github.workflow_file` or `github.workflow.event`, since the rejected path does not read the
 run's stored context.
 
-Schedules, totals, the commit map and per-pull-request totals are pruned on the
-processed-delivery retention cutoff. A pull request's stored totals therefore cover only the runs
-finalized within that window.
+Schedules and the commit map are pruned on the processed-delivery retention cutoff. The totals
+stored against each pull request, with their per-source split, are kept for
+`GHE_PR_COST_RETENTION_DAYS` instead, and never while that pull request's
+[cost record](#pull-request-cost-records) is still pending.
+
+### Pull request cost records
+
+When a `costs` table or `ingest.oidc` is configured, each pull request gets one final cost record,
+built from every run total stored against it (each run, re-run and merge-queue attempt, plus its
+post-merge `push` runs) and every vendor run attributed to it. The record is exported once, as one
+span and one log, when the first of these rules applies:
+
+| `ci.pr.finalized_by` | Rule |
+| --- | --- |
+| `post_merge_run` | The pull request was merged, a `push` run on its merge commit has been totalled, and no run on that commit has been totalled for `GHE_PR_COST_SETTLE_SECONDS` (default `1800`). |
+| `timeout` | The pull request was merged, but no `push` run on its merge commit was totalled within `GHE_PR_COST_POST_MERGE_TIMEOUT_SECONDS` (default `21600`) of the close. |
+| `closed_grace` | The pull request was closed without merging `GHE_PR_COST_CLOSED_GRACE_SECONDS` ago (default `3600`) and not reopened. |
+| `max_age` | The pull request had no activity for `GHE_PR_COST_RETENTION_DAYS` (default `90`). |
+
+GitHub does not say when the last post-merge run on a commit has finished, so `post_merge_run`
+waits for a quiet period after the latest one instead. The first three rules also wait while any
+run attempt of the pull request, or any run on its merge commit, is still inside its own
+`GHE_RUN_GRACE_SECONDS`; `max_age` never waits, so a pull request is always finalized before
+retention prunes it. The finalizer polls every 60 seconds and its state is stored in SQLite, so a
+pull request that comes due while the process is down is finalized by the next process.
+
+The outcome comes from `pull_request` deliveries: `closed` records whether the pull request was
+merged, its `merge_commit_sha` and its `closed_at` time, and `reopened` makes it open again. Once a
+record is final, later deliveries no longer change its outcome. A `push` run counts as post-merge
+only when its head commit is the stored merge commit, which also attributes it to the pull request
+through the `commit_map` rule above.
+
+The record exports one parentless span named `ci.pr.cost`, with `sentry.op=ci.pr.cost`,
+`sentry.description` `PR #<N> cost` and an instant timestamp. It carries:
+
+- `github.repository.name`, and `github.pull_request.number` and `ci.pull_request.number`, both
+  scalars;
+- `github.pr_outcome`: `merged`, `closed`, or `open` for a pull request finalized by `max_age`
+  while still open;
+- `ci.pr.commits`, the distinct head commits of its runs and vendor runs; `ci.pr.runs`, its
+  distinct workflow runs; `ci.pr.reruns`, the attempts after each run's first; and
+  `ci.pr.vendor_runs`;
+- `ci.pr.open_hours`, from the pull request's `created_at` (or its first cost activity when no
+  `pull_request` delivery was seen) to its close, or to finalization when it never closed;
+- `ci.cost.total_usd`, the sum of its run totals and vendor runs, and one `ci.cost.<source>_usd`
+  per source: `github_actions`, each usage `source` and each vendor name, bounded to 16 keys as in
+  run totals;
+- `ci.pr.finalized_by`, the rule above;
+- `ci.pr.partial`, `true` when the pull request was created before run totals began, or its
+  creation time is unknown, so earlier runs may be missing from the record.
+
+When run totals began is recorded once: from the earliest stored run-cost schedule, totalled or
+still pending, when this exporter version first starts, or from the first run total finalized
+after that.
+
+The same record also writes one `ci pr cost finalized` info log, whether or not trace export is
+enabled, with no trace context. It carries the span's attributes except the Sentry and repository
+name keys, plus `github.repository`, with the per-source breakdown as a `key=value` list in
+`ci.cost.by_source`.
+
+A run total or vendor run that arrives after its pull request's record is final is stored but not
+counted, and logs a `ci pr cost after finalize` warning with `ci.cost_usd`,
+`github.pull_request.number` and `github.repository`, plus `cicd.pipeline.run.id` and
+`github.workflow.run.attempt` for a run or `ci.vendor` for a vendor run. A late run's warning
+carries that run's pipeline trace ID; a vendor run's has no trace context. The message differs
+from the run-level `ci cost after finalize`, which means a record arrived after its run's total
+rather than after its pull request's record. The record is never
+emitted a second time while its state is retained. A failed finalization logs a
+`ci pr cost finalization failed` warning with only an `outcome` and an opaque
+`error_correlation_id`, and is retried on the next poll.
+
+A pull request's state, run totals and vendor runs are pruned once it is final and has had no
+activity for `GHE_PR_COST_RETENTION_DAYS`. Activity after that starts a new record.
 
 ### Branch-protection required checks
 
@@ -422,14 +500,16 @@ or metrics.
 Commands, output, logs, actors, payload-provided URLs, request bodies, arbitrary payload fragments,
 secrets, signatures, authorization/other headers, unsupported actions, and raw unknown conclusions
 never enter workflow telemetry, in traces, logs, or metrics. Workflow identifiers and names stay
-out of logs with five exceptions. One is a parentless structured warning on a newly claimed
+out of logs with seven exceptions. One is a parentless structured warning on a newly claimed
 `too_many_steps` rejection, which may contain only `repository_name`, `delivery_id`,
 `workflow_run_id`, `workflow_run_attempt`, `workflow_job_id`, `step_count`, and `step_limit`. The
 second is the `ci cost recorded` log described above, written for priced jobs when a `costs`
 table is configured, for accepted usage entries and for matched vendor runs, and carrying only the
 listed fields, so cost can be charted from the logs dataset. The other three are the `ci run cost
 finalized` log and the `ci run unattributed` and `ci cost after finalize` warnings, each carrying
-only the fields listed under [Run cost totals](#run-cost-totals). The `ci usage post rejected` warning carries only its
+only the fields listed under [Run cost totals](#run-cost-totals). The last two are the
+`ci pr cost finalized` log and the `ci pr cost after finalize` warning, each carrying only the
+fields listed under [Pull request cost records](#pull-request-cost-records). The `ci usage post rejected` warning carries only its
 `reason` and, after token verification, `github.repository`; the `ci usage post failed` error
 carries only `outcome`, `error_id` and `github.repository`. Operators can query
 `GET /repos/{owner}/{repo}/actions/jobs/{job_id}` with the canonical repository name and
@@ -446,8 +526,9 @@ root trace summarizing the whole run attempt. It is a second, separate trace: it
 trace ID with the live `http.request` trace or with any `github.actions.job` trace, and it never
 changes the structure or attributes of those job traces.
 
-The root's span name and `sentry.description` are the sanitized workflow name (fixed fallback
-`workflow`), and its `sentry.op` is `github.actions.pipeline`. It carries one direct child per job
+The root's span name and `sentry.description` are the sanitized workflow name (see
+[Completed workflow traces](#completed-workflow-traces); fixed fallback `workflow`), and its
+`sentry.op` is `github.actions.pipeline`. It carries one direct child per job
 of that run attempt, named `<workflow-name> / <job-name>` with `sentry.op`
 `github.actions.pipeline.task`. Both span kinds are `INTERNAL`. Step spans stay on the job traces
 and are never repeated here.

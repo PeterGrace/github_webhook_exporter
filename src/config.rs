@@ -18,6 +18,10 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     costs::{CostsConfig, COSTS_VARIABLE},
+    pr_costs::{
+        DEFAULT_PR_COST_CLOSED_GRACE_SECONDS, DEFAULT_PR_COST_POST_MERGE_TIMEOUT_SECONDS,
+        DEFAULT_PR_COST_RETENTION_DAYS, DEFAULT_PR_COST_SETTLE_SECONDS,
+    },
     security::{AdminToken, MasterKey},
     security::{IngestOidcConfig, INGEST_OIDC_VARIABLE},
 };
@@ -252,6 +256,10 @@ pub struct RuntimeConfig {
     delivery_prune_interval: Duration,
     required_check_ttl: Duration,
     run_grace: Duration,
+    pr_cost_retention: Duration,
+    pr_cost_settle: Duration,
+    pr_cost_post_merge_timeout: Duration,
+    pr_cost_closed_grace: Duration,
     github_app: Option<GitHubAppConfig>,
     costs: Option<CostsConfig>,
     ingest_oidc: Option<IngestOidcConfig>,
@@ -329,6 +337,28 @@ impl RuntimeConfig {
     /// totalled.
     pub fn run_grace(&self) -> Duration {
         self.run_grace
+    }
+
+    /// Returns how long a pull request may go without activity before its cost record is
+    /// finalized with `max_age`; its cost state is pruned on the same clock.
+    pub fn pr_cost_retention(&self) -> Duration {
+        self.pr_cost_retention
+    }
+
+    /// Returns the quiet period after a merged pull request's latest post-merge run before its
+    /// cost record is finalized.
+    pub fn pr_cost_settle(&self) -> Duration {
+        self.pr_cost_settle
+    }
+
+    /// Returns how long a merged pull request waits for its first post-merge run.
+    pub fn pr_cost_post_merge_timeout(&self) -> Duration {
+        self.pr_cost_post_merge_timeout
+    }
+
+    /// Returns how long a pull request closed without merging waits before it is finalized.
+    pub fn pr_cost_closed_grace(&self) -> Duration {
+        self.pr_cost_closed_grace
     }
 
     /// Returns the optional GitHub App credentials that fill the required-check cache.
@@ -495,6 +525,30 @@ impl RuntimeConfig {
                 variable: "GHE_RUN_GRACE_SECONDS",
             });
         }
+        let pr_cost_retention_seconds = optional_positive_u64(
+            &mut lookup,
+            "GHE_PR_COST_RETENTION_DAYS",
+            DEFAULT_PR_COST_RETENTION_DAYS,
+        )?
+        .checked_mul(SECONDS_PER_DAY)
+        .ok_or(ConfigError::Invalid {
+            variable: "GHE_PR_COST_RETENTION_DAYS",
+        })?;
+        let pr_cost_settle_seconds = optional_positive_u64(
+            &mut lookup,
+            "GHE_PR_COST_SETTLE_SECONDS",
+            DEFAULT_PR_COST_SETTLE_SECONDS,
+        )?;
+        let pr_cost_post_merge_timeout_seconds = optional_positive_u64(
+            &mut lookup,
+            "GHE_PR_COST_POST_MERGE_TIMEOUT_SECONDS",
+            DEFAULT_PR_COST_POST_MERGE_TIMEOUT_SECONDS,
+        )?;
+        let pr_cost_closed_grace_seconds = optional_positive_u64(
+            &mut lookup,
+            "GHE_PR_COST_CLOSED_GRACE_SECONDS",
+            DEFAULT_PR_COST_CLOSED_GRACE_SECONDS,
+        )?;
         let github_app = GitHubAppConfig::from_lookup(&mut lookup)?;
         let costs = optional_string(&mut lookup, COSTS_VARIABLE)?
             .map(|json| CostsConfig::from_json(&json))
@@ -524,6 +578,10 @@ impl RuntimeConfig {
             delivery_prune_interval: Duration::from_secs(delivery_prune_interval_seconds),
             required_check_ttl: Duration::from_secs(required_check_ttl_seconds),
             run_grace: Duration::from_secs(run_grace_seconds),
+            pr_cost_retention: Duration::from_secs(pr_cost_retention_seconds),
+            pr_cost_settle: Duration::from_secs(pr_cost_settle_seconds),
+            pr_cost_post_merge_timeout: Duration::from_secs(pr_cost_post_merge_timeout_seconds),
+            pr_cost_closed_grace: Duration::from_secs(pr_cost_closed_grace_seconds),
             github_app,
             costs,
             ingest_oidc,
@@ -644,6 +702,13 @@ impl fmt::Debug for RuntimeConfig {
             .field("delivery_prune_interval", &self.delivery_prune_interval)
             .field("required_check_ttl", &self.required_check_ttl)
             .field("run_grace", &self.run_grace)
+            .field("pr_cost_retention", &self.pr_cost_retention)
+            .field("pr_cost_settle", &self.pr_cost_settle)
+            .field(
+                "pr_cost_post_merge_timeout",
+                &self.pr_cost_post_merge_timeout,
+            )
+            .field("pr_cost_closed_grace", &self.pr_cost_closed_grace)
             .field("github_app", &self.github_app)
             .field("costs_enabled", &self.costs.is_some())
             .field(
@@ -1475,6 +1540,66 @@ mod tests {
                 "unexpected acceptance of {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn pull_request_cost_durations_default_and_reject_invalid_values_by_name() {
+        let config = RuntimeConfig::from_map(required_variables()).expect("configuration is valid");
+        assert_eq!(config.pr_cost_retention(), Duration::from_secs(90 * 86_400));
+        assert_eq!(config.pr_cost_settle(), Duration::from_secs(1_800));
+        assert_eq!(
+            config.pr_cost_post_merge_timeout(),
+            Duration::from_secs(21_600)
+        );
+        assert_eq!(config.pr_cost_closed_grace(), Duration::from_secs(3_600));
+
+        let mut variables = required_variables();
+        for (variable, value) in [
+            ("GHE_PR_COST_RETENTION_DAYS", "30"),
+            ("GHE_PR_COST_SETTLE_SECONDS", "600"),
+            ("GHE_PR_COST_POST_MERGE_TIMEOUT_SECONDS", "7200"),
+            ("GHE_PR_COST_CLOSED_GRACE_SECONDS", "60"),
+        ] {
+            variables.insert(variable.to_owned(), OsString::from(value));
+        }
+        let config = RuntimeConfig::from_map(variables).expect("configuration is valid");
+        assert_eq!(config.pr_cost_retention(), Duration::from_secs(30 * 86_400));
+        assert_eq!(config.pr_cost_settle(), Duration::from_secs(600));
+        assert_eq!(
+            config.pr_cost_post_merge_timeout(),
+            Duration::from_secs(7_200)
+        );
+        assert_eq!(config.pr_cost_closed_grace(), Duration::from_secs(60));
+
+        for variable in [
+            "GHE_PR_COST_RETENTION_DAYS",
+            "GHE_PR_COST_SETTLE_SECONDS",
+            "GHE_PR_COST_POST_MERGE_TIMEOUT_SECONDS",
+            "GHE_PR_COST_CLOSED_GRACE_SECONDS",
+        ] {
+            for value in ["0", "not-a-number", "18446744073709551616"] {
+                let mut variables = required_variables();
+                variables.insert(variable.to_owned(), OsString::from(value));
+                let error = RuntimeConfig::from_map(variables).expect_err("invalid value");
+                assert_eq!(
+                    error,
+                    ConfigError::Invalid { variable },
+                    "{variable}={value}"
+                );
+                assert!(!error.to_string().contains(value), "{variable}={value}");
+            }
+        }
+        let mut variables = required_variables();
+        variables.insert(
+            "GHE_PR_COST_RETENTION_DAYS".to_owned(),
+            OsString::from("18446744073709551615"),
+        );
+        assert_eq!(
+            RuntimeConfig::from_map(variables).expect_err("overflowing days are rejected"),
+            ConfigError::Invalid {
+                variable: "GHE_PR_COST_RETENTION_DAYS"
+            }
+        );
     }
 
     #[test]

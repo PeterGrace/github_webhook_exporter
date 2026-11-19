@@ -23,6 +23,7 @@ use crate::{
     },
     health, lifecycle,
     metrics::{self, Metrics},
+    pr_costs::{PullRequestCostFinalizer, PullRequestCostPolicy},
     retention::{run_retention, RetentionConfig},
     run_costs::RunCostFinalizer,
     security::{
@@ -30,8 +31,9 @@ use crate::{
         AdminAuthenticator, CanonicalRepositoryName, IngestOidcConfig,
     },
     storage::{
-        CiUsageStore, DeliveryStore, MergeQueueStore, PullRequestCommitStore, RepositoryStore,
-        RequiredCheckStore, RunCostStore, VendorRunStore, WorkflowJobLinkStore, WorkflowRunStore,
+        CiUsageStore, DeliveryStore, MergeQueueStore, PullRequestCommitStore, PullRequestCostStore,
+        RepositoryStore, RequiredCheckStore, RunCostStore, VendorRunStore, WorkflowJobLinkStore,
+        WorkflowRunStore,
     },
     telemetry::{
         trace::{self, Operation},
@@ -78,7 +80,9 @@ pub struct AppState {
     oidc_verifier: Option<Arc<OidcVerifier>>,
     run_cost_store: RunCostStore,
     pull_request_commit_store: PullRequestCommitStore,
+    pull_request_cost_store: PullRequestCostStore,
     run_grace_period: Duration,
+    pull_request_cost_policy: PullRequestCostPolicy,
 }
 
 /// The JWKS client for `ingest.oidc` could not be built.
@@ -102,6 +106,7 @@ impl AppState {
         let ci_usage_store = CiUsageStore::new(database_pool.clone());
         let run_cost_store = RunCostStore::new(database_pool.clone());
         let pull_request_commit_store = PullRequestCommitStore::new(database_pool.clone());
+        let pull_request_cost_store = PullRequestCostStore::new(database_pool.clone());
         let vendor_run_store = VendorRunStore::new(database_pool.clone());
         let required_check_store = RequiredCheckStore::new(
             database_pool.clone(),
@@ -127,7 +132,9 @@ impl AppState {
             oidc_verifier: None,
             run_cost_store,
             pull_request_commit_store,
+            pull_request_cost_store,
             run_grace_period: Duration::from_secs(DEFAULT_RUN_GRACE_SECONDS),
+            pull_request_cost_policy: PullRequestCostPolicy::default(),
         }
     }
 
@@ -138,6 +145,16 @@ impl AppState {
     /// * `grace_period` - How long late job and usage records may still join a run's total.
     pub fn with_run_grace_period(mut self, grace_period: Duration) -> Self {
         self.run_grace_period = grace_period;
+        self
+    }
+
+    /// Returns application state that finalizes each pull request's cost record under `policy`.
+    ///
+    /// # Parameters
+    ///
+    /// * `policy` - The validated settle, timeout, grace and maximum-age durations.
+    pub fn with_pull_request_cost_policy(mut self, policy: PullRequestCostPolicy) -> Self {
+        self.pull_request_cost_policy = policy;
         self
     }
 
@@ -318,6 +335,11 @@ impl AppState {
         &self.pull_request_commit_store
     }
 
+    /// Returns durable per-pull-request cost state.
+    pub(crate) fn pull_request_cost_store(&self) -> &PullRequestCostStore {
+        &self.pull_request_cost_store
+    }
+
     /// Returns how long a completed run waits before its cost is totalled.
     pub(crate) fn run_grace_period(&self) -> Duration {
         self.run_grace_period
@@ -445,6 +467,13 @@ where
     let run_cost_finalizer = state
         .run_costs_enabled()
         .then(|| RunCostFinalizer::new(&state.database_pool, state.workflow_trace_emitter.clone()));
+    let pull_request_cost_finalizer = state.run_costs_enabled().then(|| {
+        PullRequestCostFinalizer::new(
+            &state.database_pool,
+            state.workflow_trace_emitter.clone(),
+            state.pull_request_cost_policy,
+        )
+    });
     let BackgroundServices {
         retention,
         required_check_refresher,
@@ -465,6 +494,11 @@ where
                     finalizer.run(cancellation.clone()).await;
                 }
             };
+            let finalize_pull_requests = async {
+                if let Some(finalizer) = pull_request_cost_finalizer {
+                    finalizer.run(cancellation.clone()).await;
+                }
+            };
             // Every background workload observes the same cancellation channel, so joining them
             // keeps a single background task handle while letting each stop independently.
             tokio::join!(
@@ -476,6 +510,7 @@ where
                 ),
                 refresh,
                 finalize,
+                finalize_pull_requests,
             );
         },
     )

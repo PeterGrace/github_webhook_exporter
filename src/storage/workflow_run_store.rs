@@ -9,8 +9,8 @@ use crate::{
     telemetry::{
         trace::{self, DatabaseOperation},
         workflow::{
-            WorkflowBranch, WorkflowEvent, WorkflowFile, WorkflowRunAttempt, WorkflowRunContext,
-            WorkflowRunId,
+            DisplayName, WorkflowBranch, WorkflowEvent, WorkflowFile, WorkflowRunAttempt,
+            WorkflowRunContext, WorkflowRunId,
         },
     },
 };
@@ -54,13 +54,14 @@ impl WorkflowRunStore {
         sqlx::query(
             "INSERT INTO workflow_run_contexts \
              (repository_id, workflow_run_id, workflow_run_attempt, event, source_branch, \
-              target_branch, pull_request_number, workflow_file, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+              target_branch, pull_request_number, workflow_file, workflow_name, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
              ON CONFLICT(repository_id, workflow_run_id, workflow_run_attempt) DO UPDATE SET \
              event = excluded.event, source_branch = excluded.source_branch, \
              target_branch = excluded.target_branch, \
              pull_request_number = excluded.pull_request_number, \
-             workflow_file = excluded.workflow_file, updated_at = excluded.updated_at",
+             workflow_file = excluded.workflow_file, workflow_name = excluded.workflow_name, \
+             updated_at = excluded.updated_at",
         )
         .bind(repository_id.get())
         .bind(context.run_id().get())
@@ -70,6 +71,7 @@ impl WorkflowRunStore {
         .bind(context.target_branch().map(WorkflowBranch::as_str))
         .bind(context.pull_request().map(PullRequestNumber::get))
         .bind(context.workflow_file().map(WorkflowFile::as_str))
+        .bind(context.workflow_name().map(DisplayName::as_str))
         .execute(&self.pool)
         .await
         .map_err(map_sqlx_error)?;
@@ -97,8 +99,8 @@ impl WorkflowRunStore {
         run_attempt: WorkflowRunAttempt,
     ) -> Result<Option<WorkflowRunContext>, WorkflowRunStoreError> {
         let row = sqlx::query_as::<_, StoredWorkflowRunContext>(
-            "SELECT event, source_branch, target_branch, pull_request_number, workflow_file \
-             FROM workflow_run_contexts \
+            "SELECT event, source_branch, target_branch, pull_request_number, workflow_file, \
+             workflow_name FROM workflow_run_contexts \
              WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ?",
         )
         .bind(repository_id.get())
@@ -154,6 +156,7 @@ struct StoredWorkflowRunContext {
     target_branch: Option<String>,
     pull_request_number: Option<i64>,
     workflow_file: Option<String>,
+    workflow_name: Option<String>,
 }
 
 impl StoredWorkflowRunContext {
@@ -177,10 +180,21 @@ impl StoredWorkflowRunContext {
             .as_deref()
             .map(|file| WorkflowFile::from_path(file).ok_or(WorkflowRunStoreError::Internal))
             .transpose()?;
+        // a stored name is already sanitized, so one that changes under sanitizing was tampered
+        let workflow_name = self
+            .workflow_name
+            .as_deref()
+            .map(|name| {
+                DisplayName::sanitize(name)
+                    .filter(|sanitized| sanitized.as_str() == name)
+                    .ok_or(WorkflowRunStoreError::Internal)
+            })
+            .transpose()?;
         Ok(
             WorkflowRunContext::new(run_id, run_attempt, event, source_branch, target_branch)
                 .with_pull_request(pull_request)
-                .with_workflow_file(workflow_file),
+                .with_workflow_file(workflow_file)
+                .with_workflow_name(workflow_name),
         )
     }
 }
@@ -231,8 +245,8 @@ mod tests {
         domain::{merge_queue::PullRequestNumber, repository::RepositoryId},
         storage::open_database,
         telemetry::workflow::{
-            WorkflowBranch, WorkflowEvent, WorkflowFile, WorkflowRunAttempt, WorkflowRunContext,
-            WorkflowRunId,
+            DisplayName, WorkflowBranch, WorkflowEvent, WorkflowFile, WorkflowRunAttempt,
+            WorkflowRunContext, WorkflowRunId,
         },
     };
 
@@ -285,6 +299,7 @@ mod tests {
                 "pull_request_number",
                 "workflow_file",
                 "updated_at",
+                "workflow_name",
             ]
         );
         for forbidden in ["payload", "signature", "actor", "html_url", "logs"] {
@@ -466,7 +481,8 @@ mod tests {
             None,
         )
         .with_pull_request(Some(PullRequestNumber::new(9201).expect("PR is positive")))
-        .with_workflow_file(WorkflowFile::from_path(".github/workflows/claude.yml"));
+        .with_workflow_file(WorkflowFile::from_path(".github/workflows/claude.yml"))
+        .with_workflow_name(DisplayName::sanitize("Code Review"));
 
         store
             .upsert(repository_id, &attributed)
@@ -586,19 +602,27 @@ mod tests {
             .await
             .expect("context persists");
 
-        sqlx::query("UPDATE workflow_run_contexts SET workflow_file = 'bad name.yaml'")
-            .execute(&pool)
-            .await
-            .expect("row updates");
+        for tampered in [
+            "UPDATE workflow_run_contexts SET workflow_file = 'bad name.yaml'",
+            "UPDATE workflow_run_contexts SET workflow_file = NULL, workflow_name = 'Build\nWorkflow'",
+        ] {
+            sqlx::query(tampered)
+                .execute(&pool)
+                .await
+                .expect("row updates");
 
-        assert!(store
-            .get(
-                repository_id,
-                WorkflowRunId::new(31).expect("run id is positive"),
-                WorkflowRunAttempt::new(1).expect("attempt is positive"),
-            )
-            .await
-            .is_err());
+            assert!(
+                store
+                    .get(
+                        repository_id,
+                        WorkflowRunId::new(31).expect("run id is positive"),
+                        WorkflowRunAttempt::new(1).expect("attempt is positive"),
+                    )
+                    .await
+                    .is_err(),
+                "{tampered}"
+            );
+        }
     }
 
     #[tokio::test]

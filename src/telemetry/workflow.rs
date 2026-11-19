@@ -690,6 +690,7 @@ pub(crate) struct WorkflowRunContext {
     target_branch: Option<WorkflowBranch>,
     pull_request: Option<PullRequestNumber>,
     workflow_file: Option<WorkflowFile>,
+    workflow_name: Option<DisplayName>,
 }
 
 impl WorkflowRunContext {
@@ -709,6 +710,7 @@ impl WorkflowRunContext {
             target_branch,
             pull_request: None,
             workflow_file: None,
+            workflow_name: None,
         }
     }
 
@@ -721,6 +723,14 @@ impl WorkflowRunContext {
     /// Returns this context with the file name of the workflow definition, when known.
     pub(crate) fn with_workflow_file(mut self, workflow_file: Option<WorkflowFile>) -> Self {
         self.workflow_file = workflow_file;
+        self
+    }
+
+    /// Returns this context with the workflow definition's own name, when known.
+    ///
+    /// Unlike the run's name, it is not replaced by a `run-name`.
+    pub(crate) fn with_workflow_name(mut self, workflow_name: Option<DisplayName>) -> Self {
+        self.workflow_name = workflow_name;
         self
     }
 
@@ -762,6 +772,11 @@ impl WorkflowRunContext {
     /// Returns the file name of the workflow definition, when known.
     pub(crate) fn workflow_file(&self) -> Option<&WorkflowFile> {
         self.workflow_file.as_ref()
+    }
+
+    /// Returns the workflow definition's own name, when known.
+    pub(crate) fn workflow_name(&self) -> Option<&DisplayName> {
+        self.workflow_name.as_ref()
     }
 }
 

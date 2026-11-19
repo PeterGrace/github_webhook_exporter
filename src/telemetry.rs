@@ -11,6 +11,7 @@ mod http_client;
 #[cfg(test)]
 mod otlp_test;
 pub(crate) mod pipeline;
+pub(crate) mod pr_cost;
 mod queue;
 pub(crate) mod run_cost;
 pub(crate) mod trace;
