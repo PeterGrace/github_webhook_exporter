@@ -16,6 +16,28 @@ use crate::{
 #[derive(Deserialize)]
 struct WorkflowRunEnvelope {
     workflow_run: WorkflowRunProjection,
+    /// The workflow definition the run belongs to.
+    workflow: Option<WorkflowDefinitionProjection>,
+}
+
+#[derive(Deserialize)]
+struct WorkflowDefinitionProjection {
+    name: Option<Value>,
+}
+
+impl WorkflowRunEnvelope {
+    /// Returns the workflow definition's name, falling back to the run's.
+    ///
+    /// A workflow with a `run-name` reports that run name in `workflow_run.name`, so the run's name
+    /// would split one workflow into a series per run; `workflow.name` is the definition's own.
+    fn workflow_name(&self) -> Option<DisplayName> {
+        let sanitized =
+            |name: Option<&Value>| name.and_then(Value::as_str).and_then(DisplayName::sanitize);
+        self.workflow
+            .as_ref()
+            .and_then(|workflow| sanitized(workflow.name.as_ref()))
+            .or_else(|| sanitized(self.workflow_run.name.as_ref()))
+    }
 }
 
 #[derive(Deserialize)]
@@ -63,6 +85,7 @@ struct BranchProjection {
 /// Projects bounded correlation metadata from an authenticated workflow-run payload.
 pub(super) fn project_context(body: &[u8]) -> Option<WorkflowRunContext> {
     let envelope: WorkflowRunEnvelope = serde_json::from_slice(body).ok()?;
+    let workflow_name = envelope.workflow_name();
     let workflow_run = envelope.workflow_run;
     let run_id = WorkflowRunId::new(workflow_run.id).ok()?;
     let run_attempt = WorkflowRunAttempt::new(workflow_run.run_attempt).ok()?;
@@ -91,7 +114,8 @@ pub(super) fn project_context(body: &[u8]) -> Option<WorkflowRunContext> {
     Some(
         WorkflowRunContext::new(run_id, run_attempt, event, source_branch, target_branch)
             .with_pull_request(pull_request)
-            .with_workflow_file(workflow_file),
+            .with_workflow_file(workflow_file)
+            .with_workflow_name(workflow_name),
     )
 }
 
@@ -207,19 +231,16 @@ fn pull_request_from_run_name(run_name: &str) -> Option<PullRequestNumber> {
 /// individual field degrades to absent rather than failing the projection.
 pub(super) fn project_run_summary(body: &[u8]) -> Option<WorkflowRunSummary> {
     let envelope: WorkflowRunEnvelope = serde_json::from_slice(body).ok()?;
+    let workflow_name = envelope.workflow_name();
     let workflow_run = envelope.workflow_run;
     let event = WorkflowEvent::normalize(workflow_run.event.as_ref().and_then(Value::as_str));
 
     Some(WorkflowRunSummary {
+        workflow_name,
         conclusion: WorkflowConclusion::normalize(
             workflow_run.conclusion.as_ref().and_then(Value::as_str),
         ),
         pull_request: resolve_pull_request(&workflow_run, event),
-        workflow_name: workflow_run
-            .name
-            .as_ref()
-            .and_then(Value::as_str)
-            .and_then(DisplayName::sanitize),
         head_sha: workflow_run
             .head_sha
             .as_ref()
@@ -561,6 +582,42 @@ mod run_summary_tests {
         );
         assert_eq!(summary.pull_requests.len(), 20);
         assert_eq!(summary.pull_requests.as_slice()[0].get(), 1);
+    }
+
+    #[test]
+    fn the_workflow_definition_name_wins_over_a_run_name() {
+        let body = |workflow: serde_json::Value| {
+            serde_json::to_vec(&json!({
+                "workflow_run": {
+                    "id": 31,
+                    "run_attempt": 1,
+                    "name": "PR #7 · fix the thing",
+                    "display_title": "PR #7 · fix the thing"
+                },
+                "workflow": workflow
+            }))
+            .expect("fixture serializes")
+        };
+        let named = body(json!({"name": "Code Review"}));
+        let summary = project_run_summary(&named).expect("summary projects");
+        assert_eq!(
+            summary.workflow_name.as_ref().map(DisplayName::as_str),
+            Some("Code Review")
+        );
+        let context = super::project_context(&named).expect("context projects");
+        assert_eq!(
+            context.workflow_name().map(DisplayName::as_str),
+            Some("Code Review")
+        );
+
+        for unusable in [json!(null), json!({"name": "\n\t"}), json!({})] {
+            let summary = project_run_summary(&body(unusable)).expect("summary projects");
+            assert_eq!(
+                summary.workflow_name.as_ref().map(DisplayName::as_str),
+                Some("PR #7 · fix the thing"),
+                "the run name is the fallback"
+            );
+        }
     }
 
     #[test]

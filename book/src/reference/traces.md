@@ -172,6 +172,12 @@ it is omitted when there is no PR or more than one.
 The job root also carries `github.workflow`, the workflow name. It repeats `cicd.pipeline.name` so
 job spans and in-job usage spans group spend by the same key.
 
+The workflow name is the workflow definition's own `name`, taken from the top-level `workflow`
+of the run's `workflow_run` deliveries and stored with the run context. A workflow that sets
+`run-name` reports that run name in `workflow_run.name` and `workflow_job.workflow_name`, so those
+are used only as a fallback: for a job whose run context was not stored, or a run delivery with
+no usable `workflow.name`. Pipeline roots and `ci.run.cost` spans use the same name.
+
 ### Runner and cost attributes
 
 Every job root carries the runner and the minutes GitHub bills for the job:
@@ -517,8 +523,9 @@ root trace summarizing the whole run attempt. It is a second, separate trace: it
 trace ID with the live `http.request` trace or with any `github.actions.job` trace, and it never
 changes the structure or attributes of those job traces.
 
-The root's span name and `sentry.description` are the sanitized workflow name (fixed fallback
-`workflow`), and its `sentry.op` is `github.actions.pipeline`. It carries one direct child per job
+The root's span name and `sentry.description` are the sanitized workflow name (see
+[Completed workflow traces](#completed-workflow-traces); fixed fallback `workflow`), and its
+`sentry.op` is `github.actions.pipeline`. It carries one direct child per job
 of that run attempt, named `<workflow-name> / <job-name>` with `sentry.op`
 `github.actions.pipeline.task`. Both span kinds are `INTERNAL`. Step spans stay on the job traces
 and are never repeated here.
