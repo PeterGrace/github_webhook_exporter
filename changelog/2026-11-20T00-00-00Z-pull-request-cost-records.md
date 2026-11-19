@@ -40,10 +40,20 @@ Date: 2026-11-20T00:00:00Z
   `pull_request_run_cost_sources`, `pull_request_costs` and `pull_request_cost_rollup`. It fills
   the head commit and per-source split of existing run totals from the run schedules, job links and
   usage entries retention still holds, and dates the start of run totals from the earliest stored
-  schedule.
+  schedule. Every pull request with a stored run total or vendor run starts with a pending record,
+  so it is finalized and its stored costs are kept until then. It also adds two partial indexes on
+  pending `run_cost_finalizations`, by pull request and by head commit, for the finalizer's
+  pending-run check.
+- Finalization evaluates its rule again inside its write transaction, so a pull request reopened,
+  or given a new pending run, between the poll and the write is left for a later poll.
 
 ## Operator action
 
 Back up the SQLite volume before upgrading. Migration `202611200001` is forward-only, so roll back
-by restoring that backup. Pull requests that were open before run totals were deployed are
-finalized with `ci.pr.partial=true`.
+by restoring that backup.
+
+Pull requests that already had stored costs at upgrade start pending with no creation time. One
+that sees a later `pull_request` delivery records its creation time, and its record is partial
+only if it was created before run totals began. One that already closed before the upgrade gets no
+close event, so it is finalized with `max_age` and `github.pr_outcome=open` once it has been
+inactive for `GHE_PR_COST_RETENTION_DAYS`, and is partial.

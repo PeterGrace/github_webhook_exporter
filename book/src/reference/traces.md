@@ -272,8 +272,10 @@ enabled. It has no trace context, and carries `ci.source`, `ci.vendor`, `ci.vend
 `ci.cost_usd`, `ci.price_table.version`, `github.pull_request.number` (when attributed),
 `github.repository` and `vcs.ref.head.revision` (when valid).
 
-Runs attributed to a pull request are stored per repository and pull request, and pruned on the
-processed-delivery retention cutoff. An unattributed run is exported and logged but not stored.
+Runs attributed to a pull request are stored per repository and pull request, and count toward
+its [cost record](#pull-request-cost-records). They are pruned on the `GHE_PR_COST_RETENTION_DAYS`
+cutoff, and never while that record is still pending. An unattributed run is exported and logged
+but not stored.
 A storage failure keeps the authenticated `204 No Content` response, increments
 `github_webhook_processing_failures_total{stage="vendor_run"}`, and writes one
 `vendor-run persistence failed` error log carrying only `stage`, `result` and
@@ -488,14 +490,17 @@ or metrics.
 Commands, output, logs, actors, payload-provided URLs, request bodies, arbitrary payload fragments,
 secrets, signatures, authorization/other headers, unsupported actions, and raw unknown conclusions
 never enter workflow telemetry, in traces, logs, or metrics. Workflow identifiers and names stay
-out of logs with five exceptions. One is a parentless structured warning on a newly claimed
+out of logs with six exceptions. One is a parentless structured warning on a newly claimed
 `too_many_steps` rejection, which may contain only `repository_name`, `delivery_id`,
 `workflow_run_id`, `workflow_run_attempt`, `workflow_job_id`, `step_count`, and `step_limit`. The
 second is the `ci cost recorded` log described above, written for priced jobs when a `costs`
 table is configured, for accepted usage entries and for matched vendor runs, and carrying only the
 listed fields, so cost can be charted from the logs dataset. The other three are the `ci run cost
 finalized` log and the `ci run unattributed` and `ci cost after finalize` warnings, each carrying
-only the fields listed under [Run cost totals](#run-cost-totals). The `ci usage post rejected` warning carries only its
+only the fields listed under [Run cost totals](#run-cost-totals). The sixth is the
+`ci pr cost finalized` log, carrying only the fields listed under
+[Pull request cost records](#pull-request-cost-records), which also lists the extra fields of a
+`ci cost after finalize` warning about a pull request. The `ci usage post rejected` warning carries only its
 `reason` and, after token verification, `github.repository`; the `ci usage post failed` error
 carries only `outcome`, `error_id` and `github.repository`. Operators can query
 `GET /repos/{owner}/{repo}/actions/jobs/{job_id}` with the canonical repository name and

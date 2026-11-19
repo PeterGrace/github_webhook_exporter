@@ -172,7 +172,10 @@ impl PullRequestCostFinalizer {
                 break;
             }
             let span = trace::operation_span(Operation::PullRequestCostFinalize);
-            let outcome = self.finalize(&pull_request).instrument(span.clone()).await;
+            let outcome = self
+                .finalize(&pull_request, cutoffs)
+                .instrument(span.clone())
+                .await;
             trace::set_status(
                 &span,
                 match outcome {
@@ -191,8 +194,12 @@ impl PullRequestCostFinalizer {
     }
 
     /// Returns whether this call finalized `due`, or `None` when the store failed.
-    async fn finalize(&self, due: &DuePullRequestCost) -> Option<bool> {
-        let total = self.store.finalize(due).await.ok()?;
+    async fn finalize(
+        &self,
+        due: &DuePullRequestCost,
+        cutoffs: PullRequestCostCutoffs,
+    ) -> Option<bool> {
+        let total = self.store.finalize(due, cutoffs).await.ok()?;
         let Some(total) = total else {
             return Some(false);
         };

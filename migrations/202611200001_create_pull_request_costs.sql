@@ -91,6 +91,29 @@ CREATE INDEX pull_request_costs_pending_idx
 CREATE INDEX pull_request_costs_last_activity_at_idx
     ON pull_request_costs(last_activity_at);
 
+-- Pull requests with run totals or vendor runs stored before this migration start pending, so they
+-- are finalized and their stored costs are kept until then. Their creation time is unknown until a
+-- `pull_request` delivery records it, so until then they are partial.
+INSERT INTO pull_request_costs (
+    repository_id, pull_request_number, first_activity_at, last_activity_at
+)
+SELECT repository_id, pull_request_number, MIN(updated_at), MAX(updated_at)
+FROM (
+    SELECT repository_id, pull_request_number, updated_at FROM pull_request_run_costs
+    UNION ALL
+    SELECT repository_id, pull_request_number, updated_at FROM ci_vendor_runs
+)
+GROUP BY repository_id, pull_request_number;
+
+-- Finalization waits while a run of the pull request, or a run on its merge commit, is still
+-- pending; these keep that check from scanning every schedule of the repository.
+CREATE INDEX run_cost_finalizations_pending_pull_request_idx
+    ON run_cost_finalizations(repository_id, pull_request_number)
+    WHERE finalized_at IS NULL AND abandoned_at IS NULL;
+CREATE INDEX run_cost_finalizations_pending_head_sha_idx
+    ON run_cost_finalizations(repository_id, head_sha)
+    WHERE finalized_at IS NULL AND abandoned_at IS NULL;
+
 -- When run totals began, written once. A pull request created earlier is marked partial, since
 -- its earlier runs were never totalled. Run totals that already exist date it.
 CREATE TABLE pull_request_cost_rollup (

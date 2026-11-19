@@ -17,6 +17,38 @@ use crate::{
 use super::sqlite_is_busy_or_locked;
 
 const PULL_REQUEST_COST_PRUNE_BATCH_SIZE: i64 = 1_000;
+
+/// The SQL expression naming the first finalization rule that applies to the row `state`, or
+/// `NULL`. `?1` to `?4` are the settled, merged, closed and inactive cutoffs, in that order.
+///
+/// It is a macro rather than a constant so `concat!` can splice it into each query at compile
+/// time, keeping `due` and `finalize` on one definition.
+macro_rules! finalization_rule {
+    () => {
+        "CASE \
+             WHEN state.outcome = 'merged' AND state.post_merge_activity_at <= ?1 \
+                 THEN 'post_merge_run' \
+             WHEN state.outcome = 'merged' AND state.post_merge_activity_at IS NULL \
+                 AND state.closed_at <= ?2 THEN 'timeout' \
+             WHEN state.outcome = 'closed' AND state.closed_at <= ?3 THEN 'closed_grace' \
+             WHEN state.last_activity_at <= ?4 THEN 'max_age' \
+         END"
+    };
+}
+
+/// The SQL condition that the row `state` has no run attempt still inside its grace period, or is
+/// inactive past `?4`, the maximum-age cutoff.
+macro_rules! no_pending_run_unless_inactive {
+    () => {
+        "(state.last_activity_at <= ?4 OR NOT EXISTS (\
+             SELECT 1 FROM run_cost_finalizations AS pending \
+             WHERE pending.repository_id = state.repository_id \
+             AND pending.finalized_at IS NULL AND pending.abandoned_at IS NULL \
+             AND (pending.pull_request_number = state.pull_request_number \
+                  OR pending.head_sha = state.merge_commit_sha)\
+         ))"
+    };
+}
 const PULL_REQUEST_COST_TIMESTAMP_FORMAT: &[FormatItem<'static>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
 
@@ -171,38 +203,25 @@ impl PullRequestCostStore {
         cutoffs: PullRequestCostCutoffs,
         limit: i64,
     ) -> Result<Vec<DuePullRequestCost>, PullRequestCostStoreError> {
-        let rows = sqlx::query_as::<_, StoredDuePullRequestCost>(
+        let [settled_before, merged_before, closed_before, inactive_before] =
+            format_cutoffs(cutoffs)?;
+        let rows = sqlx::query_as::<_, StoredDuePullRequestCost>(concat!(
             "SELECT due.repository_id, repositories.full_name, due.pull_request_number, \
              due.finalized_by FROM (\
-                 SELECT state.repository_id, state.pull_request_number, state.last_activity_at, \
-                 CASE \
-                     WHEN state.outcome = 'merged' AND state.post_merge_activity_at <= ? \
-                         THEN 'post_merge_run' \
-                     WHEN state.outcome = 'merged' AND state.post_merge_activity_at IS NULL \
-                         AND state.closed_at <= ? THEN 'timeout' \
-                     WHEN state.outcome = 'closed' AND state.closed_at <= ? \
-                         THEN 'closed_grace' \
-                     WHEN state.last_activity_at <= ? THEN 'max_age' \
-                 END AS finalized_by \
-                 FROM pull_request_costs AS state \
-                 WHERE state.finalized_at IS NULL \
-                 AND (state.last_activity_at <= ? OR NOT EXISTS (\
-                     SELECT 1 FROM run_cost_finalizations AS pending \
-                     WHERE pending.repository_id = state.repository_id \
-                     AND pending.finalized_at IS NULL AND pending.abandoned_at IS NULL \
-                     AND (pending.pull_request_number = state.pull_request_number \
-                          OR pending.head_sha = state.merge_commit_sha)\
-                 ))\
-             ) AS due \
+                 SELECT state.repository_id, state.pull_request_number, state.last_activity_at, ",
+            finalization_rule!(),
+            " AS finalized_by FROM pull_request_costs AS state \
+                 WHERE state.finalized_at IS NULL AND ",
+            no_pending_run_unless_inactive!(),
+            ") AS due \
              JOIN repositories ON repositories.id = due.repository_id \
              WHERE due.finalized_by IS NOT NULL \
-             ORDER BY due.last_activity_at LIMIT ?",
-        )
-        .bind(format_timestamp(cutoffs.settled_before)?)
-        .bind(format_timestamp(cutoffs.merged_before)?)
-        .bind(format_timestamp(cutoffs.closed_before)?)
-        .bind(format_timestamp(cutoffs.inactive_before)?)
-        .bind(format_timestamp(cutoffs.inactive_before)?)
+             ORDER BY due.last_activity_at LIMIT ?5",
+        ))
+        .bind(settled_before)
+        .bind(merged_before)
+        .bind(closed_before)
+        .bind(inactive_before)
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -218,11 +237,14 @@ impl PullRequestCostStore {
     ///
     /// The reads and the update share one transaction that takes SQLite's write lock first, so a
     /// run total or vendor run either commits before the record is built and is counted, or
-    /// commits after and sees the pull request as final.
+    /// commits after and sees the pull request as final. The rule `due` chose is evaluated again
+    /// under that lock with the same `cutoffs`, so a reopen or a newly pending run that landed in
+    /// between leaves the pull request for a later poll.
     ///
     /// # Returns
     ///
-    /// The record, or `None` when the pull request was already final.
+    /// The record, or `None` when the pull request was already final or its rule no longer
+    /// applies.
     ///
     /// # Errors
     ///
@@ -232,14 +254,16 @@ impl PullRequestCostStore {
     pub(crate) async fn finalize(
         &self,
         due: &DuePullRequestCost,
+        cutoffs: PullRequestCostCutoffs,
     ) -> Result<Option<PullRequestCostTotal>, PullRequestCostStoreError> {
+        let cutoffs = format_cutoffs(cutoffs)?;
         trace::instrument_database_operation(DatabaseOperation::PullRequestCostFinalize, async {
             let mut transaction = self
                 .pool
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .map_err(map_sqlx_error)?;
-            let Some(total) = pull_request_total_in(&mut transaction, due)
+            let Some(total) = pull_request_total_in(&mut transaction, due, &cutoffs)
                 .await
                 .map_err(map_sqlx_error)?
             else {
@@ -332,30 +356,41 @@ pub(crate) async fn record_cost_activity_in(
 }
 
 /// Reads one pending pull request's state and sums its stored costs, or `None` when it is
-/// already final.
+/// already final or the rule `due` chose no longer applies at `cutoffs`.
 async fn pull_request_total_in(
     connection: &mut SqliteConnection,
     due: &DuePullRequestCost,
+    cutoffs: &[String; 4],
 ) -> Result<Option<PullRequestCostTotal>, sqlx::Error> {
     let repository_id = due.repository_id.get();
     let pull_request = due.pull_request.get();
+    let [settled_before, merged_before, closed_before, inactive_before] = cutoffs;
     // `julianday` reads the stored UTC timestamps, so the difference is in days.
-    let state = sqlx::query_as::<_, StoredPullRequestState>(
-        "SELECT state.outcome, \
+    let state = sqlx::query_as::<_, StoredPullRequestState>(concat!(
+        "SELECT state.outcome, ",
+        finalization_rule!(),
+        " AS finalized_by, \
          (state.created_at IS NULL OR rollup.started_at IS NULL \
           OR state.created_at < rollup.started_at) AS partial, \
          (julianday(coalesce(state.closed_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))) \
           - julianday(coalesce(state.created_at, state.first_activity_at))) * 24 AS open_hours \
          FROM pull_request_costs AS state \
          LEFT JOIN pull_request_cost_rollup AS rollup ON rollup.id = 1 \
-         WHERE state.repository_id = ? AND state.pull_request_number = ? \
-         AND state.finalized_at IS NULL",
-    )
+         WHERE state.repository_id = ?5 AND state.pull_request_number = ?6 \
+         AND state.finalized_at IS NULL AND ",
+        no_pending_run_unless_inactive!(),
+    ))
+    .bind(settled_before)
+    .bind(merged_before)
+    .bind(closed_before)
+    .bind(inactive_before)
     .bind(repository_id)
     .bind(pull_request)
     .fetch_optional(&mut *connection)
     .await?;
-    let Some(state) = state else {
+    let Some(state) =
+        state.filter(|state| state.finalized_by.as_deref() == Some(due.finalized_by.as_str()))
+    else {
         return Ok(None);
     };
     let Some(outcome) = PullRequestOutcome::from_stored(&state.outcome) else {
@@ -449,6 +484,7 @@ impl StoredDuePullRequestCost {
 #[derive(FromRow)]
 struct StoredPullRequestState {
     outcome: String,
+    finalized_by: Option<String>,
     partial: bool,
     open_hours: f64,
 }
@@ -471,6 +507,18 @@ impl fmt::Debug for PullRequestCostStoreError {
             Self::Internal => "PullRequestCostStoreError::Internal",
         })
     }
+}
+
+/// Formats the four cutoffs in the `?1` to `?4` order the rule fragments use.
+fn format_cutoffs(
+    cutoffs: PullRequestCostCutoffs,
+) -> Result<[String; 4], PullRequestCostStoreError> {
+    Ok([
+        format_timestamp(cutoffs.settled_before)?,
+        format_timestamp(cutoffs.merged_before)?,
+        format_timestamp(cutoffs.closed_before)?,
+        format_timestamp(cutoffs.inactive_before)?,
+    ])
 }
 
 fn format_timestamp(value: OffsetDateTime) -> Result<String, PullRequestCostStoreError> {
@@ -688,7 +736,7 @@ mod tests {
         assert_eq!(due[0].finalized_by, PullRequestFinalizedBy::PostMergeRun);
         let total = fixture
             .store
-            .finalize(&due[0])
+            .finalize(&due[0], elapsed(due[0].finalized_by))
             .await
             .expect("finalize succeeds")
             .expect("the pull request was pending");
@@ -710,7 +758,7 @@ mod tests {
         );
         assert!(fixture
             .store
-            .finalize(&due[0])
+            .finalize(&due[0], elapsed(due[0].finalized_by))
             .await
             .expect("finalize succeeds")
             .is_none());
@@ -741,7 +789,7 @@ mod tests {
             .expect("due query succeeds");
         let total = fixture
             .store
-            .finalize(&due[0])
+            .finalize(&due[0], elapsed(due[0].finalized_by))
             .await
             .expect("finalize succeeds")
             .expect("the pull request was pending");
@@ -835,6 +883,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reopen_or_new_pending_run_after_the_due_poll_leaves_the_pull_request_pending() {
+        let fixture = fixture().await;
+        let cutoffs = elapsed(PullRequestFinalizedBy::ClosedGrace);
+        fixture
+            .record(datetime!(2030-01-01 00:00 UTC), closed(false))
+            .await;
+        let due = fixture
+            .store
+            .due(cutoffs, 10)
+            .await
+            .expect("due query succeeds");
+        fixture
+            .runs
+            .schedule(
+                fixture.repository_id,
+                &pending(1, 1, WorkflowEvent::PullRequest, HEAD_SHA),
+                datetime!(2026-11-18 10:05 UTC),
+            )
+            .await
+            .expect("schedule succeeds");
+
+        assert!(
+            fixture
+                .store
+                .finalize(&due[0], cutoffs)
+                .await
+                .expect("finalize succeeds")
+                .is_none(),
+            "a run scheduled after the due poll is waited for"
+        );
+
+        sqlx::query("DELETE FROM run_cost_finalizations")
+            .execute(&fixture.pool)
+            .await
+            .expect("pending run clears");
+        let due = fixture
+            .store
+            .due(cutoffs, 10)
+            .await
+            .expect("due query succeeds");
+        fixture
+            .record(
+                datetime!(2030-01-01 00:00 UTC),
+                PullRequestCostTransition::Reopened,
+            )
+            .await;
+
+        assert!(
+            fixture
+                .store
+                .finalize(&due[0], cutoffs)
+                .await
+                .expect("finalize succeeds")
+                .is_none(),
+            "a pull request reopened after the due poll is no longer past its closed grace"
+        );
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pull_request_costs WHERE finalized_at IS NULL",
+        )
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("state loads");
+        assert_eq!(pending, 1);
+    }
+
+    #[tokio::test]
     async fn a_pull_request_created_before_run_totals_began_is_partial() {
         let fixture = fixture().await;
         fixture
@@ -854,7 +968,7 @@ mod tests {
 
         let total = fixture
             .store
-            .finalize(&due[0])
+            .finalize(&due[0], elapsed(due[0].finalized_by))
             .await
             .expect("finalize succeeds")
             .expect("the pull request was pending");
@@ -908,6 +1022,10 @@ mod tests {
             "INSERT INTO ci_usage_entries (repository_id, workflow_run_id, \
              workflow_run_attempt, source, cost_usd, price_fell_back, updated_at) \
              VALUES (1, 31, 1, 'anthropic', 0.25, 0, '2026-11-18T10:00:00.000Z')",
+            "INSERT INTO ci_vendor_runs (repository_id, pull_request_number, vendor, trigger, \
+             cost_usd, price_table_version, updated_at) \
+             VALUES (1, 43, 'review-bot', 'check_suite', 1, '0123456789ab', \
+             '2026-11-18T11:00:00.000Z')",
         ] {
             sqlx::query(statement)
                 .execute(&pool)
@@ -945,6 +1063,21 @@ mod tests {
                 .await
                 .expect("rollup start loads");
         assert_eq!(started_at, "2026-11-18T10:05:00.000Z");
+        let seeded: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT pull_request_number, outcome, created_at, finalized_at \
+             FROM pull_request_costs ORDER BY pull_request_number",
+        )
+        .fetch_all(&migrated)
+        .await
+        .expect("seeded state loads");
+        assert_eq!(
+            seeded,
+            [
+                (42, "open".to_owned(), None, None),
+                (43, "open".to_owned(), None, None)
+            ],
+            "pull requests with stored run totals or vendor runs start pending"
+        );
     }
 
     #[tokio::test]
@@ -975,7 +1108,7 @@ mod tests {
             .expect("due query succeeds");
         fixture
             .store
-            .finalize(&due[0])
+            .finalize(&due[0], elapsed(due[0].finalized_by))
             .await
             .expect("finalize succeeds")
             .expect("the pull request was pending");
