@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use serde_json::Value;
-use time::OffsetDateTime;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::Instrument;
 
 use crate::{
@@ -11,7 +11,10 @@ use crate::{
     },
     metrics::{Action, EventType, MergeQueueCompletion, Metrics, QueueTransitionFailureReason},
     security::CanonicalRepositoryName,
-    storage::{CompletionTransition, EnqueueTransition, MergeQueueStore, MergeQueueStoreError},
+    storage::{
+        CompletionTransition, EnqueueTransition, MergeQueueStore, MergeQueueStoreError,
+        PullRequestActivity, PullRequestCostTransition,
+    },
     telemetry::trace::{
         self, CommitSha, Operation, OperationFailureReason, OperationOutcome, QueueEntity,
     },
@@ -26,7 +29,9 @@ struct HeadProjection {
 #[derive(Deserialize)]
 pub(super) struct PullRequestProjection {
     number: i64,
+    created_at: Option<String>,
     updated_at: Option<String>,
+    closed_at: Option<String>,
     merged: Option<bool>,
     head: Option<HeadProjection>,
     merge_commit_sha: Option<Value>,
@@ -41,6 +46,38 @@ impl PullRequestProjection {
             .and_then(|sha| CommitSha::parse(sha).ok())
     }
 
+    fn merge_commit_sha(&self) -> Option<CommitSha> {
+        self.merge_commit_sha
+            .as_ref()
+            .and_then(Value::as_str)
+            .and_then(|sha| CommitSha::parse(sha).ok())
+    }
+
+    /// Returns what this delivery tells the pull request's cost record, or `None` for an invalid
+    /// number.
+    ///
+    /// A close without a valid `closed_at` uses `received_at`.
+    pub(super) fn cost_activity(
+        &self,
+        action: Action,
+        received_at: OffsetDateTime,
+    ) -> Option<PullRequestActivity> {
+        let transition = match action {
+            Action::Closed => PullRequestCostTransition::Closed {
+                merged: self.merged == Some(true),
+                merge_commit_sha: self.merge_commit_sha(),
+                closed_at: parse_rfc3339(self.closed_at.as_deref()).unwrap_or(received_at),
+            },
+            Action::Reopened => PullRequestCostTransition::Reopened,
+            _ => PullRequestCostTransition::None,
+        };
+        Some(PullRequestActivity {
+            number: PullRequestNumber::new(self.number).ok()?,
+            created_at: parse_rfc3339(self.created_at.as_deref()),
+            transition,
+        })
+    }
+
     /// Returns the commit a run attributed to this pull request can be found by: the head commit
     /// when the pull request is opened, synchronized or reopened, and the merge commit when it is
     /// closed.
@@ -50,15 +87,15 @@ impl PullRequestProjection {
     ) -> Option<(PullRequestNumber, CommitSha)> {
         let commit = match action {
             Action::Opened | Action::Synchronize | Action::Reopened => self.head_sha(),
-            Action::Closed => self
-                .merge_commit_sha
-                .as_ref()
-                .and_then(Value::as_str)
-                .and_then(|sha| CommitSha::parse(sha).ok()),
+            Action::Closed => self.merge_commit_sha(),
             _ => None,
         }?;
         Some((PullRequestNumber::new(self.number).ok()?, commit))
     }
+}
+
+fn parse_rfc3339(value: Option<&str>) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value?, &Rfc3339).ok()
 }
 
 /// Authenticated, bounded dependencies for one pull-request queue event.
@@ -249,9 +286,10 @@ impl QueueProcessor<'_> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use time::macros::datetime;
 
     use super::PullRequestProjection;
-    use crate::metrics::Action;
+    use crate::{metrics::Action, storage::PullRequestCostTransition, telemetry::trace::CommitSha};
 
     const HEAD_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
     const MERGE_SHA: &str = "1123456789abcdef0123456789abcdef01234567";
@@ -280,5 +318,75 @@ mod tests {
         for action in [Action::Edited, Action::Labeled, Action::Enqueued] {
             assert_eq!(attributable(action), None);
         }
+    }
+
+    #[test]
+    fn a_close_records_the_outcome_merge_commit_and_close_time() {
+        let received_at = datetime!(2026-11-20 12:00 UTC);
+        let projection: PullRequestProjection = serde_json::from_value(json!({
+            "number": 42,
+            "created_at": "2026-11-18T09:00:00Z",
+            "closed_at": "2026-11-20T11:00:00Z",
+            "merged": true,
+            "merge_commit_sha": MERGE_SHA
+        }))
+        .expect("projection parses");
+
+        let activity = projection
+            .cost_activity(Action::Closed, received_at)
+            .expect("the number is valid");
+
+        assert_eq!(activity.number.get(), 42);
+        assert_eq!(activity.created_at, Some(datetime!(2026-11-18 09:00 UTC)));
+        assert_eq!(
+            activity.transition,
+            PullRequestCostTransition::Closed {
+                merged: true,
+                merge_commit_sha: CommitSha::parse(MERGE_SHA).ok(),
+                closed_at: datetime!(2026-11-20 11:00 UTC),
+            }
+        );
+    }
+
+    #[test]
+    fn unparseable_fields_fall_back_without_failing_the_activity() {
+        let received_at = datetime!(2026-11-20 12:00 UTC);
+        let projection: PullRequestProjection = serde_json::from_value(json!({
+            "number": 42,
+            "created_at": "yesterday",
+            "closed_at": "today",
+            "merged": false,
+            "merge_commit_sha": "not-a-sha"
+        }))
+        .expect("projection parses");
+
+        let activity = projection
+            .cost_activity(Action::Closed, received_at)
+            .expect("the number is valid");
+
+        assert_eq!(activity.created_at, None);
+        assert_eq!(
+            activity.transition,
+            PullRequestCostTransition::Closed {
+                merged: false,
+                merge_commit_sha: None,
+                closed_at: received_at,
+            }
+        );
+        assert_eq!(
+            projection
+                .cost_activity(Action::Reopened, received_at)
+                .map(|activity| activity.transition),
+            Some(PullRequestCostTransition::Reopened)
+        );
+        assert_eq!(
+            projection
+                .cost_activity(Action::Labeled, received_at)
+                .map(|activity| activity.transition),
+            Some(PullRequestCostTransition::None)
+        );
+        let invalid: PullRequestProjection =
+            serde_json::from_value(json!({"number": 0})).expect("projection parses");
+        assert!(invalid.cost_activity(Action::Closed, received_at).is_none());
     }
 }

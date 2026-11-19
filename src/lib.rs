@@ -20,6 +20,8 @@ pub mod health;
 pub mod lifecycle;
 /// Bounded Prometheus instruments and label normalization.
 pub mod metrics;
+/// Background finalization of one cost record per pull request.
+pub mod pr_costs;
 /// Scheduled delivery, workflow-run context, and completed merge-queue-attempt retention.
 pub mod retention;
 /// Background finalization of per-run cost totals after each run's grace period.

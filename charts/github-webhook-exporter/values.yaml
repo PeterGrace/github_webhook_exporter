@@ -23,6 +23,9 @@ application:
   workflowJobMaxSteps: 256
   requiredCheckTtlSeconds: 300
   runGraceSeconds: 300
+  prCostSettleSeconds: 1800
+  prCostPostMergeTimeoutSeconds: 21600
+  prCostClosedGraceSeconds: 3600
   rustLog: info
 githubApp:
   appId: null
@@ -34,6 +37,7 @@ ingest:
 retention:
   deliveryDays: 7
   mergeQueueDays: 90
+  pullRequestCostDays: 90
   pruneIntervalSeconds: 3600
 telemetry:
   endpoint: ""

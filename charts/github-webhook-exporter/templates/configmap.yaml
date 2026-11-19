@@ -11,6 +11,9 @@ data:
   GHE_WORKFLOW_JOB_MAX_STEPS: {{ .Values.application.workflowJobMaxSteps | int | quote }}
   GHE_REQUIRED_CHECK_TTL_SECONDS: {{ .Values.application.requiredCheckTtlSeconds | int | quote }}
   GHE_RUN_GRACE_SECONDS: {{ .Values.application.runGraceSeconds | int | quote }}
+  GHE_PR_COST_SETTLE_SECONDS: {{ .Values.application.prCostSettleSeconds | int | quote }}
+  GHE_PR_COST_POST_MERGE_TIMEOUT_SECONDS: {{ .Values.application.prCostPostMergeTimeoutSeconds | int | quote }}
+  GHE_PR_COST_CLOSED_GRACE_SECONDS: {{ .Values.application.prCostClosedGraceSeconds | int | quote }}
   {{- with .Values.costs }}
   GHE_COSTS_JSON: {{ toJson . | quote }}
   {{- end }}
@@ -19,6 +22,7 @@ data:
   {{- end }}
   GHE_DELIVERY_RETENTION_DAYS: {{ .Values.retention.deliveryDays | int | quote }}
   GHE_MERGE_QUEUE_RETENTION_DAYS: {{ .Values.retention.mergeQueueDays | int | quote }}
+  GHE_PR_COST_RETENTION_DAYS: {{ .Values.retention.pullRequestCostDays | int | quote }}
   GHE_DELIVERY_PRUNE_INTERVAL_SECONDS: {{ .Values.retention.pruneIntervalSeconds | int | quote }}
   RUST_LOG: {{ .Values.application.rustLog | quote }}
   GHE_OTEL_QUEUE_CAPACITY: {{ .Values.telemetry.queueCapacity | int | quote }}

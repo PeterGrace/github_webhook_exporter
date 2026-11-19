@@ -256,14 +256,18 @@ assert_yq \
     "${TEMPORARY_DIRECTORY}/default-statefulset.yaml" \
     'StatefulSet must mount and use the durable SQLite data path'
 assert_yq \
-    '(.data | length) == 15 and .data.GHE_BIND_ADDRESS == "[::]:8080" and
+    '(.data | length) == 19 and .data.GHE_BIND_ADDRESS == "[::]:8080" and
      .data.GHE_SHUTDOWN_TIMEOUT_SECONDS == "30" and
      .data.GHE_WEBHOOK_BODY_LIMIT_BYTES == "2097152" and
      .data.GHE_WORKFLOW_JOB_MAX_STEPS == "256" and
      .data.GHE_REQUIRED_CHECK_TTL_SECONDS == "300" and
      .data.GHE_RUN_GRACE_SECONDS == "300" and
+     .data.GHE_PR_COST_SETTLE_SECONDS == "1800" and
+     .data.GHE_PR_COST_POST_MERGE_TIMEOUT_SECONDS == "21600" and
+     .data.GHE_PR_COST_CLOSED_GRACE_SECONDS == "3600" and
      .data.GHE_DELIVERY_RETENTION_DAYS == "7" and
      .data.GHE_MERGE_QUEUE_RETENTION_DAYS == "90" and
+     .data.GHE_PR_COST_RETENTION_DAYS == "90" and
      .data.GHE_DELIVERY_PRUNE_INTERVAL_SECONDS == "3600" and
      .data.RUST_LOG == "info" and .data.GHE_OTEL_QUEUE_CAPACITY == "2048" and
      .data.GHE_OTEL_BATCH_SIZE == "512" and
@@ -1133,6 +1137,16 @@ expect_failure \
     'zero run grace period' \
     helm template github-webhook-exporter "${CHART_DIRECTORY}" \
         --set application.runGraceSeconds=0
+for pull_request_cost_value in \
+    application.prCostSettleSeconds \
+    application.prCostPostMergeTimeoutSeconds \
+    application.prCostClosedGraceSeconds \
+    retention.pullRequestCostDays; do
+    expect_failure \
+        "zero ${pull_request_cost_value}" \
+        helm template github-webhook-exporter "${CHART_DIRECTORY}" \
+            --set "${pull_request_cost_value}=0"
+done
 
 cat >"${TEMPORARY_DIRECTORY}/costs-values.yaml" <<'EOF'
 costs:

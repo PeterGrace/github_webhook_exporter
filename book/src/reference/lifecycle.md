@@ -29,10 +29,14 @@ fewer than 1,000. Delivery pruning preserves fresh claims; queue pruning deletes
 a non-null completion time older than its cutoff, preserving fresh completed and all pending
 attempts. Pruning runs in a fixed order: deliveries, merge-queue attempts, workflow-run contexts,
 workflow-job links, the branch-protection required-check cache, in-job usage entries, vendor runs,
-run-cost schedules and totals, per-pull-request run totals, then the commit-to-pull-request map.
-Everything after merge-queue attempts is keyed to deliveries, runs and pull requests and shares
-the delivery cutoff; the required-check cache additionally expires on read after `GHE_REQUIRED_CHECK_TTL_SECONDS`, so pruning only reclaims
-space rather than governing correctness.
+run-cost schedules and totals, per-pull-request run totals, pull-request cost records, then the
+commit-to-pull-request map. Workflow, usage and run-cost rows and the commit map are keyed to
+deliveries and runs and share the delivery cutoff. Vendor runs, per-pull-request run totals and
+pull-request cost records share the `GHE_PR_COST_RETENTION_DAYS` cutoff (default `90`), measured
+from each row's last update; rows of a pull request whose cost record is still pending are kept,
+and a pending record is never pruned. The required-check cache additionally expires on read after
+`GHE_REQUIRED_CHECK_TTL_SECONDS`, so pruning only reclaims space rather than governing
+correctness.
 
 A database failure stops only the affected workload's current pass. Normalized structured logging
 identifies the workload and outcome and includes an opaque correlation ID for failures; it excludes
@@ -83,13 +87,23 @@ no GitHub API calls.
 Without a `costs` table or `ingest.oidc` the task never starts and completed runs are not
 scheduled.
 
+## Pull request cost finalization
+
+With the same configuration, a fourth background task finalizes each pull request's cost record
+once one of the rules in [Pull request cost records](traces.md#pull-request-cost-records)
+applies. It polls SQLite every 60 seconds, at once on startup, and finalizes at most 100 pull
+requests per poll, honoring shutdown between them. Pending pull requests are stored in SQLite, so
+one that comes due while the process is down is finalized by the next process. Each record is
+built and marked final in one transaction, and its span and log are emitted only by the poll that
+wrote it. A storage failure leaves the pull request pending for the next poll.
+
 ## Graceful shutdown
 
 Tokio listens for both `SIGINT` and `SIGTERM`. Either signal follows the same sequence:
 
 1. Record the normalized signal in structured stderr logging.
-2. Notify Axum, the shared retention task, the required-check refresher, and the run-cost
-   finalizer through one cancellation signal.
+2. Notify Axum, the shared retention task, the required-check refresher, and the run-cost and
+   pull-request cost finalizers through one cancellation signal.
 3. Stop accepting new connections, stop scheduling new prune batches, stop serving new
    required-check refresh requests, and stop starting new run totals.
 4. Allow active requests, active SQLite prune work, and a run total already being written to

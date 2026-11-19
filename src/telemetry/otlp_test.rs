@@ -6091,6 +6091,7 @@ async fn integrated_core_trace_privacy() {
         std::time::Duration::from_secs(60),
         std::time::Duration::from_secs(86_400),
         std::time::Duration::from_secs(90 * 86_400),
+        std::time::Duration::from_secs(90 * 86_400),
     )
     .expect("retention configuration is valid");
     let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
@@ -6269,6 +6270,11 @@ async fn integrated_core_trace_privacy() {
             (
                 "sqlite.query",
                 Some("pull_request_commit.prune"),
+                Some("success")
+            ),
+            (
+                "sqlite.query",
+                Some("pull_request_cost.prune"),
                 Some("success")
             ),
             (
@@ -6655,6 +6661,7 @@ mod retention {
             StdDuration::from_secs(60),
             StdDuration::from_secs(86_400),
             StdDuration::from_secs(90 * 86_400),
+            StdDuration::from_secs(90 * 86_400),
         )
         .expect("retention configuration is valid")
     }
@@ -6662,6 +6669,7 @@ mod retention {
     fn invalid_cutoff_config() -> RetentionConfig {
         RetentionConfig::new(
             StdDuration::from_secs(60),
+            StdDuration::from_secs(100_000_000 * 86_400),
             StdDuration::from_secs(100_000_000 * 86_400),
             StdDuration::from_secs(100_000_000 * 86_400),
         )

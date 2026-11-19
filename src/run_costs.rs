@@ -11,9 +11,10 @@ use crate::{
     lifecycle,
     storage::{
         DueRunCost, FinalizedRunCost, JobCostTotals, PullRequestCommitStore, RunCostStore,
-        UsageTotals,
+        RunFinalization, UsageTotals,
     },
     telemetry::{
+        pr_cost::{warn_pull_request_cost_after_finalize, LatePullRequestCost},
         run_cost::{
             bounded_breakdown, breakdown_key, log_run_cost_finalized, PullRequestResolution,
             RunCostTotal,
@@ -48,20 +49,22 @@ struct FinalizeFailure;
 ///
 /// Due times are stored as wall-clock timestamps, but advancing Tokio's paused clock in tests
 /// must still make them due.
-struct FinalizerClock {
+pub(crate) struct FinalizerClock {
     started_at: OffsetDateTime,
     started: Instant,
 }
 
 impl FinalizerClock {
-    fn start() -> Self {
+    /// Starts the clock at the current wall-clock time.
+    pub(crate) fn start() -> Self {
         Self {
             started_at: OffsetDateTime::now_utc(),
             started: Instant::now(),
         }
     }
 
-    fn now(&self) -> OffsetDateTime {
+    /// Returns the start time advanced by the monotonic time elapsed since.
+    pub(crate) fn now(&self) -> OffsetDateTime {
         self.started_at + self.started.elapsed()
     }
 }
@@ -160,13 +163,14 @@ impl RunCostFinalizer {
     async fn finalize(&self, run: &DueRunCost) -> Result<bool, FinalizeFailure> {
         let pending = &run.pending;
         let (pull_request, resolution) = self.resolve_pull_request(run).await?;
-        let total = self
+        let finalization = self
             .run_costs
             .finalize(
                 run.repository_id,
                 pending.run_id,
                 pending.run_attempt,
                 |jobs, usage| {
+                    let cost_by_source = stored_cost_by_source(&jobs, &usage);
                     let total = run_cost_total(run, jobs, usage, pull_request, resolution);
                     (
                         FinalizedRunCost {
@@ -174,6 +178,9 @@ impl RunCostFinalizer {
                             resolution,
                             total_usd: total.total_usd,
                             price_table_version: total.price_table_version.clone(),
+                            event: pending.event,
+                            head_sha: pending.head_sha.clone(),
+                            cost_by_source,
                         },
                         total,
                     )
@@ -181,11 +188,26 @@ impl RunCostFinalizer {
             )
             .await
             .map_err(|_| FinalizeFailure)?;
-        let Some(total) = total else {
+        let Some(RunFinalization {
+            value: total,
+            pull_request_was_final,
+        }) = finalization
+        else {
             return Ok(false);
         };
         self.emitter.emit_run_cost(&total);
         log_run_cost_finalized(&total);
+        if let Some(pull_request) = total.pull_request.filter(|_| pull_request_was_final) {
+            warn_pull_request_cost_after_finalize(
+                &total.repository_name,
+                pull_request,
+                LatePullRequestCost::Run {
+                    run_id: total.run_id,
+                    run_attempt: total.run_attempt,
+                    total_usd: total.total_usd,
+                },
+            );
+        }
         Ok(true)
     }
 
@@ -210,6 +232,16 @@ impl RunCostFinalizer {
             None => (None, PullRequestResolution::None),
         })
     }
+}
+
+/// Returns the attempt's job and usage USD per stored source name, unbounded, for its pull
+/// request's record to re-sum.
+fn stored_cost_by_source(jobs: &JobCostTotals, usage: &UsageTotals) -> Vec<(String, f64)> {
+    jobs.cost_usd
+        .map(|cost_usd| (CI_SOURCE_GITHUB_ACTIONS.to_owned(), cost_usd))
+        .into_iter()
+        .chain(usage.cost_by_source.iter().cloned())
+        .collect()
 }
 
 fn run_cost_total(

@@ -236,6 +236,9 @@
         "workflowJobMaxSteps",
         "requiredCheckTtlSeconds",
         "runGraceSeconds",
+        "prCostSettleSeconds",
+        "prCostPostMergeTimeoutSeconds",
+        "prCostClosedGraceSeconds",
         "rustLog"
       ],
       "properties": {
@@ -263,6 +266,18 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 3600
+        },
+        "prCostSettleSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "prCostPostMergeTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "prCostClosedGraceSeconds": {
+          "type": "integer",
+          "minimum": 1
         },
         "rustLog": {
           "type": "string",
@@ -362,13 +377,22 @@
     "retention": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["deliveryDays", "mergeQueueDays", "pruneIntervalSeconds"],
+      "required": [
+        "deliveryDays",
+        "mergeQueueDays",
+        "pullRequestCostDays",
+        "pruneIntervalSeconds"
+      ],
       "properties": {
         "deliveryDays": {
           "type": "integer",
           "minimum": 1
         },
         "mergeQueueDays": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pullRequestCostDays": {
           "type": "integer",
           "minimum": 1
         },

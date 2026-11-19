@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-use super::sqlite_is_busy_or_locked;
+use super::{pull_request_cost_store::record_cost_activity_in, sqlite_is_busy_or_locked};
 
 const VENDOR_RUN_PRUNE_BATCH_SIZE: i64 = 1_000;
 const VENDOR_RUN_TIMESTAMP_FORMAT: &[FormatItem<'static>] =
@@ -30,7 +30,12 @@ impl VendorRunStore {
         Self { pool }
     }
 
-    /// Stores one vendor run, or nothing when it is not attributed to a single pull request.
+    /// Stores one vendor run and records it as activity on its pull request, or does nothing when
+    /// it is not attributed to a single pull request.
+    ///
+    /// # Returns
+    ///
+    /// Whether the pull request's cost record was already final, so this run is not counted in it.
     ///
     /// # Errors
     ///
@@ -40,11 +45,16 @@ impl VendorRunStore {
         &self,
         repository_id: RepositoryId,
         run: &VendorRun,
-    ) -> Result<(), VendorRunStoreError> {
+    ) -> Result<bool, VendorRunStoreError> {
         let Some(pull_request) = run.pull_request else {
-            return Ok(());
+            return Ok(false);
         };
         trace::instrument_database_operation(DatabaseOperation::VendorRunRecord, async {
+            let mut transaction = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(map_sqlx_error)?;
             sqlx::query(
                 "INSERT INTO ci_vendor_runs \
                  (repository_id, pull_request_number, head_sha, vendor, trigger, cost_usd, \
@@ -58,10 +68,15 @@ impl VendorRunStore {
             .bind(run.trigger.as_str())
             .bind(run.cost_usd)
             .bind(run.price_table_version.as_str())
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
-            .map(|_| ())
-            .map_err(map_sqlx_error)
+            .map_err(map_sqlx_error)?;
+            let was_final =
+                record_cost_activity_in(&mut transaction, repository_id, pull_request, None)
+                    .await
+                    .map_err(map_sqlx_error)?;
+            transaction.commit().await.map_err(map_sqlx_error)?;
+            Ok(was_final)
         })
         .await
     }
@@ -91,6 +106,11 @@ impl VendorRunStore {
         let result = sqlx::query(
             "DELETE FROM ci_vendor_runs WHERE id IN (\
                  SELECT id FROM ci_vendor_runs WHERE updated_at < ? \
+                 AND NOT EXISTS (\
+                     SELECT 1 FROM pull_request_costs AS state \
+                     WHERE state.repository_id = ci_vendor_runs.repository_id \
+                     AND state.pull_request_number = ci_vendor_runs.pull_request_number \
+                     AND state.finalized_at IS NULL) \
                  ORDER BY updated_at, id LIMIT ?\
              )",
         )
@@ -307,12 +327,45 @@ mod tests {
         .await
         .expect("row ages");
 
-        let pruned = store
-            .prune_batch(datetime!(2026-06-01 00:00 UTC))
-            .await
-            .expect("prune succeeds");
+        let cutoff = datetime!(2026-06-01 00:00 UTC);
+        assert_eq!(
+            store.prune_batch(cutoff).await.expect("prune succeeds"),
+            0,
+            "a pending pull request keeps its vendor runs"
+        );
+        sqlx::query(
+            "UPDATE pull_request_costs SET finalized_at = '2026-01-01T00:00:00.000Z', \
+             finalized_by = 'max_age', partial = 0, total_usd = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("pull request finalizes");
+
+        let pruned = store.prune_batch(cutoff).await.expect("prune succeeds");
 
         assert_eq!(pruned, 1);
         assert_eq!(row_count(&pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_run_reports_whether_its_pull_request_was_already_final() {
+        let (_directory, pool, store, repository_id) = store_with_repository().await;
+        assert!(!store
+            .record(repository_id, &run(Some(42), 0.5))
+            .await
+            .expect("run persists"));
+        sqlx::query(
+            "UPDATE pull_request_costs SET finalized_at = '2026-01-01T00:00:00.000Z', \
+             finalized_by = 'closed_grace', partial = 0, total_usd = 0.5",
+        )
+        .execute(&pool)
+        .await
+        .expect("pull request finalizes");
+
+        assert!(store
+            .record(repository_id, &run(Some(42), 0.5))
+            .await
+            .expect("late run persists"));
+        assert_eq!(row_count(&pool).await, 2);
     }
 }

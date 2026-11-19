@@ -96,6 +96,14 @@ const CICD_PIPELINE_RESULT_KEY: &str = "cicd.pipeline.result";
 const GITHUB_PR_RESOLUTION_KEY: &str = "github.pr_resolution";
 const CI_VENDOR_KEY: &str = "ci.vendor";
 const CI_VENDOR_TRIGGER_KEY: &str = "ci.vendor.trigger";
+const GITHUB_PR_OUTCOME_KEY: &str = "github.pr_outcome";
+const CI_PR_COMMITS_KEY: &str = "ci.pr.commits";
+const CI_PR_RUNS_KEY: &str = "ci.pr.runs";
+const CI_PR_RERUNS_KEY: &str = "ci.pr.reruns";
+const CI_PR_VENDOR_RUNS_KEY: &str = "ci.pr.vendor_runs";
+const CI_PR_OPEN_HOURS_KEY: &str = "ci.pr.open_hours";
+const CI_PR_FINALIZED_BY_KEY: &str = "ci.pr.finalized_by";
+const CI_PR_PARTIAL_KEY: &str = "ci.pr.partial";
 
 /// The `ci.source` of GitHub Actions runner minutes.
 pub(crate) const CI_SOURCE_GITHUB_ACTIONS: &str = "github_actions";
@@ -111,6 +119,7 @@ pub(super) const GITHUB_ACTIONS_STEP_OPERATION: &str = "github.actions.step";
 pub(super) const CI_USAGE_OPERATION: &str = "ci.usage";
 pub(super) const CI_RUN_COST_OPERATION: &str = "ci.run.cost";
 pub(super) const CI_VENDOR_RUN_OPERATION: &str = "ci.vendor.run";
+pub(super) const CI_PR_COST_OPERATION: &str = "ci.pr.cost";
 
 fn string_key_value(key: &'static str, value: impl Into<String>) -> KeyValue {
     KeyValue::new(key, value.into())
@@ -315,6 +324,33 @@ pub(crate) fn vendor_run_attributes(vendor: &str, trigger: &str, cost_usd: f64) 
         KeyValue::new(CI_COST_USD_KEY, cost_usd),
         string_key_value(CI_VENDOR_KEY, vendor),
         string_key_value(CI_VENDOR_TRIGGER_KEY, trigger),
+    ]
+}
+
+/// The counts and classification of one finalized pull request's cost record.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PullRequestCostSummary {
+    pub(crate) outcome: &'static str,
+    pub(crate) finalized_by: &'static str,
+    pub(crate) partial: bool,
+    pub(crate) commits: i64,
+    pub(crate) runs: i64,
+    pub(crate) reruns: i64,
+    pub(crate) vendor_runs: i64,
+    pub(crate) open_hours: f64,
+}
+
+/// Returns the `github.pr_outcome` and `ci.pr.*` attributes of one pull request's cost record.
+pub(crate) fn pull_request_cost_attributes(summary: &PullRequestCostSummary) -> [KeyValue; 8] {
+    [
+        string_key_value(GITHUB_PR_OUTCOME_KEY, summary.outcome),
+        KeyValue::new(CI_PR_COMMITS_KEY, summary.commits),
+        KeyValue::new(CI_PR_RUNS_KEY, summary.runs),
+        KeyValue::new(CI_PR_RERUNS_KEY, summary.reruns),
+        KeyValue::new(CI_PR_VENDOR_RUNS_KEY, summary.vendor_runs),
+        KeyValue::new(CI_PR_OPEN_HOURS_KEY, summary.open_hours),
+        string_key_value(CI_PR_FINALIZED_BY_KEY, summary.finalized_by),
+        KeyValue::new(CI_PR_PARTIAL_KEY, summary.partial),
     ]
 }
 
@@ -536,6 +572,8 @@ pub(crate) enum Operation {
     RetentionRun,
     /// Finalizing one run attempt's cost total in the background.
     RunCostFinalize,
+    /// Finalizing one pull request's cost record in the background.
+    PullRequestCostFinalize,
 }
 
 /// A bounded terminal outcome recorded in tracing.
@@ -735,6 +773,12 @@ pub(crate) enum DatabaseOperation {
     VendorRunRecord,
     /// Pruning stored vendor runs.
     VendorRunPrune,
+    /// Recording one `pull_request` delivery for the pull request's cost record.
+    PullRequestCostRecord,
+    /// Finalizing one pull request's cost record.
+    PullRequestCostFinalize,
+    /// Pruning finalized pull-request cost records.
+    PullRequestCostPrune,
 }
 
 /// Creates a bounded tracing span for a high-level operation.
@@ -761,6 +805,9 @@ pub(crate) fn operation_span(operation: Operation) -> Span {
         }
         Operation::RunCostFinalize => {
             info_span!(target: TELEMETRY_TARGET, parent: None, "run_cost.finalize")
+        }
+        Operation::PullRequestCostFinalize => {
+            info_span!(target: TELEMETRY_TARGET, parent: None, "pull_request_cost.finalize")
         }
     }
 }
@@ -1015,6 +1062,7 @@ impl Operation {
             Self::MergeQueueUpdate => "merge_queue.update",
             Self::RetentionRun => "retention.run",
             Self::RunCostFinalize => "run_cost.finalize",
+            Self::PullRequestCostFinalize => "pull_request_cost.finalize",
         }
     }
 }
@@ -1164,6 +1212,9 @@ impl DatabaseOperation {
             Self::PullRequestCommitPrune => "pull_request_commit.prune",
             Self::VendorRunRecord => "vendor_run.record",
             Self::VendorRunPrune => "vendor_run.prune",
+            Self::PullRequestCostRecord => "pull_request_cost.record",
+            Self::PullRequestCostFinalize => "pull_request_cost.finalize",
+            Self::PullRequestCostPrune => "pull_request_cost.prune",
         }
     }
 }

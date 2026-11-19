@@ -37,6 +37,7 @@ use crate::{
             run_trace_context, PipelineRunTrace, PipelineRunTraceParts, WorkflowJobTraceIdentity,
             MAX_PIPELINE_JOB_SPANS,
         },
+        pr_cost::{warn_pull_request_cost_after_finalize, LatePullRequestCost},
         run_cost::warn_cost_after_finalize,
         trace::{
             self, CommitSha, Operation, OperationOutcome, QueueEntity, CI_SOURCE_GITHUB_ACTIONS,
@@ -315,6 +316,14 @@ async fn webhook_handler(
                     if event_type == EventType::PullRequest && state.run_costs_enabled() {
                         record_pull_request_commit(&state, repository_id, pull_request, action)
                             .await;
+                        record_pull_request_cost_activity(
+                            &state,
+                            repository_id,
+                            pull_request,
+                            action,
+                            received_at,
+                        )
+                        .await;
                     }
                     let processor = QueueProcessor {
                         repository_id,
@@ -498,6 +507,27 @@ async fn record_pull_request_commit(
     }
 }
 
+/// Records a `pull_request` delivery's creation time, close or reopen for its cost record.
+async fn record_pull_request_cost_activity(
+    state: &AppState,
+    repository_id: RepositoryId,
+    pull_request: &PullRequestProjection,
+    action: Action,
+    received_at: OffsetDateTime,
+) {
+    let Some(activity) = pull_request.cost_activity(action, received_at) else {
+        return;
+    };
+    if state
+        .pull_request_cost_store()
+        .record_activity(repository_id, &activity)
+        .await
+        .is_err()
+    {
+        log_run_cost_enrichment_failure("pull_request_cost_record_failed");
+    }
+}
+
 fn log_run_cost_enrichment_failure(outcome: &'static str) {
     let error_correlation_id = crate::error::ErrorCorrelationId::new();
     error!(
@@ -516,12 +546,18 @@ fn log_run_cost_enrichment_failure(outcome: &'static str) {
 async fn record_vendor_run(state: &AppState, repository_id: RepositoryId, run: &VendorRun) {
     log_vendor_run_cost(run);
     state.workflow_trace_emitter().emit_vendor_run(run);
-    if state
-        .vendor_run_store()
-        .record(repository_id, run)
-        .await
-        .is_err()
-    {
+    let recorded = state.vendor_run_store().record(repository_id, run).await;
+    if let (Ok(true), Some(pull_request)) = (recorded, run.pull_request) {
+        warn_pull_request_cost_after_finalize(
+            &run.repository_name,
+            pull_request,
+            LatePullRequestCost::Vendor {
+                vendor: run.vendor.as_str(),
+                cost_usd: run.cost_usd,
+            },
+        );
+    }
+    if recorded.is_err() {
         state
             .metrics()
             .record_failure(Some(&run.repository_name), FailureStage::VendorRun);
