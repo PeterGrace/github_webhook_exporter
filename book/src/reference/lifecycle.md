@@ -29,12 +29,15 @@ fewer than 1,000. Delivery pruning preserves fresh claims; queue pruning deletes
 a non-null completion time older than its cutoff, preserving fresh completed and all pending
 attempts. Pruning runs in a fixed order: deliveries, merge-queue attempts, workflow-run contexts,
 workflow-job links, the branch-protection required-check cache, in-job usage entries, vendor runs,
-run-cost schedules and totals, per-pull-request run totals, pull-request cost records, then the
-commit-to-pull-request map. Workflow, usage and run-cost rows and the commit map are keyed to
-deliveries and runs and share the delivery cutoff. Vendor runs, per-pull-request run totals and
-pull-request cost records share the `GHE_PR_COST_RETENTION_DAYS` cutoff (default `90`), measured
-from each row's last update; rows of a pull request whose cost record is still pending are kept,
-and a pending record is never pruned. The required-check cache additionally expires on read after
+run-cost schedules and totals, per-pull-request run totals, pull-request cost records, commit cost
+records, then the commit-to-pull-request map. Workflow, usage and run-cost rows and the commit map
+are keyed to deliveries and runs and share the delivery cutoff. Vendor runs, per-pull-request run
+totals, pull-request cost records and commit cost records share the `GHE_PR_COST_RETENTION_DAYS`
+cutoff (default `90`), measured from each row's last update. Rows of a pull request whose cost
+record is still pending are kept, vendor runs are also kept while their commit's cost record is
+pending, and a pending pull-request or commit record is never pruned. A commit's per-run totals
+are deleted when its record is finalized, so pruning removes only finalized commit records and the
+pre-upgrade markers behind `ci.commit.partial`. The required-check cache additionally expires on read after
 `GHE_REQUIRED_CHECK_TTL_SECONDS`, so pruning only reclaims space rather than governing
 correctness.
 

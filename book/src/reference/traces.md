@@ -486,7 +486,8 @@ carries:
 - `github.repository.name` and `vcs.ref.head.revision`, the commit SHA, under the same key as the
   run total span;
 - `github.pull_request.number` and `ci.pull_request.number`, both scalars, naming the pull request
-  most of its runs and vendor runs were attributed to, the lowest number on a tie. Both are omitted
+  most of its runs and vendor runs were attributed to, counting each workflow run once whatever
+  its number of attempts, the lowest number on a tie. Both are omitted
   when none were, such as for a `push` to the default branch the commit map could not attribute;
 - `ci.commit.trigger`: `merge_group` when any of its runs was a merge-queue run, otherwise `push`
   when any was a `push` run, otherwise `pull_request`. A commit whose only cost is vendor runs is
@@ -496,7 +497,10 @@ carries:
 - `ci.cost.total_usd`, the sum of its run totals and vendor runs, and one `ci.cost.<source>_usd`
   per source, bounded to 16 keys as in run totals;
 - `ci.commit.partial`, `true` when a commit-triggered run on the commit was totalled before this
-  exporter version first started, so that run is missing from the record.
+  exporter version first started, so that run is missing from the record. The upgrade can only see
+  run totals still retained under the delivery cutoff (`GHE_DELIVERY_RETENTION_DAYS`, default
+  `7`), so a commit last totalled before that and re-run after the upgrade reports `false` even
+  though its earlier run is missing.
 
 The same record also writes one `ci commit cost finalized` info log, whether or not trace export
 is enabled, with no trace context. It carries `vcs.ref.head.revision`, `ci.pull_request.number`

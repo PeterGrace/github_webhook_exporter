@@ -26,8 +26,9 @@ Date: 2026-11-20T02:00:00Z
   pending.
 - Migration `202611200003` adds `commit_run_costs`, `commit_run_cost_sources`, `commit_costs` and
   `commit_costs_before_rollup`, and an index on `ci_vendor_runs` by head commit. It marks every
-  commit with a commit-triggered run total already finalized, so a record for one of those commits
-  is `ci.commit.partial=true`.
+  commit with a commit-triggered run total already finalized and still retained under the delivery
+  cutoff, so a record for one of those commits is `ci.commit.partial=true`. Totals pruned before
+  the upgrade leave no marker.
 
 ## Operator action
 

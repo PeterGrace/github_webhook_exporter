@@ -377,11 +377,12 @@ async fn commit_total_in(
     .fetch_all(&mut *connection)
     .await?;
     let pull_request: Option<i64> = sqlx::query_scalar(
+        // one vote per workflow run, not per attempt, and one per vendor run
         "SELECT pull_request_number FROM (\
-             SELECT pull_request_number FROM commit_run_costs \
+             SELECT DISTINCT workflow_run_id, pull_request_number FROM commit_run_costs \
              WHERE repository_id = ?1 AND commit_sha = ?2 AND pull_request_number IS NOT NULL \
              UNION ALL \
-             SELECT pull_request_number FROM ci_vendor_runs \
+             SELECT -id, pull_request_number FROM ci_vendor_runs \
              WHERE repository_id = ?1 AND head_sha = ?2\
          ) GROUP BY pull_request_number ORDER BY COUNT(*) DESC, pull_request_number LIMIT 1",
     )
@@ -718,6 +719,25 @@ mod tests {
         assert!(fixture.due_shas(settled()).await.is_empty());
         assert_eq!(fixture.count("commit_run_costs").await, 0);
         assert_eq!(fixture.count("commit_run_cost_sources").await, 0);
+    }
+
+    #[tokio::test]
+    async fn the_pull_request_counts_each_run_once_whatever_its_attempts() {
+        let fixture = fixture().await;
+        for attempt in 1..=3 {
+            let rerun = pending(1, attempt, WorkflowEvent::PullRequest);
+            let run = finalized(&rerun, Some(7), &[("github_actions", 1.0)]);
+            fixture.finalize_run(&rerun, run).await;
+        }
+        for run_id in [2, 3] {
+            let other = pending(run_id, 1, WorkflowEvent::PullRequest);
+            let run = finalized(&other, Some(42), &[("github_actions", 1.0)]);
+            fixture.finalize_run(&other, run).await;
+        }
+
+        let total = fixture.finalize(settled()).await.expect("commit finalizes");
+
+        assert_eq!(total.pull_request.map(PullRequestNumber::get), Some(42));
     }
 
     #[tokio::test]
