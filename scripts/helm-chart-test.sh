@@ -256,7 +256,7 @@ assert_yq \
     "${TEMPORARY_DIRECTORY}/default-statefulset.yaml" \
     'StatefulSet must mount and use the durable SQLite data path'
 assert_yq \
-    '(.data | length) == 19 and .data.GHE_BIND_ADDRESS == "[::]:8080" and
+    '(.data | length) == 20 and .data.GHE_BIND_ADDRESS == "[::]:8080" and
      .data.GHE_SHUTDOWN_TIMEOUT_SECONDS == "30" and
      .data.GHE_WEBHOOK_BODY_LIMIT_BYTES == "2097152" and
      .data.GHE_WORKFLOW_JOB_MAX_STEPS == "256" and
@@ -265,6 +265,7 @@ assert_yq \
      .data.GHE_PR_COST_SETTLE_SECONDS == "1800" and
      .data.GHE_PR_COST_POST_MERGE_TIMEOUT_SECONDS == "21600" and
      .data.GHE_PR_COST_CLOSED_GRACE_SECONDS == "3600" and
+     .data.GHE_COMMIT_COST_SETTLE_SECONDS == "21600" and
      .data.GHE_DELIVERY_RETENTION_DAYS == "7" and
      .data.GHE_MERGE_QUEUE_RETENTION_DAYS == "90" and
      .data.GHE_PR_COST_RETENTION_DAYS == "90" and
@@ -1141,6 +1142,7 @@ for pull_request_cost_value in \
     application.prCostSettleSeconds \
     application.prCostPostMergeTimeoutSeconds \
     application.prCostClosedGraceSeconds \
+    application.commitCostSettleSeconds \
     retention.pullRequestCostDays; do
     expect_failure \
         "zero ${pull_request_cost_value}" \

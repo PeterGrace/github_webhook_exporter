@@ -133,9 +133,10 @@ impl PullRequestCostTotal {
     }
 }
 
-/// A cost that reached a pull request after its record was final, so the record leaves it out.
+/// A cost that reached a pull request or commit after its record was final, so the record leaves
+/// it out.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum LatePullRequestCost<'cost> {
+pub(crate) enum LateCost<'cost> {
     /// A finalized run attempt's total.
     Run {
         run_id: WorkflowRunId,
@@ -144,6 +145,36 @@ pub(crate) enum LatePullRequestCost<'cost> {
     },
     /// A priced vendor run.
     Vendor { vendor: &'cost str, cost_usd: f64 },
+}
+
+/// The log fields of one [`LateCost`]: its USD, run ID, run attempt and vendor.
+pub(crate) type LateCostFields<'cost> = (f64, Option<i64>, Option<i64>, Option<&'cost str>);
+
+impl<'cost> LateCost<'cost> {
+    /// Returns the context a late-cost warning is logged in: a late run total belongs to its
+    /// run's derived pipeline trace, while a vendor run has no workflow run and is parentless.
+    pub(crate) fn trace_context(&self, repository_name: &CanonicalRepositoryName) -> Context {
+        match *self {
+            Self::Run {
+                run_id,
+                run_attempt,
+                ..
+            } => run_trace_context(repository_name, run_id, run_attempt),
+            Self::Vendor { .. } => Context::new(),
+        }
+    }
+
+    /// Returns the warning's log fields.
+    pub(crate) fn fields(&self) -> LateCostFields<'cost> {
+        match *self {
+            Self::Run {
+                run_id,
+                run_attempt,
+                total_usd,
+            } => (total_usd, Some(run_id.get()), Some(run_attempt.get()), None),
+            Self::Vendor { vendor, cost_usd } => (cost_usd, None, None, Some(vendor)),
+        }
+    }
 }
 
 impl WorkflowTraceEmitter {
@@ -228,25 +259,10 @@ pub(crate) fn log_pull_request_cost_finalized(total: &PullRequestCostTotal) {
 pub(crate) fn warn_pull_request_cost_after_finalize(
     repository_name: &CanonicalRepositoryName,
     pull_request: PullRequestNumber,
-    late: LatePullRequestCost<'_>,
+    late: LateCost<'_>,
 ) {
-    let _trace_context = match late {
-        LatePullRequestCost::Run {
-            run_id,
-            run_attempt,
-            ..
-        } => run_trace_context(repository_name, run_id, run_attempt),
-        LatePullRequestCost::Vendor { .. } => Context::new(),
-    }
-    .attach();
-    let (cost_usd, run_id, run_attempt, vendor) = match late {
-        LatePullRequestCost::Run {
-            run_id,
-            run_attempt,
-            total_usd,
-        } => (total_usd, Some(run_id.get()), Some(run_attempt.get()), None),
-        LatePullRequestCost::Vendor { vendor, cost_usd } => (cost_usd, None, None, Some(vendor)),
-    };
+    let _trace_context = late.trace_context(repository_name).attach();
+    let (cost_usd, run_id, run_attempt, vendor) = late.fields();
     warn!(
         parent: None,
         ci.cost_usd = cost_usd,

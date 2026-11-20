@@ -33,11 +33,12 @@ use crate::{
     },
     storage::{DeliveryClaim, PendingRunCost},
     telemetry::{
+        commit_cost::warn_commit_cost_after_finalize,
         pipeline::{
             run_trace_context, PipelineRunTrace, PipelineRunTraceParts, WorkflowJobTraceIdentity,
             MAX_PIPELINE_JOB_SPANS,
         },
-        pr_cost::{warn_pull_request_cost_after_finalize, LatePullRequestCost},
+        pr_cost::{warn_pull_request_cost_after_finalize, LateCost},
         run_cost::warn_cost_after_finalize,
         trace::{
             self, CommitSha, Operation, OperationOutcome, QueueEntity, CI_SOURCE_GITHUB_ACTIONS,
@@ -547,15 +548,17 @@ async fn record_vendor_run(state: &AppState, repository_id: RepositoryId, run: &
     log_vendor_run_cost(run);
     state.workflow_trace_emitter().emit_vendor_run(run);
     let recorded = state.vendor_run_store().record(repository_id, run).await;
-    if let (Ok(true), Some(pull_request)) = (recorded, run.pull_request) {
-        warn_pull_request_cost_after_finalize(
-            &run.repository_name,
-            pull_request,
-            LatePullRequestCost::Vendor {
-                vendor: run.vendor.as_str(),
-                cost_usd: run.cost_usd,
-            },
-        );
+    let late = LateCost::Vendor {
+        vendor: run.vendor.as_str(),
+        cost_usd: run.cost_usd,
+    };
+    if let Ok(recorded) = recorded {
+        if let Some(pull_request) = run.pull_request.filter(|_| recorded.pull_request_was_final) {
+            warn_pull_request_cost_after_finalize(&run.repository_name, pull_request, late);
+        }
+        if let Some(commit_sha) = run.head_sha.as_ref().filter(|_| recorded.commit_was_final) {
+            warn_commit_cost_after_finalize(&run.repository_name, commit_sha, late);
+        }
     }
     if recorded.is_err() {
         state

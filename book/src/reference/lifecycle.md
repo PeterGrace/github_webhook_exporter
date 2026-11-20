@@ -97,19 +97,28 @@ one that comes due while the process is down is finalized by the next process. E
 built and marked final in one transaction, and its span and log are emitted only by the poll that
 wrote it. A storage failure leaves the pull request pending for the next poll.
 
+## Commit cost finalization
+
+With the same configuration, a fifth background task finalizes each commit's cost record once the
+rule in [Commit cost records](traces.md#commit-cost-records) applies. It polls SQLite every 60
+seconds, at once on startup, and finalizes at most 100 commits per poll, honoring shutdown between
+them. Like the pull-request finalizer, it builds and marks each record final in one transaction,
+emits its span and log only from the poll that wrote it, and leaves a commit pending for the next
+poll after a storage failure.
+
 ## Graceful shutdown
 
 Tokio listens for both `SIGINT` and `SIGTERM`. Either signal follows the same sequence:
 
 1. Record the normalized signal in structured stderr logging.
-2. Notify Axum, the shared retention task, the required-check refresher, and the run-cost and
-   pull-request cost finalizers through one cancellation signal.
+2. Notify Axum, the shared retention task, the required-check refresher, and the run-cost,
+   pull-request cost and commit cost finalizers through one cancellation signal.
 3. Stop accepting new connections, stop scheduling new prune batches, stop serving new
-   required-check refresh requests, and stop starting new run totals and pull-request cost
-   records.
-4. Allow active requests, active SQLite prune work, and a run total or pull-request cost record
-   already being written to finish within one shared `GHE_SHUTDOWN_TIMEOUT_SECONDS` deadline.
-   Runs not yet totalled and pull requests not yet finalized stay pending for the next start.
+   required-check refresh requests, and stop starting new run totals and pull-request and commit
+   cost records.
+4. Allow active requests, active SQLite prune work, and a run total or cost record already being
+   written to finish within one shared `GHE_SHUTDOWN_TIMEOUT_SECONDS` deadline. Runs not yet
+   totalled and pull requests and commits not yet finalized stay pending for the next start.
 5. Record that telemetry provider shutdown is starting, close both telemetry admission boundaries,
    and begin trace and log provider shutdown concurrently.
 6. Wait at most the separate shared `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` deadline for both

@@ -21,13 +21,14 @@ matter directly when running the container or binary yourself.
 | `GHE_WORKFLOW_JOB_MAX_STEPS` | `256` | Step cap for `workflow_job` traces; integer in `1..=1024`. No unlimited mode. |
 | `GHE_DELIVERY_RETENTION_DAYS` | `7` | Delivery-ID retention; positive integer. |
 | `GHE_MERGE_QUEUE_RETENTION_DAYS` | `90` | Completed merge-queue attempt retention; positive integer. |
-| `GHE_PR_COST_RETENTION_DAYS` | `90` | Days without activity before a pull request's cost record is finalized with `max_age`; its cost state, run totals and vendor runs are pruned on the same clock. Positive integer. See [Pull request cost records](traces.md#pull-request-cost-records). |
+| `GHE_PR_COST_RETENTION_DAYS` | `90` | Days without activity before a pull request's cost record is finalized with `max_age`, and before a commit's cost record is finalized whatever is pending; their cost state, run totals and vendor runs are pruned on the same clock. Positive integer. See [Pull request cost records](traces.md#pull-request-cost-records). |
 | `GHE_DELIVERY_PRUNE_INTERVAL_SECONDS` | `3600` | Retention sweep interval; positive integer. |
 | `GHE_REQUIRED_CHECK_TTL_SECONDS` | `300` | How long a cached branch-protection answer stays confident; integer in `1..=86400`. |
 | `GHE_RUN_GRACE_SECONDS` | `300` | How long after `workflow_run.completed` a run's cost is totalled, so late job deliveries and usage posts still count; integer in `1..=3600`. Used only when `GHE_COSTS_JSON` or `GHE_INGEST_OIDC_JSON` is set. See [Run cost totals](traces.md#run-cost-totals). |
 | `GHE_PR_COST_SETTLE_SECONDS` | `1800` | Quiet period after a merged pull request's latest post-merge run before its cost record is finalized; positive integer. Used only when `GHE_COSTS_JSON` or `GHE_INGEST_OIDC_JSON` is set. |
 | `GHE_PR_COST_POST_MERGE_TIMEOUT_SECONDS` | `21600` | How long a merged pull request waits for its first post-merge run before its cost record is finalized with `timeout`; positive integer. |
 | `GHE_PR_COST_CLOSED_GRACE_SECONDS` | `3600` | How long a pull request closed without merging waits before its cost record is finalized; positive integer. |
+| `GHE_COMMIT_COST_SETTLE_SECONDS` | `21600` | Quiet period after a commit's latest run total or vendor run, once none of its commit-triggered runs is pending, before its cost record is finalized; positive integer. Used only when `GHE_COSTS_JSON` or `GHE_INGEST_OIDC_JSON` is set. See [Commit cost records](traces.md#commit-cost-records). |
 | `GHE_OTEL_QUEUE_CAPACITY` | `2048` | Bounded export queue capacity, per enabled signal. |
 | `GHE_OTEL_BATCH_SIZE` | `512` | Export batch size; cannot exceed queue capacity. |
 | `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` | `5` | Telemetry flush deadline. |

@@ -14,7 +14,8 @@ use crate::{
         RunFinalization, UsageTotals,
     },
     telemetry::{
-        pr_cost::{warn_pull_request_cost_after_finalize, LatePullRequestCost},
+        commit_cost::warn_commit_cost_after_finalize,
+        pr_cost::{warn_pull_request_cost_after_finalize, LateCost},
         run_cost::{
             bounded_breakdown, breakdown_key, log_run_cost_finalized, PullRequestResolution,
             RunCostTotal,
@@ -191,22 +192,23 @@ impl RunCostFinalizer {
         let Some(RunFinalization {
             value: total,
             pull_request_was_final,
+            commit_was_final,
         }) = finalization
         else {
             return Ok(false);
         };
         self.emitter.emit_run_cost(&total);
         log_run_cost_finalized(&total);
+        let late = LateCost::Run {
+            run_id: total.run_id,
+            run_attempt: total.run_attempt,
+            total_usd: total.total_usd,
+        };
         if let Some(pull_request) = total.pull_request.filter(|_| pull_request_was_final) {
-            warn_pull_request_cost_after_finalize(
-                &total.repository_name,
-                pull_request,
-                LatePullRequestCost::Run {
-                    run_id: total.run_id,
-                    run_attempt: total.run_attempt,
-                    total_usd: total.total_usd,
-                },
-            );
+            warn_pull_request_cost_after_finalize(&total.repository_name, pull_request, late);
+        }
+        if let Some(commit_sha) = total.head_sha.as_ref().filter(|_| commit_was_final) {
+            warn_commit_cost_after_finalize(&total.repository_name, commit_sha, late);
         }
         Ok(true)
     }

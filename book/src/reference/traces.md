@@ -459,6 +459,61 @@ emitted a second time while its state is retained. A failed finalization logs a
 A pull request's state, run totals and vendor runs are pruned once it is final and has had no
 activity for `GHE_PR_COST_RETENTION_DAYS`. Activity after that starts a new record.
 
+### Commit cost records
+
+With the same configuration, each commit also gets one final cost record, so cost can be charted
+per commit as well as per run and per pull request. It is built from the run totals of the runs
+the commit triggered, each attempt counted once, and the vendor runs on it:
+
+- runs whose trigger is `pull_request`, `pull_request_target`, `push` or `merge_group` and whose
+  head commit is this commit. Runs started by comments, reviews, schedules, manual dispatch or
+  another workflow's run happen to run on a commit without being caused by it, so they are left
+  out;
+- vendor runs whose head commit is this commit. Only vendor runs attributed to a pull request are
+  stored, as above.
+
+A commit is finalized once none of its commit-triggered run attempts is still inside its
+`GHE_RUN_GRACE_SECONDS` and no run total or vendor run has reached it for
+`GHE_COMMIT_COST_SETTLE_SECONDS` (default `21600`, six hours), so a re-run within that time still
+counts. A commit with no activity for `GHE_PR_COST_RETENTION_DAYS` is finalized whatever is still
+pending, so it is always finalized before retention prunes it. The finalizer polls every 60
+seconds and its state is stored in SQLite.
+
+The record exports one parentless span named `ci.commit.cost`, with `sentry.op=ci.commit.cost`,
+`sentry.description` `Commit <first 7 characters of the SHA> cost` and an instant timestamp. It
+carries:
+
+- `github.repository.name` and `vcs.ref.head.revision`, the commit SHA, under the same key as the
+  run total span;
+- `github.pull_request.number` and `ci.pull_request.number`, both scalars, naming the pull request
+  most of its runs and vendor runs were attributed to, the lowest number on a tie. Both are omitted
+  when none were, such as for a `push` to the default branch the commit map could not attribute;
+- `ci.commit.trigger`: `merge_group` when any of its runs was a merge-queue run, otherwise `push`
+  when any was a `push` run, otherwise `pull_request`. A commit whose only cost is vendor runs is
+  `pull_request`;
+- `ci.commit.runs`, its distinct workflow runs; `ci.commit.reruns`, the attempts after each run's
+  first; and `ci.commit.vendor_runs`;
+- `ci.cost.total_usd`, the sum of its run totals and vendor runs, and one `ci.cost.<source>_usd`
+  per source, bounded to 16 keys as in run totals;
+- `ci.commit.partial`, `true` when a commit-triggered run on the commit was totalled before this
+  exporter version first started, so that run is missing from the record.
+
+The same record also writes one `ci commit cost finalized` info log, whether or not trace export
+is enabled, with no trace context. It carries `vcs.ref.head.revision`, `ci.pull_request.number`
+when known, the `ci.commit.*` attributes, `ci.cost.total_usd`, the per-source breakdown as a
+`key=value` list in `ci.cost.by_source`, and `github.repository`.
+
+A run total or vendor run that arrives after its commit's record is final is not counted, and logs
+a `ci commit cost after finalize` warning with `ci.cost_usd`, `vcs.ref.head.revision` and
+`github.repository`, plus `cicd.pipeline.run.id` and `github.workflow.run.attempt` for a run or
+`ci.vendor` for a vendor run, in the same trace context as `ci pr cost after finalize`. A failed
+finalization logs a `ci commit cost finalization failed` warning with only an `outcome` and an
+opaque `error_correlation_id`, and is retried on the next poll.
+
+A commit's run totals are deleted when its record is final. Its state is pruned once it has had no
+activity for `GHE_PR_COST_RETENTION_DAYS`, and its vendor runs are kept while its record is
+pending.
+
 ### Branch-protection required checks
 
 `github.workflow.required` is a boolean reporting whether a job is a **branch-protection required
@@ -500,16 +555,18 @@ or metrics.
 Commands, output, logs, actors, payload-provided URLs, request bodies, arbitrary payload fragments,
 secrets, signatures, authorization/other headers, unsupported actions, and raw unknown conclusions
 never enter workflow telemetry, in traces, logs, or metrics. Workflow identifiers and names stay
-out of logs with seven exceptions. One is a parentless structured warning on a newly claimed
+out of logs with nine exceptions. One is a parentless structured warning on a newly claimed
 `too_many_steps` rejection, which may contain only `repository_name`, `delivery_id`,
 `workflow_run_id`, `workflow_run_attempt`, `workflow_job_id`, `step_count`, and `step_limit`. The
 second is the `ci cost recorded` log described above, written for priced jobs when a `costs`
 table is configured, for accepted usage entries and for matched vendor runs, and carrying only the
 listed fields, so cost can be charted from the logs dataset. The other three are the `ci run cost
 finalized` log and the `ci run unattributed` and `ci cost after finalize` warnings, each carrying
-only the fields listed under [Run cost totals](#run-cost-totals). The last two are the
+only the fields listed under [Run cost totals](#run-cost-totals). Two more are the
 `ci pr cost finalized` log and the `ci pr cost after finalize` warning, each carrying only the
-fields listed under [Pull request cost records](#pull-request-cost-records). The `ci usage post rejected` warning carries only its
+fields listed under [Pull request cost records](#pull-request-cost-records). The last two are the
+`ci commit cost finalized` log and the `ci commit cost after finalize` warning, each carrying only
+the fields listed under [Commit cost records](#commit-cost-records). The `ci usage post rejected` warning carries only its
 `reason` and, after token verification, `github.repository`; the `ci usage post failed` error
 carries only `outcome`, `error_id` and `github.repository`. Operators can query
 `GET /repos/{owner}/{repo}/actions/jobs/{job_id}` with the canonical repository name and

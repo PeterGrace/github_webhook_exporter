@@ -1,4 +1,5 @@
 mod ci_usage_store;
+mod commit_cost_store;
 mod delivery_store;
 mod merge_queue_store;
 mod pull_request_commit_store;
@@ -16,6 +17,9 @@ use std::{fs::OpenOptions, io, path::Path, time::Duration};
 use std::os::unix::fs::OpenOptionsExt;
 
 pub(crate) use ci_usage_store::{CiUsageStore, CiUsageStoreError, UsageTotals};
+pub(crate) use commit_cost_store::{
+    CommitCostCutoffs, CommitCostStore, CommitCostStoreError, DueCommitCost,
+};
 pub use delivery_store::{DeliveryClaim, DeliveryStore, DeliveryStoreError};
 pub use merge_queue_store::{
     CompletionTransition, EnqueueTransition, MergeQueueStore, MergeQueueStoreError,
