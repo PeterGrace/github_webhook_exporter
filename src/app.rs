@@ -16,6 +16,7 @@ use tracing::Instrument;
 
 use crate::{
     api,
+    commit_costs::{CommitCostFinalizer, CommitCostPolicy},
     config::{GitHubAppConfig, DEFAULT_REQUIRED_CHECK_TTL_SECONDS, DEFAULT_RUN_GRACE_SECONDS},
     costs::CostsConfig,
     github::{
@@ -83,6 +84,7 @@ pub struct AppState {
     pull_request_cost_store: PullRequestCostStore,
     run_grace_period: Duration,
     pull_request_cost_policy: PullRequestCostPolicy,
+    commit_cost_policy: CommitCostPolicy,
 }
 
 /// The JWKS client for `ingest.oidc` could not be built.
@@ -135,6 +137,7 @@ impl AppState {
             pull_request_cost_store,
             run_grace_period: Duration::from_secs(DEFAULT_RUN_GRACE_SECONDS),
             pull_request_cost_policy: PullRequestCostPolicy::default(),
+            commit_cost_policy: CommitCostPolicy::default(),
         }
     }
 
@@ -155,6 +158,16 @@ impl AppState {
     /// * `policy` - The validated settle, timeout, grace and maximum-age durations.
     pub fn with_pull_request_cost_policy(mut self, policy: PullRequestCostPolicy) -> Self {
         self.pull_request_cost_policy = policy;
+        self
+    }
+
+    /// Returns application state that finalizes each commit's cost record under `policy`.
+    ///
+    /// # Parameters
+    ///
+    /// * `policy` - The validated settle and maximum-age durations.
+    pub fn with_commit_cost_policy(mut self, policy: CommitCostPolicy) -> Self {
+        self.commit_cost_policy = policy;
         self
     }
 
@@ -474,6 +487,13 @@ where
             state.pull_request_cost_policy,
         )
     });
+    let commit_cost_finalizer = state.run_costs_enabled().then(|| {
+        CommitCostFinalizer::new(
+            &state.database_pool,
+            state.workflow_trace_emitter.clone(),
+            state.commit_cost_policy,
+        )
+    });
     let BackgroundServices {
         retention,
         required_check_refresher,
@@ -499,6 +519,11 @@ where
                     finalizer.run(cancellation.clone()).await;
                 }
             };
+            let finalize_commits = async {
+                if let Some(finalizer) = commit_cost_finalizer {
+                    finalizer.run(cancellation.clone()).await;
+                }
+            };
             // Every background workload observes the same cancellation channel, so joining them
             // keeps a single background task handle while letting each stop independently.
             tokio::join!(
@@ -511,6 +536,7 @@ where
                 refresh,
                 finalize,
                 finalize_pull_requests,
+                finalize_commits,
             );
         },
     )

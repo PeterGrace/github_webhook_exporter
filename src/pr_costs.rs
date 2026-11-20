@@ -63,12 +63,7 @@ impl PullRequestCostPolicy {
         closed_grace: Duration,
         max_age: Duration,
     ) -> Result<Self, PullRequestCostPolicyError> {
-        let validate = |duration: Duration| {
-            if duration.is_zero() {
-                return Err(PullRequestCostPolicyError);
-            }
-            time::Duration::try_from(duration).map_err(|_| PullRequestCostPolicyError)
-        };
+        let validate = |duration| cost_duration(duration).ok_or(PullRequestCostPolicyError);
         Ok(Self {
             settle: validate(settle)?,
             post_merge_timeout: validate(post_merge_timeout)?,
@@ -86,6 +81,14 @@ impl PullRequestCostPolicy {
             inactive_before: now.checked_sub(self.max_age)?,
         })
     }
+}
+
+/// Converts a positive cost-record duration to `time`, or `None` when it is zero or too large.
+pub(crate) fn cost_duration(duration: Duration) -> Option<time::Duration> {
+    if duration.is_zero() {
+        return None;
+    }
+    time::Duration::try_from(duration).ok()
 }
 
 impl Default for PullRequestCostPolicy {

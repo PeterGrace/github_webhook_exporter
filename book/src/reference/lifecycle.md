@@ -29,12 +29,15 @@ fewer than 1,000. Delivery pruning preserves fresh claims; queue pruning deletes
 a non-null completion time older than its cutoff, preserving fresh completed and all pending
 attempts. Pruning runs in a fixed order: deliveries, merge-queue attempts, workflow-run contexts,
 workflow-job links, the branch-protection required-check cache, in-job usage entries, vendor runs,
-run-cost schedules and totals, per-pull-request run totals, pull-request cost records, then the
-commit-to-pull-request map. Workflow, usage and run-cost rows and the commit map are keyed to
-deliveries and runs and share the delivery cutoff. Vendor runs, per-pull-request run totals and
-pull-request cost records share the `GHE_PR_COST_RETENTION_DAYS` cutoff (default `90`), measured
-from each row's last update; rows of a pull request whose cost record is still pending are kept,
-and a pending record is never pruned. The required-check cache additionally expires on read after
+run-cost schedules and totals, per-pull-request run totals, pull-request cost records, commit cost
+records, then the commit-to-pull-request map. Workflow, usage and run-cost rows and the commit map
+are keyed to deliveries and runs and share the delivery cutoff. Vendor runs, per-pull-request run
+totals, pull-request cost records and commit cost records share the `GHE_PR_COST_RETENTION_DAYS`
+cutoff (default `90`), measured from each row's last update. Rows of a pull request whose cost
+record is still pending are kept, vendor runs are also kept while their commit's cost record is
+pending, and a pending pull-request or commit record is never pruned. A commit's per-run totals
+are deleted when its record is finalized, so pruning removes only finalized commit records and the
+pre-upgrade markers behind `ci.commit.partial`. The required-check cache additionally expires on read after
 `GHE_REQUIRED_CHECK_TTL_SECONDS`, so pruning only reclaims space rather than governing
 correctness.
 
@@ -97,19 +100,28 @@ one that comes due while the process is down is finalized by the next process. E
 built and marked final in one transaction, and its span and log are emitted only by the poll that
 wrote it. A storage failure leaves the pull request pending for the next poll.
 
+## Commit cost finalization
+
+With the same configuration, a fifth background task finalizes each commit's cost record once the
+rule in [Commit cost records](traces.md#commit-cost-records) applies. It polls SQLite every 60
+seconds, at once on startup, and finalizes at most 100 commits per poll, honoring shutdown between
+them. Like the pull-request finalizer, it builds and marks each record final in one transaction,
+emits its span and log only from the poll that wrote it, and leaves a commit pending for the next
+poll after a storage failure.
+
 ## Graceful shutdown
 
 Tokio listens for both `SIGINT` and `SIGTERM`. Either signal follows the same sequence:
 
 1. Record the normalized signal in structured stderr logging.
-2. Notify Axum, the shared retention task, the required-check refresher, and the run-cost and
-   pull-request cost finalizers through one cancellation signal.
+2. Notify Axum, the shared retention task, the required-check refresher, and the run-cost,
+   pull-request cost and commit cost finalizers through one cancellation signal.
 3. Stop accepting new connections, stop scheduling new prune batches, stop serving new
-   required-check refresh requests, and stop starting new run totals and pull-request cost
-   records.
-4. Allow active requests, active SQLite prune work, and a run total or pull-request cost record
-   already being written to finish within one shared `GHE_SHUTDOWN_TIMEOUT_SECONDS` deadline.
-   Runs not yet totalled and pull requests not yet finalized stay pending for the next start.
+   required-check refresh requests, and stop starting new run totals and pull-request and commit
+   cost records.
+4. Allow active requests, active SQLite prune work, and a run total or cost record already being
+   written to finish within one shared `GHE_SHUTDOWN_TIMEOUT_SECONDS` deadline. Runs not yet
+   totalled and pull requests and commits not yet finalized stay pending for the next start.
 5. Record that telemetry provider shutdown is starting, close both telemetry admission boundaries,
    and begin trace and log provider shutdown concurrently.
 6. Wait at most the separate shared `GHE_OTEL_SHUTDOWN_TIMEOUT_SECONDS` deadline for both

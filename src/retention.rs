@@ -11,12 +11,12 @@ use crate::{
     error::ErrorCorrelationId,
     lifecycle,
     storage::{
-        CiUsageStore, CiUsageStoreError, DeliveryStore, DeliveryStoreError, MergeQueueStore,
-        MergeQueueStoreError, PullRequestCommitStore, PullRequestCommitStoreError,
-        PullRequestCostStore, PullRequestCostStoreError, RequiredCheckStore,
-        RequiredCheckStoreError, RunCostStore, RunCostStoreError, VendorRunStore,
-        VendorRunStoreError, WorkflowJobLinkStore, WorkflowJobLinkStoreError, WorkflowRunStore,
-        WorkflowRunStoreError,
+        CiUsageStore, CiUsageStoreError, CommitCostStore, CommitCostStoreError, DeliveryStore,
+        DeliveryStoreError, MergeQueueStore, MergeQueueStoreError, PullRequestCommitStore,
+        PullRequestCommitStoreError, PullRequestCostStore, PullRequestCostStoreError,
+        RequiredCheckStore, RequiredCheckStoreError, RunCostStore, RunCostStoreError,
+        VendorRunStore, VendorRunStoreError, WorkflowJobLinkStore, WorkflowJobLinkStoreError,
+        WorkflowRunStore, WorkflowRunStoreError,
     },
     telemetry::trace::{self, Operation, OperationOutcome},
 };
@@ -143,6 +143,7 @@ struct DerivedRetentionStores {
     pull_request_run_cost: PullRequestRunCosts,
     pull_request_commit: PullRequestCommitStore,
     pull_request_cost: PullRequestCostStore,
+    commit_cost: CommitCostStore,
     vendor_run: VendorRunStore,
 }
 
@@ -162,6 +163,7 @@ impl DerivedRetentionStores {
             pull_request_run_cost: PullRequestRunCosts(RunCostStore::new(pool.clone())),
             pull_request_commit: PullRequestCommitStore::new(pool.clone()),
             pull_request_cost: PullRequestCostStore::new(pool.clone()),
+            commit_cost: CommitCostStore::new(pool.clone()),
             vendor_run: VendorRunStore::new(pool.clone()),
         }
     }
@@ -201,9 +203,9 @@ async fn prune_retention_pass(
     let merge_queue_cutoff = pass_started_at.checked_sub(config.merge_queue_retention);
     let pull_request_cost_cutoff = pass_started_at.checked_sub(config.pull_request_cost_retention);
     // Workflow correlation, required-check, usage and run-cost rows are keyed to deliveries and
-    // runs, so they share the delivery cutoff. Pull-request cost state, and the run totals and
-    // vendor runs it is built from, can outlive a run by weeks, so they share the pull-request
-    // cost cutoff instead; rows of a still pending pull request are kept regardless.
+    // runs, so they share the delivery cutoff. Pull-request and commit cost state, and the run
+    // totals and vendor runs they are built from, can outlive a run by weeks, so they share the
+    // pull-request cost cutoff instead; rows of a still pending record are kept regardless.
     prune_retention_workloads(
         &[
             (delivery_store, delivery_cutoff),
@@ -219,6 +221,7 @@ async fn prune_retention_pass(
                 pull_request_cost_cutoff,
             ),
             (&derived_stores.pull_request_cost, pull_request_cost_cutoff),
+            (&derived_stores.commit_cost, pull_request_cost_cutoff),
             (&derived_stores.pull_request_commit, delivery_cutoff),
         ],
         shutdown,
@@ -413,6 +416,19 @@ impl PrunableStore for PullRequestRunCosts {
             .prune_pull_request_batch(cutoff)
             .await
             .map_err(|_: RunCostStoreError| StorePruneFailure)
+    }
+}
+
+#[async_trait]
+impl PrunableStore for CommitCostStore {
+    fn workload(&self) -> &'static str {
+        "commit_cost"
+    }
+
+    async fn prune_batch_erased(&self, cutoff: OffsetDateTime) -> Result<u64, StorePruneFailure> {
+        CommitCostStore::prune_batch(self, cutoff)
+            .await
+            .map_err(|_: CommitCostStoreError| StorePruneFailure)
     }
 }
 

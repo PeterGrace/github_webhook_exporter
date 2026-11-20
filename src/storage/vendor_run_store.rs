@@ -12,11 +12,23 @@ use crate::{
     },
 };
 
-use super::{pull_request_cost_store::record_cost_activity_in, sqlite_is_busy_or_locked};
+use super::{
+    commit_cost_store::record_commit_activity_in, pull_request_cost_store::record_cost_activity_in,
+    sqlite_is_busy_or_locked,
+};
 
 const VENDOR_RUN_PRUNE_BATCH_SIZE: i64 = 1_000;
 const VENDOR_RUN_TIMESTAMP_FORMAT: &[FormatItem<'static>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
+
+/// Which cost records a stored vendor run arrived too late for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VendorRunRecorded {
+    /// The pull request's record was already final.
+    pub(crate) pull_request_was_final: bool,
+    /// The head commit's record was already final.
+    pub(crate) commit_was_final: bool,
+}
 
 /// Durable priced vendor runs, keyed by repository and pull request for per-PR totals.
 #[derive(Clone)]
@@ -30,12 +42,12 @@ impl VendorRunStore {
         Self { pool }
     }
 
-    /// Stores one vendor run and records it as activity on its pull request, or does nothing when
-    /// it is not attributed to a single pull request.
+    /// Stores one vendor run and records it as activity on its pull request and, when it names
+    /// one, its head commit. Does nothing when it is not attributed to a single pull request.
     ///
     /// # Returns
     ///
-    /// Whether the pull request's cost record was already final, so this run is not counted in it.
+    /// Which cost records were already final, so this run is not counted in them.
     ///
     /// # Errors
     ///
@@ -45,9 +57,9 @@ impl VendorRunStore {
         &self,
         repository_id: RepositoryId,
         run: &VendorRun,
-    ) -> Result<bool, VendorRunStoreError> {
+    ) -> Result<VendorRunRecorded, VendorRunStoreError> {
         let Some(pull_request) = run.pull_request else {
-            return Ok(false);
+            return Ok(VendorRunRecorded::default());
         };
         trace::instrument_database_operation(DatabaseOperation::VendorRunRecord, async {
             let mut transaction = self
@@ -71,12 +83,23 @@ impl VendorRunStore {
             .execute(&mut *transaction)
             .await
             .map_err(map_sqlx_error)?;
-            let was_final =
+            let pull_request_was_final =
                 record_cost_activity_in(&mut transaction, repository_id, pull_request, None)
                     .await
                     .map_err(map_sqlx_error)?;
+            let commit_was_final = match run.head_sha.as_ref() {
+                Some(commit_sha) => {
+                    record_commit_activity_in(&mut transaction, repository_id, commit_sha)
+                        .await
+                        .map_err(map_sqlx_error)?
+                }
+                None => false,
+            };
             transaction.commit().await.map_err(map_sqlx_error)?;
-            Ok(was_final)
+            Ok(VendorRunRecorded {
+                pull_request_was_final,
+                commit_was_final,
+            })
         })
         .await
     }
@@ -111,6 +134,11 @@ impl VendorRunStore {
                      WHERE state.repository_id = ci_vendor_runs.repository_id \
                      AND state.pull_request_number = ci_vendor_runs.pull_request_number \
                      AND state.finalized_at IS NULL) \
+                 AND NOT EXISTS (\
+                     SELECT 1 FROM commit_costs AS commit_state \
+                     WHERE commit_state.repository_id = ci_vendor_runs.repository_id \
+                     AND commit_state.commit_sha = ci_vendor_runs.head_sha \
+                     AND commit_state.finalized_at IS NULL) \
                  ORDER BY updated_at, id LIMIT ?\
              )",
         )
@@ -158,7 +186,7 @@ mod tests {
     use sqlx::{Row, SqlitePool};
     use time::macros::datetime;
 
-    use super::VendorRunStore;
+    use super::{VendorRunRecorded, VendorRunStore};
     use crate::{
         domain::{merge_queue::PullRequestNumber, repository::RepositoryId},
         security::CanonicalRepositoryName,
@@ -340,6 +368,18 @@ mod tests {
         .execute(&pool)
         .await
         .expect("pull request finalizes");
+        assert_eq!(
+            store.prune_batch(cutoff).await.expect("prune succeeds"),
+            0,
+            "a pending commit keeps its vendor runs"
+        );
+        sqlx::query(
+            "UPDATE commit_costs SET finalized_at = '2026-01-01T00:00:00.000Z', partial = 0, \
+             total_usd = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("commit finalizes");
 
         let pruned = store.prune_batch(cutoff).await.expect("prune succeeds");
 
@@ -348,12 +388,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_run_reports_whether_its_pull_request_was_already_final() {
+    async fn a_run_reports_which_of_its_records_were_already_final() {
         let (_directory, pool, store, repository_id) = store_with_repository().await;
-        assert!(!store
-            .record(repository_id, &run(Some(42), 0.5))
-            .await
-            .expect("run persists"));
+        assert_eq!(
+            store
+                .record(repository_id, &run(Some(42), 0.5))
+                .await
+                .expect("run persists"),
+            VendorRunRecorded::default()
+        );
         sqlx::query(
             "UPDATE pull_request_costs SET finalized_at = '2026-01-01T00:00:00.000Z', \
              finalized_by = 'closed_grace', partial = 0, total_usd = 0.5",
@@ -361,11 +404,34 @@ mod tests {
         .execute(&pool)
         .await
         .expect("pull request finalizes");
+        assert_eq!(
+            store
+                .record(repository_id, &run(Some(42), 0.5))
+                .await
+                .expect("late run persists"),
+            VendorRunRecorded {
+                pull_request_was_final: true,
+                commit_was_final: false,
+            }
+        );
+        sqlx::query(
+            "UPDATE commit_costs SET finalized_at = '2026-01-01T00:00:00.000Z', partial = 0, \
+             total_usd = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("commit finalizes");
 
-        assert!(store
-            .record(repository_id, &run(Some(42), 0.5))
-            .await
-            .expect("late run persists"));
-        assert_eq!(row_count(&pool).await, 2);
+        assert_eq!(
+            store
+                .record(repository_id, &run(Some(42), 0.5))
+                .await
+                .expect("late run persists"),
+            VendorRunRecorded {
+                pull_request_was_final: true,
+                commit_was_final: true,
+            }
+        );
+        assert_eq!(row_count(&pool).await, 3);
     }
 }

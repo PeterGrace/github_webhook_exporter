@@ -6265,6 +6265,7 @@ async fn integrated_core_trace_privacy() {
         retention_children,
         [
             ("sqlite.query", Some("ci_usage.prune"), Some("success")),
+            ("sqlite.query", Some("commit_cost.prune"), Some("success")),
             ("sqlite.query", Some("delivery.prune"), Some("success")),
             ("sqlite.query", Some("merge_queue.prune"), Some("success")),
             (

@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use github_webhook_exporter::{
     app::{self, AppState, BackgroundServices, ShutdownOutcome},
+    commit_costs::CommitCostPolicy,
     config::RuntimeConfig,
     lifecycle,
     metrics::Metrics,
@@ -78,6 +79,10 @@ async fn run_service(
             config.pr_cost_retention(),
         )
         .context("failed to initialize pull-request cost finalization")?,
+    )
+    .with_commit_cost_policy(
+        CommitCostPolicy::new(config.commit_cost_settle(), config.pr_cost_retention())
+            .context("failed to initialize commit cost finalization")?,
     )
     .with_costs(config.costs().cloned())
     .with_ingest_oidc(config.ingest_oidc().cloned())
