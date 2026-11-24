@@ -17,6 +17,7 @@ use thiserror::Error;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
+    commit_costs::DEFAULT_COMMIT_COST_SETTLE_SECONDS,
     costs::{CostsConfig, COSTS_VARIABLE},
     pr_costs::{
         DEFAULT_PR_COST_CLOSED_GRACE_SECONDS, DEFAULT_PR_COST_POST_MERGE_TIMEOUT_SECONDS,
@@ -260,6 +261,7 @@ pub struct RuntimeConfig {
     pr_cost_settle: Duration,
     pr_cost_post_merge_timeout: Duration,
     pr_cost_closed_grace: Duration,
+    commit_cost_settle: Duration,
     github_app: Option<GitHubAppConfig>,
     costs: Option<CostsConfig>,
     ingest_oidc: Option<IngestOidcConfig>,
@@ -359,6 +361,12 @@ impl RuntimeConfig {
     /// Returns how long a pull request closed without merging waits before it is finalized.
     pub fn pr_cost_closed_grace(&self) -> Duration {
         self.pr_cost_closed_grace
+    }
+
+    /// Returns the quiet period after a commit's latest run, once none of its runs is pending,
+    /// before its cost record is finalized.
+    pub fn commit_cost_settle(&self) -> Duration {
+        self.commit_cost_settle
     }
 
     /// Returns the optional GitHub App credentials that fill the required-check cache.
@@ -549,6 +557,11 @@ impl RuntimeConfig {
             "GHE_PR_COST_CLOSED_GRACE_SECONDS",
             DEFAULT_PR_COST_CLOSED_GRACE_SECONDS,
         )?;
+        let commit_cost_settle_seconds = optional_positive_u64(
+            &mut lookup,
+            "GHE_COMMIT_COST_SETTLE_SECONDS",
+            DEFAULT_COMMIT_COST_SETTLE_SECONDS,
+        )?;
         let github_app = GitHubAppConfig::from_lookup(&mut lookup)?;
         let costs = optional_string(&mut lookup, COSTS_VARIABLE)?
             .map(|json| CostsConfig::from_json(&json))
@@ -582,6 +595,7 @@ impl RuntimeConfig {
             pr_cost_settle: Duration::from_secs(pr_cost_settle_seconds),
             pr_cost_post_merge_timeout: Duration::from_secs(pr_cost_post_merge_timeout_seconds),
             pr_cost_closed_grace: Duration::from_secs(pr_cost_closed_grace_seconds),
+            commit_cost_settle: Duration::from_secs(commit_cost_settle_seconds),
             github_app,
             costs,
             ingest_oidc,
@@ -709,6 +723,7 @@ impl fmt::Debug for RuntimeConfig {
                 &self.pr_cost_post_merge_timeout,
             )
             .field("pr_cost_closed_grace", &self.pr_cost_closed_grace)
+            .field("commit_cost_settle", &self.commit_cost_settle)
             .field("github_app", &self.github_app)
             .field("costs_enabled", &self.costs.is_some())
             .field(
@@ -1600,6 +1615,29 @@ mod tests {
                 variable: "GHE_PR_COST_RETENTION_DAYS"
             }
         );
+    }
+
+    #[test]
+    fn the_commit_cost_settle_period_defaults_to_six_hours_and_rejects_invalid_values() {
+        let config = RuntimeConfig::from_map(required_variables()).expect("configuration is valid");
+        assert_eq!(config.commit_cost_settle(), Duration::from_secs(21_600));
+
+        let mut variables = required_variables();
+        variables.insert(
+            "GHE_COMMIT_COST_SETTLE_SECONDS".to_owned(),
+            OsString::from("900"),
+        );
+        let config = RuntimeConfig::from_map(variables).expect("configuration is valid");
+        assert_eq!(config.commit_cost_settle(), Duration::from_secs(900));
+
+        let variable = "GHE_COMMIT_COST_SETTLE_SECONDS";
+        for value in ["0", "not-a-number", "18446744073709551616"] {
+            let mut variables = required_variables();
+            variables.insert(variable.to_owned(), OsString::from(value));
+            let error = RuntimeConfig::from_map(variables).expect_err("invalid value");
+            assert_eq!(error, ConfigError::Invalid { variable }, "{value}");
+            assert!(!error.to_string().contains(value), "{value}");
+        }
     }
 
     #[test]

@@ -239,6 +239,7 @@
         "prCostSettleSeconds",
         "prCostPostMergeTimeoutSeconds",
         "prCostClosedGraceSeconds",
+        "commitCostSettleSeconds",
         "rustLog"
       ],
       "properties": {
@@ -276,6 +277,10 @@
           "minimum": 1
         },
         "prCostClosedGraceSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "commitCostSettleSeconds": {
           "type": "integer",
           "minimum": 1
         },

@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) mod commit_cost;
 mod diagnostics;
 mod http_client;
 #[cfg(test)]

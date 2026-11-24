@@ -4,6 +4,8 @@
 pub mod api;
 /// HTTP application state, router construction, and server lifecycle primitives.
 pub mod app;
+/// Background finalization of one cost record per commit.
+pub mod commit_costs;
 /// Typed, validated, and redacted runtime configuration.
 pub mod config;
 /// Optional validated unit-price table for CI cost attribution.

@@ -18,8 +18,8 @@ use crate::{
 };
 
 use super::{
-    pull_request_cost_store::record_cost_activity_in, sqlite_is_busy_or_locked, CiUsageStore,
-    JobCostTotals, UsageTotals, WorkflowJobLinkStore,
+    commit_cost_store::record_commit_run_in, pull_request_cost_store::record_cost_activity_in,
+    sqlite_is_busy_or_locked, CiUsageStore, JobCostTotals, UsageTotals, WorkflowJobLinkStore,
 };
 
 const RUN_COST_PRUNE_BATCH_SIZE: i64 = 1_000;
@@ -78,6 +78,15 @@ pub(crate) struct RunFinalization<T> {
     pub(crate) value: T,
     /// Whether the attempt's pull request already had a final record, so its cost is late there.
     pub(crate) pull_request_was_final: bool,
+    /// Whether the attempt's head commit already had a final record, so its cost is late there.
+    pub(crate) commit_was_final: bool,
+}
+
+/// Which records a newly finalized attempt arrived too late for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LateRecords {
+    pull_request: bool,
+    commit: bool,
 }
 
 /// Durable run-cost finalizations and the finalized totals attributed to pull requests.
@@ -293,7 +302,7 @@ impl RunCostStore {
             .await
             .map_err(map_sqlx_error)?;
             let (finalized, value) = build(jobs, usage);
-            let Some(pull_request_was_final) = finalize_in(
+            let Some(late) = finalize_in(
                 &mut transaction,
                 repository_id,
                 run_id,
@@ -308,7 +317,8 @@ impl RunCostStore {
             transaction.commit().await.map_err(map_sqlx_error)?;
             Ok(Some(RunFinalization {
                 value,
-                pull_request_was_final,
+                pull_request_was_final: late.pull_request,
+                commit_was_final: late.commit,
             }))
         })
         .await
@@ -455,19 +465,20 @@ pub(crate) async fn attempt_is_final(
     .map(|row| row.is_some())
 }
 
-/// Finalizes one pending attempt and stores its total, split by source, against its pull request.
+/// Finalizes one pending attempt and stores its total, split by source, against its pull request
+/// and its head commit.
 ///
 /// # Returns
 ///
-/// `None` when the attempt was already final. Otherwise whether its pull request already had a
-/// final record; `false` when the attempt has no pull request.
+/// `None` when the attempt was already final. Otherwise whether its pull request and its head
+/// commit already had a final record; each is `false` when the attempt does not count toward one.
 async fn finalize_in(
     connection: &mut SqliteConnection,
     repository_id: RepositoryId,
     run_id: WorkflowRunId,
     run_attempt: WorkflowRunAttempt,
     finalized: &FinalizedRunCost,
-) -> Result<Option<bool>, sqlx::Error> {
+) -> Result<Option<LateRecords>, sqlx::Error> {
     let updated = sqlx::query(
         "UPDATE run_cost_finalizations SET \
              finalized_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), total_usd = ?, \
@@ -494,6 +505,30 @@ async fn finalize_in(
     )
     .execute(&mut *connection)
     .await?;
+    let commit =
+        record_commit_run_in(connection, repository_id, run_id, run_attempt, finalized).await?;
+    let pull_request =
+        record_pull_request_run_in(connection, repository_id, run_id, run_attempt, finalized)
+            .await?;
+    Ok(Some(LateRecords {
+        pull_request,
+        commit,
+    }))
+}
+
+/// Stores one newly finalized attempt's total, split by source, against its pull request,
+/// replacing any total it had under another pull request.
+///
+/// # Returns
+///
+/// Whether the pull request already had a final record; `false` when the attempt has none.
+async fn record_pull_request_run_in(
+    connection: &mut SqliteConnection,
+    repository_id: RepositoryId,
+    run_id: WorkflowRunId,
+    run_attempt: WorkflowRunAttempt,
+    finalized: &FinalizedRunCost,
+) -> Result<bool, sqlx::Error> {
     sqlx::query(
         "DELETE FROM pull_request_run_costs \
              WHERE repository_id = ? AND workflow_run_id = ? AND workflow_run_attempt = ? \
@@ -517,7 +552,7 @@ async fn finalize_in(
     .execute(&mut *connection)
     .await?;
     let Some(pull_request) = finalized.pull_request else {
-        return Ok(Some(false));
+        return Ok(false);
     };
     sqlx::query(
         "INSERT INTO pull_request_run_costs \
@@ -558,9 +593,7 @@ async fn finalize_in(
     let post_merge_commit = (finalized.event == WorkflowEvent::Push)
         .then_some(finalized.head_sha.as_ref())
         .flatten();
-    record_cost_activity_in(connection, repository_id, pull_request, post_merge_commit)
-        .await
-        .map(Some)
+    record_cost_activity_in(connection, repository_id, pull_request, post_merge_commit).await
 }
 
 #[derive(FromRow)]
@@ -1051,6 +1084,7 @@ mod tests {
             Some(RunFinalization {
                 value: (),
                 pull_request_was_final: false,
+                commit_was_final: false,
             })
         );
         late_job

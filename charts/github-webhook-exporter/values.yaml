@@ -26,6 +26,7 @@ application:
   prCostSettleSeconds: 1800
   prCostPostMergeTimeoutSeconds: 21600
   prCostClosedGraceSeconds: 3600
+  commitCostSettleSeconds: 21600
   rustLog: info
 githubApp:
   appId: null
